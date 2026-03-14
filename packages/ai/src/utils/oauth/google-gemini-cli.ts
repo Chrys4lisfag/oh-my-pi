@@ -98,10 +98,40 @@ async function discoverProject(accessToken: string, onProgress?: (message: strin
 	const headers = {
 		Authorization: `Bearer ${accessToken}`,
 		"Content-Type": "application/json",
+		Accept: "application/json",
 		...getGeminiCliHeaders(),
 	};
 
+	try {
+		await fetch("https://oauth2.googleapis.com/tokeninfo", {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/x-www-form-urlencoded",
+				"Content-Length": "0",
+				"User-Agent": "google-api-nodejs-client/9.15.1",
+				Authorization: `Bearer ${accessToken}`,
+			},
+		});
+	} catch {
+		// Ignore failure, this is just to match the client footprint
+	}
+
 	onProgress?.("Checking for existing Cloud Code Assist project...");
+	try {
+		await fetch(`${CODE_ASSIST_ENDPOINT}/v1internal:retrieveUserQuota`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify(envProjectId ? { project: envProjectId } : {}),
+		});
+		await fetch(`${CODE_ASSIST_ENDPOINT}/v1internal:listExperiments`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ ...(envProjectId && { project: envProjectId }), metadata: { updateChannel: "stable" } }),
+		});
+	} catch {
+		// Ignore failure
+	}
+
 	const loadResponse = await fetch(`${CODE_ASSIST_ENDPOINT}/v1internal:loadCodeAssist`, {
 		method: "POST",
 		headers,

@@ -69,10 +69,10 @@ const ANTIGRAVITY_ENDPOINT_FALLBACKS = [ANTIGRAVITY_DAILY_ENDPOINT, ANTIGRAVITY_
  * GeminiCLI/VERSION/MODEL (PLATFORM; ARCH) google-api-nodejs-client/10.5.0
  */
 export function getGeminiCliUserAgent(modelId = "gemini-3.1-pro-preview"): string {
-	const version = process.env.PI_AI_GEMINI_CLI_VERSION || "0.34.0";
+	const version = process.env.PI_AI_GEMINI_CLI_VERSION || "0.33.1";
 	const platform = process.platform === "win32" ? "win32" : process.platform;
 	const arch = process.arch === "x64" ? "x64" : process.arch;
-	return `GeminiCLI/${version}/${modelId} (${platform}; ${arch}) google-api-nodejs-client/10.5.0`;
+	return `GeminiCLI/${version}/${modelId} (${platform}; ${arch}) google-api-nodejs-client/9.15.1`;
 }
 
 const ANTIGRAVITY_USER_AGENT = (() => {
@@ -90,7 +90,8 @@ const ANTIGRAVITY_USER_AGENT = (() => {
 const GEMINI_CLI_HEADERS = (modelId?: string) =>
 	Object.freeze({
 		"User-Agent": getGeminiCliUserAgent(modelId),
-		"Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
+		"x-goog-api-client": `gl-node/${process.versions.node}`,
+		"Accept-Encoding": "gzip,deflate",
 	});
 
 // Antigravity auth headers (project discovery/onboarding).
@@ -452,6 +453,25 @@ interface CloudCodeAssistResponseChunk {
 	traceId?: string;
 }
 
+export function fireAndForgetGeminiCliTelemetry(projectId: string, accessToken: string): void {
+	const headers = {
+		Authorization: `Bearer ${accessToken}`,
+		"Content-Type": "application/json",
+		Accept: "application/json",
+		...getGeminiCliHeaders(),
+	};
+
+	Promise.allSettled([
+		fetch(`${DEFAULT_ENDPOINT}/v1internal:retrieveUserQuota`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ project: projectId }),
+		}),
+	]).catch(() => {
+		// Fire and forget
+	});
+}
+
 export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 	model: Model<"google-gemini-cli">,
 	context: Context,
@@ -501,12 +521,16 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 			if (replacementPayload !== undefined) {
 				requestBody = replacementPayload as typeof requestBody;
 			}
+			if (!isAntigravity) {
+				fireAndForgetGeminiCliTelemetry(projectId, accessToken);
+			}
+
 			const headers = isAntigravity ? getAntigravityHeaders() : getGeminiCliHeaders(model.id);
 
 			const requestHeaders = {
 				Authorization: `Bearer ${accessToken}`,
 				"Content-Type": "application/json",
-				Accept: "text/event-stream",
+				Accept: isAntigravity ? "text/event-stream" : "*/*",
 				...headers,
 				...(needsClaudeThinkingBetaHeader(model) ? { "anthropic-beta": CLAUDE_THINKING_BETA_HEADER } : {}),
 				...(options?.headers ?? {}),
