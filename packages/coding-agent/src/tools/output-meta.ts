@@ -12,6 +12,7 @@ import type {
 	AgentToolUpdateCallback,
 } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
+import { getDefault, type Settings } from "../config/settings";
 import { formatGroupedDiagnosticMessages } from "../lsp/utils";
 import type { Theme } from "../modes/theme/theme";
 import { type OutputSummary, type TruncationResult, truncateTail } from "../session/streaming-output";
@@ -414,16 +415,17 @@ export function formatStyledTruncationWarning(meta: OutputMeta | undefined, them
  * Append output notice to tool result content if meta is present.
  */
 function appendOutputNotice(
-	content: Array<{ type: string; text?: string }>,
+	content: (TextContent | ImageContent)[],
 	meta: OutputMeta | undefined,
-): Array<{ type: string; text?: string }> {
+): (TextContent | ImageContent)[] {
 	const notice = formatOutputNotice(meta);
 	if (!notice) return content;
 
 	const result = [...content];
 	for (let i = result.length - 1; i >= 0; i--) {
-		if (result[i].type === "text" && result[i].text != null) {
-			result[i] = { ...result[i], text: result[i].text + notice };
+		const item = result[i];
+		if (item.type === "text") {
+			result[i] = { ...item, text: item.text + notice };
 			return result;
 		}
 	}
@@ -438,14 +440,17 @@ const kUnwrappedExecute = Symbol("OutputMeta.UnwrappedExecute");
 // Centralized artifact spill for large tool results
 // =============================================================================
 
-/** Text content above this byte threshold gets saved to an artifact. */
-const RESULT_ARTIFACT_THRESHOLD = 50 * 1024; // 50KB
-
-/** When spilling, keep this many bytes of tail in the result sent to the LLM. */
-const RESULT_ARTIFACT_TAIL_BYTES = 20 * 1024; // 20KB
-
-/** When spilling, keep at most this many lines of tail. */
-const RESULT_ARTIFACT_TAIL_LINES = 500;
+/** Resolved artifact spill config sourced from the session settings (or schema defaults). */
+function getSpillConfig(s: Settings | undefined) {
+	const get = <P extends "tools.artifactSpillThreshold" | "tools.artifactTailBytes" | "tools.artifactTailLines">(
+		path: P,
+	) => s?.get(path) ?? getDefault(path);
+	return {
+		threshold: get("tools.artifactSpillThreshold") * 1024,
+		tailBytes: get("tools.artifactTailBytes") * 1024,
+		tailLines: get("tools.artifactTailLines"),
+	};
+}
 
 /**
  * If the tool result text exceeds RESULT_ARTIFACT_THRESHOLD, save the full
@@ -460,9 +465,10 @@ async function spillLargeResultToArtifact(
 ): Promise<AgentToolResult> {
 	const sessionManager = context?.sessionManager;
 	if (!sessionManager) return result;
+	const { threshold, tailBytes, tailLines } = getSpillConfig(context?.settings);
 
 	// Skip if tool already saved an artifact
-	const existingMeta = (result.details as { meta?: OutputMeta } | undefined)?.meta;
+	const existingMeta: OutputMeta | undefined = result.details?.meta;
 	if (existingMeta?.truncation?.artifactId) return result;
 
 	// Measure total text content
@@ -476,7 +482,7 @@ async function spillLargeResultToArtifact(
 
 	const fullText = textParts.length === 1 ? textParts[0] : textParts.join("\n");
 	const totalBytes = Buffer.byteLength(fullText, "utf-8");
-	if (totalBytes <= RESULT_ARTIFACT_THRESHOLD) return result;
+	if (totalBytes <= threshold) return result;
 
 	// Save full output as artifact
 	const artifactId = await sessionManager.saveArtifact(fullText, toolName);
@@ -484,8 +490,8 @@ async function spillLargeResultToArtifact(
 
 	// Truncate to tail
 	const truncated = truncateTail(fullText, {
-		maxBytes: RESULT_ARTIFACT_TAIL_BYTES,
-		maxLines: RESULT_ARTIFACT_TAIL_LINES,
+		maxBytes: tailBytes,
+		maxLines: tailLines,
 	});
 
 	// Replace text blocks with single tail-truncated block, keep images
@@ -508,7 +514,7 @@ async function spillLargeResultToArtifact(
 		totalBytes: truncated.totalBytes,
 		outputLines,
 		outputBytes,
-		maxBytes: RESULT_ARTIFACT_TAIL_BYTES,
+		maxBytes: tailBytes,
 		shownRange: { start: shownStart, end: truncated.totalLines },
 		artifactId,
 	};
@@ -540,11 +546,11 @@ async function wrappedExecute(
 		result = await spillLargeResultToArtifact(result, this.name, context);
 
 		// Append notices from meta
-		const meta = (result.details as { meta?: OutputMeta } | undefined)?.meta;
+		const meta: OutputMeta | undefined = result.details?.meta;
 		if (meta) {
 			return {
 				...result,
-				content: appendOutputNotice(result.content, meta) as (TextContent | ImageContent)[],
+				content: appendOutputNotice(result.content, meta),
 			};
 		}
 		return result;

@@ -226,6 +226,36 @@ export const SETTINGS_SCHEMA = {
 			submenu: true,
 		},
 	},
+	"tools.artifactSpillThreshold": {
+		type: "number",
+		default: 50,
+		ui: {
+			tab: "tools",
+			label: "Artifact spill threshold (KB)",
+			description: "Tool output above this size is saved as an artifact; tail is kept inline",
+			submenu: true,
+		},
+	},
+	"tools.artifactTailBytes": {
+		type: "number",
+		default: 20,
+		ui: {
+			tab: "tools",
+			label: "Artifact tail size (KB)",
+			description: "Amount of tail content kept inline when output spills to artifact",
+			submenu: true,
+		},
+	},
+	"tools.artifactTailLines": {
+		type: "number",
+		default: 500,
+		ui: {
+			tab: "tools",
+			label: "Artifact tail lines",
+			description: "Maximum lines of tail content kept inline when output spills to artifact",
+			submenu: true,
+		},
+	},
 
 	"statusLine.showHookStatus": {
 		type: "boolean",
@@ -626,6 +656,16 @@ export const SETTINGS_SCHEMA = {
 			tab: "context",
 			label: "Compaction Threshold",
 			description: "Percent threshold for context maintenance; set to Default to use legacy reserve-based behavior",
+			submenu: true,
+		},
+	},
+	"compaction.thresholdTokens": {
+		type: "number",
+		default: -1,
+		ui: {
+			tab: "context",
+			label: "Compaction Token Limit",
+			description: "Fixed token limit for context maintenance; overrides percentage if set",
 			submenu: true,
 		},
 	},
@@ -1252,6 +1292,17 @@ export const SETTINGS_SCHEMA = {
 		default: {} as Record<string, string>,
 	},
 
+	"tasks.todoClearDelay": {
+		type: "number",
+		default: 60,
+		ui: {
+			tab: "tasks",
+			label: "Todo auto-clear delay",
+			description: "How long to wait before removing completed/abandoned tasks from the list",
+			submenu: true,
+		},
+	},
+
 	// Skills
 	"skills.enabled": { type: "boolean", default: true },
 
@@ -1518,6 +1569,7 @@ export interface CompactionSettings {
 	enabled: boolean;
 	strategy: "context-full" | "handoff" | "off";
 	thresholdPercent: number;
+	thresholdTokens: number;
 	reserveTokens: number;
 	keepRecentTokens: number;
 	handoffSaveToDisk: boolean;
@@ -1574,6 +1626,7 @@ export interface SkillsSettings {
 	customDirectories?: string[];
 	ignoredSkills?: string[];
 	includeSkills?: string[];
+	disabledExtensions?: string[];
 }
 
 export interface CommitSettings {

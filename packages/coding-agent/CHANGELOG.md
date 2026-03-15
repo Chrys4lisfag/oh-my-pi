@@ -2,6 +2,61 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added automatic clearing of completed and abandoned todo tasks after ~1 minute
+
+### Changed
+
+- Strip already-completed tasks when restoring session from branch history
+
+## [13.12.4] - 2026-03-15
+### Added
+
+- Exposed `settings` instance in `CustomToolContext` for session-specific configuration access
+
+### Changed
+
+- Improved artifact spill configuration to use session settings with schema defaults as fallback
+- Refactored type annotations for better type safety in tool result handling
+
+## [13.12.2] - 2026-03-15
+
+### Added
+
+- Added `compaction.thresholdTokens` setting as a fixed token limit alternative to percentage-based compaction threshold
+- Added more artifact spill threshold options (1 KB to 1 MB) with size descriptions
+- Added more artifact tail bytes and tail lines options with descriptions
+- Added `toExtensionId` capability method to enable granular disabling of individual capabilities by ID
+- Added support for disabling specific capabilities (skills, tools, hooks, rules, prompts, instructions, slash commands, MCP servers, extension modules, and context files) via `disabledExtensions` setting
+- Added `includeDisabled` and `disabledExtensions` options to `LoadOptions` for capability loading
+- Added plugin manifest support for `extensions` entry points to allow plugins to contribute extension modules
+- Added `extensions` field to plugin features for feature-specific extension entry points
+- Added automatic discovery of extension modules from installed plugins during extension loading
+- Added `disabledExtensions` setting to allow disabling specific extensions and skills by ID
+- Added support for filtering skills by disabled extension IDs with `skill:` prefix
+
+### Changed
+
+- Changed capability loading to filter out disabled items based on extension IDs before returning results
+- Changed plugin loader to support `extensions` as a manifest entry type alongside tools, hooks, and commands
+- Changed extension discovery to include extension entry points from all enabled plugins
+- Changed context file path handling to use `path.basename()` for consistent cross-platform filename extraction
+
+### Fixed
+
+- Fixed skill loading to properly respect disabled skill names when loading from custom directories
+
+## [13.12.1] - 2026-03-15
+### Added
+
+- Support for move-only operations that preserve exact bytes including binary files
+
+### Fixed
+
+- Fixed handling of file moves when no edits are specified, now correctly preserves binary content
+- Fixed validation to reject move operations where source and destination paths are identical
+
 ## [13.12.0] - 2026-03-14
 
 ### Added

@@ -82,12 +82,28 @@ const OPTION_PROVIDERS: Partial<Record<SettingPath, OptionProvider>> = {
 	// Context maintenance threshold
 	"compaction.thresholdPercent": [
 		{ value: "default", label: "Default", description: "Legacy reserve-based threshold" },
-		{ value: "70", label: "70%", description: "Very early maintenance" },
-		{ value: "75", label: "75%", description: "Early maintenance" },
-		{ value: "80", label: "80%", description: "Balanced" },
-		{ value: "85", label: "85%", description: "Typical threshold" },
-		{ value: "90", label: "90%", description: "Aggressive context usage" },
+		{ value: "10", label: "10%", description: "Extremely early maintenance" },
+		{ value: "20", label: "20%", description: "Very early maintenance" },
+		{ value: "30", label: "30%", description: "Early maintenance" },
+		{ value: "40", label: "40%", description: "Moderately early maintenance" },
+		{ value: "50", label: "50%", description: "Halfway point" },
+		{ value: "60", label: "60%", description: "Moderate context usage" },
+		{ value: "70", label: "70%", description: "Balanced" },
+		{ value: "75", label: "75%", description: "Slightly aggressive" },
+		{ value: "80", label: "80%", description: "Typical threshold" },
+		{ value: "85", label: "85%", description: "Aggressive context usage" },
+		{ value: "90", label: "90%", description: "Very aggressive" },
 		{ value: "95", label: "95%", description: "Near context limit" },
+	],
+	"compaction.thresholdTokens": [
+		{ value: "default", label: "Default", description: "Use percentage-based threshold" },
+		{ value: "25000", label: "25K tokens", description: "Quarter of a 200K window" },
+		{ value: "50000", label: "50K tokens", description: "Half of a 200K window" },
+		{ value: "100000", label: "100K tokens", description: "Half of a 200K window" },
+		{ value: "150000", label: "150K tokens", description: "Three-quarters of a 200K window" },
+		{ value: "200000", label: "200K tokens", description: "Full standard context window" },
+		{ value: "300000", label: "300K tokens", description: "Large context window" },
+		{ value: "500000", label: "500K tokens", description: "Very large context window" },
 	],
 	// Retry max retries
 	"retry.maxRetries": [
@@ -190,6 +206,40 @@ const OPTION_PROVIDERS: Partial<Record<SettingPath, OptionProvider>> = {
 		{ value: "300", label: "5 minutes" },
 		{ value: "600", label: "10 minutes" },
 	],
+	// Artifact spill settings
+	"tools.artifactSpillThreshold": [
+		{ value: "1", label: "1 KB", description: "~250 tokens" },
+		{ value: "2.5", label: "2.5 KB", description: "~625 tokens" },
+		{ value: "5", label: "5 KB", description: "~1.25K tokens" },
+		{ value: "10", label: "10 KB", description: "~2.5K tokens" },
+		{ value: "20", label: "20 KB", description: "~5K tokens" },
+		{ value: "30", label: "30 KB", description: "~7.5K tokens" },
+		{ value: "50", label: "50 KB", description: "Default; ~12.5K tokens" },
+		{ value: "75", label: "75 KB", description: "~19K tokens" },
+		{ value: "100", label: "100 KB", description: "~25K tokens" },
+		{ value: "200", label: "200 KB", description: "~50K tokens" },
+		{ value: "500", label: "500 KB", description: "~125K tokens" },
+		{ value: "1000", label: "1 MB", description: "~250K tokens" },
+	],
+	"tools.artifactTailBytes": [
+		{ value: "1", label: "1 KB", description: "~250 tokens" },
+		{ value: "2.5", label: "2.5 KB", description: "~625 tokens" },
+		{ value: "5", label: "5 KB", description: "~1.25K tokens" },
+		{ value: "10", label: "10 KB", description: "~2.5K tokens" },
+		{ value: "20", label: "20 KB", description: "Default; ~5K tokens" },
+		{ value: "50", label: "50 KB", description: "~12.5K tokens" },
+		{ value: "100", label: "100 KB", description: "~25K tokens" },
+		{ value: "200", label: "200 KB", description: "~50K tokens" },
+	],
+	"tools.artifactTailLines": [
+		{ value: "50", label: "50 lines", description: "~250 tokens" },
+		{ value: "100", label: "100 lines", description: "~500 tokens" },
+		{ value: "250", label: "250 lines", description: "~1.25K tokens" },
+		{ value: "500", label: "500 lines", description: "Default; ~2.5K tokens" },
+		{ value: "1000", label: "1000 lines", description: "~5K tokens" },
+		{ value: "2000", label: "2000 lines", description: "~10K tokens" },
+		{ value: "5000", label: "5000 lines", description: "~25K tokens" },
+	],
 	// Read line limit
 	"read.defaultLimit": [
 		{ value: "200", label: "200 lines" },
@@ -198,6 +248,17 @@ const OPTION_PROVIDERS: Partial<Record<SettingPath, OptionProvider>> = {
 		{ value: "1000", label: "1000 lines" },
 		{ value: "5000", label: "5000 lines" },
 	],
+	// Todo auto-clear delay
+	"tasks.todoClearDelay": [
+		{ value: "0", label: "Instant" },
+		{ value: "60", label: "1 minute", description: "Default" },
+		{ value: "300", label: "5 minutes" },
+		{ value: "900", label: "15 minutes" },
+		{ value: "1800", label: "30 minutes" },
+		{ value: "3600", label: "1 hour" },
+		{ value: "-1", label: "Never" },
+	],
+
 	// Edit fuzzy threshold
 	"edit.fuzzyThreshold": [
 		{ value: "0.85", label: "0.85", description: "Lenient" },
