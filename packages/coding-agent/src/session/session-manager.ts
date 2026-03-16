@@ -21,6 +21,8 @@ import {
 	isEnoent,
 	logger,
 	parseJsonlLenient,
+	pathIsWithin,
+	resolveEquivalentPath,
 	Snowflake,
 	toError,
 } from "@oh-my-pi/pi-utils";
@@ -345,7 +347,7 @@ export function migrateSessionEntries(entries: FileEntry[]): void {
 	migrateToCurrentVersion(entries);
 }
 
-let sessionDirsMigrated = false;
+const migratedSessionRoots = new Set<string>();
 
 /**
  * Merge or rename a legacy session directory into its canonical target.
@@ -375,29 +377,36 @@ function encodeLegacyAbsoluteSessionDirName(cwd: string): string {
 	return `--${resolvedCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
 }
 
-function pathIsWithin(root: string, candidate: string): boolean {
-	const relative = path.relative(root, candidate);
-	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
-
 function encodeRelativeSessionDirName(prefix: string, root: string, cwd: string): string {
 	const relative = path.relative(root, cwd).replace(/[/\\:]/g, "-");
-	return relative ? `${prefix}-${relative}` : prefix;
+	return relative ? (prefix.endsWith("-") ? `${prefix}${relative}` : `${prefix}-${relative}`) : prefix;
+}
+
+function getDefaultSessionDirName(cwd: string): { encodedDirName: string; resolvedCwd: string } {
+	const resolvedCwd = path.resolve(cwd);
+	const canonicalCwd = resolveEquivalentPath(resolvedCwd);
+	const home = resolveEquivalentPath(os.homedir());
+	const tempRoot = resolveEquivalentPath(os.tmpdir());
+	const encodedDirName = pathIsWithin(home, canonicalCwd)
+		? encodeRelativeSessionDirName("-", home, canonicalCwd)
+		: pathIsWithin(tempRoot, canonicalCwd)
+			? encodeRelativeSessionDirName("-tmp", tempRoot, canonicalCwd)
+			: encodeLegacyAbsoluteSessionDirName(canonicalCwd);
+	return { encodedDirName, resolvedCwd };
 }
 
 /**
  * Migrate old `--<home-encoded>-*--` session dirs to the new `-*` format.
- * Runs once on first access, best-effort.
+ * Runs once per sessions root on first access, best-effort.
  */
-function migrateHomeSessionDirs(): void {
-	if (sessionDirsMigrated) return;
-	sessionDirsMigrated = true;
+function migrateHomeSessionDirs(sessionsRoot: string): void {
+	if (migratedSessionRoots.has(sessionsRoot)) return;
+	migratedSessionRoots.add(sessionsRoot);
 
 	const home = os.homedir();
 	const homeEncoded = home.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-");
 	const oldPrefix = `--${homeEncoded}-`;
 	const oldExact = `--${homeEncoded}--`;
-	const sessionsRoot = getSessionsDir();
 
 	let entries: string[];
 	try {
@@ -428,8 +437,8 @@ function migrateHomeSessionDirs(): void {
 	}
 }
 
-function migrateLegacyAbsoluteSessionDir(cwd: string, sessionDir: string): void {
-	const legacyDir = path.join(getSessionsDir(), encodeLegacyAbsoluteSessionDirName(cwd));
+function migrateLegacyAbsoluteSessionDir(cwd: string, sessionDir: string, sessionsRoot: string): void {
+	const legacyDir = path.join(sessionsRoot, encodeLegacyAbsoluteSessionDirName(cwd));
 	if (legacyDir === sessionDir || !fs.existsSync(legacyDir)) return;
 
 	try {
@@ -437,6 +446,15 @@ function migrateLegacyAbsoluteSessionDir(cwd: string, sessionDir: string): void 
 	} catch {
 		// Best effort
 	}
+}
+
+function resolveManagedSessionRoot(sessionDir: string, cwd: string): string | undefined {
+	const currentDirName = path.basename(sessionDir);
+	const { encodedDirName } = getDefaultSessionDirName(cwd);
+	if (currentDirName !== encodedDirName && currentDirName !== encodeLegacyAbsoluteSessionDirName(cwd)) {
+		return undefined;
+	}
+	return path.dirname(sessionDir);
 }
 
 /** Exported for compaction.test.ts */
@@ -634,33 +652,19 @@ export function buildSessionContext(
 }
 
 /**
- * Encode a cwd into a safe directory name for session storage.
- * Home-relative paths use single-dash format: `/Users/x/Projects/pi` → `-Projects-pi`
- * Temp-root paths use `-tmp-` prefixes: `/tmp/foo` → `-tmp-foo`
- * Other absolute paths keep the legacy double-dash format for compatibility.
- */
-function encodeSessionDirName(cwd: string): string {
-	const resolvedCwd = path.resolve(cwd);
-	const home = path.resolve(os.homedir());
-	if (pathIsWithin(home, resolvedCwd)) {
-		return encodeRelativeSessionDirName("-", home, resolvedCwd);
-	}
-	const tempRoot = path.resolve(os.tmpdir());
-	if (pathIsWithin(tempRoot, resolvedCwd)) {
-		return encodeRelativeSessionDirName("-tmp", tempRoot, resolvedCwd);
-	}
-	return encodeLegacyAbsoluteSessionDirName(resolvedCwd);
-}
-
-/**
  * Compute the default session directory for a cwd.
- * Encodes cwd into a safe directory name under ~/.omp/agent/sessions/.
+ * Classifies cwd by canonical location so symlink/alias paths resolve to the
+ * same home-relative or temp-root directory names as their real targets.
  */
-function getDefaultSessionDir(cwd: string, storage: SessionStorage): string {
-	const resolvedCwd = path.resolve(cwd);
-	migrateHomeSessionDirs();
-	const sessionDir = path.join(getSessionsDir(), encodeSessionDirName(resolvedCwd));
-	migrateLegacyAbsoluteSessionDir(resolvedCwd, sessionDir);
+function computeDefaultSessionDir(
+	cwd: string,
+	storage: SessionStorage,
+	sessionsRoot: string = getSessionsDir(),
+): string {
+	const { encodedDirName, resolvedCwd } = getDefaultSessionDirName(cwd);
+	migrateHomeSessionDirs(sessionsRoot);
+	const sessionDir = path.join(sessionsRoot, encodedDirName);
+	migrateLegacyAbsoluteSessionDir(resolvedCwd, sessionDir, sessionsRoot);
 	storage.ensureDirSync(sessionDir);
 	return sessionDir;
 }
@@ -1322,7 +1326,8 @@ export async function resolveResumableSession(
 	sessionDir?: string,
 	storage: SessionStorage = new FileSessionStorage(),
 ): Promise<ResolvedSessionMatch | undefined> {
-	const localSessions = await SessionManager.list(cwd, sessionDir, storage);
+	const localSessionDir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
+	const localSessions = await SessionManager.list(cwd, localSessionDir, storage);
 	const localMatch = localSessions.find(session => sessionMatchesResumeArg(session, sessionArg));
 	if (localMatch) {
 		return { session: localMatch, scope: "local" };
@@ -1489,7 +1494,10 @@ export class SessionManager {
 		const resolvedCwd = path.resolve(newCwd);
 		if (resolvedCwd === this.cwd) return;
 
-		const newSessionDir = getDefaultSessionDir(resolvedCwd, this.storage);
+		const managedSessionsRoot = resolveManagedSessionRoot(this.sessionDir, this.cwd);
+		const newSessionDir = managedSessionsRoot
+			? computeDefaultSessionDir(resolvedCwd, this.storage, managedSessionsRoot)
+			: computeDefaultSessionDir(resolvedCwd, this.storage);
 		let hadSessionFile = false;
 
 		if (this.persist && this.#sessionFile) {
@@ -2447,12 +2455,23 @@ export class SessionManager {
 	}
 
 	/**
+	 * Resolve the canonical default session directory for a cwd.
+	 */
+	static getDefaultSessionDir(
+		cwd: string,
+		agentDir?: string,
+		storage: SessionStorage = new FileSessionStorage(),
+	): string {
+		return computeDefaultSessionDir(cwd, storage, getSessionsDir(agentDir));
+	}
+
+	/**
 	 * Create a new session.
 	 * @param cwd Working directory (stored in session header)
 	 * @param sessionDir Optional session directory. If omitted, uses default (~/.omp/agent/sessions/<encoded-cwd>/).
 	 */
 	static create(cwd: string, sessionDir?: string, storage: SessionStorage = new FileSessionStorage()): SessionManager {
-		const dir = sessionDir ?? getDefaultSessionDir(cwd, storage);
+		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const manager = new SessionManager(cwd, dir, true, storage);
 		manager.#initNewSession();
 		return manager;
@@ -2468,7 +2487,7 @@ export class SessionManager {
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
 	): Promise<SessionManager> {
-		const dir = sessionDir ?? getDefaultSessionDir(cwd, storage);
+		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const manager = new SessionManager(cwd, dir, true, storage);
 		const forkEntries = structuredClone(await loadEntriesFromFile(sourcePath, storage)) as FileEntry[];
 		migrateToCurrentVersion(forkEntries);
@@ -2516,7 +2535,7 @@ export class SessionManager {
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
 	): Promise<SessionManager> {
-		const dir = sessionDir ?? getDefaultSessionDir(cwd, storage);
+		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		// Prefer terminal-scoped breadcrumb (handles concurrent sessions correctly)
 		const terminalSession = await readTerminalBreadcrumb(cwd);
 		const mostRecent = terminalSession ?? (await findMostRecentSession(dir, storage));
@@ -2549,7 +2568,7 @@ export class SessionManager {
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
 	): Promise<SessionInfo[]> {
-		const dir = sessionDir ?? getDefaultSessionDir(cwd, storage);
+		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		try {
 			const files = storage.listFilesSync(dir, "*.jsonl");
 			return await collectSessionsFromFiles(files, storage);
