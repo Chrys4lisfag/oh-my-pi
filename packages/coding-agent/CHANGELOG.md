@@ -2,13 +2,40 @@
 
 ## [Unreleased]
 
+## [13.12.6] - 2026-03-15
+### Changed
+
+- Updated llama.cpp model discovery to read context window from the `/props` endpoint's `default_generation_settings.n_ctx` field instead of using hardcoded 128000 default
+- Updated llama.cpp model discovery to detect vision capabilities from the `/props` endpoint's `modalities.vision` field instead of defaulting to text-only input
+- Changed llama.cpp `maxTokens` calculation to respect discovered context window limits, capping at 8192 or the server's context window, whichever is smaller
+
+### Fixed
+
+- Fixed llama.cpp auto-discovery to read context window and vision support from the native `/props` endpoint instead of relying on hardcoded defaults
+
+## [13.12.5] - 2026-03-15
+
 ### Added
 
+- Automatic discovery of Ollama model context window from model metadata, enabling accurate token limit configuration
+- Added `attribution` option to `PromptOptions` to explicitly control billing/initiator attribution for prompts
 - Added automatic clearing of completed and abandoned todo tasks after ~1 minute
 
 ### Changed
 
+- Ollama model registration now uses discovered context window instead of hardcoded 128000 token default
+- Ollama model maxTokens now respects discovered context window constraints
+- Improved session directory migration to handle legacy absolute paths with double-dash format, automatically relocating them to new canonical locations
+- Enhanced session directory encoding to use `-tmp-` prefix for temporary directories instead of legacy double-dash format for better clarity
+- Updated `SessionManager.create()` to require both `cwd` and `sessionDir` parameters for explicit session directory control
+- Improved session directory naming for temporary working directories using `-tmp-` prefix instead of legacy `--` format
+- Made `cwd` and `sessionDir` fields mutable in SessionManager to support session relocation without type casting
+- Changed subagent prompts to explicitly set `attribution: "agent"` for accurate billing attribution
 - Strip already-completed tasks when restoring session from branch history
+
+### Fixed
+
+- Fixed automatic migration of legacy session directories to new `-tmp-` prefixed naming scheme for temp-root sessions
 
 ## [13.12.4] - 2026-03-15
 ### Added
