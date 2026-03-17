@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [13.12.10] - 2026-03-17
+### Added
+
+- Added `args` field to ShellResult to capture the executed command
+- Added `exit_code` property to ShellResult as an alias for `returncode`
+- Added `check_returncode()` method to ShellResult to raise CalledProcessError on non-zero exit codes
+
+### Changed
+
+- Renamed `code` field to `returncode` in ShellResult (accessible via `code` property for backward compatibility)
+- Updated `run()` command documentation to clarify available ShellResult fields
+
 ## [13.12.9] - 2026-03-17
 ### Added
 
