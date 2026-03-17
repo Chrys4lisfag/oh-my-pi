@@ -1,3 +1,4 @@
+import { resolveOpenAICompat } from "./providers/openai-completions-compat";
 import type { Api, Model as ApiModel, ThinkingConfig } from "./types";
 
 /** User-facing thinking levels, ordered least to most intensive. */
@@ -385,6 +386,17 @@ function inferFallbackEfforts<TApi extends Api>(model: ApiModel<TApi>): readonly
 	}
 	if (model.api === "bedrock-converse-stream") {
 		return DEFAULT_REASONING_EFFORTS;
+	}
+	if (model.api === "openai-completions") {
+		const compat = resolveOpenAICompat(model as ApiModel<"openai-completions">);
+		if (compat.thinkingFormat === "openai" && compat.supportsReasoningEffort) {
+			return DEFAULT_REASONING_EFFORTS_WITH_XHIGH;
+		}
+		return DEFAULT_REASONING_EFFORTS;
+	}
+	// OpenAI Responses APIs encode discrete effort levels, including xhigh.
+	if (model.api === "openai-responses" || model.api === "openai-codex-responses") {
+		return DEFAULT_REASONING_EFFORTS_WITH_XHIGH;
 	}
 	return DEFAULT_REASONING_EFFORTS;
 }
