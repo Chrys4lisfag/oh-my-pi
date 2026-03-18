@@ -4,7 +4,7 @@
  */
 
 import { $env } from "@oh-my-pi/pi-utils";
-import { getGeminiCliHeaders } from "../../providers/google-gemini-cli";
+import { EMULATED_NODE_VERSION, getGeminiCliHeaders } from "../../providers/google-gemini-cli";
 import { OAuthCallbackFlow } from "./callback-server";
 import type { OAuthController, OAuthCredentials } from "./types";
 
@@ -109,6 +109,8 @@ async function discoverProject(accessToken: string, onProgress?: (message: strin
 				"Content-Type": "application/x-www-form-urlencoded",
 				"Content-Length": "0",
 				"User-Agent": "google-api-nodejs-client/9.15.1",
+				"x-goog-api-client": `gl-node/${EMULATED_NODE_VERSION}`,
+				"Accept-Encoding": "gzip,deflate",
 				Authorization: `Bearer ${accessToken}`,
 			},
 		});
@@ -126,7 +128,17 @@ async function discoverProject(accessToken: string, onProgress?: (message: strin
 		await fetch(`${CODE_ASSIST_ENDPOINT}/v1internal:listExperiments`, {
 			method: "POST",
 			headers,
-			body: JSON.stringify({ ...(envProjectId && { project: envProjectId }), metadata: { updateChannel: "stable" } }),
+			body: JSON.stringify({
+				...(envProjectId && { project: envProjectId }),
+				metadata: {
+					updateChannel: "stable",
+					ideName: "IDE_UNSPECIFIED",
+					pluginType: "GEMINI",
+					ideVersion: "0.34.0",
+					platform: "WINDOWS_AMD64",
+					...(envProjectId && { duetProject: envProjectId }),
+				},
+			}),
 		});
 	} catch {
 		// Ignore failure
@@ -240,9 +252,13 @@ async function discoverProject(accessToken: string, onProgress?: (message: strin
 
 async function getUserEmail(accessToken: string): Promise<string | undefined> {
 	try {
-		const response = await fetch("https://www.googleapis.com/oauth2/v1/userinfo?alt=json", {
+		const response = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
 			headers: {
 				Authorization: `Bearer ${accessToken}`,
+				"user-agent": "node",
+				"accept-language": "*",
+				"sec-fetch-mode": "cors",
+				"Accept-Encoding": "gzip, deflate, br",
 			},
 		});
 
@@ -281,7 +297,12 @@ class GeminiCliOAuthFlow extends OAuthCallbackFlow {
 
 		const tokenResponse = await fetch(TOKEN_URL, {
 			method: "POST",
-			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			headers: {
+				"Content-Type": "application/x-www-form-urlencoded",
+				"User-Agent": "google-api-nodejs-client/9.15.1",
+				"x-goog-api-client": `gl-node/${EMULATED_NODE_VERSION}`,
+				"Accept-Encoding": "gzip,deflate",
+			},
 			body: new URLSearchParams({
 				client_id: CLIENT_ID,
 				client_secret: CLIENT_SECRET,
@@ -335,7 +356,12 @@ export async function loginGeminiCli(ctrl: OAuthController): Promise<OAuthCreden
 export async function refreshGoogleCloudToken(refreshToken: string, projectId: string): Promise<OAuthCredentials> {
 	const response = await fetch(TOKEN_URL, {
 		method: "POST",
-		headers: { "Content-Type": "application/x-www-form-urlencoded" },
+		headers: {
+			"Content-Type": "application/x-www-form-urlencoded",
+			"User-Agent": "google-api-nodejs-client/9.15.1",
+			"x-goog-api-client": `gl-node/${EMULATED_NODE_VERSION}`,
+			"Accept-Encoding": "gzip,deflate",
+		},
 		body: new URLSearchParams({
 			client_id: CLIENT_ID,
 			client_secret: CLIENT_SECRET,

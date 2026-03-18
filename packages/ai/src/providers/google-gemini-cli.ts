@@ -69,11 +69,19 @@ const ANTIGRAVITY_ENDPOINT_FALLBACKS = [ANTIGRAVITY_DAILY_ENDPOINT, ANTIGRAVITY_
  * GeminiCLI/VERSION/MODEL (PLATFORM; ARCH) google-api-nodejs-client/10.5.0
  */
 export function getGeminiCliUserAgent(modelId = "gemini-3.1-pro-preview"): string {
-	const version = process.env.PI_AI_GEMINI_CLI_VERSION || "0.33.1";
+	const version = process.env.PI_AI_GEMINI_CLI_VERSION || "0.34.0";
 	const platform = process.platform === "win32" ? "win32" : process.platform;
 	const arch = process.arch === "x64" ? "x64" : process.arch;
 	return `GeminiCLI/${version}/${modelId} (${platform}; ${arch}) google-api-nodejs-client/9.15.1`;
 }
+
+/**
+ * Emulated Node.js version for x-goog-api-client header.
+ * Bun reports its own version via process.versions.node (e.g. 24.3.0),
+ * but the real Gemini CLI runs on actual Node.js. Override via
+ * PI_AI_NODE_VERSION env var when the upstream CLI updates Node.
+ */
+export const EMULATED_NODE_VERSION = process.env.PI_AI_NODE_VERSION || "24.12.0";
 
 const ANTIGRAVITY_USER_AGENT = (() => {
 	const DEFAULT_ANTIGRAVITY_VERSION = "1.104.0";
@@ -90,7 +98,7 @@ const ANTIGRAVITY_USER_AGENT = (() => {
 const GEMINI_CLI_HEADERS = (modelId?: string) =>
 	Object.freeze({
 		"User-Agent": getGeminiCliUserAgent(modelId),
-		"x-goog-api-client": `gl-node/${process.versions.node}`,
+		"x-goog-api-client": `gl-node/${EMULATED_NODE_VERSION}`,
 		"Accept-Encoding": "gzip,deflate",
 	});
 
@@ -136,6 +144,11 @@ export const ANTIGRAVITY_SYSTEM_INSTRUCTION =
 
 // Counter for generating unique tool call IDs
 let toolCallCounter = 0;
+
+// Counter for generating unique user_prompt_id values (format: UUID########N).
+// Matches the Gemini CLI's incrementing prompt counter per session.
+const geminiCliPromptUUID = randomUUID();
+let geminiCliPromptCounter = 0;
 
 // Retry configuration
 const MAX_RETRIES = 3;
@@ -420,6 +433,7 @@ interface CloudCodeAssistRequest {
 	requestType?: string;
 	userAgent?: string;
 	requestId?: string;
+	user_prompt_id?: string;
 }
 
 interface CloudCodeAssistResponseChunk {
@@ -1142,16 +1156,20 @@ export function buildRequest(
 		};
 	}
 
-	return {
+	const result: CloudCodeAssistRequest = {
 		project: projectId,
 		model: model.id,
 		request,
-		...(isAntigravity
-			? {
-					requestType: "agent",
-					userAgent: "antigravity",
-					requestId: `agent-${randomUUID()}`,
-				}
-			: {}),
 	};
+
+	if (isAntigravity) {
+		result.requestType = "agent";
+		result.userAgent = "antigravity";
+		result.requestId = `agent-${randomUUID()}`;
+	} else {
+		// Gemini CLI sends an incrementing user_prompt_id with format UUID########N
+		result.user_prompt_id = `${geminiCliPromptUUID}########${geminiCliPromptCounter++}`;
+	}
+
+	return result;
 }
