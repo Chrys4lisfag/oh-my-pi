@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [13.13.0] - 2026-03-18
+
+### Added
+
+- Added `startup.checkUpdate` setting, set to `true` by default, can be disabled to skip the update check on agent initialization
+
 ## [13.12.7] - 2026-03-16
 
 ### Added
