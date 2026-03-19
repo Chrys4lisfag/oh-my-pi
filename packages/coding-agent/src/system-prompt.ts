@@ -260,6 +260,18 @@ export interface LoadContextFilesOptions {
 	cwd?: string;
 }
 
+function dedupeExactContextFiles(
+	contextFiles: Array<{ path: string; content: string; depth?: number }>,
+): Array<{ path: string; content: string; depth?: number }> {
+	const lastIndexByContent = new Map<string, number>();
+	for (const [index, file] of contextFiles.entries()) {
+		// Keep the closest matching context entry when content is byte-for-byte identical.
+		lastIndexByContent.set(file.content, index);
+	}
+
+	return contextFiles.filter((file, index) => lastIndexByContent.get(file.content) === index);
+}
+
 /**
  * Load all project context files using the capability API.
  * Returns {path, content, depth} entries for all discovered context files.
@@ -290,12 +302,12 @@ export async function loadProjectContextFiles(
 		return depthB - depthA;
 	});
 
-	return files;
+	return dedupeExactContextFiles(files);
 }
 
 /**
- * Load system prompt customization files (SYSTEM.md).
- * Returns combined content from all discovered SYSTEM.md files.
+ * Load the effective system prompt customization from SYSTEM.md.
+ * Project-level SYSTEM.md overrides user-level SYSTEM.md.
  */
 export async function loadSystemPromptFiles(options: LoadContextFilesOptions = {}): Promise<string | null> {
 	const resolvedCwd = options.cwd ?? getProjectDir();
@@ -304,16 +316,13 @@ export async function loadSystemPromptFiles(options: LoadContextFilesOptions = {
 
 	if (result.items.length === 0) return null;
 
-	// Combine all SYSTEM.md contents (user-level first, then project-level)
-	const userLevel = result.items.filter(item => item.level === "user");
-	const projectLevel = result.items.filter(item => item.level === "project");
-
-	const parts: string[] = [];
-	for (const item of [...userLevel, ...projectLevel]) {
-		parts.push(item.content);
+	const projectLevel = result.items.find(item => item.level === "project");
+	if (projectLevel) {
+		return projectLevel.content;
 	}
 
-	return parts.join("\n\n");
+	const userLevel = result.items.find(item => item.level === "user");
+	return userLevel?.content ?? null;
 }
 
 export interface SystemPromptToolMetadata {
@@ -447,7 +456,9 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	let resolvedCustomPrompt: string | undefined;
 	let resolvedAppendPrompt: string | undefined;
 	let systemPromptCustomization: string | null = null;
-	let contextFiles: Array<{ path: string; content: string; depth?: number }> = providedContextFiles ?? [];
+	let contextFiles: Array<{ path: string; content: string; depth?: number }> = dedupeExactContextFiles(
+		providedContextFiles ?? [],
+	);
 	let agentsMdSearch: AgentsMdSearch = {
 		scopePath: ".",
 		limit: AGENTS_MD_LIMIT,
@@ -474,7 +485,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		resolvedCustomPrompt = prepResult.value.resolvedCustomPrompt;
 		resolvedAppendPrompt = prepResult.value.resolvedAppendPrompt;
 		systemPromptCustomization = prepResult.value.systemPromptCustomization;
-		contextFiles = prepResult.value.contextFiles;
+		contextFiles = dedupeExactContextFiles(prepResult.value.contextFiles);
 		agentsMdSearch = prepResult.value.agentsMdSearch;
 		skills = prepResult.value.skills;
 	}
@@ -510,7 +521,8 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 
 	const environment = await logger.timeAsync("getEnvironmentInfo", getEnvironmentInfo);
 	const data = {
-		systemPromptCustomization: systemPromptCustomization ?? "",
+		// Explicit custom prompts replace discovered SYSTEM.md content rather than layering it twice.
+		systemPromptCustomization: resolvedCustomPrompt ? "" : (systemPromptCustomization ?? ""),
 		customPrompt: resolvedCustomPrompt,
 		appendPrompt: resolvedAppendPrompt ?? "",
 		tools: toolNames,

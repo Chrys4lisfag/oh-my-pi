@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [13.13.2] - 2026-03-18
+
+### Added
+
+- Added automatic stripping of hashline display prefixes (LINE#ID:) from write tool content when hashline edit mode is enabled, preventing the model from accidentally copying display markers into files
+- Added `mcpServerName` and `mcpToolName` optional properties to custom tools for MCP server discovery and search metadata
+
+## [13.13.1] - 2026-03-18
+### Added
+
+- Automatic deduplication of identical context files by content, keeping the closest (lowest depth) copy when duplicates are discovered
+
 ## [13.13.0] - 2026-03-18
 
 ### Added
@@ -2214,7 +2226,7 @@
 - New `appendModeChange()` method in SessionManager to record mode transitions
 - New `mode` and `modeData` fields in SessionContext to track active agent mode
 - Support for `PI_PACKAGE_DIR` environment variable to override package directory (useful for Nix/Guix store paths)
-- New keybindings for session management: `toggleSessionNamedFilter` (Ctrl+N), `newSession`, `tree`, `fork`, and `resume` actions
+- New keybindings for session management: `newSession`, `tree`, `fork`, and `resume` actions
 - Support for shell command execution in configuration values (API keys, headers) using `!` prefix, with result caching
 - New `clearOnShrink` display setting to control whether empty rows are cleared when content shrinks
 - New `SlashCommandInfo`, `SlashCommandLocation`, and `SlashCommandSource` types for extension slash command discovery

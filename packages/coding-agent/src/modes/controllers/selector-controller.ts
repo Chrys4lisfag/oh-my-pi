@@ -26,6 +26,7 @@ import {
 	setPreferredImageProvider,
 	setPreferredSearchProvider,
 } from "../../tools";
+import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { AgentDashboard } from "../components/agent-dashboard";
 import { AssistantMessageComponent } from "../components/assistant-message";
 import { ExtensionDashboard } from "../components/extensions";
@@ -638,6 +639,14 @@ export class SelectorController {
 		this.ctx.pendingTools.clear();
 	}
 
+	#refreshSessionTerminalTitle(): void {
+		const sessionManager = this.ctx.sessionManager as {
+			getSessionName?: () => string | undefined;
+			getCwd: () => string;
+		};
+		setSessionTerminalTitle(sessionManager.getSessionName?.(), sessionManager.getCwd());
+	}
+
 	async #detachActiveSessionBeforeDeletion(sessionPath: string): Promise<boolean> {
 		const currentSessionFile = this.ctx.sessionManager.getSessionFile();
 		if (currentSessionFile !== sessionPath) {
@@ -648,6 +657,7 @@ export class SelectorController {
 		if (!detached) {
 			return false;
 		}
+		this.#refreshSessionTerminalTitle();
 
 		this.#clearTransientSessionUi();
 		this.ctx.statusLine.invalidate();
@@ -664,6 +674,7 @@ export class SelectorController {
 
 		// Switch session via AgentSession (emits hook and tool session events)
 		await this.ctx.session.switchSession(sessionPath);
+		this.#refreshSessionTerminalTitle();
 
 		// Clear and re-render the chat
 		this.ctx.chatContainer.clear();
