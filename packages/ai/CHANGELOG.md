@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [13.14.0] - 2026-03-20
+
+### Fixed
+
+- Fixed resumed OpenAI Responses sessions to avoid replaying stale same-provider native history on the first follow-up after process restart ([#488](https://github.com/can1357/oh-my-pi/issues/488))
+
+### Added
+
+- Added bundled GPT-5.4 mini model metadata for OpenAI, OpenAI Codex, and GitHub Copilot, including low-to-xhigh thinking support and GitHub Copilot premium multiplier metadata
+- Added bundled GPT-5.4 nano model metadata for OpenAI and OpenAI Codex, including low-to-xhigh thinking support
+
+
 ## [13.13.2] - 2026-03-18
 ### Changed
 
