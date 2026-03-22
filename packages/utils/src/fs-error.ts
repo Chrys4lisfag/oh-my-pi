@@ -54,3 +54,9 @@ export function isEnotempty(err: unknown): err is FsError {
 export function hasFsCode(err: unknown, code: string): err is FsError {
 	return isFsError(err) && err.code === code;
 }
+
+export function isEpipe(err: unknown): boolean {
+	if (isFsError(err) && err.code === "EPIPE") return true;
+	// Bun may throw a plain Error with the code embedded in the message.
+	return err instanceof Error && /\bEPIPE\b/.test(err.message);
+}

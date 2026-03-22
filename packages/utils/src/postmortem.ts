@@ -8,6 +8,7 @@
 import inspector from "node:inspector";
 import { isMainThread } from "node:worker_threads";
 import { logger } from ".";
+import { isEpipe } from "./fs-error";
 
 // Cleanup reasons, in order of priority/meaning.
 export enum Reason {
@@ -97,6 +98,14 @@ if (isMainThread) {
 		})
 		.on("unhandledRejection", async reason => {
 			const err = reason instanceof Error ? reason : new Error(String(reason));
+			// EPIPE on subprocess stdin is benign — the child process died and the
+			// transport read loop will detect EOF and clean up pending requests.
+			// Bun can deliver the pipe error as an async microtask that escapes
+			// synchronous try-catch, so suppress it here instead of crashing.
+			if (isEpipe(err)) {
+				logger.debug("Suppressed EPIPE unhandled rejection", { stack: err.stack });
+				return;
+			}
 			process.stderr.write(formatFatalError("Unhandled Rejection", err));
 			logger.error("Unhandled rejection", { err, stack: err.stack });
 			await runCleanup(Reason.UNHANDLED_REJECTION);

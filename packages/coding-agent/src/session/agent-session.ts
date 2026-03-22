@@ -127,6 +127,7 @@ import {
 	compact,
 	estimateTokens,
 	generateBranchSummary,
+	getLastAssistantUsage,
 	prepareCompaction,
 	shouldCompact,
 } from "./compaction";
@@ -170,6 +171,7 @@ export type AgentSessionEvent =
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
 	| { type: "ttsr_triggered"; rules: Rule[] }
 	| { type: "todo_reminder"; todos: TodoItem[]; attempt: number; maxAttempts: number }
+	| { type: "auto_compaction_confirm"; contextTokens: number; contextWindow: number }
 	| { type: "todo_auto_clear" };
 
 /** Listener function for agent session events */
@@ -370,6 +372,7 @@ export class AgentSession {
 	// Compaction state
 	#compactionAbortController: AbortController | undefined = undefined;
 	#autoCompactionAbortController: AbortController | undefined = undefined;
+	#compactionConfirmResolve: ((confirmed: boolean) => void) | undefined = undefined;
 
 	// Branch summarization state
 	#branchSummaryAbortController: AbortController | undefined = undefined;
@@ -862,7 +865,7 @@ export class AgentSession {
 				this.#checkpointState = undefined;
 				this.#pendingRewindReport = undefined;
 			}
-			const compactionTask = this.#checkCompaction(msg);
+			const compactionTask = this.#checkCompaction(msg, true, false);
 			this.#trackPostPromptTask(compactionTask);
 			await compactionTask;
 			// Check for incomplete todos only after a final assistant stop, not intermediate tool-use turns.
@@ -2283,7 +2286,7 @@ export class AgentSession {
 			// Check if we need to compact before sending (catches aborted responses)
 			const lastAssistant = this.#findLastAssistantMessage();
 			if (lastAssistant && !options?.skipCompactionCheck) {
-				await this.#checkCompaction(lastAssistant, false);
+				await this.#checkCompaction(lastAssistant, false, true);
 			}
 
 			// Build messages array (session context, eager todo prelude, then active prompt message)
@@ -3468,6 +3471,14 @@ export class AgentSession {
 		this.#compactionAbortController?.abort();
 		this.#autoCompactionAbortController?.abort();
 		this.#handoffAbortController?.abort();
+		this.resolveCompactionConfirm(false);
+	}
+
+	resolveCompactionConfirm(confirmed: boolean): void {
+		const resolve = this.#compactionConfirmResolve;
+		if (!resolve) return;
+		this.#compactionConfirmResolve = undefined;
+		resolve(confirmed);
 	}
 
 	/**
@@ -3663,7 +3674,11 @@ export class AgentSession {
 	 * @param assistantMessage The assistant message to check
 	 * @param skipAbortedCheck If false, include aborted messages (for pre-prompt check). Default: true
 	 */
-	async #checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<void> {
+	async #checkCompaction(
+		assistantMessage: AssistantMessage,
+		skipAbortedCheck = true,
+		confirmBeforeCompact = false,
+	): Promise<void> {
 		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
 		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return;
 		const contextWindow = this.model?.contextWindow ?? 0;
@@ -3700,7 +3715,7 @@ export class AgentSession {
 			// No promotion target available fall through to compaction
 			const compactionSettings = this.settings.getGroup("compaction");
 			if (compactionSettings.enabled && compactionSettings.strategy !== "off") {
-				await this.#runAutoCompaction("overflow", true);
+				await this.#runAutoCompaction("overflow", true, false, false);
 			}
 			return;
 		}
@@ -3719,7 +3734,7 @@ export class AgentSession {
 			// Try promotion first — if a larger model is available, switch instead of compacting
 			const promoted = await this.#tryContextPromotion(assistantMessage);
 			if (!promoted) {
-				await this.#runAutoCompaction("threshold", false);
+				await this.#runAutoCompaction("threshold", false, false, confirmBeforeCompact);
 			}
 		}
 	}
@@ -4081,7 +4096,12 @@ export class AgentSession {
 	/**
 	 * Internal: Run auto-compaction with events.
 	 */
-	async #runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean, deferred = false): Promise<void> {
+	async #runAutoCompaction(
+		reason: "overflow" | "threshold",
+		willRetry: boolean,
+		deferred = false,
+		confirm = false,
+	): Promise<void> {
 		const compactionSettings = this.settings.getGroup("compaction");
 		if (!compactionSettings.enabled || compactionSettings.strategy === "off") return;
 		const generation = this.#promptGeneration;
@@ -4090,7 +4110,7 @@ export class AgentSession {
 				async signal => {
 					await Promise.resolve();
 					if (signal.aborted) return;
-					await this.#runAutoCompaction(reason, willRetry, true);
+					await this.#runAutoCompaction(reason, willRetry, true, confirm);
 				},
 				{ generation },
 			);
@@ -4099,6 +4119,21 @@ export class AgentSession {
 
 		let action: "context-full" | "handoff" =
 			compactionSettings.strategy === "handoff" && reason !== "overflow" ? "handoff" : "context-full";
+
+		// Ask user for confirmation on threshold-triggered compaction
+		if (confirm && reason !== "overflow" && compactionSettings.confirm !== false) {
+			const lastUsage = getLastAssistantUsage(this.sessionManager.getBranch());
+			const contextTokens = lastUsage ? calculateContextTokens(lastUsage) : 0;
+			const contextWindow = this.model?.contextWindow ?? 0;
+			await this.#emitSessionEvent({ type: "auto_compaction_confirm", contextTokens, contextWindow });
+			const { promise, resolve } = Promise.withResolvers<boolean>();
+			this.#compactionConfirmResolve = resolve;
+			const confirmed = await promise;
+			if (!confirmed) {
+				return;
+			}
+		}
+
 		await this.#emitSessionEvent({ type: "auto_compaction_start", reason, action });
 		// Abort any older auto-compaction before installing this run's controller.
 		this.#autoCompactionAbortController?.abort();

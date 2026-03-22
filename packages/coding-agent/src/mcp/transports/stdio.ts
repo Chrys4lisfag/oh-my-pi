@@ -261,9 +261,7 @@ export class StdioTransport implements MCPTransport {
 
 		const message = `${JSON.stringify(request)}\n`;
 		try {
-			// Bun's FileSink has write() method directly
-			this.#process.stdin.write(message);
-			this.#process.stdin.flush();
+			this.#writeToStdin(message);
 		} catch (error: unknown) {
 			cleanup();
 			reject(error instanceof Error ? error : new Error(String(error)));
@@ -283,10 +281,30 @@ export class StdioTransport implements MCPTransport {
 			params: params ?? {},
 		};
 
-		const message = `${JSON.stringify(notification)}\n`;
-		// Bun's FileSink has write() method directly
-		this.#process.stdin.write(message);
-		this.#process.stdin.flush();
+		try {
+			this.#writeToStdin(`${JSON.stringify(notification)}\n`);
+		} catch {
+			// Process already dead — close the transport so callers see the disconnect.
+			this.#handleClose();
+		}
+	}
+
+	/**
+	 * Write a message to the subprocess stdin with EPIPE protection.
+	 * Bun's FileSink.flush() can return a Promise; swallow its rejection
+	 * so a dead process does not surface as an unhandled promise rejection.
+	 */
+	#writeToStdin(message: string): void {
+		const sink = this.#process?.stdin;
+		if (!sink) throw new Error("Transport not connected");
+		sink.write(message);
+		const flushed = sink.flush();
+		if (flushed && typeof (flushed as { catch?: unknown }).catch === "function") {
+			(flushed as Promise<unknown>).catch(() => {
+				// EPIPE / broken pipe — process died. The read loop will
+				// detect EOF and call #handleClose, which rejects pending requests.
+			});
+		}
 	}
 
 	async close(): Promise<void> {

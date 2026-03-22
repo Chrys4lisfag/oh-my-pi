@@ -437,6 +437,40 @@ export class EventController {
 				this.sendCompletionNotification();
 				break;
 
+			case "auto_compaction_confirm": {
+				const pct = event.contextWindow > 0 ? Math.round((event.contextTokens / event.contextWindow) * 100) : 0;
+				const tokenStr = event.contextTokens.toLocaleString();
+				const windowStr = event.contextWindow.toLocaleString();
+				this.ctx.autoCompactionEscapeHandler = this.ctx.editor.onEscape;
+				this.ctx.editor.onEscape = () => {
+					cleanupConfirm();
+					this.ctx.session.resolveCompactionConfirm(false);
+				};
+				const cleanupConfirm = () => {
+					if (this.ctx.autoCompactionEscapeHandler) {
+						this.ctx.editor.onEscape = this.ctx.autoCompactionEscapeHandler;
+						this.ctx.autoCompactionEscapeHandler = undefined;
+					}
+					this.ctx.editor.removeCustomKeyHandler("y");
+					this.ctx.editor.removeCustomKeyHandler("n");
+					this.ctx.statusContainer.clear();
+					this.ctx.ui.requestRender();
+				};
+				this.ctx.editor.setCustomKeyHandler("y", () => {
+					cleanupConfirm();
+					this.ctx.session.resolveCompactionConfirm(true);
+				});
+				this.ctx.editor.setCustomKeyHandler("n", () => {
+					cleanupConfirm();
+					this.ctx.session.resolveCompactionConfirm(false);
+				});
+				this.ctx.statusContainer.clear();
+				const msg = theme.fg("warning", `Context at ${pct}% (${tokenStr}/${windowStr} tokens). Compact? (y/n)`);
+				this.ctx.statusContainer.addChild(new Text(msg, 1, 0));
+				this.ctx.ui.requestRender();
+				break;
+			}
+
 			case "auto_compaction_start": {
 				this.ctx.autoCompactionEscapeHandler = this.ctx.editor.onEscape;
 				this.ctx.editor.onEscape = () => {

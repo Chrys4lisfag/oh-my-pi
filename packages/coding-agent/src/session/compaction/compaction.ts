@@ -134,6 +134,7 @@ export interface CompactionResult<T = unknown> {
 
 export interface CompactionSettings {
 	enabled: boolean;
+	confirm?: boolean;
 	strategy?: "context-full" | "handoff" | "off";
 	thresholdPercent?: number;
 	thresholdTokens?: number;
@@ -146,6 +147,7 @@ export interface CompactionSettings {
 
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
+	confirm: true,
 	strategy: "context-full",
 	thresholdPercent: -1,
 	thresholdTokens: -1,

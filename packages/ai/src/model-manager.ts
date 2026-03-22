@@ -269,10 +269,10 @@ function preferDiscoveryLimit(discoveryLimit: number, fallbackLimit: number): nu
 	if (!Number.isFinite(discoveryLimit) || discoveryLimit <= 0) {
 		return fallbackLimit;
 	}
-	if (discoveryLimit === 4096 && fallbackLimit > discoveryLimit) {
-		return fallbackLimit;
-	}
-	return discoveryLimit;
+	// Discovery may report a stale (lower) context window or max-tokens limit
+	// for models whose curated static entry already reflects the correct value.
+	// Never let dynamic discovery shrink a known-good curated limit.
+	return Math.max(discoveryLimit, fallbackLimit);
 }
 
 function normalizeModelList<TApi extends Api>(value: unknown): Model<TApi>[] {

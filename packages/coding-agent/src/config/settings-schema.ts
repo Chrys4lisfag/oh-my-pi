@@ -647,6 +647,16 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"compaction.confirm": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "context",
+			label: "Confirm Before Compact",
+			description: "Ask for confirmation before auto-compacting (does not apply to context overflow)",
+		},
+	},
+
 	"compaction.strategy": {
 		type: "enum",
 		values: ["context-full", "handoff", "off"] as const,
@@ -1605,6 +1615,7 @@ export type TreeFilterMode = SettingValue<"treeFilterMode">;
 
 export interface CompactionSettings {
 	enabled: boolean;
+	confirm: boolean;
 	strategy: "context-full" | "handoff" | "off";
 	thresholdPercent: number;
 	thresholdTokens: number;
