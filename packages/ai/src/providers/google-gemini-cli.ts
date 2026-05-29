@@ -97,6 +97,12 @@ function needsClaudeThinkingBetaHeader(model: Model<"google-gemini-cli">): boole
 
 function shouldInjectAntigravitySystemInstruction(modelId: string): boolean {
 	const normalized = modelId.toLowerCase();
+	// Matches every Gemini-3 variant (pro-high/medium/low, flash, flash-lite).
+	// Considered narrowing to `gemini-3-pro-high` only — preamble is tuned for
+	// high reasoning budgets and may waste tokens / nudge smaller variants
+	// outside their trained format — but kept broad to match upstream behavior
+	// and avoid silently disabling Antigravity scaffolding on variants users
+	// may rely on through CCA. Revisit if Flash/low-budget calls misbehave.
 	return normalized.includes("claude") || normalized.includes("gemini-3");
 }
 

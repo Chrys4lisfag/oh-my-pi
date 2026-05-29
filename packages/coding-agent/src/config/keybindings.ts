@@ -48,6 +48,7 @@ interface AppKeybindings {
 	"app.plan.toggle": true;
 	"app.history.search": true;
 	"app.stt.toggle": true;
+	"app.profile.cycle": true;
 }
 
 export type AppKeybinding = keyof AppKeybindings;
@@ -188,6 +189,10 @@ export const KEYBINDINGS = {
 	"app.stt.toggle": {
 		defaultKeys: "alt+h",
 		description: "Toggle speech-to-text",
+	},
+	"app.profile.cycle": {
+		defaultKeys: "alt+m",
+		description: "Cycle model profile",
 	},
 } as const satisfies KeybindingDefinitions;
 

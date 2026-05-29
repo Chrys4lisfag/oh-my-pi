@@ -685,7 +685,13 @@ export function buildGoogleGenerateContentParams<T extends "google-generative-ai
 
 	const config: GenerateContentConfig = {
 		...(Object.keys(generationConfig).length > 0 && generationConfig),
-		...(systemPrompts.length > 0 && { systemInstruction: { parts: systemPrompts.map(text => ({ text })) } }),
+		...(systemPrompts.length > 0 && {
+			systemInstruction: {
+				parts: systemPrompts.map((text, i, arr) => ({
+					text: i === arr.length - 1 ? appendGeminiToolCallNudge(text) : text,
+				})),
+			},
+		}),
 		...(context.tools && context.tools.length > 0 && { tools: convertTools(context.tools, model) }),
 	};
 
@@ -899,4 +905,12 @@ function extractGoogleErrorMessage(errorText: string): string {
 		// fall through to raw text
 	}
 	return errorText;
+}
+
+const GEMINI_TOOL_CALL_NUDGE =
+	"When calling a tool, output the function name exactly as declared (no `default_api.` prefix, no namespace). Ensure all string values in function call arguments are properly JSON-escaped (escape backslashes, quotes, newlines, and tabs).";
+
+export function appendGeminiToolCallNudge(systemPrompt: string): string {
+	if (systemPrompt.includes(GEMINI_TOOL_CALL_NUDGE)) return systemPrompt;
+	return systemPrompt.length > 0 ? `${systemPrompt}\n\n${GEMINI_TOOL_CALL_NUDGE}` : GEMINI_TOOL_CALL_NUDGE;
 }

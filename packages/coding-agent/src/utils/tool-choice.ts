@@ -2,8 +2,7 @@ import type { Api, Model, ToolChoice } from "@oh-my-pi/pi-ai";
 
 /**
  * Build a provider-aware tool choice that targets one specific tool when supported.
- * Providers that only expose required/any forcing may still honor named choices by
- * narrowing their request tool list before transport.
+ * Some providers only support "any tool" forcing, not a named tool.
  */
 export function buildNamedToolChoice(toolName: string, model?: Model<Api>): ToolChoice | undefined {
 	if (!model) return undefined;
@@ -21,11 +20,15 @@ export function buildNamedToolChoice(toolName: string, model?: Model<Api>): Tool
 		return { type: "function", name: toolName };
 	}
 
-	if (model.api === "ollama-chat") {
-		return { type: "function", name: toolName };
+	if (model.api === "google-generative-ai" || model.api === "google-gemini-cli" || model.api === "google-vertex") {
+		// Gemini API: emit ANY mode + allowedFunctionNames=[toolName].
+		// Bare "required" causes the constraint engine to compile a grammar over
+		// every declared function and fails with INVALID_ARGUMENT ("too many
+		// states for serving") on large MCP-aggregated tool catalogs.
+		return { type: "tool", name: toolName };
 	}
 
-	if (model.api === "google-generative-ai" || model.api === "google-gemini-cli" || model.api === "google-vertex") {
+	if (model.api === "ollama-chat") {
 		return "required";
 	}
 

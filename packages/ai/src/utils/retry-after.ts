@@ -1,3 +1,24 @@
+/**
+ * Incremental backoff schedule for retries that lack a server-provided
+ * retry-after hint. The same sequence gemini-cli's provider already uses
+ * for MODEL_CAPACITY_EXHAUSTED (see google-gemini-cli.ts).
+ *
+ * Rationale: exponential 2∇n (2s → 4s → 8s) is too aggressive for capacity
+ * or overload errors and can re-trigger rate limits. This schedule gives the
+ * upstream real recovery time while still staying bounded.
+ */
+export const INCREMENTAL_BACKOFF_MS = [5_000, 15_000, 50_000, 50_000] as const;
+
+/**
+ * Pick the backoff delay for a given zero-indexed attempt count.
+ * Attempts beyond the schedule repeat the last value.
+ */
+export function getIncrementalBackoffMs(attempt: number, schedule: readonly number[] = INCREMENTAL_BACKOFF_MS): number {
+	if (schedule.length === 0) return 0;
+	const idx = Math.max(0, Math.min(attempt, schedule.length - 1));
+	return schedule[idx];
+}
+
 export type HeadersLike = Headers | Record<string, string | undefined> | undefined | null;
 
 const RETRY_AFTER_HINT = "retry-after-ms=";

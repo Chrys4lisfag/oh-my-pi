@@ -14,6 +14,15 @@ import { Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@oh-my-pi
 import { formatDuration, Snowflake, setProjectDir } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 import { reset as resetCapabilities } from "../../capability";
+import {
+	addProfile,
+	deleteProfile,
+	getActiveProfileName,
+	listProfiles,
+	renameProfile,
+	saveActiveProfile,
+	switchProfile,
+} from "../../config/profiles";
 import { clearClaudePluginRootsCache } from "../../discovery/helpers";
 import { loadCustomShare } from "../../export/custom-share";
 import type { CompactOptions } from "../../extensibility/extensions/types";
@@ -1010,6 +1019,119 @@ export class CommandController {
 			this.ctx.showStatus(`Session renamed to "${name}".`);
 		} catch (err) {
 			this.ctx.showError(`Rename failed: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	}
+
+	async handleProfilesCommand(args: string): Promise<void> {
+		const parts = args.trim().split(/\s+/).filter(Boolean);
+		const sub = parts[0]?.toLowerCase() ?? "list";
+
+		if (sub === "list" || !parts.length) {
+			const profiles = listProfiles();
+			if (profiles.length === 0) {
+				this.ctx.showStatus("No profiles saved. Use /profiles add <name> to create one.");
+				return;
+			}
+			const lines = ["Model Profiles:"];
+			for (const p of profiles) {
+				const indicator = p.isActive ? theme.fg("accent", "●") : theme.fg("dim", "○");
+				const label = p.isActive ? `${theme.bold(p.name)} ${theme.fg("dim", "(active)")}` : p.name;
+				lines.push(`  ${indicator} ${label}`);
+				for (const [role, model] of Object.entries(p.snapshot.modelRoles)) {
+					lines.push(`    ${theme.fg("muted", role)}: ${model}`);
+				}
+				lines.push(`    ${theme.fg("muted", "thinking")}: ${p.snapshot.defaultThinkingLevel}`);
+			}
+			this.ctx.showStatus(lines.join("\n"), { dim: false });
+			return;
+		}
+
+		if (sub === "add") {
+			const name = parts[1];
+			if (!name) {
+				this.ctx.showStatus("Usage: /profiles add <name>");
+				return;
+			}
+			try {
+				addProfile(name);
+				this.ctx.statusLine.invalidate();
+				this.ctx.showStatus(`Profile "${name}" created and activated.`);
+			} catch (err) {
+				this.ctx.showError(err instanceof Error ? err.message : String(err));
+			}
+			return;
+		}
+
+		if (sub === "switch") {
+			const name = parts[1];
+			if (!name) {
+				this.ctx.showStatus("Usage: /profiles switch <name>");
+				return;
+			}
+			try {
+				switchProfile(name);
+				await this.#applyProfileModelToSession();
+				this.ctx.statusLine.invalidate();
+				this.ctx.updateEditorBorderColor();
+				this.ctx.showStatus(`Switched to profile "${name}".`);
+			} catch (err) {
+				this.ctx.showError(err instanceof Error ? err.message : String(err));
+			}
+			return;
+		}
+
+		if (sub === "delete") {
+			const name = parts[1];
+			if (!name) {
+				this.ctx.showStatus("Usage: /profiles delete <name>");
+				return;
+			}
+			try {
+				deleteProfile(name);
+				this.ctx.statusLine.invalidate();
+				this.ctx.showStatus(`Profile "${name}" deleted.`);
+			} catch (err) {
+				this.ctx.showError(err instanceof Error ? err.message : String(err));
+			}
+			return;
+		}
+
+		if (sub === "rename") {
+			const oldName = parts[1];
+			const newName = parts[2];
+			if (!oldName || !newName) {
+				this.ctx.showStatus("Usage: /profiles rename <old> <new>");
+				return;
+			}
+			try {
+				renameProfile(oldName, newName);
+				this.ctx.statusLine.invalidate();
+				this.ctx.showStatus(`Profile renamed: "${oldName}" → "${newName}".`);
+			} catch (err) {
+				this.ctx.showError(err instanceof Error ? err.message : String(err));
+			}
+			return;
+		}
+
+		if (sub === "save") {
+			try {
+				saveActiveProfile();
+				const active = getActiveProfileName();
+				this.ctx.showStatus(`Profile "${active}" updated with current config.`);
+			} catch (err) {
+				this.ctx.showError(err instanceof Error ? err.message : String(err));
+			}
+			return;
+		}
+
+		this.ctx.showStatus("Usage: /profiles [list|add|switch|delete|rename|save]");
+	}
+
+	/** Resolve the default model from current settings and apply it to the session. */
+	async #applyProfileModelToSession(): Promise<void> {
+		const model = this.ctx.session.resolveRoleModel("default");
+		if (model) {
+			await this.ctx.session.setModel(model);
 		}
 	}
 

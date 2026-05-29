@@ -2943,6 +2943,11 @@ export const SETTINGS_SCHEMA = {
 	"thinkingBudgets.high": { type: "number", default: 16384 },
 
 	"thinkingBudgets.xhigh": { type: "number", default: 32768 },
+
+	// Profiles (gemini-mimic)
+	"profiles.items": { type: "record", default: {} as Record<string, unknown> },
+
+	"profiles.active": { type: "string", default: "" },
 } as const;
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -41,6 +41,20 @@ export async function openInEditor(
 		const [editor, ...editorArgs] = editorCmd.split(" ");
 		const stdio = options?.stdio ?? ["inherit", "inherit", "inherit"];
 
+		// GUI editors (VSCode, Cursor, Sublime, Zed, Atom) launchers exit immediately,
+		// delegating the actual editor window to a background daemon. Without the wait
+		// flag, our `child.once("exit")` fires before the user has typed anything; we
+		// read back the unmodified temp file and lose the edit. Auto-inject `--wait`
+		// (`-w` for Sublime) if the user hasn't supplied one.
+		const lowerCmd = editorCmd.toLowerCase();
+		const isGuiEditor = ["code", "code-insiders", "cursor", "subl", "zed", "atom"].some(gui =>
+			lowerCmd.includes(gui),
+		);
+		const hasWaitFlag = lowerCmd.includes("--wait") || / -w(\s|$)/.test(lowerCmd);
+		if (isGuiEditor && !hasWaitFlag) {
+			editorArgs.unshift(lowerCmd.includes("subl") ? "-w" : "--wait");
+		}
+
 		const child = spawn(editor, [...editorArgs, tmpFile], { stdio, shell: process.platform === "win32" });
 		const { promise, reject, resolve } = Promise.withResolvers<number>();
 		child.once("exit", (code, signal) => resolve(code ?? (signal ? -1 : 0)));

@@ -56,8 +56,18 @@ pi-*.html
 
 # Generated files
 packages/coding-agent/src/internal-urls/docs-index.generated.ts
-/runs/
+.nucleus
+*.har
+*.bat
+packages/natives/native/pi_natives.win32-x64-baseline.node.old
+packages/typescript-edit-benchmark/runs/
 python/omp-rpc/src/omp_rpc.egg-info/
+.turbo
+net-intercept
+nxs-manager
+/runs/
+scripts/session-stats/Cargo.lock
+scripts/session-stats/edit-analysis.csv
 # parallel-agent worktrees
 .wt/
 CPU*.md
@@ -69,3 +79,4 @@ python/robomp/.cache/
 python/robomp/src/robomp/static/
 python/robomp/web/dist/
 python/robomp/.env
+tools/tls-capture

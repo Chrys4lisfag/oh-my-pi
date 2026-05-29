@@ -75,9 +75,18 @@ export function calculateRateLimitBackoffMs(reason: RateLimitReason): number {
 	}
 }
 
-/** Detect usage/quota limit errors in error messages (persistent, requires credential switch). */
-const USAGE_LIMIT_PATTERN =
-	/usage.?limit|usage_limit_reached|usage_not_included|limit_reached|quota.?exceeded|resource.?exhausted/i;
+/**
+ * Detect credential-level usage limit errors (persistent quota exhaustion that
+ * requires switching to a different account).
+ *
+ * NOTE: deliberately does NOT include `resource.?exhausted` — Google's
+ * `RESOURCE_EXHAUSTED` status is a transient server-side capacity issue, not a
+ * credential limit. Routing it through the credential-rotation path forces a
+ * 45-75s `MODEL_CAPACITY_EXHAUSTED` backoff and exhausts other healthy accounts
+ * for nothing. It belongs in the generic transient-retry path where the
+ * configured `retry.incrementalBackoffMs` schedule applies.
+ */
+const USAGE_LIMIT_PATTERN = /usage.?limit|usage_limit_reached|usage_not_included|limit_reached|quota.?exceeded/i;
 
 export function isUsageLimitError(errorMessage: string): boolean {
 	return USAGE_LIMIT_PATTERN.test(errorMessage);

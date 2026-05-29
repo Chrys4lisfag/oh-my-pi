@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import { type AgentMessage, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { AutocompleteProvider, SlashCommand } from "@oh-my-pi/pi-tui";
 import { $env, sanitizeText } from "@oh-my-pi/pi-utils";
+import { cycleProfile } from "../../config/profiles";
 import { isSettingsInitialized, settings } from "../../config/settings";
 import { expandEmoticons } from "../../modes/emoji-autocomplete";
 import { createPromptActionAutocompleteProvider } from "../../modes/prompt-action-autocomplete";
@@ -158,6 +159,9 @@ export class InputController {
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.session.resume")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => this.ctx.showSessionSelector());
+		}
+		for (const key of this.ctx.keybindings.getKeys("app.profile.cycle")) {
+			this.ctx.editor.setCustomKeyHandler(key, () => void this.cycleModelProfile());
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.message.followUp")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => void this.handleFollowUp());
@@ -699,6 +703,30 @@ export class InputController {
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorBorderColor();
 		}
+	}
+
+	async cycleModelProfile(): Promise<void> {
+		const result = cycleProfile();
+		if (!result) {
+			this.ctx.showStatus("No profiles to cycle (create with /profiles add <name>)");
+			return;
+		}
+		try {
+			const model = this.ctx.session.resolveRoleModel("default");
+			if (model) {
+				await this.ctx.session.setModel(model);
+			}
+		} catch (err) {
+			this.ctx.showError(err instanceof Error ? err.message : String(err));
+			return;
+		}
+		this.ctx.statusLine.invalidate();
+		this.ctx.updateEditorBorderColor();
+		const profileName = theme.bold(theme.fg("accent", result.name));
+		const rolesSummary = Object.entries(result.snapshot.modelRoles)
+			.map(([role, model]) => `${theme.fg("muted", role)}: ${model.split("/").pop()}`)
+			.join(theme.fg("dim", ", "));
+		this.ctx.showStatus(`Profile: ${profileName} (${rolesSummary})`, { dim: false });
 	}
 
 	async cycleRoleModel(options?: { temporary?: boolean }): Promise<void> {

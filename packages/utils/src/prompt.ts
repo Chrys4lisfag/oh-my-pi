@@ -425,6 +425,10 @@ handlebars.registerHelper("includes", (collection: unknown, item: unknown): bool
  */
 handlebars.registerHelper("not", (value: unknown): boolean => !value);
 
+/**
+ * {{jsonStringify value}}
+ * Serializes value to a JSON string. Used to embed values into YAML/JSON safely.
+ */
 handlebars.registerHelper("jsonStringify", (value: unknown): string => JSON.stringify(value));
 
 export function registerHelper(name: string, fn: HelperDelegate): void {

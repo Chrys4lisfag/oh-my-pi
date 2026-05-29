@@ -1600,6 +1600,25 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		description: "Quit the application",
 		handleTui: shutdownHandlerTui,
 	},
+	{
+		name: "profiles",
+		aliases: ["profile"],
+		description: "Manage model profiles",
+		subcommands: [
+			{ name: "list", description: "List all profiles" },
+			{ name: "add", description: "Save current config as a profile", usage: "<name>" },
+			{ name: "switch", description: "Switch to a profile", usage: "<name>" },
+			{ name: "delete", description: "Delete a profile", usage: "<name>" },
+			{ name: "rename", description: "Rename a profile", usage: "<old> <new>" },
+			{ name: "save", description: "Update active profile with current config" },
+		],
+		allowArgs: true,
+		handle: async (command, runtime) => {
+			runtime.ctx.editor.addToHistory(command.text);
+			runtime.ctx.editor.setText("");
+			await runtime.ctx.handleProfilesCommand(command.args);
+		},
+	},
 ];
 
 const BUILTIN_SLASH_COMMAND_LOOKUP = new Map<string, SlashCommandSpec>();
