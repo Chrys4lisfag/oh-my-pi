@@ -2433,6 +2433,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#commandController.handleRenameCommand(title);
 	}
 
+	handleProfilesCommand(args: string): Promise<void> {
+		return this.#commandController.handleProfilesCommand(args);
+	}
+
 	handleMemoryCommand(text: string): Promise<void> {
 		return this.#commandController.handleMemoryCommand(text);
 	}

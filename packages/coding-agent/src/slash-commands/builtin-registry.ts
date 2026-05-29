@@ -1613,7 +1613,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			{ name: "save", description: "Update active profile with current config" },
 		],
 		allowArgs: true,
-		handle: async (command, runtime) => {
+		handleTui: async (command, runtime) => {
 			runtime.ctx.editor.addToHistory(command.text);
 			runtime.ctx.editor.setText("");
 			await runtime.ctx.handleProfilesCommand(command.args);
