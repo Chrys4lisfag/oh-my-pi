@@ -61,6 +61,8 @@ packages/coding-agent/src/internal-urls/docs-index.generated.ts
 *.bat
 packages/natives/native/pi_natives.win32-x64-baseline.node.old
 packages/typescript-edit-benchmark/runs/
+packages/natives/npm/
+/runs/
 python/omp-rpc/src/omp_rpc.egg-info/
 .turbo
 net-intercept

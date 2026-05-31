@@ -762,8 +762,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const tempArtifactsDir = artifactsDir ? null : path.join(os.tmpdir(), `omp-task-${Snowflake.next()}`);
 		const effectiveArtifactsDir = artifactsDir || tempArtifactsDir!;
 
-		// Share the parent session's local:// root with subagents so they read/write the same scratch space
-		const localProtocolOptions: LocalProtocolOptions = {
+		const localProtocolOptions: LocalProtocolOptions = this.session.localProtocolOptions ?? {
 			getArtifactsDir: this.session.getArtifactsDir ?? (() => null),
 			getSessionId: this.session.getSessionId ?? (() => null),
 		};
@@ -864,6 +863,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			);
 			const promptTemplates = this.session.promptTemplates;
 			const parentEvalSessionId = this.session.getEvalSessionId?.() ?? undefined;
+			const mcpManager = this.session.mcpManager ?? MCPManager.instance();
 
 			// Initialize progress for all tasks
 			for (let i = 0; i < tasksWithUniqueIds.length; i++) {
@@ -921,7 +921,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						authStorage: this.session.authStorage,
 						modelRegistry: this.session.modelRegistry,
 						settings: this.session.settings,
-						mcpManager: MCPManager.instance(),
+						mcpManager,
 						contextFiles,
 						skills: availableSkills,
 						autoloadSkills: resolvedAutoloadSkills,
@@ -930,6 +930,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						localProtocolOptions,
 						parentArtifactManager,
 						parentHindsightSessionState: this.session.getHindsightSessionState?.(),
+						parentMnemopiSessionState: this.session.getMnemopiSessionState?.(),
 						parentTelemetry: this.session.getTelemetry?.(),
 						parentEvalSessionId,
 					});
@@ -977,7 +978,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						authStorage: this.session.authStorage,
 						modelRegistry: this.session.modelRegistry,
 						settings: this.session.settings,
-						mcpManager: MCPManager.instance(),
+						mcpManager,
 						contextFiles,
 						skills: availableSkills,
 						autoloadSkills: resolvedAutoloadSkills,
@@ -986,6 +987,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						localProtocolOptions,
 						parentArtifactManager,
 						parentHindsightSessionState: this.session.getHindsightSessionState?.(),
+						parentMnemopiSessionState: this.session.getMnemopiSessionState?.(),
 						parentTelemetry: this.session.getTelemetry?.(),
 						parentEvalSessionId,
 					});

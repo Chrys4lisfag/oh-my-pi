@@ -22,6 +22,7 @@ import {
 	readSseEvents,
 } from "@oh-my-pi/pi-utils";
 import {
+	disablesParallelToolUse,
 	hasOpus47ApiRestrictions,
 	mapEffortToAnthropicAdaptiveEffort,
 	supportsMidConversationSystemMessages,
@@ -64,7 +65,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { isFoundryEnabled } from "../utils/foundry";
 import { finalizeErrorMessage, type RawHttpRequestDump, rewriteCopilotError } from "../utils/http-inspector";
 import { getStreamFirstEventTimeoutMs, getStreamIdleTimeoutMs, iterateWithIdleTimeout } from "../utils/idle-iterator";
-import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse";
+import { parseJsonWithRepair, parseStreamingJson, parseStreamingJsonThrottled } from "../utils/json-parse";
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { isCopilotTransientModelError } from "../utils/retry";
@@ -654,17 +655,6 @@ function convertContentBlocks(
 	return blocks;
 }
 
-/**
- * Marker phrase that Claude has been observed to hallucinate inside reasoning summaries
- * (e.g. "I don't see any current rewritten thinking or next thinking to process. Could
- * you provide..."). When this substring appears in a streamed thinking block we collapse
- * the entire block to {@link BROKEN_THINKING_REPLACEMENT} and drop the signature so
- * downstream UI/transcripts don't surface the meta-prompt and replay can't re-anchor on
- * the garbled chain.
- */
-const BROKEN_THINKING_MARKER = "rewritten thinking";
-const BROKEN_THINKING_REPLACEMENT = "Thinking...";
-
 export type AnthropicEffort = "low" | "medium" | "high" | "xhigh" | "max";
 export type AnthropicThinkingDisplay = "summarized" | "omitted";
 
@@ -1214,19 +1204,13 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				| ThinkingContent
 				| RedactedThinkingContent
 				| TextContent
-				| (ToolCall & { partialJson: string })
+				| (ToolCall & { partialJson: string; lastParseLen?: number })
 			) & { index: number };
 			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
 			const firstEventTimeoutMs = options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs);
 			const requestTimeoutMs =
 				firstEventTimeoutMs !== undefined && firstEventTimeoutMs > 0 ? firstEventTimeoutMs : undefined;
 			const blocks = output.content as Block[];
-			// Recent Claude releases occasionally hallucinate meta-prompts asking the operator
-			// to supply "rewritten thinking" / "next thinking" as reasoning content. The summary
-			// is useless and confuses the UI, so we collapse any thinking block whose stream
-			// contains the marker phrase down to a plain "Thinking..." placeholder and drop the
-			// (now invalid) signature so subsequent turns don't replay the garbled chain.
-			const suppressedThinkingBlocks = new WeakSet<Block>();
 			stream.push({ type: "start", partial: output });
 			// Retry loop for transient errors from the stream.
 			// Provider-level transport/rate-limit failures: only before any streamed content starts.
@@ -1381,14 +1365,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 								const index = blocks.findIndex(b => b.index === event.index);
 								const block = blocks[index];
 								if (block && block.type === "thinking") {
-									if (suppressedThinkingBlocks.has(block)) continue;
 									block.thinking += event.delta.thinking;
-									if (block.thinking.includes(BROKEN_THINKING_MARKER)) {
-										suppressedThinkingBlocks.add(block);
-										block.thinking = BROKEN_THINKING_REPLACEMENT;
-										block.thinkingSignature = "";
-										continue;
-									}
 									stream.push({
 										type: "thinking_delta",
 										contentIndex: index,
@@ -1401,7 +1378,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 								const block = blocks[index];
 								if (block && block.type === "toolCall") {
 									block.partialJson += event.delta.partial_json;
-									block.arguments = parseStreamingJson(block.partialJson);
+									const throttled = parseStreamingJsonThrottled(block.partialJson, block.lastParseLen ?? 0);
+									if (throttled) {
+										block.arguments = throttled.value;
+										block.lastParseLen = throttled.parsedLen;
+									}
 									stream.push({
 										type: "toolcall_delta",
 										contentIndex: index,
@@ -1412,7 +1393,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							} else if (event.delta.type === "signature_delta") {
 								const index = blocks.findIndex(b => b.index === event.index);
 								const block = blocks[index];
-								if (block && block.type === "thinking" && !suppressedThinkingBlocks.has(block)) {
+								if (block && block.type === "thinking") {
 									block.thinkingSignature = block.thinkingSignature || "";
 									block.thinkingSignature += event.delta.signature;
 								}
@@ -1430,14 +1411,6 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 										partial: output,
 									});
 								} else if (block.type === "thinking") {
-									if (
-										!suppressedThinkingBlocks.has(block) &&
-										block.thinking.includes(BROKEN_THINKING_MARKER)
-									) {
-										suppressedThinkingBlocks.add(block);
-										block.thinking = BROKEN_THINKING_REPLACEMENT;
-										block.thinkingSignature = "";
-									}
 									stream.push({
 										type: "thinking_end",
 										contentIndex: index,
@@ -1447,6 +1420,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 								} else if (block.type === "toolCall") {
 									block.arguments = parseStreamingJson(block.partialJson);
 									delete (block as { partialJson?: string }).partialJson;
+									delete (block as { lastParseLen?: number }).lastParseLen;
 									stream.push({
 										type: "toolcall_end",
 										contentIndex: index,
@@ -1567,9 +1541,15 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					}
 					const isTransientEnvelopeFailure =
 						isTransientStreamParseError(streamFailure) || isTransientStreamEnvelopeError(streamFailure);
+					const isLocalIdleTimeout =
+						streamFailure === idleTimeoutAbortError ||
+						(streamFailure instanceof Error && streamFailure.message === idleTimeoutAbortError.message);
 					const canRetryTransientEnvelopeFailure = isTransientEnvelopeFailure && !streamedReplayUnsafeContent;
 					const canRetryProviderFailure =
-						firstTokenTime === undefined && isProviderRetryableError(streamFailure, model.provider);
+						!isLocalIdleTimeout &&
+						firstTokenTime === undefined &&
+						!streamedReplayUnsafeContent &&
+						isProviderRetryableError(streamFailure, model.provider);
 					if (
 						activeAbortTracker.wasCallerAbort() ||
 						providerRetryAttempt >= PROVIDER_MAX_RETRIES ||
@@ -1605,6 +1585,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			for (const block of output.content) {
 				delete (block as { index?: number }).index;
 				delete (block as { partialJson?: string }).partialJson;
+				delete (block as { lastParseLen?: number }).lastParseLen;
 			}
 			const firstEventTimeoutError = activeAbortTracker.getLocalAbortReason();
 			output.stopReason = activeAbortTracker.wasCallerAbort() ? "aborted" : "error";
@@ -1806,7 +1787,7 @@ function disableThinkingIfToolChoiceForced(params: MessageCreateParamsStreaming)
 
 function ensureMaxTokensForThinking(params: MessageCreateParamsStreaming, model: Model<"anthropic-messages">): void {
 	const thinking = params.thinking;
-	if (!thinking || thinking.type !== "enabled") return;
+	if (thinking?.type !== "enabled") return;
 
 	const budgetTokens = thinking.budget_tokens ?? 0;
 	if (budgetTokens <= 0) return;
@@ -2162,6 +2143,21 @@ function buildParams(
 			};
 		} else {
 			params.tool_choice = options.toolChoice;
+		}
+	}
+
+	// Claude Opus 4.8 must emit at most one tool call per turn. Force
+	// `disable_parallel_tool_use` onto the outgoing tool_choice (synthesizing an
+	// `auto` choice when none is set). Gated on tools being present: Anthropic
+	// rejects `tool_choice` without `tools`, and parallelism is moot otherwise.
+	// `none` rejects the field, so leave it untouched. A fresh object is built
+	// rather than mutated so the caller's `options.toolChoice` is never aliased.
+	if (disablesParallelToolUse(model.id) && params.tools && params.tools.length > 0) {
+		const current = params.tool_choice;
+		if (!current) {
+			params.tool_choice = { type: "auto", disable_parallel_tool_use: true };
+		} else if (current.type !== "none") {
+			params.tool_choice = { ...current, disable_parallel_tool_use: true };
 		}
 	}
 

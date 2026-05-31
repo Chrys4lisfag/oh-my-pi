@@ -50,7 +50,7 @@ import {
 	getStreamFirstEventTimeoutMs,
 	iterateWithIdleTimeout,
 } from "../utils/idle-iterator";
-import { parseStreamingJson } from "../utils/json-parse";
+import { parseStreamingJson, parseStreamingJsonThrottled } from "../utils/json-parse";
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { getKimiCommonHeaders } from "../utils/oauth/kimi";
 import { notifyProviderResponse } from "../utils/provider-response";
@@ -539,7 +539,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			// so users don't see raw `<｜...｜>` tokens.
 			const stripDeepseekChatTemplateTokens =
 				/deepseek/i.test(model.id) && (model.provider === "nvidia" || model.provider === "deepseek");
-			type ToolCallStreamBlock = ToolCall & { partialArgs?: string; streamIndex?: number };
+			type ToolCallStreamBlock = ToolCall & { partialArgs?: string; streamIndex?: number; lastParseLen?: number };
 			type OpenAIStreamBlock = TextContent | ThinkingContent | ToolCallStreamBlock;
 			const pendingToolCallBlocks: ToolCallStreamBlock[] = [];
 			const toolCallBlockByIndex = new Map<number, ToolCallStreamBlock>();
@@ -554,6 +554,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				if (contentIndex < 0) return;
 				block.arguments = parseStreamingJson(block.partialArgs);
 				delete block.partialArgs;
+				delete block.lastParseLen;
 				if (block.streamIndex !== undefined) {
 					toolCallBlockByIndex.delete(block.streamIndex);
 					delete block.streamIndex;
@@ -586,7 +587,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				eventStream: AssistantMessageEventStream,
 				text: string,
 			): void => {
-				if (!currentBlock || currentBlock.type !== "text") {
+				if (currentBlock?.type !== "text") {
 					finishCurrentBlock(currentBlock);
 					currentBlock = { type: "text", text: "" };
 					message.content.push(currentBlock);
@@ -607,8 +608,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				signature?: string,
 			): void => {
 				if (
-					!currentBlock ||
-					currentBlock.type !== "thinking" ||
+					currentBlock?.type !== "thinking" ||
 					(signature !== undefined && currentBlock.thinkingSignature !== signature)
 				) {
 					finishCurrentBlock(currentBlock);
@@ -815,7 +815,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 							}
 
 							if (!block) {
-								if (!currentBlock || currentBlock.type !== "toolCall") {
+								if (currentBlock?.type !== "toolCall") {
 									finishCurrentBlock(currentBlock);
 								}
 								block = {
@@ -849,7 +849,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 							if (toolCall.function?.arguments) {
 								delta = toolCall.function.arguments;
 								block.partialArgs = (block.partialArgs ?? "") + toolCall.function.arguments;
-								block.arguments = parseStreamingJson(block.partialArgs);
+								const throttled = parseStreamingJsonThrottled(block.partialArgs, block.lastParseLen ?? 0);
+								if (throttled) {
+									block.arguments = throttled.value;
+									block.lastParseLen = throttled.parsedLen;
+								}
 							}
 							stream.push({
 								type: "toolcall_delta",
@@ -1341,29 +1345,56 @@ export function parseChunkUsage(
 	const completionTokenDetails = getOptionalObjectProperty(rawUsage, "completion_tokens_details");
 	const cachedTokens =
 		getOptionalNumberProperty(rawUsage, "cached_tokens") ??
+		getOptionalNumberProperty(rawUsage, "prompt_cache_hit_tokens") ??
 		(promptTokenDetails ? getOptionalNumberProperty(promptTokenDetails, "cached_tokens") : undefined) ??
 		0;
 	// OpenRouter exposes cache writes via `prompt_tokens_details.cache_write_tokens`
-	// and INCLUDES them in `prompt_tokens`. Without subtracting, cache-write tokens
-	// leak into `input` (e.g. GLM/Anthropic via OpenRouter on a fresh cache).
+	// and INCLUDES them in `prompt_tokens` — they are billed on top of the input, so
+	// we subtract them to get the real billed input.
+	// DeepSeek exposes cache hit/miss via `prompt_cache_hit_tokens` /
+	// `prompt_cache_miss_tokens` at the top level where `prompt_tokens` equals their
+	// sum. The miss portion IS the billed input — we must NOT subtract it.
 	// Ref: https://openrouter.ai/docs/guides/best-practices/prompt-caching
-	const cacheWriteTokens = promptTokenDetails
-		? (getOptionalNumberProperty(promptTokenDetails, "cache_write_tokens") ?? 0)
-		: 0;
+	// Ref: https://api-docs.deepseek.com/api/create-chat-completion
+	//
+	// Resolve cacheWrite from both possible sources separately.
+	// They have different billing semantics: OpenRouter's cache_write is billed
+	// on top of prompt_tokens, while DeepSeek's miss IS the billed input.
+	const cacheWriteOpenRouter = promptTokenDetails
+		? getOptionalNumberProperty(promptTokenDetails, "cache_write_tokens")
+		: undefined;
+	const cacheWriteDeepSeek = getOptionalNumberProperty(rawUsage, "prompt_cache_miss_tokens");
+	// Prefer OpenRouter's value for the input subtraction; fall back to DeepSeek.
+	const cacheWriteTokens = cacheWriteOpenRouter ?? cacheWriteDeepSeek ?? 0;
+
 	const reasoningTokens =
 		(completionTokenDetails ? getOptionalNumberProperty(completionTokenDetails, "reasoning_tokens") : undefined) ?? 0;
 	const promptTokens = getOptionalNumberProperty(rawUsage, "prompt_tokens") ?? 0;
-	const input = Math.max(0, promptTokens - cachedTokens - cacheWriteTokens);
+
+	const isDeepSeekNative =
+		getOptionalNumberProperty(rawUsage, "prompt_cache_hit_tokens") !== undefined && cacheWriteDeepSeek !== undefined;
+	// Only use the DeepSeek input path when cacheWrite came from DeepSeek's
+	// miss field, not from prompt_tokens_details. Avoids false positives when
+	// DeepSeek models route through OpenRouter (which may pass through native
+	// fields alongside its own cache_write_tokens).
+	const isDeepSeekUsage = isDeepSeekNative && cacheWriteOpenRouter === undefined && cacheWriteDeepSeek > 0;
+	const input = isDeepSeekUsage
+		? Math.max(0, promptTokens - cachedTokens)
+		: Math.max(0, promptTokens - cachedTokens - cacheWriteTokens);
 	// Per OpenAI's CompletionUsage spec, `reasoning_tokens` is a subset of
 	// `completion_tokens` (which is the total billed output). Adding them would
 	// double-count.
 	const outputTokens = getOptionalNumberProperty(rawUsage, "completion_tokens") ?? 0;
+	// DeepSeek only exposes cache hit/miss (no cache-write data).
+	// Emitting miss tokens as cacheWrite would make downstream consumers
+	// double-count them (input already equals miss for DeepSeek).
+	const emittedCacheWrite = isDeepSeekUsage ? 0 : cacheWriteTokens;
 	const usage: AssistantMessage["usage"] = {
 		input,
 		output: outputTokens,
 		cacheRead: cachedTokens,
-		cacheWrite: cacheWriteTokens,
-		totalTokens: input + outputTokens + cachedTokens + cacheWriteTokens,
+		cacheWrite: emittedCacheWrite,
+		totalTokens: input + outputTokens + cachedTokens + emittedCacheWrite,
 		...(reasoningTokens > 0 ? { reasoningTokens } : {}),
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		...(premiumRequests !== undefined ? { premiumRequests } : {}),
@@ -1551,10 +1582,9 @@ export function convertMessages(
 				});
 			}
 		} else if (msg.role === "assistant") {
-			// Some providers (e.g. Mistral) don't accept null content, use empty string instead
 			const assistantMsg: ChatCompletionAssistantMessageParam = {
 				role: "assistant",
-				content: compat.requiresAssistantAfterToolResult ? "" : null,
+				content: null,
 			};
 
 			const textBlocks = msg.content.filter(b => b.type === "text") as TextContent[];
@@ -1726,8 +1756,10 @@ export function convertMessages(
 					(assistantMsg as any).reasoning_details = reasoningDetails;
 				}
 			}
-			// DeepSeek requires non-null content when reasoning_content is present
-			if (assistantMsg.content === null && hasReasoningField) {
+			// Some OpenAI-compatible backends concatenate assistant content as a
+			// string even for tool-call replay. OpenAI accepts an empty string here;
+			// null trips strict/proxy implementations before the tool result is read.
+			if (assistantMsg.content === null && (hasReasoningField || assistantMsg.tool_calls)) {
 				assistantMsg.content = "";
 			}
 			// Skip assistant messages that have no content, no tool calls, and no reasoning payload.

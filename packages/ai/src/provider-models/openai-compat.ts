@@ -1218,37 +1218,62 @@ export interface OpenCodeModelManagerConfig {
 	baseUrl?: string;
 }
 
+function normalizeOpenCodeBasePath(baseUrl: string | undefined, fallbackBasePath: string): string {
+	const value = normalizeAnthropicBaseUrl(baseUrl, fallbackBasePath);
+	return value.endsWith("/v1") ? value.slice(0, -3) : value;
+}
+
+function openCodeBaseUrlForApi(api: Api, basePath: string): string {
+	return api === "anthropic-messages" ? basePath : `${basePath}/v1`;
+}
+
 function openCodeModelManagerOptions(
 	providerId: "opencode-go" | "opencode-zen",
-	defaultBaseUrl: string,
+	defaultBasePath: string,
 	config?: OpenCodeModelManagerConfig,
-): ModelManagerOptions<"openai-completions"> {
+): ModelManagerOptions<Api> {
 	const apiKey = config?.apiKey;
-	const baseUrl = config?.baseUrl ?? defaultBaseUrl;
+	const basePath = normalizeOpenCodeBasePath(config?.baseUrl, defaultBasePath);
+	const discoveryBaseUrl = openCodeBaseUrlForApi("openai-completions", basePath);
+	const references = createBundledReferenceMap<Api>(providerId);
 	return {
 		providerId,
 		...(apiKey && {
 			fetchDynamicModels: () =>
-				fetchOpenAICompatibleModels({
+				fetchOpenAICompatibleModels<Api>({
 					api: "openai-completions",
 					provider: providerId,
-					baseUrl,
+					baseUrl: discoveryBaseUrl,
 					apiKey,
+					mapModel: (entry, defaults) => {
+						const reference = references.get(defaults.id);
+						const name = toModelName(entry.name, reference?.name ?? defaults.name);
+						if (!reference) {
+							return {
+								...defaults,
+								name,
+							};
+						}
+						return {
+							...reference,
+							id: defaults.id,
+							name,
+							baseUrl: openCodeBaseUrlForApi(reference.api, basePath),
+							contextWindow: toPositiveNumber(entry.context_length, reference.contextWindow),
+							maxTokens: toPositiveNumber(entry.max_completion_tokens, reference.maxTokens),
+						};
+					},
 				}),
 		}),
 	};
 }
 
-export function opencodeZenModelManagerOptions(
-	config?: OpenCodeModelManagerConfig,
-): ModelManagerOptions<"openai-completions"> {
-	return openCodeModelManagerOptions("opencode-zen", "https://opencode.ai/zen/v1", config);
+export function opencodeZenModelManagerOptions(config?: OpenCodeModelManagerConfig): ModelManagerOptions<Api> {
+	return openCodeModelManagerOptions("opencode-zen", "https://opencode.ai/zen", config);
 }
 
-export function opencodeGoModelManagerOptions(
-	config?: OpenCodeModelManagerConfig,
-): ModelManagerOptions<"openai-completions"> {
-	return openCodeModelManagerOptions("opencode-go", "https://opencode.ai/zen/go/v1", config);
+export function opencodeGoModelManagerOptions(config?: OpenCodeModelManagerConfig): ModelManagerOptions<Api> {
+	return openCodeModelManagerOptions("opencode-go", "https://opencode.ai/zen/go", config);
 }
 
 // ---------------------------------------------------------------------------
@@ -2122,25 +2147,23 @@ export function githubCopilotModelManagerOptions(config?: GithubCopilotModelMana
 						const reference = resolveReference(defaults.id);
 						const copilotLimits = extractCopilotLimits(entry);
 						// Copilot exposes token limits under capabilities.limits.*.
-						// max_prompt_tokens is the prompt capacity (what OMP calls contextWindow).
-						// max_context_window_tokens is the total window (prompt + output budget)
-						// and must NOT be used for contextWindow — it inflates the limit and
-						// breaks compaction thresholds, overflow detection, and promotion.
-						// The OpenAI-compatible root-level `context_length` field mirrors the
-						// total window (e.g. 400k for gpt-5.4), so Copilot's max_prompt_tokens
-						// (the true prompt budget) must take precedence whenever it is present.
-						const contextWindowFallback = toPositiveNumber(
-							entry.context_length,
-							reference?.contextWindow ?? defaults.contextWindow,
-						);
+						// max_context_window_tokens is the model's total usable window;
+						// max_prompt_tokens is Copilot's prompt/summarization budget and
+						// must only be a fallback when total-window fields are absent.
 						const contextWindow = toPositiveNumber(
-							copilotLimits.maxPromptTokens,
-							reference ? Math.min(contextWindowFallback, reference.contextWindow) : contextWindowFallback,
+							copilotLimits.maxContextWindowTokens,
+							toPositiveNumber(
+								entry.context_length,
+								toPositiveNumber(
+									copilotLimits.maxPromptTokens,
+									reference?.contextWindow ?? defaults.contextWindow,
+								),
+							),
 						);
 						const maxTokens = toPositiveNumber(
-							entry.max_completion_tokens,
+							copilotLimits.maxOutputTokens,
 							toPositiveNumber(
-								copilotLimits.maxOutputTokens,
+								entry.max_completion_tokens,
 								toPositiveNumber(
 									copilotLimits.maxNonStreamingOutputTokens,
 									reference?.maxTokens ?? defaults.maxTokens,
@@ -2643,9 +2666,16 @@ const MODELS_DEV_PROVIDER_DESCRIPTORS_CODING_PLANS: readonly ModelsDevProviderDe
 	// --- zAI ---
 	anthropicMessagesDescriptor("zai-coding-plan", "zai", "https://api.z.ai/api/anthropic"),
 	// --- Xiaomi ---
-	anthropicMessagesDescriptor("xiaomi", "xiaomi", "https://api.xiaomimimo.com/anthropic", {
+	openAiCompletionsDescriptor("xiaomi", "xiaomi", "https://api.xiaomimimo.com/v1", {
 		defaultContextWindow: 262144,
 		defaultMaxTokens: 8192,
+		compat: {
+			supportsStore: false,
+			thinkingFormat: "zai",
+			reasoningContentField: "reasoning_content",
+			requiresReasoningContentForToolCalls: true,
+			allowsSyntheticReasoningContentForToolCalls: false,
+		},
 	}),
 	// --- MiniMax Coding Plan ---
 	openAiCompletionsDescriptor("minimax-coding-plan", "minimax-code", "https://api.minimax.io/v1", {

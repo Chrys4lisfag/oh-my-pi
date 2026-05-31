@@ -2,28 +2,50 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Markdown, Text } from "@oh-my-pi/pi-tui";
-import { prompt } from "@oh-my-pi/pi-utils";
+import { formatNumber, prompt } from "@oh-my-pi/pi-utils";
 import * as z from "zod/v4";
+import { settings } from "../config/settings";
 import { jsBackend, pythonBackend } from "../eval";
-import type { ExecutorBackend } from "../eval/backend";
+import type { ExecutorBackend, ExecutorBackendResult } from "../eval/backend";
+import { IdleTimeout } from "../eval/idle-timeout";
 import { defaultEvalSessionId } from "../eval/session-id";
 import type { EvalCellResult, EvalDisplayOutput, EvalLanguage, EvalStatusEvent, EvalToolDetails } from "../eval/types";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
+import { formatContextUsage } from "../modes/components/status-line/context-thresholds";
 import { truncateToVisualLines } from "../modes/components/visual-truncate";
+import { shimmerEnabled } from "../modes/theme/shimmer";
 import { getMarkdownTheme, type Theme } from "../modes/theme/theme";
 import evalDescription from "../prompts/tools/eval.md" with { type: "text" };
 import { DEFAULT_MAX_BYTES, OutputSink, type OutputSummary, TailBuffer } from "../session/streaming-output";
-import { getTreeBranch, getTreeContinuePrefix, renderCodeCell } from "../tui";
+import { borderShimmerTick, renderCodeCell } from "../tui";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import { resolveEvalBackends, type ToolSession } from ".";
 import { truncateForPrompt } from "./approval";
+import {
+	JSON_TREE_MAX_DEPTH_COLLAPSED,
+	JSON_TREE_MAX_DEPTH_EXPANDED,
+	JSON_TREE_MAX_LINES_COLLAPSED,
+	JSON_TREE_MAX_LINES_EXPANDED,
+	JSON_TREE_SCALAR_LEN_COLLAPSED,
+	JSON_TREE_SCALAR_LEN_EXPANDED,
+	renderJsonTreeLines,
+} from "./json-tree";
 import {
 	formatStyledTruncationWarning,
 	resolveOutputMaxColumns,
 	resolveOutputSinkHeadBytes,
 	stripOutputNotice,
 } from "./output-meta";
-import { formatTitle, replaceTabs, shortenPath, truncateToWidth, wrapBrackets } from "./render-utils";
+import {
+	formatBadge,
+	formatDuration,
+	formatStatusIcon,
+	formatTitle,
+	replaceTabs,
+	shortenPath,
+	truncateToWidth,
+	wrapBrackets,
+} from "./render-utils";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
@@ -61,15 +83,6 @@ export type EvalToolResult = {
 
 export type EvalProxyExecutor = (params: EvalToolParams, signal?: AbortSignal) => Promise<EvalToolResult>;
 
-function formatJsonScalar(value: unknown): string {
-	if (value === null) return "null";
-	if (value === undefined) return "undefined";
-	if (typeof value === "string") return JSON.stringify(value);
-	if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value);
-	if (typeof value === "function") return "[function]";
-	return "[object]";
-}
-
 /** Cap per `display()` value sent back to the model. */
 const MAX_DISPLAY_TEXT_BYTES = 8000;
 
@@ -100,41 +113,6 @@ function formatDisplayOutputsForText(outputs: EvalDisplayOutput[]): string {
 		chunks.push(`display[${displayIndex}]:\n${formatDisplayJsonForText(output.data)}`);
 	}
 	return chunks.join("\n\n");
-}
-
-function renderJsonTree(value: unknown, theme: Theme, expanded: boolean, maxDepth = expanded ? 6 : 2): string[] {
-	const maxItems = expanded ? 20 : 5;
-
-	const renderNode = (node: unknown, prefix: string, depth: number, isLast: boolean, label?: string): string[] => {
-		const branch = getTreeBranch(isLast, theme);
-		const displayLabel = label ? `${label}: ` : "";
-
-		if (depth >= maxDepth || node === null || typeof node !== "object") {
-			return [`${prefix}${branch} ${displayLabel}${formatJsonScalar(node)}`];
-		}
-
-		const isArray = Array.isArray(node);
-		const entries = isArray
-			? node.map((val, index) => [String(index), val] as const)
-			: Object.entries(node as object);
-		const header = `${prefix}${branch} ${displayLabel}${isArray ? `Array(${entries.length})` : `Object(${entries.length})`}`;
-		const lines = [header];
-
-		const childPrefix = prefix + getTreeContinuePrefix(isLast, theme);
-		const visible = entries.slice(0, maxItems);
-		for (let i = 0; i < visible.length; i++) {
-			const [key, val] = visible[i];
-			const childLast = i === visible.length - 1 && (expanded || entries.length <= maxItems);
-			lines.push(...renderNode(val, childPrefix, depth + 1, childLast, isArray ? `[${key}]` : key));
-		}
-		if (!expanded && entries.length > maxItems) {
-			const moreBranch = theme.tree.last;
-			lines.push(`${childPrefix}${moreBranch} ${entries.length - maxItems} more item(s)`);
-		}
-		return lines;
-	};
-
-	return renderNode(value, "", 0, true);
 }
 
 export interface EvalToolDescriptionOptions {
@@ -369,12 +347,20 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				for (let i = 0; i < cells.length; i++) {
 					const cell = cells[i];
 					const backend = cell.resolved.backend;
-					const timeoutSec = timeoutSecondsFromMs(cell.timeoutMs);
-					const deadlineMs = Date.now() + timeoutSec * 1000;
-					const timeoutSignal = AbortSignal.timeout(Math.max(0, deadlineMs - Date.now()));
+					// The per-cell `timeout` is an *inactivity* budget, not a hard
+					// wall-clock cap: it bounds the gap between progress signals
+					// (status events — agent() updates, log()/phase(), tool-bridge
+					// activity), so a long fanout that keeps reporting progress runs to
+					// completion while a genuinely stalled cell (no progress for the
+					// whole window) is still interrupted. Raw stdout deliberately does
+					// NOT re-arm it, so pure-compute runaway loops stay bounded. The
+					// watchdog drives `combinedSignal`; we pass no wall-clock deadline
+					// downstream so the backends never arm a competing fixed timer.
+					const idleTimeoutMs = timeoutSecondsFromMs(cell.timeoutMs) * 1000;
+					const idle = new IdleTimeout(idleTimeoutMs);
 					const combinedSignal = signal
-						? AbortSignal.any([signal, timeoutSignal, sessionAbortController.signal])
-						: AbortSignal.any([timeoutSignal, sessionAbortController.signal]);
+						? AbortSignal.any([signal, idle.signal, sessionAbortController.signal])
+						: AbortSignal.any([idle.signal, sessionAbortController.signal]);
 
 					const cellResult = cellResults[i];
 					cellResult.status = "running";
@@ -385,21 +371,32 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					pushUpdate();
 
 					const startTime = Date.now();
-					const result = await backend.execute(cell.code, {
-						cwd: session.cwd,
-						sessionId,
-						sessionFile: sessionFile ?? undefined,
-						kernelOwnerId,
-						signal: combinedSignal,
-						session,
-						deadlineMs,
-						reset: cell.reset,
-						artifactPath,
-						artifactId,
-						onChunk: chunk => {
-							outputSink!.push(chunk);
-						},
-					});
+					let result: ExecutorBackendResult;
+					try {
+						result = await backend.execute(cell.code, {
+							cwd: session.cwd,
+							sessionId,
+							sessionFile: sessionFile ?? undefined,
+							kernelOwnerId,
+							signal: combinedSignal,
+							session,
+							idleTimeoutMs,
+							reset: cell.reset,
+							artifactPath,
+							artifactId,
+							onChunk: chunk => {
+								outputSink!.push(chunk);
+							},
+							onStatus: event => {
+								idle.bump();
+								cellResult.statusEvents ??= [];
+								upsertStatusEvent(cellResult.statusEvents, event);
+								pushUpdate();
+							},
+						});
+					} finally {
+						idle.dispose();
+					}
 					const durationMs = Date.now() - startTime;
 
 					const cellStatusEvents: EvalStatusEvent[] = [];
@@ -434,8 +431,8 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 							}
 						}
 						if (output.type === "status") {
-							statusEvents.push(output.event);
-							cellStatusEvents.push(output.event);
+							upsertStatusEvent(statusEvents, output.event);
+							upsertStatusEvent(cellStatusEvents, output.event);
 						}
 						if (output.type === "markdown") {
 							cellHasMarkdown = true;
@@ -642,6 +639,137 @@ function getRenderCells(args: EvalRenderArgs | undefined): EvalRenderCell[] {
 	return out;
 }
 
+type AgentEventStatus = "pending" | "running" | "completed" | "failed" | "aborted";
+
+/**
+ * Append or replace a status event. `agent` events are progress snapshots keyed
+ * by `id`, so they coalesce in place (preserving first-seen order); every other
+ * op is a discrete action and simply appends. Keeps the persisted event list
+ * bounded even when a subagent emits hundreds of throttled progress ticks.
+ */
+function upsertStatusEvent(events: EvalStatusEvent[], event: EvalStatusEvent): void {
+	if (event.op === "agent" && typeof event.id === "string") {
+		const id = event.id;
+		const idx = events.findIndex(e => e.op === "agent" && e.id === id);
+		if (idx >= 0) {
+			events[idx] = event;
+			return;
+		}
+	}
+	events.push(event);
+}
+
+function eventString(value: unknown): string | undefined {
+	return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function eventNumber(value: unknown): number {
+	return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function agentEventStatus(value: unknown): AgentEventStatus {
+	switch (value) {
+		case "pending":
+		case "running":
+		case "completed":
+		case "failed":
+		case "aborted":
+			return value;
+		default:
+			return "running";
+	}
+}
+
+/** Append the toolCount · context · cost · model stat run, mirroring the task tool. */
+function formatAgentStats(event: EvalStatusEvent, theme: Theme): string {
+	let line = "";
+	const toolCount = eventNumber(event.toolCount);
+	if (toolCount > 0) {
+		line += `${theme.sep.dot}${theme.fg("dim", `${formatNumber(toolCount)} ${theme.icon.extensionTool}`)}`;
+	}
+	const contextTokens = eventNumber(event.contextTokens);
+	if (contextTokens > 0) {
+		const contextWindow = eventNumber(event.contextWindow);
+		const ctx =
+			contextWindow > 0
+				? formatContextUsage((contextTokens / contextWindow) * 100, contextWindow)
+				: formatNumber(contextTokens);
+		line += `${theme.sep.dot}${theme.fg("dim", ctx)}`;
+	}
+	const cost = eventNumber(event.cost);
+	if (cost > 0) {
+		line += `${theme.sep.dot}${theme.fg("statusLineCost", `$${cost.toFixed(2)}`)}`;
+	}
+	const model = eventString(event.model);
+	if (model && settings.get("task.showResolvedModelBadge")) {
+		line += `${theme.sep.dot}${theme.fg("dim", truncateToWidth(replaceTabs(model), 30))}`;
+	}
+	return line;
+}
+
+/**
+ * Render coalesced `agent()` progress as a Task-tool-style tree, one entry per
+ * subagent: a status line (icon · id · stats) plus, while running, the current
+ * tool/intent. Drawn below the cell box so progress streams live.
+ */
+function renderAgentProgressEvents(events: EvalStatusEvent[], theme: Theme, spinnerFrame?: number): string[] {
+	const lines: string[] = [];
+	for (let i = 0; i < events.length; i++) {
+		const event = events[i];
+		const isLast = i === events.length - 1;
+		const prefix = theme.fg("dim", isLast ? theme.tree.last : theme.tree.branch);
+		const cont = isLast ? "   " : `${theme.fg("dim", theme.tree.vertical)}  `;
+
+		const status = agentEventStatus(event.status);
+		const iconStatus =
+			status === "completed"
+				? "success"
+				: status === "failed"
+					? "error"
+					: status === "aborted"
+						? "aborted"
+						: status === "pending"
+							? "pending"
+							: "running";
+		const iconColor =
+			status === "completed" ? "success" : status === "failed" || status === "aborted" ? "error" : "accent";
+		const icon = formatStatusIcon(iconStatus, theme, status === "running" ? spinnerFrame : undefined);
+
+		const id = eventString(event.id) ?? "agent";
+		let line = `${prefix} ${theme.fg(iconColor, icon)} ${theme.fg("accent", theme.bold(id))}`;
+
+		if (status === "failed" || status === "aborted") {
+			line += ` ${formatBadge(status, iconColor, theme)}`;
+		}
+
+		const currentTool = eventString(event.currentTool);
+		const lastIntent = eventString(event.lastIntent);
+		if (status === "running" && !currentTool && !lastIntent) {
+			const preview = eventString(event.taskPreview);
+			if (preview) line += ` ${theme.fg("muted", truncateToWidth(replaceTabs(preview), 48))}`;
+		}
+
+		line += formatAgentStats(event, theme);
+		if (status === "completed" || status === "failed" || status === "aborted") {
+			const durationMs = eventNumber(event.durationMs);
+			if (durationMs > 0) line += `${theme.sep.dot}${theme.fg("dim", formatDuration(durationMs))}`;
+		}
+		lines.push(line);
+
+		if (status === "running") {
+			if (currentTool) {
+				let toolLine = `${cont}${theme.tree.hook} ${theme.fg("muted", currentTool)}`;
+				const detail = lastIntent ?? eventString(event.currentToolArgs);
+				if (detail) toolLine += `: ${theme.fg("dim", truncateToWidth(replaceTabs(detail), 48))}`;
+				lines.push(toolLine);
+			} else if (lastIntent) {
+				lines.push(`${cont}${theme.tree.hook} ${theme.fg("dim", truncateToWidth(replaceTabs(lastIntent), 48))}`);
+			}
+		}
+	}
+	return lines;
+}
+
 /** Format a status event as a single line for display. */
 function formatStatusEvent(event: EvalStatusEvent, theme: Theme): string {
 	const { op, ...data } = event;
@@ -669,6 +797,9 @@ function formatStatusEvent(event: EvalStatusEvent, theme: Theme): string {
 		sh: "icon.package",
 		env: "icon.package",
 		batch: "icon.package",
+		llm: "icon.package",
+		log: "icon.package",
+		phase: "icon.package",
 	};
 
 	const iconKey = opIcons[op] ?? "icon.file";
@@ -735,6 +866,11 @@ function formatStatusEvent(event: EvalStatusEvent, theme: Theme): string {
 		case "batch":
 			parts.push(`${data.files} file${(data.files as number) !== 1 ? "s" : ""} processed`);
 			break;
+		case "llm":
+			if (data.model) parts.push(String(data.model));
+			if (data.tier && data.tier !== data.model) parts.push(`(${data.tier})`);
+			parts.push(`${data.chars ?? 0} chars`);
+			break;
 		case "wc":
 			parts.push(`${data.lines}L ${data.words}W ${data.chars}C`);
 			break;
@@ -743,6 +879,12 @@ function formatStatusEvent(event: EvalStatusEvent, theme: Theme): string {
 		case "mkdir":
 		case "touch":
 			if (data.path) parts.push(shortenPath(String(data.path)));
+			break;
+		case "log":
+			parts.push(String(data.message ?? ""));
+			break;
+		case "phase":
+			parts.push(String(data.title ?? ""));
 			break;
 		default:
 			if (data.count !== undefined) {
@@ -886,7 +1028,7 @@ function formatCellOutputLines(
 }
 
 export const evalToolRenderer = {
-	renderCall(args: EvalRenderArgs, _options: RenderResultOptions, uiTheme: Theme): Component {
+	renderCall(args: EvalRenderArgs, options: RenderResultOptions, uiTheme: Theme): Component {
 		const cells = getRenderCells(args);
 
 		if (cells.length === 0) {
@@ -899,7 +1041,8 @@ export const evalToolRenderer = {
 
 		return {
 			render: (width: number): string[] => {
-				const key = cells.map(c => `${c.language}:${c.title ?? ""}:${c.code.length}`).join("|");
+				const animate = options.isPartial && shimmerEnabled();
+				const key = `${animate ? borderShimmerTick() : 0}|${cells.map(c => `${c.language}:${c.title ?? ""}:${c.code.length}`).join("|")}`;
 				if (cached && cached.key === key && cached.width === width) {
 					return cached.result;
 				}
@@ -918,6 +1061,7 @@ export const evalToolRenderer = {
 							width,
 							codeMaxLines: EVAL_DEFAULT_PREVIEW_LINES,
 							expanded: true,
+							animate,
 						},
 						uiTheme,
 					);
@@ -950,10 +1094,15 @@ export const evalToolRenderer = {
 		const output = stripOutputNotice(rawOutput, details?.meta).trimEnd();
 
 		const jsonOutputs = details?.jsonOutputs ?? [];
+		const treeExpanded = options.renderContext?.expanded ?? options.expanded;
+		const treeDepth = treeExpanded ? JSON_TREE_MAX_DEPTH_EXPANDED : JSON_TREE_MAX_DEPTH_COLLAPSED;
+		const treeLineCap = treeExpanded ? JSON_TREE_MAX_LINES_EXPANDED : JSON_TREE_MAX_LINES_COLLAPSED;
+		const treeScalarLen = treeExpanded ? JSON_TREE_SCALAR_LEN_EXPANDED : JSON_TREE_SCALAR_LEN_COLLAPSED;
+		const labelOutputs = jsonOutputs.length > 1;
 		const jsonLines = jsonOutputs.flatMap((value, index) => {
-			const header = `JSON output ${index + 1}`;
-			const treeLines = renderJsonTree(value, uiTheme, options.renderContext?.expanded ?? options.expanded);
-			return [header, ...treeLines];
+			const tree = renderJsonTreeLines(value, uiTheme, treeDepth, treeLineCap, treeScalarLen);
+			const body = tree.truncated ? [...tree.lines, uiTheme.fg("dim", "…")] : tree.lines;
+			return labelOutputs ? [uiTheme.fg("dim", `display[${index + 1}]`), ...body] : body;
 		});
 
 		const timeoutSeconds = options.renderContext?.timeout;
@@ -975,7 +1124,8 @@ export const evalToolRenderer = {
 				render: (width: number): string[] => {
 					const expanded = options.renderContext?.expanded ?? options.expanded;
 					const previewLines = options.renderContext?.previewLines ?? EVAL_DEFAULT_PREVIEW_LINES;
-					const key = `${expanded}|${previewLines}|${options.spinnerFrame}`;
+					const animate = options.isPartial && shimmerEnabled();
+					const key = `${expanded}|${previewLines}|${options.spinnerFrame}|${animate ? borderShimmerTick() : 0}`;
 					if (cached && cached.key === key && cached.width === width) {
 						return cached.result;
 					}
@@ -983,7 +1133,10 @@ export const evalToolRenderer = {
 					const lines: string[] = [];
 					for (let i = 0; i < cellResults.length; i++) {
 						const cell = cellResults[i];
-						const statusLines = renderStatusEvents(cell.statusEvents ?? [], uiTheme, expanded);
+						const allEvents = cell.statusEvents ?? [];
+						const agentEvents = allEvents.filter(e => e.op === "agent");
+						const otherEvents = agentEvents.length > 0 ? allEvents.filter(e => e.op !== "agent") : allEvents;
+						const statusLines = renderStatusEvents(otherEvents, uiTheme, expanded);
 						const outputContent = formatCellOutputLines(cell, expanded, previewLines, uiTheme, width);
 						const outputLines = [...outputContent.lines];
 						if (!expanded && outputContent.hiddenCount > 0) {
@@ -1012,10 +1165,14 @@ export const evalToolRenderer = {
 								codeMaxLines: expanded ? Number.POSITIVE_INFINITY : EVAL_DEFAULT_PREVIEW_LINES,
 								expanded,
 								width,
+								animate,
 							},
 							uiTheme,
 						);
 						lines.push(...cellLines);
+						if (agentEvents.length > 0) {
+							lines.push(...renderAgentProgressEvents(agentEvents, uiTheme, options.spinnerFrame));
+						}
 						if (i < cellResults.length - 1) {
 							lines.push("");
 						}

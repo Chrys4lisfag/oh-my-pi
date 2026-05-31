@@ -132,6 +132,7 @@ export type SymbolKey =
 	| "thinking.medium"
 	| "thinking.high"
 	| "thinking.xhigh"
+	| "thinking.autoPending"
 	// Checkboxes
 	| "checkbox.checked"
 	| "checkbox.unchecked"
@@ -144,6 +145,7 @@ export type SymbolKey =
 	| "md.quoteBorder"
 	| "md.hrChar"
 	| "md.bullet"
+	| "md.colorSwatch"
 	// Language/file type icons
 	| "lang.default"
 	| "lang.typescript"
@@ -296,6 +298,7 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	"thinking.medium": "◒ med",
 	"thinking.high": "◕ high",
 	"thinking.xhigh": "◉ xhigh",
+	"thinking.autoPending": "▣?",
 	// Checkboxes
 	"checkbox.checked": "☑",
 	"checkbox.unchecked": "☐",
@@ -308,6 +311,7 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	"md.quoteBorder": "▏",
 	"md.hrChar": "─",
 	"md.bullet": "•",
+	"md.colorSwatch": "■",
 	// Language/file icons (emoji-centric, no Nerd Font required)
 	"lang.default": "⌘",
 	"lang.typescript": "🟦",
@@ -548,6 +552,8 @@ const NERD_SYMBOLS: SymbolMap = {
 	"thinking.high": "\u{F111} high",
 	// pick: 🧠 xhi | alt:  xhi  xhi
 	"thinking.xhigh": "\u{F06D} xhi",
+	// pick: 󰞋 (nf-md-help_box) | alt:  [?]
+	"thinking.autoPending": "\u{f078b}",
 	// Checkboxes
 	// pick:  | alt:  
 	"checkbox.checked": "\uf14a",
@@ -568,6 +574,8 @@ const NERD_SYMBOLS: SymbolMap = {
 	"md.hrChar": "─",
 	// pick:  | alt:  •
 	"md.bullet": "\uf111",
+	// pick: ■ | alt:  (U+F096)
+	"md.colorSwatch": "■",
 	// Language icons (nerd font devicons)
 	"lang.default": "",
 	"lang.typescript": "\u{E628}",
@@ -719,6 +727,7 @@ const ASCII_SYMBOLS: SymbolMap = {
 	"thinking.medium": "[med]",
 	"thinking.high": "[high]",
 	"thinking.xhigh": "[xhi]",
+	"thinking.autoPending": "[?]",
 	// Checkboxes
 	"checkbox.checked": "[x]",
 	"checkbox.unchecked": "[ ]",
@@ -730,6 +739,7 @@ const ASCII_SYMBOLS: SymbolMap = {
 	"md.quoteBorder": "|",
 	"md.hrChar": "-",
 	"md.bullet": "*",
+	"md.colorSwatch": "[]",
 	// Language icons (ASCII uses abbreviations)
 	"lang.default": "code",
 	"lang.typescript": "ts",
@@ -1305,6 +1315,24 @@ export class Theme {
 		return ansi;
 	}
 
+	/**
+	 * Foreground ANSI for text drawn **on top of** `fillColor` used as a solid
+	 * background (e.g. a powerline chip). Picks near-black or near-white by the
+	 * fill's perceived luminance (Rec. 601 luma) so the label stays legible on
+	 * both bright and dark fills, across light and dark themes.
+	 *
+	 * Reads the RGB out of the already-resolved truecolor escape; when the fill
+	 * is encoded as a 256-palette index (limited terminals) the RGB is
+	 * unavailable, so it falls back to the theme `text` color.
+	 */
+	getContrastFgAnsi(fillColor: ThemeColor): string {
+		const ansi = this.#fgColors[fillColor];
+		const match = ansi ? /38;2;(\d+);(\d+);(\d+)/.exec(ansi) : null;
+		if (!match) return this.#fgColors.text;
+		const luma = 0.299 * Number(match[1]) + 0.587 * Number(match[2]) + 0.114 * Number(match[3]);
+		return luma > 140 ? "\x1b[38;2;0;0;0m" : "\x1b[38;2;255;255;255m";
+	}
+
 	getColorMode(): ColorMode {
 		return this.mode;
 	}
@@ -1495,6 +1523,7 @@ export class Theme {
 			medium: this.#symbols["thinking.medium"],
 			high: this.#symbols["thinking.high"],
 			xhigh: this.#symbols["thinking.xhigh"],
+			autoPending: this.#symbols["thinking.autoPending"],
 		};
 	}
 
@@ -1519,6 +1548,7 @@ export class Theme {
 			quoteBorder: this.#symbols["md.quoteBorder"],
 			hrChar: this.#symbols["md.hrChar"],
 			bullet: this.#symbols["md.bullet"],
+			colorSwatch: this.#symbols["md.colorSwatch"],
 		};
 	}
 
@@ -1923,17 +1953,20 @@ export function setThemeInstance(themeInstance: Theme): void {
  */
 export async function setSymbolPreset(preset: SymbolPreset): Promise<void> {
 	currentSymbolPresetOverride = preset;
-	if (currentThemeName) {
-		try {
-			theme = await loadTheme(currentThemeName, getCurrentThemeOptions());
-		} catch {
-			// Fall back to dark theme with new preset
-			theme = await loadTheme("dark", getCurrentThemeOptions());
-		}
-		if (onThemeChangeCallback) {
-			onThemeChangeCallback();
-		}
+	if (!currentThemeName) return;
+
+	const requestId = ++themeLoadRequestId;
+	try {
+		const loadedTheme = await loadTheme(currentThemeName, getCurrentThemeOptions());
+		if (requestId !== themeLoadRequestId) return;
+		theme = loadedTheme;
+	} catch {
+		if (requestId !== themeLoadRequestId) return;
+		// Fall back to dark theme with new preset
+		theme = await loadTheme("dark", getCurrentThemeOptions());
+		if (requestId !== themeLoadRequestId) return;
 	}
+	onThemeChangeCallback?.();
 }
 
 /**
@@ -1949,17 +1982,20 @@ export function getSymbolPresetOverride(): SymbolPreset | undefined {
  */
 export async function setColorBlindMode(enabled: boolean): Promise<void> {
 	currentColorBlindMode = enabled;
-	if (currentThemeName) {
-		try {
-			theme = await loadTheme(currentThemeName, getCurrentThemeOptions());
-		} catch {
-			// Fall back to dark theme
-			theme = await loadTheme("dark", getCurrentThemeOptions());
-		}
-		if (onThemeChangeCallback) {
-			onThemeChangeCallback();
-		}
+	if (!currentThemeName) return;
+
+	const requestId = ++themeLoadRequestId;
+	try {
+		const loadedTheme = await loadTheme(currentThemeName, getCurrentThemeOptions());
+		if (requestId !== themeLoadRequestId) return;
+		theme = loadedTheme;
+	} catch {
+		if (requestId !== themeLoadRequestId) return;
+		// Fall back to dark theme
+		theme = await loadTheme("dark", getCurrentThemeOptions());
+		if (requestId !== themeLoadRequestId) return;
 	}
+	onThemeChangeCallback?.();
 }
 
 /**
@@ -2340,6 +2376,7 @@ export function getSymbolTheme(): SymbolTheme {
 		table: theme.boxSharp,
 		quoteBorder: theme.md.quoteBorder,
 		hrChar: theme.md.hrChar,
+		colorSwatch: theme.md.colorSwatch,
 		spinnerFrames: theme.getSpinnerFrames("activity"),
 	};
 }

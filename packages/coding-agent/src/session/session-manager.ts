@@ -702,6 +702,53 @@ export function buildSessionContext(
 		}
 	}
 
+	// Strip dangling tool_use blocks — a tool_use with no matching tool_result on the
+	// resolved leaf→root path — from ANY assistant turn, not just the trailing one.
+	// This happens whenever the leaf (or a branch point) lands such that an assistant
+	// turn's tool results are off the selected path: its result children live on a
+	// sibling branch, or it is the leaf itself (results are children below it). Left
+	// in place, `transformMessages` fabricates one synthetic "aborted"/"No result
+	// provided" result per dangling call plus a `<turn-aborted>` developer note, which
+	// render as phantom failed calls and re-inject the failed batch into the model's
+	// context — the rewind/restore loop.
+	//
+	// Stripping is necessary but not sufficient: a *modified* assistant turn that still
+	// carries signed `thinking`/`redacted_thinking` is rejected by Anthropic — "thinking
+	// blocks in the latest assistant message cannot be modified", and signed thinking
+	// replayed out of its original turn shape can also fail signature validation (this
+	// bites the handoff/branch-summary request). So when we rewrite a turn we also
+	// neutralize its protected reasoning: drop `redactedThinking` (encrypted, no
+	// plaintext to keep) and clear `thinking` signatures so the provider encoder
+	// downgrades them to plain text (verified accepted by the live API), preserving the
+	// visible reasoning while removing the immutability/invalid-signature hazard. Drop a
+	// turn left with no content. (Live turns never qualify: their results are persisted
+	// on the same path before any context rebuild.)
+	const pairedToolResultIds = new Set<string>();
+	for (const message of messages) {
+		if (message.role === "toolResult") pairedToolResultIds.add(message.toolCallId);
+	}
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message.role !== "assistant") continue;
+		const hasDangling = message.content.some(
+			block => block.type === "toolCall" && !pairedToolResultIds.has(block.id),
+		);
+		if (!hasDangling) continue;
+		const normalized = message.content
+			.filter(
+				block =>
+					!(block.type === "toolCall" && !pairedToolResultIds.has(block.id)) && block.type !== "redactedThinking",
+			)
+			.map(block =>
+				block.type === "thinking" && block.thinkingSignature ? { ...block, thinkingSignature: undefined } : block,
+			);
+		if (normalized.length === 0) {
+			messages.splice(i, 1);
+		} else {
+			messages[i] = { ...message, content: normalized };
+		}
+	}
+
 	return {
 		messages,
 		thinkingLevel,
@@ -1790,6 +1837,12 @@ export class SessionManager {
 		premiumRequests: 0,
 		cost: 0,
 	} satisfies UsageStatistics;
+	/** Per-turn output-token budget set by a `+Nk` directive (total null when none this turn). */
+	#turnBudget: { total: number | null; hard: boolean } = { total: null, hard: false };
+	/** Cumulative `output` snapshot captured when the current turn budget window opened. */
+	#turnBaselineOutput = 0;
+	/** Output tokens consumed by eval-spawned subagents in the current turn window. */
+	#turnEvalOutput = 0;
 	#persistWriter: NdjsonFileWriter | undefined;
 	#persistWriterPath: string | undefined;
 	#persistChain: Promise<void> = Promise.resolve();
@@ -2348,6 +2401,32 @@ export class SessionManager {
 	/** Get usage statistics across all assistant messages in the session. */
 	getUsageStatistics(): UsageStatistics {
 		return this.#usageStatistics;
+	}
+
+	/**
+	 * Open a new per-turn budget window: snapshot the cumulative output baseline,
+	 * reset the eval-subagent counter, and set the (optional) ceiling. Called once
+	 * per real user message; `total` is null when no `+Nk` directive was present.
+	 */
+	beginTurnBudget(total: number | null, hard: boolean): void {
+		this.#turnBudget = { total, hard };
+		this.#turnBaselineOutput = this.#usageStatistics.output;
+		this.#turnEvalOutput = 0;
+	}
+
+	/** Record output tokens consumed by an eval-spawned subagent in the current turn. */
+	recordEvalSubagentOutput(output: number): void {
+		if (Number.isFinite(output) && output > 0) this.#turnEvalOutput += output;
+	}
+
+	/**
+	 * Current turn budget for the eval `budget` helper: the ceiling (null = none),
+	 * output tokens spent this turn (main loop + eval-spawned subagents, no
+	 * double-count), and whether the ceiling is hard.
+	 */
+	getTurnBudget(): { total: number | null; spent: number; hard: boolean } {
+		const mainDelta = Math.max(0, this.#usageStatistics.output - this.#turnBaselineOutput);
+		return { total: this.#turnBudget.total, spent: mainDelta + this.#turnEvalOutput, hard: this.#turnBudget.hard };
 	}
 
 	getSessionDir(): string {

@@ -312,6 +312,17 @@ export class MCPManager {
 
 		// Prepare connection tasks
 		const connectionTasks: ConnectionTask[] = [];
+		// Per-server startup timing interceptor (gated on PI_MCP_TIMING).
+		// Separates connect (spawn+initialize) from tools/list so a slow
+		// server can be pinpointed against the 250ms startup race.
+		type McpTimingEntry = {
+			t0: number;
+			connectMs?: number;
+			toolsMs?: number;
+			tools?: number;
+			error?: string;
+		};
+		const mcpTiming = process.env.PI_MCP_TIMING ? new Map<string, McpTimingEntry>() : undefined;
 
 		for (const [name, config] of Object.entries(configs)) {
 			if (sources[name]) {
@@ -349,6 +360,7 @@ export class MCPManager {
 			this.#serverConfigs.set(name, config);
 
 			// Resolve auth config before connecting, but do so per-server in parallel.
+			if (mcpTiming) mcpTiming.set(name, { t0: performance.now() });
 			const connectionPromise = (async () => {
 				const resolvedConfig = await this.#resolveAuthConfig(config);
 				return connectToServer(name, resolvedConfig, {
@@ -391,11 +403,22 @@ export class MCPManager {
 						void this.reconnectServer(name);
 					};
 
+					if (mcpTiming) {
+						const e = mcpTiming.get(name);
+						if (e) e.connectMs = performance.now() - e.t0;
+					}
 					return connection;
 				},
 				error => {
 					if (this.#pendingConnections.get(name) === connectionPromise) {
 						this.#pendingConnections.delete(name);
+					}
+					if (mcpTiming) {
+						const e = mcpTiming.get(name);
+						if (e) {
+							e.connectMs = performance.now() - e.t0;
+							e.error = error instanceof Error ? error.message : String(error);
+						}
 					}
 					throw error;
 				},
@@ -404,6 +427,13 @@ export class MCPManager {
 
 			const toolsPromise = connectionPromise.then(async connection => {
 				const serverTools = await listTools(connection);
+				if (mcpTiming) {
+					const e = mcpTiming.get(name);
+					if (e) {
+						e.toolsMs = performance.now() - e.t0 - (e.connectMs ?? 0);
+						e.tools = serverTools.length;
+					}
+				}
 				return { connection, serverTools };
 			});
 			this.#pendingToolLoads.set(name, toolsPromise);
@@ -489,6 +519,22 @@ export class MCPManager {
 					}
 				}
 			}
+		}
+
+		if (mcpTiming) {
+			const rows = [...mcpTiming.entries()]
+				.map(([name, e]) => {
+					const total = (e.connectMs ?? 0) + (e.toolsMs ?? 0);
+					const status = e.error ? "ERROR" : e.toolsMs === undefined ? "deferred(cache)" : "ok";
+					return { name, connectMs: e.connectMs ?? 0, toolsMs: e.toolsMs ?? 0, total, tools: e.tools ?? 0, status, error: e.error };
+				})
+				.sort((a, b) => b.total - a.total);
+			let out = `\n[PI_MCP_TIMING] ${rows.length} server(s), startup race=${STARTUP_TIMEOUT_MS}ms\n`;
+			out += `${"server".padEnd(24)}${"connect".padStart(10)}${"tools/list".padStart(12)}${"total".padStart(10)}${"tools".padStart(7)}  status\n`;
+			for (const r of rows) {
+				out += `${r.name.padEnd(24)}${`${r.connectMs.toFixed(0)}ms`.padStart(10)}${`${r.toolsMs.toFixed(0)}ms`.padStart(12)}${`${r.total.toFixed(0)}ms`.padStart(10)}${String(r.tools).padStart(7)}  ${r.status}${r.error ? ` (${r.error})` : ""}\n`;
+			}
+			process.stderr.write(out);
 		}
 
 		// Stable sort by name so the order is independent of connection completion.

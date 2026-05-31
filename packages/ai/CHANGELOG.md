@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+## [15.7.4] - 2026-05-31
+
+### Fixed
+
+- Fixed Anthropic stream idle-timeout retries after the provider stream has already begun.
+- Fixed Xiaomi MiMo `/login` rejecting token-plan (`tp-`) keys with `401 Invalid API Key`. The validation request was still sending the legacy Anthropic `x-api-key` header against the OpenAI-compatible `/v1/chat/completions` endpoint; switched to `Authorization: Bearer`, matching the runtime path. ([#1580](https://github.com/can1357/oh-my-pi/issues/1580))
+- Fixed OpenAI-compatible tool-call replay to send empty assistant content instead of `null`, avoiding strict custom backends that crash with `str`/`NoneType` concatenation after subagent tool results. ([#1585](https://github.com/can1357/oh-my-pi/issues/1585))
+
+## [15.7.3] - 2026-05-31
+
+### Changed
+
+- Throttled per-delta streaming JSON re-parsing of OpenAI Responses/Codex tool-call arguments (bounding mid-stream parse cost from O(N²) to O(N)). Finalization via `response.output_item.done` now writes the authoritative full arguments back to the persisted assistant-message block, so tool calls finalized without a trailing `response.function_call_arguments.done` no longer retain stale/empty (`{}`) arguments. ([#1507](https://github.com/can1357/oh-my-pi/pull/1507))
+
+## [15.6.0] - 2026-05-30
+
+### Fixed
+
+- Fixed Anthropic adaptive-thinking replay preserving signed thinking blocks on the latest abandoned tool-use assistant message, avoiding `thinking blocks in the latest assistant message cannot be modified` 400s. ([#1531](https://github.com/can1357/oh-my-pi/issues/1531))
+
+## [15.5.15] - 2026-05-30
+
+### Added
+
+- Added `PI_REQ_DEBUG=1` request/response recording for provider transports. Each request writes `rr-session-N.json`; each received response writes `rr-session-N.res.log` with response headers followed by raw body bytes.
+
+### Fixed
+
+- Fixed OpenCode-Go dynamic model refresh downgrading `qwen3.7-max` from Anthropic Messages to OpenAI-compatible transport, which caused `401 Model qwen3.7-max is not supported for format oa-compat` after `/v1/models` cache refreshes.
+
 ## [15.5.12] - 2026-05-29
 ### Removed
 
@@ -113,6 +143,15 @@
 ### Fixed
 
 - Fixed Synthetic model discovery to treat the provider `/models` response as authoritative so deprecated bundled IDs are pruned from the runtime cache, and changed Synthetic login validation to avoid probing a specific model ([#1417](https://github.com/can1357/oh-my-pi/issues/1417)).
+
+### Added
+
+- Added `parseStreamingJsonThrottled` to `@oh-my-pi/pi-ai/utils/json-parse` — a per-delta wrapper around `parseStreamingJson` that skips re-parses until the buffer has grown by `minGrowthBytes` (default 256). Wired into the streaming hot path of every provider's tool-call argument accumulator (`anthropic`, `amazon-bedrock`, `openai-completions`, `openai-codex-responses`, `openai-responses-shared`) so per-delta cost is O(N) in total buffer length instead of O(N²). Each provider's `toolcall_end` still runs a final unthrottled parse, so the published `block.arguments` is unchanged.
+- Added named-tool routing support to Google providers: `GoogleSharedStreamOptions.toolChoice` and `GoogleGeminiCliOptions.toolChoice` now accept `{ mode: "ANY"; allowedFunctionNames: [string, ...string[]] }` in addition to the string forms. `mapGoogleToolChoice` converts `ToolChoice` objects of shape `{ type: "tool" | "function", name }` to the wire form. Mirrors the equivalent Anthropic mapper.
+
+### Changed
+
+- Changed `mapGoogleToolChoice` to be exported from `@oh-my-pi/pi-ai/stream` so callers can build the wire-shape allow-list directly without re-deriving it.
 
 ## [15.5.0] - 2026-05-26
 ### Added
