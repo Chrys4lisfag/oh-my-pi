@@ -5,6 +5,7 @@ import { $env, sanitizeText } from "@oh-my-pi/pi-utils";
 import { cycleProfile } from "../../config/profiles";
 import { getRoleInfo } from "../../config/model-registry";
 import { isSettingsInitialized, settings } from "../../config/settings";
+import { theme } from "../../modes/theme/theme";
 import { renderSegmentTrack } from "../../modes/components/segment-track";
 import { TinyTitleDownloadProgressComponent } from "../../modes/components/tiny-title-download-progress";
 import { expandEmoticons } from "../../modes/emoji-autocomplete";
