@@ -11,9 +11,8 @@ import {
 	type UsageReport,
 } from "@oh-my-pi/pi-ai";
 import { Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@oh-my-pi/pi-tui";
-import { formatDuration, Snowflake, setProjectDir } from "@oh-my-pi/pi-utils";
+import { formatDuration, Snowflake } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
-import { reset as resetCapabilities } from "../../capability";
 import {
 	addProfile,
 	deleteProfile,
@@ -23,7 +22,6 @@ import {
 	saveActiveProfile,
 	switchProfile,
 } from "../../config/profiles";
-import { clearClaudePluginRootsCache } from "../../discovery/helpers";
 import { loadCustomShare } from "../../export/custom-share";
 import type { CompactOptions } from "../../extensibility/extensions/types";
 import {
@@ -1002,14 +1000,7 @@ export class CommandController {
 		try {
 			await this.ctx.sessionManager.flush();
 			await this.ctx.sessionManager.moveTo(resolvedPath);
-			setProjectDir(resolvedPath);
-			clearClaudePluginRootsCache(); // re-warms preloadedPluginRoots with new project dir (async)
-			resetCapabilities();
-			await this.ctx.refreshSlashCommandState(resolvedPath);
-			await this.ctx.session.refreshSshTool({ activateIfAvailable: true });
-
-			this.ctx.statusLine.invalidate();
-			this.ctx.updateEditorTopBorder();
+			await this.ctx.applyCwdChange(resolvedPath);
 
 			this.ctx.chatContainer.addChild(new Spacer(1));
 			this.ctx.chatContainer.addChild(

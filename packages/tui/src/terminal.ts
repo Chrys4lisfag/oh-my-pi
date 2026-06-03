@@ -18,7 +18,6 @@ let activeTerminal: ProcessTerminal | null = null;
 let terminalEverStarted = false;
 
 const STD_INPUT_HANDLE = -10;
-const STD_OUTPUT_HANDLE = -11;
 const ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200;
 /**
  * Emergency terminal restore - call this from signal/crash handlers
@@ -96,6 +95,32 @@ export interface Terminal {
 	/**
 	 * Returns whether the native terminal viewport is at the scrollback tail when
 	 * the host exposes that state. `undefined` means the terminal cannot report it.
+	 *
+	 * `ProcessTerminal` deliberately does not implement this — no real terminal
+	 * can answer it truthfully:
+	 *
+	 * - POSIX terminals expose no scrollback-position API at all.
+	 * - Every modern Windows terminal host (Windows Terminal, VS Code, Tabby,
+	 *   Hyper, Alacritty, WezTerm, JetBrains, …) fronts console apps through
+	 *   ConPTY, where kernel32's `GetConsoleScreenBufferInfo` describes the
+	 *   pseudo-console buffer. That buffer is pinned to the visible grid —
+	 *   scrollback lives in the host UI, invisible to console APIs
+	 *   (microsoft/terminal#10191) — so a probe reads "at bottom" no matter
+	 *   where the user scrolled. Trusting it let streaming-time rebuilds emit
+	 *   `\x1b[3J` and yank scrolled readers: #1635 (Windows Terminal), #1746
+	 *   (Tabby and other ConPTY hosts). No env var distinguishes these hosts
+	 *   (Tabby sets none), so trust cannot be conditional on the environment.
+	 * - Legacy conhost (the only non-ConPTY host) keeps a real scrollback
+	 *   buffer, but its window follows the output cursor: a probe comparing
+	 *   `srWindow.Bottom` against `dwSize.Y - 1` reads "scrolled up" for a user
+	 *   following live output until all ~9001 buffer rows fill, permanently
+	 *   blocking checkpoint scrollback reconciliation.
+	 *
+	 * The renderer treats a missing implementation / `undefined` as "unknown":
+	 * live mutations defer destructive rebuilds and reconcile native scrollback
+	 * at explicit checkpoints (prompt submit), where the user's keystroke has
+	 * already pinned the host viewport to the bottom. Only test terminals
+	 * (xterm.js-backed) implement this with a real answer.
 	 */
 	isNativeViewportAtBottom?(): boolean | undefined;
 
@@ -208,33 +233,6 @@ export class ProcessTerminal implements Terminal {
 		// but avoid background polling there.
 		if (!isWindowsSubsystemForLinux()) {
 			this.#startOsc11Poll();
-		}
-	}
-
-	/**
-	 * Returns true when Windows' active console viewport is at the scrollback tail.
-	 * POSIX terminals do not expose native scrollback position through a standard API.
-	 */
-	isNativeViewportAtBottom(): boolean | undefined {
-		if (process.platform !== "win32") return undefined;
-		try {
-			const kernel32 = dlopen("kernel32.dll", {
-				GetStdHandle: { args: [FFIType.i32], returns: FFIType.ptr },
-				GetConsoleScreenBufferInfo: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.bool },
-			});
-			try {
-				const handle = kernel32.symbols.GetStdHandle(STD_OUTPUT_HANDLE);
-				const info = new Uint8Array(22);
-				const infoPtr = ptr(info);
-				if (!infoPtr || !kernel32.symbols.GetConsoleScreenBufferInfo(handle, infoPtr)) return undefined;
-				const viewBottom = new DataView(info.buffer, info.byteOffset, info.byteLength).getInt16(16, true);
-				const bufferHeight = new DataView(info.buffer, info.byteOffset, info.byteLength).getInt16(2, true);
-				return viewBottom >= bufferHeight - 1;
-			} finally {
-				kernel32.close();
-			}
-		} catch {
-			return undefined;
 		}
 	}
 

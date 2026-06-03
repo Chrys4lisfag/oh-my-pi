@@ -15,6 +15,7 @@ import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { InternalUrlRouter } from "../internal-urls";
 import { parseInternalUrl } from "../internal-urls/parse";
 import { createLspWritethrough, type FileDiagnosticsResult, type WritethroughCallback, writethroughNoop } from "../lsp";
+import { getDiagnosticsLedger } from "../lsp/diagnostics-ledger";
 import { getLanguageFromPath, highlightCode, type Theme } from "../modes/theme/theme";
 import writeDescription from "../prompts/tools/write.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
@@ -272,14 +273,27 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	readonly loadMode = "discoverable";
 	readonly summary = "Write content to a file (creates or overwrites)";
 
+	/** Stream matchers should see the real file content, not its JSON-escaped argument encoding. */
+	matcherDigest(args: unknown): string | undefined {
+		const content = (args as Partial<WriteParams>).content;
+		return typeof content === "string" ? content : undefined;
+	}
+
 	readonly #writethrough: WritethroughCallback;
 
 	constructor(private readonly session: ToolSession) {
 		const enableLsp = session.enableLsp ?? true;
 		const enableFormat = enableLsp && session.settings.get("lsp.formatOnWrite");
 		const enableDiagnostics = enableLsp && session.settings.get("lsp.diagnosticsOnWrite");
+		const dedup = enableDiagnostics && session.settings.get("lsp.diagnosticsDeduplicate");
 		this.#writethrough = enableLsp
-			? createLspWritethrough(session.cwd, { enableFormat, enableDiagnostics })
+			? createLspWritethrough(session.cwd, {
+					enableFormat,
+					enableDiagnostics,
+					transformDiagnostics: dedup
+						? (path, result) => getDiagnosticsLedger(session).reduce(path, result)
+						: undefined,
+				})
 			: writethroughNoop;
 		this.description = prompt.render(writeDescription);
 	}

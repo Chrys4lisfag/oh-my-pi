@@ -32,6 +32,7 @@ interface AppKeybindings {
 	"app.message.followUp": true;
 	"app.message.dequeue": true;
 	"app.clipboard.pasteImage": true;
+	"app.clipboard.pasteTextRaw": true;
 	"app.clipboard.copyLine": true;
 	"app.clipboard.copyPrompt": true;
 	"app.session.new": true;
@@ -56,6 +57,13 @@ export type AppKeybinding = keyof AppKeybindings;
 
 declare module "@oh-my-pi/pi-tui" {
 	interface Keybindings extends AppKeybindings {}
+}
+
+/**
+ * Resolve default image-paste shortcuts for the current terminal platform.
+ */
+export function getDefaultPasteImageKeys(platform: NodeJS.Platform = process.platform): KeyId[] {
+	return platform === "win32" ? ["ctrl+v", "alt+v"] : ["ctrl+v"];
 }
 
 /**
@@ -120,8 +128,12 @@ export const KEYBINDINGS = {
 		description: "Dequeue message",
 	},
 	"app.clipboard.pasteImage": {
-		defaultKeys: process.platform === "win32" ? "alt+v" : "ctrl+v",
+		defaultKeys: getDefaultPasteImageKeys(),
 		description: "Paste image from clipboard",
+	},
+	"app.clipboard.pasteTextRaw": {
+		defaultKeys: ["ctrl+shift+v", "alt+shift+v"],
+		description: "Paste text from clipboard as raw text (no collapse)",
 	},
 	"app.clipboard.copyLine": {
 		defaultKeys: "alt+shift+l",
@@ -219,6 +231,7 @@ const KEYBINDING_NAME_MIGRATIONS = {
 	followUp: "app.message.followUp",
 	dequeue: "app.message.dequeue",
 	pasteImage: "app.clipboard.pasteImage",
+	pasteTextRaw: "app.clipboard.pasteTextRaw",
 	copyLine: "app.clipboard.copyLine",
 	copyPrompt: "app.clipboard.copyPrompt",
 	newSession: "app.session.new",
