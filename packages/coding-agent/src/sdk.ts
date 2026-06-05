@@ -39,6 +39,7 @@ import { createAutoresearchExtension } from "./autoresearch";
 import { loadCapability } from "./capability";
 import { type Rule, ruleCapability, setActiveRules } from "./capability/rule";
 import { bucketRules } from "./capability/rule-buckets";
+import { shouldEnableAppendOnlyContext } from "./config/append-only-context-mode";
 import { ModelRegistry } from "./config/model-registry";
 import {
 	formatModelString,
@@ -646,24 +647,6 @@ function registerPythonCleanup(): void {
 	postmortem.register("python-cleanup", disposeAllKernelSessions);
 }
 
-/**
- * Resolve whether to enable append-only context mode based on the setting and provider.
- *
- * - `"on"` → always enable
- * - `"off"` → never enable
- * - `"auto"` → enable for DeepSeek (prefix-caching provider)
- */
-function resolveAppendOnlyMode(setting: "auto" | "on" | "off" | undefined, provider: string): boolean {
-	switch (setting ?? "auto") {
-		case "on":
-			return true;
-		case "off":
-			return false;
-		default:
-			return provider === "deepseek";
-	}
-}
-
 function customToolToDefinition(tool: CustomTool): ToolDefinition {
 	const definition: ToolDefinition & { [TOOL_DEFINITION_MARKER]: true } = {
 		name: tool.name,
@@ -1259,6 +1242,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getModelString: () => (hasExplicitModel && model ? formatModelString(model) : undefined),
 			getActiveModelString,
 			getPlanModeState: () => session?.getPlanModeState(),
+			getPlanReferencePath: () => session?.getPlanReferencePath() ?? "local://PLAN.md",
 			getGoalModeState: () => session?.getGoalModeState(),
 			getGoalRuntime: () => session?.goalRuntime,
 			getUsageStatistics: () => sessionManager.getUsageStatistics(),
@@ -2027,7 +2011,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getToolChoice: () => session?.nextToolChoice(),
 			telemetry: options.telemetry,
 			appendOnlyContext: model
-				? resolveAppendOnlyMode(settings.get("provider.appendOnlyContext"), model.provider)
+				? shouldEnableAppendOnlyContext(settings.get("provider.appendOnlyContext"), model)
 					? new AppendOnlyContextManager()
 					: undefined
 				: undefined,

@@ -1,5 +1,5 @@
 import type { AssistantMessage, ImageContent, Usage } from "@oh-my-pi/pi-ai";
-import { Container, Image, ImageProtocol, Markdown, Spacer, TERMINAL, Text } from "@oh-my-pi/pi-tui";
+import { Container, Image, type ImageBudget, ImageProtocol, Markdown, Spacer, TERMINAL, Text } from "@oh-my-pi/pi-tui";
 import { formatNumber } from "@oh-my-pi/pi-utils";
 import { settings } from "../../config/settings";
 import type { AssistantThinkingRenderer } from "../../extensibility/extensions/types";
@@ -17,14 +17,17 @@ export class AssistantMessageComponent extends Container {
 	#usageInfo?: Usage;
 	#convertedKittyImages = new Map<string, ImageContent>();
 	#kittyConversionsInFlight = new Set<string>();
+	#complete: boolean;
 
 	constructor(
 		message?: AssistantMessage,
 		private hideThinkingBlock = false,
 		private readonly onImageUpdate?: () => void,
 		private readonly thinkingRenderers: readonly AssistantThinkingRenderer[] = [],
+		private readonly imageBudget?: ImageBudget,
 	) {
 		super();
+		this.#complete = message !== undefined;
 
 		// Container for text/thinking content
 		this.#contentContainer = new Container();
@@ -33,6 +36,15 @@ export class AssistantMessageComponent extends Container {
 		if (message) {
 			this.updateContent(message);
 		}
+	}
+
+	setComplete(): void {
+		this.#complete = true;
+	}
+
+	getStableLineCount(width: number): number {
+		if (!this.#complete || this.#kittyConversionsInFlight.size > 0) return 0;
+		return this.render(width).length;
 	}
 
 	override invalidate(): void {
@@ -124,7 +136,7 @@ export class AssistantMessageComponent extends Container {
 						displayImage.data,
 						displayImage.mimeType,
 						{ fallbackColor: (text: string) => theme.fg("toolOutput", text) },
-						resolveImageOptions(),
+						{ ...resolveImageOptions(), budget: this.imageBudget, imageKey: key },
 					),
 				);
 				continue;
