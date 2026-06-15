@@ -5,7 +5,8 @@
  * a summary of the branch being left so context isn't lost.
  */
 
-import type { Model } from "@oh-my-pi/pi-ai";
+import type { ApiKey, Model } from "@oh-my-pi/pi-ai";
+import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { prompt } from "@oh-my-pi/pi-utils";
 import { type AgentTelemetry, instrumentedCompleteSimple } from "../telemetry";
 import type { AgentMessage } from "../types";
@@ -13,10 +14,10 @@ import { estimateTokens } from "./compaction";
 import type { ReadonlySessionManager, SessionEntry } from "./entries";
 import {
 	type ConvertToLlm,
-	convertToLlm,
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
+	defaultConvertToLlm,
 } from "./messages";
 import branchSummaryPrompt from "./prompts/branch-summary.md" with { type: "text" };
 import branchSummaryPreamble from "./prompts/branch-summary-preamble.md" with { type: "text" };
@@ -27,6 +28,7 @@ import {
 	type FileOperations,
 	SUMMARIZATION_SYSTEM_PROMPT,
 	serializeConversation,
+	stripReadSelector,
 	upsertFileOperations,
 } from "./utils";
 
@@ -70,7 +72,7 @@ export interface GenerateBranchSummaryOptions {
 	/** Model to use for summarization */
 	model: Model;
 	/** API key for the model */
-	apiKey: string;
+	apiKey: ApiKey;
 	/** Abort signal for cancellation */
 	signal: AbortSignal;
 	/** Optional custom instructions for summarization */
@@ -214,7 +216,7 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 		if (entry.type === "branch_summary" && !entry.fromExtension && entry.details) {
 			const details = entry.details as BranchSummaryDetails;
 			if (Array.isArray(details.readFiles)) {
-				for (const f of details.readFiles) fileOps.read.add(f);
+				for (const f of details.readFiles) fileOps.read.add(stripReadSelector(f));
 			}
 			if (Array.isArray(details.modifiedFiles)) {
 				// Modified files go into both edited and written for proper deduplication
@@ -288,8 +290,8 @@ export async function generateBranchSummary(
 
 	// Transform to LLM-compatible messages, then serialize to text
 	// Serialization prevents the model from treating it as a conversation to continue
-	const llmMessages = (options.convertToLlm ?? convertToLlm)(messages);
-	const conversationText = serializeConversation(llmMessages);
+	const llmMessages = (options.convertToLlm ?? defaultConvertToLlm)(messages);
+	const conversationText = serializeConversation(llmMessages, preferredDialect(model.id));
 
 	// Build prompt
 	const instructions = customInstructions || BRANCH_SUMMARY_PROMPT;
@@ -329,7 +331,7 @@ export async function generateBranchSummary(
 
 	// Compute file lists and append to summary
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
-	summary = upsertFileOperations(summary, readFiles, modifiedFiles);
+	summary = upsertFileOperations(summary, readFiles, modifiedFiles, fileOps.read);
 
 	return {
 		summary: summary || "No summary generated",

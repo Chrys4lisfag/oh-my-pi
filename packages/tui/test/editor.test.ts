@@ -3,9 +3,10 @@ import { stripVTControlCharacters } from "node:util";
 import { CURSOR_MARKER } from "@oh-my-pi/pi-tui";
 import { CombinedAutocompleteProvider } from "@oh-my-pi/pi-tui/autocomplete";
 import { Editor } from "@oh-my-pi/pi-tui/components/editor";
+import { KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "@oh-my-pi/pi-tui/keybindings";
+import { setKittyProtocolActive } from "@oh-my-pi/pi-tui/keys";
 import { visibleWidth } from "@oh-my-pi/pi-tui/utils";
 import { setDefaultTabWidth } from "@oh-my-pi/pi-utils";
-import { KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "../src/keybindings";
 import { defaultEditorTheme } from "./test-themes";
 
 describe("Editor component", () => {
@@ -616,6 +617,16 @@ describe("Editor component", () => {
 			editor.setText("foo bar");
 			editor.handleInput("\x1b\x7f"); // Alt+Backspace (legacy)
 			expect(editor.getText()).toBe("foo ");
+
+			// Issue #2064: Ghostty on macOS reports Option+Backspace as `ESC [127;11u`
+			// (kitty modifier 11 wire = super(8)|alt(2)). Without super support the
+			// editor used to ignore this entirely and the previous word survived.
+			setKittyProtocolActive(true);
+			editor.setText("foo bar");
+			editor.handleInput("\x1b[F"); // End — park cursor at EOL
+			editor.handleInput("\x1b[127;11u"); // Ghostty Option+Backspace
+			expect(editor.getText()).toBe("foo ");
+			setKittyProtocolActive(false);
 		});
 
 		it("navigates words correctly with Ctrl+Left/Right", () => {
@@ -1810,6 +1821,13 @@ describe("Editor component", () => {
 			expect(editor.getCursor()).toEqual({ line: 0, col: 2 });
 		});
 
+		it("strips control characters from pasted text but keeps newlines", () => {
+			const editor = new Editor(defaultEditorTheme);
+			// BEL (\x07) and NUL (\x00) must be removed; the newline must survive.
+			editor.handleInput("\x1b[200~a\x07b\x00c\ndef\x1b[201~");
+			expect(editor.getText()).toBe("abc\ndef");
+		});
+
 		it("undoes the last paste when a transient #undo trigger is executed", () => {
 			const editor = new Editor(defaultEditorTheme);
 
@@ -2035,7 +2053,7 @@ describe("Editor component", () => {
 
 			editor.handleInput(`\x1b[200~${pastedText}\x1b[201~`);
 
-			expect(editor.getText()).toMatch(/\[paste #\d+ \+\d+ lines\]/);
+			expect(editor.getText()).toMatch(/\[Paste #\d+, \+\d+ lines\]/);
 			expect(editor.getExpandedText()).toBe(pastedText);
 		});
 
@@ -2063,6 +2081,121 @@ describe("Editor component", () => {
 			editor.handleInput("\r");
 
 			expect(submitted).toBe(pastedText);
+		});
+
+		it("formats a large single-line paste as a char-count marker", () => {
+			const editor = new Editor(defaultEditorTheme);
+			const pastedText = "a".repeat(1500);
+
+			editor.handleInput(`\x1b[200~${pastedText}\x1b[201~`);
+
+			expect(editor.getText()).toMatch(/^\[Paste #\d+, 1500 chars\]$/);
+			expect(editor.getExpandedText()).toBe(pastedText);
+		});
+
+		it("deletes an entire paste marker on a single backspace when atomicTokenPattern is set", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.atomicTokenPattern = /\[(?:Image|Paste) #\d+(?:,[^\]\n]*)?\]/g;
+			const pastedText = Array.from({ length: 12 }, (_, i) => `line ${i + 1}`).join("\n");
+
+			editor.handleInput(`\x1b[200~${pastedText}\x1b[201~`);
+			expect(editor.getText()).toMatch(/^\[Paste #\d+, \+\d+ lines\]$/);
+
+			// Cursor sits just after the marker; one backspace removes the whole token
+			// rather than corrupting it into stray `[Paste #1, +12 lines` text.
+			editor.handleInput("\x7f");
+			expect(editor.getText()).toBe("");
+		});
+
+		it("deletes an entire marker on forward-delete from its start", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.atomicTokenPattern = /\[(?:Image|Paste) #\d+(?:,[^\]\n]*)?\]/g;
+			editor.setText("[Image #1, 800x600]");
+
+			editor.handleInput("\x01"); // Ctrl+A → start of line
+			editor.handleInput("\x1b[3~"); // Delete (forward)
+			expect(editor.getText()).toBe("");
+		});
+
+		it("removes only the marker and keeps surrounding text on atomic backspace", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.atomicTokenPattern = /\[(?:Image|Paste) #\d+(?:,[^\]\n]*)?\]/g;
+			editor.setText("a [Paste #1, +12 lines] b");
+
+			editor.handleInput("\x05"); // Ctrl+E → end of line
+			editor.handleInput("\x1b[D"); // left over 'b'
+			editor.handleInput("\x1b[D"); // left over ' ' — cursor now just after ']'
+			editor.handleInput("\x7f"); // Backspace deletes the whole marker
+			expect(editor.getText()).toBe("a  b");
+		});
+
+		it("deletes a marker character-by-character when no atomicTokenPattern is set", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("[Paste #1, +12 lines]");
+
+			editor.handleInput("\x05"); // Ctrl+E → end of line
+			editor.handleInput("\x7f"); // Backspace removes only the closing bracket
+			expect(editor.getText()).toBe("[Paste #1, +12 lines");
+		});
+
+		it("lets onLargePaste intercept a marker-sized paste, suppressing the default marker", () => {
+			const editor = new Editor(defaultEditorTheme);
+			const seen: Array<{ text: string; lineCount: number }> = [];
+			editor.onLargePaste = (text, lineCount) => {
+				seen.push({ text, lineCount });
+				return true;
+			};
+			const pastedText = Array.from({ length: 1200 }, (_, i) => `line ${i + 1}`).join("\n");
+
+			editor.handleInput(`\x1b[200~${pastedText}\x1b[201~`);
+
+			// Hook intercepted: nothing inserted, no paste marker, hook saw the full text + line count.
+			expect(editor.getText()).toBe("");
+			expect(seen).toHaveLength(1);
+			expect(seen[0].text).toBe(pastedText);
+			expect(seen[0].lineCount).toBe(1200);
+		});
+
+		it("falls back to the default marker when onLargePaste declines", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.onLargePaste = () => false;
+			const pastedText = Array.from({ length: 1200 }, (_, i) => `line ${i + 1}`).join("\n");
+
+			editor.handleInput(`\x1b[200~${pastedText}\x1b[201~`);
+
+			expect(editor.getText()).toMatch(/^\[Paste #\d+, \+1200 lines\]$/);
+			expect(editor.getExpandedText()).toBe(pastedText);
+		});
+
+		it("does not call onLargePaste for a sub-marker paste", () => {
+			const editor = new Editor(defaultEditorTheme);
+			let calls = 0;
+			editor.onLargePaste = () => {
+				calls++;
+				return true;
+			};
+
+			editor.handleInput("\x1b[200~just a short paste\x1b[201~");
+
+			expect(calls).toBe(0);
+			expect(editor.getText()).toBe("just a short paste");
+		});
+
+		it("insertPaste collapses content to a marker that expands on submit", () => {
+			const editor = new Editor(defaultEditorTheme);
+			let submitted = "";
+			editor.onSubmit = text => {
+				submitted = text;
+			};
+			const wrapped = `\`\`\`\n${Array.from({ length: 30 }, (_, i) => `row ${i}`).join("\n")}\n\`\`\``;
+
+			editor.insertPaste(wrapped);
+
+			expect(editor.getText()).toMatch(/^\[Paste #\d+, \+\d+ lines\]$/);
+			expect(editor.getExpandedText()).toBe(wrapped);
+
+			editor.handleInput("\r");
+			expect(submitted).toBe(wrapped);
 		});
 	});
 
@@ -2103,6 +2236,215 @@ describe("Editor component", () => {
 			// The leading Hangul jamo block (U+1100..U+1112) only appears in
 			// NFD output. The Editor must not leak it after normalization.
 			expect(rendered).not.toMatch(/[\u1100-\u1112]/);
+		});
+	});
+
+	describe("Grapheme-aware vertical movement", () => {
+		it("snaps vertical movement to grapheme boundaries instead of splitting surrogate pairs", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("ab\n😀😀");
+
+			editor.handleInput("\x1b[A"); // Up to line 0
+			editor.handleInput("\x01"); // Ctrl+A
+			editor.handleInput("\x1b[C"); // Right → col 1
+			expect(editor.getCursor()).toEqual({ line: 0, col: 1 });
+
+			// Down: visual col 1 is inside the first 😀 (2 cells, surrogate pair).
+			// The cursor must snap to a grapheme boundary, never land mid-pair.
+			editor.handleInput("\x1b[B");
+			expect(editor.getCursor()).toEqual({ line: 1, col: 0 });
+
+			// Typing here must not corrupt the emoji buffer
+			editor.handleInput("X");
+			expect(editor.getText()).toBe("ab\nX😀😀");
+		});
+
+		it("preserves the visual column across lines of different glyph widths", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("ああああ\nabcdefgh");
+
+			editor.handleInput("\x01"); // Ctrl+A on line 1
+			for (let i = 0; i < 4; i++) editor.handleInput("\x1b[C"); // Right ×4 → col 4
+			expect(editor.getCursor()).toEqual({ line: 1, col: 4 });
+
+			// Up: visual col 4 on the CJK line is two double-width glyphs → logical col 2,
+			// not col 4 (which would be visual col 8 / end of line).
+			editor.handleInput("\x1b[A");
+			expect(editor.getCursor()).toEqual({ line: 0, col: 2 });
+		});
+	});
+
+	describe("Whitespace trimmed at wrap points", () => {
+		it("maps cursor positions inside wrap-trimmed whitespace to a layout line", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("aaaa bbbb\nzzzz");
+			editor.render(10); // layoutWidth 4 → "aaaa bbbb" wraps at the space
+
+			// Up from "zzzz" lands on the second visual segment of line 0
+			editor.handleInput("\x1b[A");
+			expect(editor.getCursor()).toEqual({ line: 0, col: 9 });
+
+			// Place the cursor on the trimmed space (line 0, col 4)
+			editor.handleInput("\x01"); // Ctrl+A
+			for (let i = 0; i < 4; i++) editor.handleInput("\x1b[C");
+			expect(editor.getCursor()).toEqual({ line: 0, col: 4 });
+
+			// Down must move within line 0's wrapped segments. Before the fix the
+			// position was unmapped: the cursor fell through to the buffer's last
+			// visual line and Down became a no-op.
+			editor.handleInput("\x1b[B");
+			expect(editor.getCursor()).toEqual({ line: 0, col: 9 });
+		});
+	});
+
+	describe("Atomic tokens in kill operations", () => {
+		it("extends word-delete backwards over an intersected atomic token", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.atomicTokenPattern = /\[(?:Image|Paste) #\d+(?:,[^\]\n]*)?\]/g;
+			editor.setText("a [Paste #1, +12 lines]");
+
+			// Ctrl+W from the end must consume the whole marker, not leave "[Paste #1, +12 " behind
+			editor.handleInput("\x17");
+			expect(editor.getText()).toBe("a ");
+		});
+
+		it("extends kill-to-end-of-line over an atomic token the cursor sits inside", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.atomicTokenPattern = /\[(?:Image|Paste) #\d+(?:,[^\]\n]*)?\]/g;
+			editor.setText("a [Paste #1, +12 lines] b");
+
+			editor.handleInput("\x01"); // Ctrl+A
+			for (let i = 0; i < 4; i++) editor.handleInput("\x1b[C"); // into the marker
+			editor.handleInput("\x0b"); // Ctrl+K
+			expect(editor.getText()).toBe("a ");
+			expect(editor.getCursor()).toEqual({ line: 0, col: 2 });
+		});
+	});
+
+	describe("Undo coalescing", () => {
+		it("coalesces consecutive word typing into a single undo unit", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.handleInput("h");
+			editor.handleInput("i");
+			editor.handleInput(" ");
+			editor.handleInput("y");
+			editor.handleInput("o");
+			expect(editor.getText()).toBe("hi yo");
+
+			editor.handleInput("\x1b[45;5u"); // undo → removes "yo"
+			expect(editor.getText()).toBe("hi ");
+			editor.handleInput("\x1b[45;5u"); // undo → removes the space
+			expect(editor.getText()).toBe("hi");
+			editor.handleInput("\x1b[45;5u"); // undo → removes "hi"
+			expect(editor.getText()).toBe("");
+		});
+	});
+
+	describe("decorateText around the cursor seam", () => {
+		// Editor.#decorate is the only seam that sees both the user prose AND the
+		// trailing CURSOR_MARKER, so a decorator with a right-boundary lookahead
+		// (like the magic-keyword regex /(?<!\S)ultrathink(?!\S)/g) would reject
+		// matches glued to the marker — ESC is non-whitespace. The editor must
+		// split around the marker so each side decorates as if it were a complete
+		// line. This guards the "ultrathink doesn't glow until you type a trailing
+		// character" regression reported in #2475.
+		const WORD_RE = /(?<!\S)ultrathink(?!\S)/g;
+		const PAINT_PREFIX = "<<";
+		const PAINT_SUFFIX = ">>";
+		const paintKeyword = (text: string): string => text.replace(WORD_RE, m => `${PAINT_PREFIX}${m}${PAINT_SUFFIX}`);
+
+		it("decorates a keyword glued to the trailing cursor marker", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.decorateText = paintKeyword;
+			editor.focused = true;
+			editor.setText("ultrathink");
+
+			const line = editor.render(40).join("\n");
+			// Without the seam fix, the decorator's right-boundary `(?!\S)` would
+			// trip on ESC (the first byte of CURSOR_MARKER) and the keyword would
+			// survive verbatim. With it, the marker bookends the painted region.
+			expect(line).toContain(`${PAINT_PREFIX}ultrathink${PAINT_SUFFIX}`);
+		});
+
+		it("decorates keywords on both sides of the cursor in terminal-cursor mode", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.decorateText = paintKeyword;
+			editor.focused = true;
+			editor.setUseTerminalCursor(true);
+			editor.setText("ultrathink ultrathink");
+			// Position the hardware cursor between the two keywords.
+			editor.handleInput("\x01"); // Ctrl+A → start of line
+			editor.handleInput("\x05"); // Ctrl+E → end of line
+			for (let i = 0; i < "ultrathink".length; i++) editor.handleInput("\x1b[D"); // 10× left
+
+			const line = editor.render(60).join("\n");
+			// Both keywords are painted independently — left side ends just before
+			// the marker, right side begins right after it.
+			const occurrences = line.split(`${PAINT_PREFIX}ultrathink${PAINT_SUFFIX}`).length - 1;
+			expect(occurrences).toBe(2);
+			expect(line).toContain(CURSOR_MARKER);
+		});
+
+		it("preserves the marker as-is — never splits or duplicates it", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.decorateText = paintKeyword;
+			editor.focused = true;
+			editor.setText("ultrathink");
+
+			const line = editor.render(40).join("\n");
+			expect(line.split(CURSOR_MARKER).length - 1).toBe(1);
+		});
+	});
+
+	describe("volatile speech-to-text preview", () => {
+		it("replaces the volatile preview in place rather than appending", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setVolatileText("hel");
+			expect(editor.getText()).toBe("hel");
+			editor.setVolatileText("hello wor");
+			expect(editor.getText()).toBe("hello wor");
+			editor.setVolatileText("hello world");
+			expect(editor.getText()).toBe("hello world");
+		});
+
+		it("commits the preview as permanent text and previews the next phrase after it", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setVolatileText("hello wor");
+			editor.commitVolatileText("hello world");
+			expect(editor.getText()).toBe("hello world");
+			editor.setVolatileText(" goodby");
+			expect(editor.getText()).toBe("hello world goodby");
+			editor.commitVolatileText(" goodbye");
+			expect(editor.getText()).toBe("hello world goodbye");
+		});
+
+		it("clears the preview without committing it", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.insertText("note: ");
+			editor.setVolatileText("scratch that");
+			expect(editor.getText()).toBe("note: scratch that");
+			editor.clearVolatileText();
+			expect(editor.getText()).toBe("note: ");
+		});
+
+		it("keeps preview churn out of the undo history (one undo drops a committed phrase)", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.insertText("pre ");
+			editor.setVolatileText("u");
+			editor.setVolatileText("um");
+			editor.setVolatileText("um hel");
+			editor.commitVolatileText("hello");
+			expect(editor.getText()).toBe("pre hello");
+			editor.handleInput("\x1b[45;5u"); // undo → removes the committed phrase, not preview fragments
+			expect(editor.getText()).toBe("pre ");
+		});
+
+		it("replaces a multi-line preview across line boundaries", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setVolatileText("line one\nline two");
+			expect(editor.getText()).toBe("line one\nline two");
+			editor.setVolatileText("single line");
+			expect(editor.getText()).toBe("single line");
 		});
 	});
 });

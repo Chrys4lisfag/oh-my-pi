@@ -4,7 +4,7 @@ import { resolvePromptCacheKey } from "../auth-gateway/http";
  * Parsed inbound OpenAI chat-completions request, ready to feed into pi-ai
  * `stream(model, context, options)`.
  */
-import type { AuthGatewayParsedRequest as ParsedRequest } from "../auth-gateway/types";
+import type { AuthGatewayStreamControl, AuthGatewayParsedRequest as ParsedRequest } from "../auth-gateway/types";
 import type {
 	AssistantMessage,
 	AssistantMessageEventStream,
@@ -91,6 +91,7 @@ export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
 					buildAssistantMessage(
 						(m.content ?? undefined) as string | OpenAIChatContentPart[] | undefined,
 						m.tool_calls,
+						(m as { reasoning_content?: string | null }).reasoning_content ?? undefined,
 						data.model,
 						now,
 					),
@@ -227,10 +228,17 @@ function decodeDataUri(url: string): { data: string; mimeType: string } | undefi
 function buildAssistantMessage(
 	content: string | OpenAIChatContentPart[] | undefined,
 	toolCalls: OpenAIChatToolCall[] | undefined,
+	reasoningContent: string | undefined,
 	modelId: string,
 	now: number,
 ): AssistantMessage {
 	const parts: AssistantMessage["content"] = [];
+	if (reasoningContent !== undefined && reasoningContent.length > 0) {
+		// Replayed reasoning channel. The signature names the wire field so
+		// completions providers that demand exact `reasoning_content` replay
+		// (DeepSeek/Kimi) echo the model's actual reasoning back verbatim.
+		parts.push({ type: "thinking", thinking: reasoningContent, thinkingSignature: "reasoning_content" });
+	}
 	const text = stringifyContent(content);
 	if (text.length > 0) parts.push({ type: "text", text });
 	if (toolCalls) {
@@ -493,11 +501,17 @@ export function encodeStream(
 	events: AssistantMessageEventStream,
 	requestedModelId: string,
 	options?: ParsedRequest["options"],
+	control?: AuthGatewayStreamControl,
 ): ReadableStream<Uint8Array> {
 	const encoder = new TextEncoder();
 	const id = makeId();
 	const created = Math.floor(Date.now() / 1000);
 	const includeUsage = options?.extra?.includeStreamingUsage === true;
+	let cancelled = control?.signal?.aborted === true;
+	const markCancelled = () => {
+		cancelled = true;
+	};
+	control?.signal?.addEventListener("abort", markCancelled, { once: true });
 
 	const baseChunk = (delta: Record<string, unknown>, finishReason: string | null) => ({
 		id,
@@ -510,7 +524,7 @@ export function encodeStream(
 	});
 
 	const writeSse = (controller: ReadableStreamDefaultController<Uint8Array>, payload: unknown): void => {
-		controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
+		if (!cancelled) controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
 	};
 
 	const writeUsage = (controller: ReadableStreamDefaultController<Uint8Array>, message: AssistantMessage): void => {
@@ -529,15 +543,23 @@ export function encodeStream(
 		async start(controller) {
 			// contentIndex (from pi-ai events) -> tool_calls index on the wire.
 			const toolIndexByContentIndex = new Map<number, number>();
+			// wire index -> id/name emitted on the start chunk, to detect late-arriving
+			// upstream id/name that needs a corrective chunk before the finish.
+			const sentToolMeta = new Map<number, { id: string; name: string }>();
 			let nextToolIndex = 0;
 			let hasToolCalls = false;
 			let finishReason: string = "stop";
 
 			try {
+				if (cancelled) {
+					controller.close();
+					return;
+				}
 				// Initial role chunk.
 				writeSse(controller, baseChunk({ role: "assistant" }, null));
 
 				for await (const event of events) {
+					if (cancelled) return;
 					switch (event.type) {
 						case "text_delta":
 							if (event.delta.length > 0) {
@@ -559,6 +581,7 @@ export function encodeStream(
 							toolIndexByContentIndex.set(event.contentIndex, idx);
 							const partial = event.partial.content[event.contentIndex];
 							const call = partial && partial.type === "toolCall" ? partial : undefined;
+							sentToolMeta.set(idx, { id: call?.id ?? "", name: call?.name ?? "" });
 							writeSse(
 								controller,
 								baseChunk(
@@ -588,6 +611,38 @@ export function encodeStream(
 							break;
 						}
 
+						case "toolcall_end": {
+							const idx = toolIndexByContentIndex.get(event.contentIndex);
+							if (idx === undefined) break;
+							const sent = sentToolMeta.get(idx);
+							if (sent === undefined) break;
+							// Upstream completions providers can receive the real id/name in a
+							// later chunk than toolcall_start. Emit a corrective chunk only when
+							// the streamed value was empty: accumulating clients concatenate
+							// string fields, so "" + value is the only safe correction.
+							const correctId = sent.id === "" && event.toolCall.id !== "" ? event.toolCall.id : undefined;
+							const correctName =
+								sent.name === "" && event.toolCall.name !== "" ? event.toolCall.name : undefined;
+							if (correctId !== undefined || correctName !== undefined) {
+								writeSse(
+									controller,
+									baseChunk(
+										{
+											tool_calls: [
+												{
+													index: idx,
+													...(correctId !== undefined ? { id: correctId } : {}),
+													...(correctName !== undefined ? { function: { name: correctName } } : {}),
+												},
+											],
+										},
+										null,
+									),
+								);
+							}
+							break;
+						}
+
 						case "done":
 							finishReason =
 								event.reason === "toolUse"
@@ -610,22 +665,33 @@ export function encodeStream(
 							return;
 						}
 
-						// Drop start / *_start / *_end — chat-completions wire only
-						// surfaces deltas and the terminal finish_reason.
+						// Drop start / *_start and text/thinking *_end — chat-completions
+						// wire only surfaces deltas and the terminal finish_reason.
 						default:
 							break;
 					}
 				}
 
 				// Stream ended without a terminal `done` (defensive). Close gracefully.
-				writeSse(controller, baseChunk({}, hasToolCalls ? "tool_calls" : "stop"));
-				controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-				controller.close();
+				if (!cancelled) {
+					writeSse(controller, baseChunk({}, hasToolCalls ? "tool_calls" : "stop"));
+					controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+					controller.close();
+				}
 			} catch (err) {
-				const msg = err instanceof Error ? err.message : String(err);
-				writeSse(controller, { error: { message: msg, type: "upstream_error" } });
-				controller.close();
+				if (!cancelled) {
+					const msg = err instanceof Error ? err.message : String(err);
+					writeSse(controller, { error: { message: msg, type: "upstream_error" } });
+					controller.close();
+				}
+			} finally {
+				control?.signal?.removeEventListener("abort", markCancelled);
 			}
+		},
+		cancel(reason) {
+			cancelled = true;
+			control?.signal?.removeEventListener("abort", markCancelled);
+			control?.onCancel?.(reason);
 		},
 	});
 }

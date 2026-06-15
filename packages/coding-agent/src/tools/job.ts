@@ -2,9 +2,10 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
 import { prompt } from "@oh-my-pi/pi-utils";
-import * as z from "zod/v4";
-import { type AsyncJob, AsyncJobManager, isBackgroundJobSupportEnabled } from "../async";
+import { z } from "zod/v4";
+import type { AsyncJob, AsyncJobManager } from "../async";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
+import { shimmerEnabled, shimmerText } from "../modes/theme/shimmer";
 import type { Theme } from "../modes/theme/theme";
 import jobDescription from "../prompts/tools/job.md" with { type: "text" };
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
@@ -23,7 +24,7 @@ import {
 import { ToolError } from "./tool-errors";
 
 const jobSchema = z.object({
-	poll: z.array(z.string()).optional().describe("job ids to wait for"),
+	poll: z.array(z.string()).optional().describe("job ids to wait for; omit to wait on all running jobs"),
 	cancel: z.array(z.string()).optional().describe("job ids to cancel"),
 	list: z.boolean().optional().describe("snapshot all jobs"),
 });
@@ -65,6 +66,19 @@ export interface JobToolDetails {
 	cancelled?: { id: string; status: CancelStatus }[];
 }
 
+/**
+ * A poll snapshot where every watched job is still running and nothing was
+ * cancelled — pure "still waiting" noise once a newer poll exists. The TUI
+ * keeps such a block un-finalized (displaceable) so a follow-up `job` call
+ * replaces it instead of stacking another waiting frame in the transcript.
+ */
+export function isWaitingPollDetails(details: unknown): boolean {
+	const d = details as JobToolDetails | undefined;
+	if (!d || !Array.isArray(d.jobs) || d.jobs.length === 0) return false;
+	if (d.cancelled?.length) return false;
+	return d.jobs.every(job => job?.status === "running");
+}
+
 export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 	readonly name = "job";
 	readonly approval = "read" as const;
@@ -73,14 +87,10 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 	readonly description: string;
 	readonly parameters = jobSchema;
 	readonly strict = true;
+	readonly interruptible = true;
 	readonly loadMode = "discoverable";
 	constructor(private readonly session: ToolSession) {
 		this.description = prompt.render(jobDescription);
-	}
-
-	static createIf(session: ToolSession): JobTool | null {
-		if (!isBackgroundJobSupportEnabled(session.settings)) return null;
-		return new JobTool(session);
 	}
 
 	async execute(
@@ -90,7 +100,7 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 		onUpdate?: AgentToolUpdateCallback<JobToolDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<JobToolDetails>> {
-		const manager = AsyncJobManager.instance();
+		const manager = this.session.asyncJobManager;
 		if (!manager) {
 			return {
 				content: [{ type: "text", text: "Async execution is disabled; no background jobs are available." }],
@@ -162,6 +172,9 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 			return {
 				content: [{ type: "text", text: message }],
 				details: { jobs: [] },
+				// Nothing found / nothing to wait for is noise once consumed —
+				// the follow-up call has already corrected course.
+				useless: true,
 			};
 		}
 
@@ -172,9 +185,16 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 			return this.#buildResult(manager, [...cancelledJobs, ...jobsToWatch], cancelOutcomes);
 		}
 
-		// Wait until at least one running job finishes, the wait duration elapses, or the call is aborted.
+		// Wait until at least one running job finishes, the wait window elapses,
+		// or the call is aborted. With `async.pollWaitDuration` set to `smart`,
+		// the window adapts: it starts at the ladder floor and climbs as the agent
+		// polls in a tight loop, then resets to the floor once the agent steps
+		// away from polling (see AsyncJobManager.nextPollWaitMs). Any fixed value
+		// waits that exact duration every time.
 		const racePromises: Promise<unknown>[] = runningJobs.map(j => j.promise);
-		const waitMs = parseWaitDurationMs(this.session.settings.get("async.pollWaitDuration"));
+		const pollSetting = this.session.settings.get("async.pollWaitDuration");
+		const smartPoll = pollSetting === "smart";
+		const waitMs = smartPoll ? manager.nextPollWaitMs(ownerId) : parseWaitDurationMs(pollSetting);
 		const { promise: timeoutPromise, resolve: timeoutResolve } = Promise.withResolvers<void>();
 		const timeoutHandle = setTimeout(() => timeoutResolve(), waitMs);
 		racePromises.push(timeoutPromise);
@@ -220,6 +240,11 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 			manager.unwatchJobs(watchedJobIds);
 			clearTimeout(timeoutHandle);
 			if (progressTimer) clearInterval(progressTimer);
+			if (smartPoll) {
+				// Reset the idle-gap clock: escalate if the agent polls again soon,
+				// drop back to the floor once it goes quiet for a while.
+				manager.recordPollWaitEnd(ownerId);
+			}
 		}
 
 		return this.#buildResult(manager, allTrackedJobs, cancelOutcomes);
@@ -254,7 +279,7 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 	): JobSnapshot[] {
 		const now = Date.now();
 		return jobs.map(j => {
-			const current = AsyncJobManager.instance()?.getJob(j.id);
+			const current = this.session.asyncJobManager?.getJob(j.id);
 			const latest = current ?? j;
 			return {
 				id: latest.id,
@@ -325,12 +350,17 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 			}
 		}
 
+		const details: JobToolDetails = {
+			jobs: jobResults,
+			...(cancelOutcomes.length ? { cancelled: cancelOutcomes.map(({ id, status }) => ({ id, status })) } : {}),
+		};
 		return {
 			content: [{ type: "text", text: lines.join("\n").trimEnd() }],
-			details: {
-				jobs: jobResults,
-				...(cancelOutcomes.length ? { cancelled: cancelOutcomes.map(({ id, status }) => ({ id, status })) } : {}),
-			},
+			details,
+			// A poll where everything is still running carries no new information
+			// once a later poll exists — same predicate the TUI uses to displace
+			// stale waiting frames.
+			...(isWaitingPollDetails(details) ? { useless: true } : {}),
 		};
 	}
 }
@@ -342,6 +372,7 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 interface JobRenderArgs {
 	poll?: string[];
 	cancel?: string[];
+	list?: boolean;
 }
 
 const COLLAPSED_LIST_LIMIT = PREVIEW_LIMITS.COLLAPSED_ITEMS;
@@ -355,7 +386,7 @@ const PREVIEW_LINE_WIDTH = 80;
 function statusToIcon(status: JobSnapshot["status"]): ToolUIStatus {
 	switch (status) {
 		case "completed":
-			return "success";
+			return "done";
 		case "failed":
 			return "error";
 		case "cancelled":
@@ -378,7 +409,32 @@ function statusToColor(status: JobSnapshot["status"]): ToolUIColor {
 	}
 }
 
+/**
+ * Task job results are delivered in the model-facing `<task-result>` envelope
+ * (prompts/tools/task-summary.md) so the parent agent can parse status and the
+ * `agent://` pointer. The wrapper markup is noise to a human — preview the
+ * inner <output>/<preview> body instead.
+ */
+function stripTaskResultEnvelope(text: string): string {
+	if (!text.startsWith("<task-result")) return text;
+	const body = /<(output|preview)(?:\s[^>]*)?>\n?([\s\S]*?)\n?<\/\1>/.exec(text)?.[2];
+	return body?.trim() || text;
+}
+
+/**
+ * Pretty-printed JSON output wastes the collapsed one-line preview on a lone
+ * "{" — flatten structured-looking bodies onto a single line. Slice first:
+ * downstream truncation keeps at most a few hundred columns, so collapsing
+ * whitespace across a multi-KB body would be pure waste.
+ */
+function flattenStructuredPreview(text: string): string {
+	const first = text[0];
+	if (first !== "{" && first !== "[") return text;
+	return text.slice(0, PREVIEW_LINES_EXPANDED * PREVIEW_LINE_WIDTH * 2).replace(/\s+/g, " ");
+}
+
 function describeTarget(args: JobRenderArgs | undefined): string {
+	if (args?.list) return "background jobs";
 	const poll = args?.poll ?? [];
 	const cancel = args?.cancel ?? [];
 	const parts: string[] = [];
@@ -396,7 +452,7 @@ export const jobToolRenderer = {
 	inline: true,
 
 	renderCall(args: JobRenderArgs, _options: RenderResultOptions, uiTheme: Theme): Component {
-		const text = renderStatusLine({ icon: "pending", title: "Job", description: describeTarget(args) }, uiTheme);
+		const text = renderStatusLine({ icon: "pending", title: describeTarget(args) || "Job" }, uiTheme);
 		return new Text(text, 0, 0);
 	},
 
@@ -406,35 +462,49 @@ export const jobToolRenderer = {
 		uiTheme: Theme,
 		args?: JobRenderArgs,
 	): Component {
-		const jobs = result.details?.jobs ?? [];
+		let jobs = result.details?.jobs ?? [];
 
 		if (jobs.length === 0) {
 			const fallback = result.content?.find(c => c.type === "text")?.text || "No jobs to process";
-			const header = renderStatusLine({ icon: "warning", title: "Job", description: describeTarget(args) }, uiTheme);
+			const header = renderStatusLine({ icon: "warning", title: describeTarget(args) || "Job" }, uiTheme);
 			return new Text([header, formatEmptyMessage(fallback, uiTheme)].join("\n"), 0, 0);
+		}
+
+		const isPollCall = args
+			? !args.list && (!args.cancel || args.cancel.length === 0 || args.poll !== undefined)
+			: true;
+
+		if (!options.isPartial && isPollCall) {
+			jobs = jobs.filter(job => job.status !== "running");
+			if (jobs.length === 0) {
+				return new Text("", 0, 0);
+			}
 		}
 
 		const counts = { completed: 0, failed: 0, cancelled: 0, running: 0 };
 		for (const job of jobs) counts[job.status]++;
 
+		// The title already carries the running count, so meta lists only the
+		// settled categories — "waiting on 19 of 19 · 19 running" read awkward.
 		const meta: string[] = [];
 		if (counts.completed > 0) meta.push(uiTheme.fg("success", `${counts.completed} done`));
 		if (counts.failed > 0) meta.push(uiTheme.fg("error", `${counts.failed} failed`));
 		if (counts.cancelled > 0) meta.push(uiTheme.fg("warning", `${counts.cancelled} cancelled`));
-		if (counts.running > 0) meta.push(uiTheme.fg("accent", `${counts.running} running`));
 
 		const headerIcon: ToolUIStatus = counts.failed > 0 ? "warning" : counts.running > 0 ? "info" : "success";
+		const jobsNoun = jobs.length === 1 ? "job" : "jobs";
 		const description =
 			counts.running > 0
-				? `waiting on ${counts.running} of ${jobs.length}`
-				: `${jobs.length} ${jobs.length === 1 ? "job" : "jobs"} settled`;
+				? counts.running === jobs.length
+					? `waiting on ${jobs.length} ${jobsNoun}`
+					: `waiting on ${counts.running} of ${jobs.length} ${jobsNoun}`
+				: `${jobs.length} ${jobsNoun} settled`;
 
 		const header = renderStatusLine(
 			{
 				icon: headerIcon,
 				spinnerFrame: counts.running > 0 ? options.spinnerFrame : undefined,
-				title: "Job",
-				description,
+				title: description,
 				meta,
 			},
 			uiTheme,
@@ -455,11 +525,18 @@ export const jobToolRenderer = {
 
 		let cached: RenderCache | undefined;
 		return {
-			render(width: number): string[] {
+			render(width: number): readonly string[] {
 				const expanded = options.expanded;
 				const spinnerFrame = options.spinnerFrame ?? 0;
-				const key = new Hasher().bool(expanded).u32(width).u32(spinnerFrame).digest();
-				if (cached?.key === key) return cached.lines;
+				// Running-job labels shimmer while the poll block is live; the band
+				// phase is Date.now()-sampled at render time, so serving cached bytes
+				// would pin it to the ~12.5fps spinner-glyph cadence instead of the
+				// 30fps redraw. Bypass the cache while any row animates, and key on
+				// the animation state so a sealed block never hits stale shimmered
+				// bytes (spinnerFrame falls back to 0 on both sides of the seal).
+				const shimmerActive = counts.running > 0 && options.spinnerFrame !== undefined && shimmerEnabled();
+				const key = new Hasher().bool(expanded).u32(width).u32(spinnerFrame).bool(shimmerActive).digest();
+				if (!shimmerActive && cached?.key === key) return cached.lines;
 
 				const itemLines = renderTreeList<JobSnapshot>(
 					{
@@ -475,7 +552,9 @@ export const jobToolRenderer = {
 								job.status === "running" ? options.spinnerFrame : undefined,
 							);
 							const typeBadge = formatBadge(job.type, statusToColor(job.status), uiTheme);
-							const idText = uiTheme.fg("muted", job.id);
+							// Task jobs label themselves with their agent id, which is also
+							// the job id — drop the id column instead of stuttering it twice.
+							const idPart = job.label.trim() === job.id ? "" : ` ${uiTheme.fg("muted", job.id)}`;
 							const rawLabelLines = (job.label || "(no label)").split(/\r?\n/);
 							const maxLabelLines = expanded ? LABEL_LINES_EXPANDED : LABEL_LINES_COLLAPSED;
 							const visibleLabelLines = rawLabelLines
@@ -486,13 +565,25 @@ export const jobToolRenderer = {
 								visibleLabelLines[visibleLabelLines.length - 1] = `${last} …`;
 							}
 							const durationText = uiTheme.fg("dim", formatDuration(job.durationMs));
-							const headLabel = uiTheme.fg("toolOutput", visibleLabelLines[0] ?? "");
-							lines.push(`${icon} ${idText} ${typeBadge} ${headLabel} ${durationText}`);
+							// Running rows in a live block shimmer their label; once the block
+							// stops animating (sealed, or a settled snapshot — spinnerFrame
+							// cleared) they render static so scrollback never keeps a mid-sweep
+							// shimmer band.
+							const live = job.status === "running" && options.spinnerFrame !== undefined;
+							const headRaw = visibleLabelLines[0] ?? "";
+							const headLabel = live
+								? shimmerEnabled()
+									? shimmerText(headRaw, uiTheme)
+									: uiTheme.fg("accent", headRaw)
+								: uiTheme.fg("toolOutput", headRaw);
+							lines.push(`${icon}${idPart} ${typeBadge} ${headLabel} ${durationText}`);
 							for (let i = 1; i < visibleLabelLines.length; i++) {
 								lines.push(`  ${uiTheme.fg("toolOutput", visibleLabelLines[i]!)}`);
 							}
 
-							const preview = job.errorText?.trim() || job.resultText?.trim();
+							const preview = flattenStructuredPreview(
+								stripTaskResultEnvelope(job.errorText?.trim() || job.resultText?.trim() || ""),
+							);
 							if (preview) {
 								const maxLines = expanded ? PREVIEW_LINES_EXPANDED : PREVIEW_LINES_COLLAPSED;
 								const previewLines = getPreviewLines(preview, maxLines, PREVIEW_LINE_WIDTH, Ellipsis.Unicode);

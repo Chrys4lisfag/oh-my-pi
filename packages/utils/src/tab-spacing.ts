@@ -4,17 +4,25 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { isEnoent } from "./fs-error";
+import { isFsError } from "./fs-error";
 
 export const MIN_TAB_WIDTH = 1;
 export const MAX_TAB_WIDTH = 16;
 export const DEFAULT_TAB_WIDTH = 3;
 
+/**
+ * Per-component path length cap on common filesystems (`NAME_MAX = 255` on
+ * Linux ext4 / macOS APFS / Windows NTFS). Paths with components longer than
+ * this cannot be opened at all, so editorconfig discovery short-circuits to
+ * the default instead of running into `ENAMETOOLONG` from `readFileSync`.
+ */
+const NAME_MAX_BYTES = 255;
+
 const EDITORCONFIG_NAME = ".editorconfig";
 
 let defaultTabWidth = DEFAULT_TAB_WIDTH;
 
-const editorConfigCache = new Map<string, ParsedEditorConfig>();
+const editorConfigCache = new Map<string, ParsedEditorConfig | null>();
 const editorConfigChainCache = new Map<string, ChainEntry[]>();
 const indentationCache = new Map<string, number>();
 
@@ -145,14 +153,18 @@ function parseCachedEditorConfig(configPath: string): ParsedEditorConfig | undef
 	const key = path.resolve(configPath);
 	const hit = editorConfigCache.get(key);
 	if (hit !== undefined) {
-		return hit;
+		return hit ?? undefined;
 	}
 
 	let content: string;
 	try {
 		content = fs.readFileSync(key, "utf8");
 	} catch (err) {
-		if (isEnoent(err)) return undefined;
+		// editorconfig discovery is best-effort. Any filesystem error
+		// (`ENOENT`, `ENAMETOOLONG`, `ENOTDIR`, `EACCES`, `ELOOP`, `EINVAL`,
+		// …) means "no usable config at this path" — never a fatal condition
+		// for callers like the edit renderer that hand us arbitrary strings.
+		if (isFsError(err)) return undefined;
 		throw err;
 	}
 	const parsed = parseEditorConfigFile(content);
@@ -279,6 +291,15 @@ function resolveEditorConfigTabWidth(match: EditorConfigMatch | undefined, fallb
 	return undefined;
 }
 
+function hasOverlongPathComponent(filePath: string): boolean {
+	for (const part of filePath.split(/[\\/]/)) {
+		if (part.length > 0 && Buffer.byteLength(part) > NAME_MAX_BYTES) {
+			return true;
+		}
+	}
+	return false;
+}
+
 export function getDefaultTabWidth(): number {
 	return defaultTabWidth;
 }
@@ -298,6 +319,15 @@ export function getIndentation(file?: string | null, projectDir?: string | null)
 
 	const cwd = projectDir ?? process.cwd();
 	const absoluteFile = resolveFilePath(cwd, file);
+
+	// Renderers can hand us arbitrary strings (e.g. a malformed edit tool
+	// call whose `file_path` is gibberish). Reject paths whose normalized
+	// absolute form still has any component longer than `NAME_MAX_BYTES` —
+	// the editorconfig chain would only trip `ENAMETOOLONG` from
+	// `readFileSync` and escape.
+	if (hasOverlongPathComponent(absoluteFile)) {
+		return fallback;
+	}
 	const absKey = absoluteFile;
 	const cached = indentationCache.get(absKey);
 	if (cached !== undefined) {
@@ -309,4 +339,67 @@ export function getIndentation(file?: string | null, projectDir?: string | null)
 	const clamped = clampTabWidth(resolved);
 	indentationCache.set(absKey, clamped);
 	return clamped;
+}
+
+/**
+ * `.editorconfig`-derived formatting options for an LSP `textDocument/formatting` request.
+ *
+ * Both fields are absent when the resolved `.editorconfig` chain does not pin them, so callers
+ * can layer their own fallbacks (content sniffing, project defaults) underneath. Returned values
+ * are clamped to {@link MIN_TAB_WIDTH}..{@link MAX_TAB_WIDTH} for parity with {@link getIndentation}.
+ */
+export interface EditorConfigFormatting {
+	/** Effective indent width in columns, from `indent_size` or `tab_width`. */
+	tabSize?: number;
+	/** `true` for `indent_style = space`, `false` for `indent_style = tab` (or `indent_size = tab`). */
+	insertSpaces?: boolean;
+}
+
+/**
+ * Resolve `.editorconfig` formatting hints for `file` without falling back to any default.
+ *
+ * Used by the LSP format-on-write path so a missing `.editorconfig` declaration falls through
+ * to caller-provided defaults instead of clobbering the file with the renderer's display
+ * `defaultTabWidth` (issue #2329).
+ */
+export function getEditorConfigFormatting(file?: string | null, projectDir?: string | null): EditorConfigFormatting {
+	if (file === undefined || file === null || file === "") {
+		return {};
+	}
+
+	const cwd = projectDir ?? process.cwd();
+	const absoluteFile = resolveFilePath(cwd, file);
+
+	// Same NAME_MAX guard as `getIndentation`: editorconfig discovery is
+	// best-effort and must never escape as `ENAMETOOLONG` from a renderer's
+	// stray gibberish path.
+	if (hasOverlongPathComponent(absoluteFile)) {
+		return {};
+	}
+
+	const match = resolveEditorConfigMatch(absoluteFile);
+	if (match === undefined) {
+		return {};
+	}
+
+	const result: EditorConfigFormatting = {};
+
+	if (match.indentSize?.kind === "spaces") {
+		result.tabSize = clampTabWidth(match.indentSize.n);
+	} else if (match.tabWidth !== undefined) {
+		result.tabSize = clampTabWidth(match.tabWidth);
+	}
+
+	if (match.indentStyle === IndentStyle.Space) {
+		result.insertSpaces = true;
+	} else if (match.indentStyle === IndentStyle.Tab || match.indentSize?.kind === "tab") {
+		result.insertSpaces = false;
+	} else if (match.indentSize?.kind === "spaces") {
+		// `indent_size = <n>` without an explicit `indent_style` is universally
+		// read as "indent with N spaces" — both VSCode and Sublime infer
+		// `indent_style = space` in that case.
+		result.insertSpaces = true;
+	}
+
+	return result;
 }

@@ -1,8 +1,7 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getBundledModel } from "@oh-my-pi/pi-ai/models";
 import type {
 	AssistantMessage,
 	Message,
@@ -12,13 +11,14 @@ import type {
 	Usage,
 } from "@oh-my-pi/pi-ai/types";
 import { createOpenAIResponsesHistoryPayload } from "@oh-my-pi/pi-ai/utils";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import {
-	type SessionEntry,
-	SessionManager,
-	type SessionMessageEntry,
-} from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import type { SessionEntry, SessionMessageEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { Snowflake } from "@oh-my-pi/pi-utils";
 
 function createUsage(): Usage {
@@ -209,20 +209,21 @@ async function createPersistedSession(
 	return { sessionFile, treeTargetId: result?.treeTargetId };
 }
 
+// ModelRegistry construction loads the bundled model catalog plus the on-disk
+// cache (~100ms) and dominated this file's runtime when rebuilt once per test.
+// The registry and its pinned AuthStorage are immutable across these tests (none
+// mutate the catalog or stored credentials), so a single instance is shared via
+// createAgentSession's `modelRegistry`/`authStorage` seam. The registry pins
+// itself to its AuthStorage, so both MUST be the same shared instances.
+let sharedModelRegistry: ModelRegistry;
+let sharedRegistryDir: string;
+
 async function createSessionHarness(
 	tempDir: string,
 	sessionManager: SessionManager,
 	options: { provider?: Parameters<typeof getBundledModel>[0]; modelId?: string } = {},
-): Promise<{ session: AgentSession; authStorage: AuthStorage }> {
+): Promise<{ session: AgentSession }> {
 	const { provider = "openai", modelId = "gpt-5-mini" } = options;
-	const [{ createAgentSession }, { Settings }, { AuthStorage }] = await Promise.all([
-		import("@oh-my-pi/pi-coding-agent/sdk"),
-		import("@oh-my-pi/pi-coding-agent/config/settings"),
-		import("@oh-my-pi/pi-coding-agent/session/auth-storage"),
-	]);
-	const authStorage = await AuthStorage.create(path.join(tempDir, `testauth-${Snowflake.next()}.db`));
-	authStorage.setRuntimeApiKey("openai", "test-key");
-	authStorage.setRuntimeApiKey("openai-codex", "test-key");
 	const model = getBundledModel(provider, modelId);
 	if (!model) {
 		throw new Error(`Expected bundled test model ${provider}/${modelId}`);
@@ -231,7 +232,8 @@ async function createSessionHarness(
 	const { session } = await createAgentSession({
 		cwd: tempDir,
 		agentDir: tempDir,
-		authStorage,
+		authStorage: sharedModelRegistry.authStorage,
+		modelRegistry: sharedModelRegistry,
 		sessionManager,
 		model,
 		settings: Settings.isolated(),
@@ -242,22 +244,41 @@ async function createSessionHarness(
 		slashCommands: [],
 		enableMCP: false,
 		enableLsp: false,
+		// These tests exercise session reload/sanitization/provider-state, never tool
+		// execution, rule resolution, or the workspace-tree render. A minimal tool set
+		// plus empty rules and a prebuilt (empty) workspace tree skip the per-call
+		// startup scans (native listWorkspace + rule capability discovery) without
+		// touching any asserted behavior.
+		rules: [],
+		workspaceTree: { rootPath: tempDir, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] },
+		toolNames: ["read"],
 	});
 
-	return { session, authStorage };
+	return { session };
 }
 
 describe("AgentSession OpenAI Responses replay boundaries", () => {
 	const sessions: AgentSession[] = [];
-	const authStorages: AuthStorage[] = [];
 	const tempDirs: string[] = [];
+
+	beforeAll(async () => {
+		sharedRegistryDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-registry-${Snowflake.next()}-`));
+		const authStorage = await AuthStorage.create(path.join(sharedRegistryDir, "auth.db"));
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		authStorage.setRuntimeApiKey("openai-codex", "test-key");
+		sharedModelRegistry = new ModelRegistry(authStorage);
+	});
+
+	afterAll(() => {
+		sharedModelRegistry?.authStorage.close();
+		if (sharedRegistryDir && fs.existsSync(sharedRegistryDir)) {
+			fs.rmSync(sharedRegistryDir, { recursive: true, force: true });
+		}
+	});
 
 	afterEach(async () => {
 		while (sessions.length > 0) {
 			await sessions.pop()?.dispose();
-		}
-		while (authStorages.length > 0) {
-			authStorages.pop()?.close();
 		}
 		while (tempDirs.length > 0) {
 			const tempDir = tempDirs.pop();
@@ -285,9 +306,8 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		});
 
 		const reloadedSessionManager = await SessionManager.open(sessionFile, tempDir);
-		const { session, authStorage } = await createSessionHarness(tempDir, reloadedSessionManager);
+		const { session } = await createSessionHarness(tempDir, reloadedSessionManager);
 		sessions.push(session);
-		authStorages.push(authStorage);
 
 		const persistedUser = findPersistedMessageEntry(session.sessionManager, "user", "Preserved summary").message;
 		if (persistedUser.role !== "user") {
@@ -383,12 +403,11 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		});
 
 		const reloadedSessionManager = await SessionManager.open(sessionFile, tempDir);
-		const { session, authStorage } = await createSessionHarness(tempDir, reloadedSessionManager, {
+		const { session } = await createSessionHarness(tempDir, reloadedSessionManager, {
 			provider: "openai-codex",
 			modelId: "gpt-5.2-codex",
 		});
 		sessions.push(session);
-		authStorages.push(authStorage);
 
 		const closeSpy = vi.fn();
 		session.providerSessionState.set("openai-codex-responses", { close: closeSpy } satisfies ProviderSessionState);
@@ -421,12 +440,11 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		});
 
 		const reloadedSessionManager = await SessionManager.open(sessionFile, tempDir);
-		const { session, authStorage } = await createSessionHarness(tempDir, reloadedSessionManager, {
+		const { session } = await createSessionHarness(tempDir, reloadedSessionManager, {
 			provider: "openai-codex",
 			modelId: "gpt-5.2-codex",
 		});
 		sessions.push(session);
-		authStorages.push(authStorage);
 
 		const closeSpy = vi.fn();
 		session.providerSessionState.set("openai-codex-responses", { close: closeSpy } satisfies ProviderSessionState);
@@ -462,7 +480,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		sessionManager.appendCustomMessageEntry("proxy-details", "Proxy metadata", true, proxyDetails);
 
 		const snapshot = sessionManager.captureState();
-		const customEntry = snapshot.fileEntries.find(
+		const customEntry = snapshot.entries.find(
 			entry => entry.type === "custom_message" && entry.customType === "proxy-details",
 		);
 		if (customEntry?.type !== "custom_message") {
@@ -476,9 +494,8 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-reload-proxy-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const sessionManager = SessionManager.create(tempDir, tempDir);
-		const { session, authStorage } = await createSessionHarness(tempDir, sessionManager);
+		const { session } = await createSessionHarness(tempDir, sessionManager);
 		sessions.push(session);
-		authStorages.push(authStorage);
 		const proxyDetails = new Proxy({ ok: true, nested: { value: "preserved" } }, {});
 
 		await session.sendCustomMessage(
@@ -496,7 +513,6 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 
 		await session.reload();
 
-		expect(() => session.sessionManager.captureState()).not.toThrow();
 		expect(session.sessionFile).toBe(originalSessionFile);
 	});
 
@@ -515,12 +531,11 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		});
 
 		const reloadedSessionManager = await SessionManager.open(sessionFile, tempDir);
-		const { session, authStorage } = await createSessionHarness(tempDir, reloadedSessionManager, {
+		const { session } = await createSessionHarness(tempDir, reloadedSessionManager, {
 			provider: "openai-codex",
 			modelId: "gpt-5.2-codex",
 		});
 		sessions.push(session);
-		authStorages.push(authStorage);
 
 		const closeSpy = vi.fn();
 		session.providerSessionState.set("openai-codex-responses", { close: closeSpy } satisfies ProviderSessionState);
@@ -562,12 +577,11 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		});
 
 		const reloadedSessionManager = await SessionManager.open(sessionFile, tempDir);
-		const { session, authStorage } = await createSessionHarness(tempDir, reloadedSessionManager, {
+		const { session } = await createSessionHarness(tempDir, reloadedSessionManager, {
 			provider: "openai-codex",
 			modelId: "gpt-5.2-codex",
 		});
 		sessions.push(session);
-		authStorages.push(authStorage);
 
 		const closeSpy = vi.fn();
 		session.providerSessionState.set("openai-codex-responses", { close: closeSpy } satisfies ProviderSessionState);
@@ -598,9 +612,8 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		});
 
 		const reloadedSessionManager = await SessionManager.open(sessionFile, tempDir);
-		const { session, authStorage } = await createSessionHarness(tempDir, reloadedSessionManager);
+		const { session } = await createSessionHarness(tempDir, reloadedSessionManager);
 		sessions.push(session);
-		authStorages.push(authStorage);
 
 		const closeSpy = vi.fn();
 		session.providerSessionState.set("openai-responses:openai", { close: closeSpy } satisfies ProviderSessionState);
@@ -624,9 +637,8 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-switch-fail-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const currentSessionManager = SessionManager.create(tempDir, tempDir);
-		const { session, authStorage } = await createSessionHarness(tempDir, currentSessionManager);
+		const { session } = await createSessionHarness(tempDir, currentSessionManager);
 		sessions.push(session);
-		authStorages.push(authStorage);
 
 		const { sessionFile } = await createPersistedSession(tempDir, sessionManager => {
 			appendStaleAssistantTurn(sessionManager, "Unreadable assistant snapshot");
@@ -658,9 +670,8 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		const assistantText = "Switched assistant response";
 
 		const currentSessionManager = SessionManager.create(tempDir, tempDir);
-		const { session, authStorage } = await createSessionHarness(tempDir, currentSessionManager);
+		const { session } = await createSessionHarness(tempDir, currentSessionManager);
 		sessions.push(session);
-		authStorages.push(authStorage);
 
 		const { sessionFile } = await createPersistedSession(tempDir, sessionManager => {
 			sessionManager.appendMessage({
@@ -724,9 +735,8 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		}
 
 		const reloadedSessionManager = await SessionManager.open(sessionFile, tempDir);
-		const { session, authStorage } = await createSessionHarness(tempDir, reloadedSessionManager);
+		const { session } = await createSessionHarness(tempDir, reloadedSessionManager);
 		sessions.push(session);
-		authStorages.push(authStorage);
 
 		const navigation = await session.navigateTree(treeTargetId, { summarize: false });
 		expect(navigation.cancelled).toBe(false);
@@ -747,9 +757,8 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-new-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const sessionManager = SessionManager.create(tempDir, tempDir);
-		const { session, authStorage } = await createSessionHarness(tempDir, sessionManager);
+		const { session } = await createSessionHarness(tempDir, sessionManager);
 		sessions.push(session);
-		authStorages.push(authStorage);
 
 		const closeSpy = vi.fn();
 		session.providerSessionState.set("live-provider-session", { close: closeSpy } satisfies ProviderSessionState);

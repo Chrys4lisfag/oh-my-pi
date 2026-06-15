@@ -1,8 +1,8 @@
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { Api, AssistantMessage, Model } from "@oh-my-pi/pi-ai";
+import type { Api, ApiKey, AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 import { completeSimple, validateToolCall } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
-import * as z from "zod/v4";
+import { z } from "zod/v4";
 import summarySystemPrompt from "../../commit/prompts/summary-system.md" with { type: "text" };
 import summaryUserPrompt from "../../commit/prompts/summary-user.md" with { type: "text" };
 import type { CommitSummary } from "../../commit/types";
@@ -19,7 +19,7 @@ const SummaryTool = {
 
 export interface SummaryInput {
 	model: Model<Api>;
-	apiKey: string;
+	apiKey: ApiKey;
 	thinkingLevel?: ThinkingLevel;
 	commitType: string;
 	scope: string | null;

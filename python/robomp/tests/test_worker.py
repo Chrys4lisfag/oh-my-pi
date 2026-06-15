@@ -70,6 +70,7 @@ class _FakeRpcClient:
             messages: list = []
             events: list = []
             assistant_text: str = "ok"
+            assistant_message: dict | None = None
 
         return _Turn()
 
@@ -149,7 +150,7 @@ def _patch_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr("robomp.worker.host_tools.build", lambda _b: ())
     monkeypatch.setattr(
         "robomp.worker.persona.system_append",
-        lambda *, repo, issue, workspace: "SYS",
+        lambda *, repo, issue, workspace, bot_login: "SYS",
     )
     monkeypatch.setattr(
         "robomp.worker.persona.seed_phases",

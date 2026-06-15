@@ -33,6 +33,21 @@ import { embeddedAddon } from "./embedded-addon.js";
 
 const SUPPORTED_PLATFORMS = ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64", "win32-x64"];
 
+/**
+ * Streaming startup marker, enabled by `PI_DEBUG_STARTUP`. Local copy of the
+ * pi-utils helper (this loader cannot depend on pi-utils). Synchronous on
+ * purpose: extraction/dlopen hangs must still leave the `:start` marker.
+ * @param {string} text
+ */
+function startupMarker(text) {
+	if (!process.env.PI_DEBUG_STARTUP) return;
+	try {
+		fs.writeSync(2, `[startup] ${text}\n`);
+	} catch {
+		// stderr unavailable; markers are best-effort
+	}
+}
+
 function getNativesDir() {
 	const xdgDataHome = process.env.XDG_DATA_HOME;
 	if (xdgDataHome && fs.existsSync(path.join(xdgDataHome, "omp"))) {
@@ -162,6 +177,37 @@ export function resolveLoaderCandidates({
 }
 
 // =========================================================================
+
+/**
+ * Remove version-pinned native cache directories older than the loaded package.
+ * Best-effort by design: permission errors and concurrent processes must not
+ * abort startup after the native addon has already loaded successfully.
+ *
+ * @param {{ nativesDir: string; currentVersion: string }} input
+ * @returns {string[]}
+ */
+export function cleanupStaleNativeVersions({ nativesDir, currentVersion }) {
+	const removed = [];
+	let entries;
+	try {
+		entries = fs.readdirSync(nativesDir, { withFileTypes: true });
+	} catch {
+		return removed;
+	}
+
+	for (const entry of entries) {
+		if (!entry.isDirectory() || entry.name === currentVersion) continue;
+		const targetPath = path.join(nativesDir, entry.name);
+		try {
+			fs.rmSync(targetPath, { recursive: true, force: true });
+			removed.push(targetPath);
+		} catch {
+			// Stale caches are opportunistic cleanup only.
+		}
+	}
+	return removed;
+}
+
 // Side-effectful loader. Everything below runs only when `loadNative()` is
 // called from `native/index.js` — tests that only import the pure helpers
 // above pay nothing for variant detection, subprocess spawns, or fs probes.
@@ -366,6 +412,7 @@ function maybeExtractEmbeddedAddon(ctx, errors) {
 	if (!selectedEmbeddedFile) return null;
 	const targetPath = path.join(ctx.versionedDir, selectedEmbeddedFile.filename);
 
+	startupMarker("native:extractEmbeddedAddon:start");
 	try {
 		fs.mkdirSync(ctx.versionedDir, { recursive: true });
 	} catch (err) {
@@ -469,6 +516,26 @@ function validateLoadedBindings(ctx, bindings, candidate) {
 	);
 }
 
+/**
+ * Install the addon's bounded Tokio runtime now that `dlopen` has returned and
+ * the dynamic-loader lock is released. The Rust `#[module_init]` deliberately
+ * does NOT build the runtime — spawning worker threads under the loader lock
+ * deadlocks on some hosts — so it exposes `__ompInstallTokioRuntime` for the
+ * loader to call once, before any async native runs. Best-effort: older addons
+ * predating this export simply fall back to napi-rs's default runtime.
+ */
+function installNativeTokioRuntime(bindings) {
+	const install = bindings.__ompInstallTokioRuntime;
+	if (typeof install !== "function") return;
+	try {
+		install();
+		startupMarker("native:tokioRuntime:installed");
+	} catch (err) {
+		startupMarker(`native:tokioRuntime:failed:${err instanceof Error ? err.message : String(err)}`);
+	}
+}
+
+
 function buildHelpMessage(ctx) {
 	if (ctx.isCompiledBinary) {
 		const expectedPaths = ctx.addonFilenames.map(filename => `  ${path.join(ctx.versionedDir, filename)}`).join("\n");
@@ -502,7 +569,8 @@ function initLoaderContext() {
 	const packageVersion = packageJson.version;
 	const nativeDir = path.join(import.meta.dir, "..", "native");
 	const execDir = path.dirname(process.execPath);
-	const versionedDir = path.join(getNativesDir(), packageVersion);
+	const nativesDir = getNativesDir();
+	const versionedDir = path.join(nativesDir, packageVersion);
 	const userDataDir =
 		process.platform === "win32"
 			? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "omp")
@@ -560,10 +628,12 @@ function initLoaderContext() {
 		candidates,
 		versionSentinelExport,
 		isWorkspaceLoad,
+		nativesDir,
 	};
 }
 
 export function loadNative() {
+	startupMarker("native:loadNative:start");
 	const ctx = initLoaderContext();
 	const require_ = createRequire(import.meta.url);
 
@@ -575,8 +645,12 @@ export function loadNative() {
 
 	for (const candidate of runtimeCandidates) {
 		try {
+			startupMarker(`native:require:${path.basename(candidate)}`);
 			const bindings = require_(candidate);
 			validateLoadedBindings(ctx, bindings, candidate);
+			installNativeTokioRuntime(bindings);
+	        cleanupStaleNativeVersions({ nativesDir: ctx.nativesDir, currentVersion: ctx.packageVersion });
+			startupMarker("native:loadNative:done");
 			return bindings;
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);

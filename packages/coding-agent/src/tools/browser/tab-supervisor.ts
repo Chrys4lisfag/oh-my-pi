@@ -1,11 +1,22 @@
-import { getPuppeteerDir, isCompiledBinary, logger, Snowflake } from "@oh-my-pi/pi-utils";
+import { getPuppeteerDir, logger, Snowflake, workerHostEntry } from "@oh-my-pi/pi-utils";
 import type { Page, Target } from "puppeteer-core";
 import { callSessionTool } from "../../eval/js/tool-bridge";
 import type { ToolSession } from "../../sdk";
+import { webpExclusionForModel } from "../../utils/image-loading";
 import { expandPath } from "../path-utils";
 import { ToolAbortError, ToolError } from "../tool-errors";
 import { pickElectronTarget } from "./attach";
-import { type BrowserHandle, type BrowserKindTag, holdBrowser, releaseBrowser } from "./registry";
+import { CmuxTab, runCmuxCode } from "./cmux/cmux-tab";
+import { mapWaitUntil } from "./cmux/rpc";
+import { DEFAULT_VIEWPORT } from "./launch";
+import {
+	type BrowserHandle,
+	type BrowserKindTag,
+	type CmuxBrowserHandle,
+	holdBrowser,
+	type PuppeteerBrowserHandle,
+	releaseBrowser,
+} from "./registry";
 import type {
 	ReadyInfo,
 	RunErrorPayload,
@@ -18,14 +29,8 @@ import type {
 	WorkerOutbound,
 } from "./tab-protocol";
 
-// Worker entry. The literal string in `new Worker("./packages/coding-agent/src/tools/browser/tab-worker-entry.ts", …)`
-// below is what Bun's `--compile` static analyzer needs to bundle the worker
-// (registered as an additional entrypoint in `scripts/build-binary.ts`); in
-// dev we resolve the same source via `import.meta.url`. Replaces the older
-// `with { type: "file" }` pattern, which only copied the entry as a raw
-// asset and could not resolve the worker's relative imports inside a
-// compiled binary (issue #1011 was a false-positive fix — the regression
-// test only checked emission, not actual worker startup).
+// Coding-agent binary/bundle workers route through the CLI entrypoint with a
+// hidden argv mode, so compiled/npm builds only need one JavaScript entry.
 
 interface WorkerHandle {
 	send(msg: WorkerInbound, transferList?: Transferable[]): void;
@@ -45,17 +50,30 @@ export interface PendingRun {
 	toolCalls: Map<string, AbortController>;
 }
 
-export interface TabSession {
+interface TabSessionBase<TBrowser extends BrowserHandle = BrowserHandle> {
 	name: string;
-	browser: BrowserHandle;
+	browser: TBrowser;
 	targetId: string;
-	worker: WorkerHandle;
 	state: "alive" | "dead";
 	info: ReadyInfo;
 	pending: Map<string, PendingRun>;
 	dialogPolicy?: DialogPolicy;
 	kindTag: BrowserKindTag;
 }
+
+export interface WorkerTabSession extends TabSessionBase<PuppeteerBrowserHandle> {
+	backend: "worker";
+	worker: WorkerHandle;
+}
+
+export interface CmuxTabSession extends TabSessionBase<CmuxBrowserHandle> {
+	backend: "cmux";
+	cmuxTab: CmuxTab;
+	cmuxOwnsSurface: boolean;
+	cmuxAttachedSurface?: string;
+}
+
+export type TabSession = WorkerTabSession | CmuxTabSession;
 
 export interface AcquireTabOptions {
 	url?: string;
@@ -65,6 +83,7 @@ export interface AcquireTabOptions {
 	signal?: AbortSignal;
 	timeoutMs: number;
 	dialogs?: DialogPolicy;
+	cmuxSurface?: string;
 }
 
 export interface AcquireTabResult {
@@ -84,28 +103,75 @@ export interface ReleaseTabOptions {
 }
 
 const tabs = new Map<string, TabSession>();
+// Per-name acquisition chain: serializes concurrent `acquireTab` calls for the
+// same tab name so the existence check and `tabs.set` (separated by several
+// awaits) cannot interleave and leak a worker + browser refCount.
+const acquireChains = new Map<string, Promise<void>>();
 const GRACE_MS = 750;
 
 export function getTab(name: string): TabSession | undefined {
 	return tabs.get(name);
 }
 
-export async function acquireTab(
+export function acquireTab(name: string, browser: BrowserHandle, opts: AcquireTabOptions): Promise<AcquireTabResult> {
+	const prior = acquireChains.get(name) ?? Promise.resolve();
+	const result = prior.then(() => acquireTabImpl(name, browser, opts));
+	const tail = result.then(
+		() => undefined,
+		() => undefined,
+	);
+	acquireChains.set(name, tail);
+	void tail.then(() => {
+		if (acquireChains.get(name) === tail) acquireChains.delete(name);
+	});
+	return result;
+}
+
+async function acquireTabImpl(
 	name: string,
 	browser: BrowserHandle,
 	opts: AcquireTabOptions,
 ): Promise<AcquireTabResult> {
+	// Serialized opens can sit behind a slow predecessor in the per-name
+	// chain; honor an abort at dequeue instead of spawning a worker and
+	// browser hold nobody is waiting for.
+	if (opts.signal?.aborted) {
+		throw new ToolAbortError("Browser tab open aborted");
+	}
+	// Temporary refCount hold so releasing an existing tab on the SAME browser
+	// below cannot drop it to refCount 0 and dispose the instance we are about
+	// to reuse (e.g. reopening the sole tab with a different dialogs policy).
+	let tempHold = false;
 	const existing = tabs.get(name);
 	if (existing) {
 		if (existing.browser === browser && existing.state === "alive") {
-			if (opts.dialogs !== undefined && opts.dialogs !== existing.dialogPolicy) {
+			const requestedCmuxSurface = "client" in browser ? (opts.cmuxSurface ?? browser.surface) : undefined;
+			if (existing.backend === "cmux" && existing.cmuxAttachedSurface !== requestedCmuxSurface) {
+				holdBrowser(browser);
+				tempHold = true;
+				await releaseTab(name, { kill: false });
+			} else if (opts.dialogs !== undefined && opts.dialogs !== existing.dialogPolicy) {
+				holdBrowser(browser);
+				tempHold = true;
 				await releaseTab(name, { kill: false });
 			} else {
+				const reuseSteps: string[] = [];
+				if (opts.viewport && browser.kind.kind !== "cmux") {
+					const dsf = opts.viewport.deviceScaleFactor;
+					reuseSteps.push(
+						`await page.setViewport({ width: ${opts.viewport.width}, height: ${opts.viewport.height}, deviceScaleFactor: ${dsf === undefined ? "undefined" : String(dsf)} });`,
+					);
+				}
 				if (opts.url) {
+					reuseSteps.push(
+						`await tab.goto(${JSON.stringify(opts.url)}, { waitUntil: ${JSON.stringify(opts.waitUntil ?? "load")} });`,
+					);
+				}
+				if (reuseSteps.length) {
 					await runInTabWithSnapshot(
 						name,
 						{
-							code: `await tab.goto(${JSON.stringify(opts.url)}, { waitUntil: ${JSON.stringify(opts.waitUntil ?? "load")} });`,
+							code: reuseSteps.join("\n"),
 							timeoutMs: opts.timeoutMs,
 							signal: opts.signal,
 						},
@@ -115,12 +181,35 @@ export async function acquireTab(
 				return { tab: tabs.get(name)!, created: false };
 			}
 		} else {
+			if (existing.browser === browser) {
+				holdBrowser(browser);
+				tempHold = true;
+			}
 			await releaseTab(name, { kill: false });
 		}
 	}
 
-	const initPayload = await buildInitPayload(browser, opts);
-	let worker = await spawnTabWorker();
+	if ("client" in browser) {
+		try {
+			const result = await acquireCmuxTab(name, browser, opts);
+			if (tempHold) await releaseBrowser(browser, { kill: false });
+			return result;
+		} catch (error) {
+			if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false });
+			throw error;
+		}
+	}
+	let initPayload: WorkerInitPayload;
+	let worker: WorkerHandle;
+	try {
+		initPayload = await buildInitPayload(browser, opts);
+		worker = await spawnTabWorker();
+	} catch (error) {
+		// Failing before the worker took its own hold must release the
+		// temporary one, or the browser's refCount never reaches 0 again.
+		if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false });
+		throw error;
+	}
 	let info: ReadyInfo;
 	try {
 		info = await initializeTabWorker(worker, initPayload, opts.timeoutMs + GRACE_MS);
@@ -130,7 +219,7 @@ export async function acquireTab(
 		// the inline worker here so module-resolution failures don't poison every tab open.
 		await worker.terminate().catch(() => undefined);
 		if (worker.mode === "inline") {
-			if (browser.refCount === 0) await releaseBrowser(browser, { kill: false });
+			if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false });
 			throw error;
 		}
 		logger.warn("Tab worker init failed; retrying with inline tab worker (no sync-loop guard)", {
@@ -141,7 +230,7 @@ export async function acquireTab(
 			info = await initializeTabWorker(worker, initPayload, opts.timeoutMs + GRACE_MS);
 		} catch (inlineError) {
 			await worker.terminate().catch(() => undefined);
-			if (browser.refCount === 0) await releaseBrowser(browser, { kill: false });
+			if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false });
 			const finalError = new ToolError(
 				`Failed to start browser tab worker (inline fallback also failed): ${inlineError instanceof Error ? inlineError.message : String(inlineError)}`,
 			);
@@ -151,10 +240,12 @@ export async function acquireTab(
 	}
 
 	holdBrowser(browser);
-	const tab: TabSession = {
+	if (tempHold) await releaseBrowser(browser, { kill: false });
+	const tab: WorkerTabSession = {
 		name,
 		browser,
 		targetId: info.targetId,
+		backend: "worker",
 		worker,
 		state: "alive",
 		info,
@@ -167,11 +258,85 @@ export async function acquireTab(
 	return { tab, created: true };
 }
 
+async function acquireCmuxTab(
+	name: string,
+	browser: CmuxBrowserHandle,
+	opts: AcquireTabOptions,
+): Promise<AcquireTabResult> {
+	const attachedSurface = opts.cmuxSurface ?? browser.surface;
+	if (attachedSurface?.startsWith("surface:")) {
+		throw new ToolError(
+			"app.surface must be a surface UUID (e.g. CMUX_SURFACE_ID), not a 'surface:N' ref; omit it to open a new split",
+		);
+	}
+
+	let surfaceId = attachedSurface;
+	let initialUrl = opts.url;
+	let ownsSurface = false;
+	try {
+		if (!surfaceId) {
+			const params: Record<string, unknown> = { url: opts.url ?? "about:blank", focus: false };
+			if (process.env.CMUX_WORKSPACE_ID) params.workspace_id = process.env.CMUX_WORKSPACE_ID;
+			if (process.env.CMUX_SURFACE_ID) params.surface_id = process.env.CMUX_SURFACE_ID;
+			const result = await browser.client.request("browser.open_split", params, { timeoutMs: opts.timeoutMs });
+			if (typeof result.surface_id !== "string" || result.surface_id.length === 0) {
+				throw new ToolError("cmux browser.open_split did not return a surface_id");
+			}
+			surfaceId = result.surface_id;
+			ownsSurface = true;
+			if (typeof result.url === "string" && result.url.length > 0) initialUrl = result.url;
+			if (opts.url) {
+				await browser.client.request(
+					"browser.wait",
+					{
+						surface_id: surfaceId,
+						load_state: mapWaitUntil(opts.waitUntil ?? "load"),
+						timeout_ms: opts.timeoutMs,
+					},
+					{ timeoutMs: opts.timeoutMs },
+				);
+			}
+		}
+
+		const cmuxTab = new CmuxTab({ client: browser.client, surfaceId, url: initialUrl });
+		if (attachedSurface && opts.url) {
+			await cmuxTab.goto(opts.url, { waitUntil: opts.waitUntil ?? "load", timeoutMs: opts.timeoutMs });
+		}
+		const info = await cmuxTab.readyInfo(opts.viewport ?? DEFAULT_VIEWPORT);
+		holdBrowser(browser);
+		const tab: CmuxTabSession = {
+			name,
+			browser,
+			targetId: surfaceId,
+			backend: "cmux",
+			cmuxTab,
+			cmuxOwnsSurface: ownsSurface,
+			state: "alive",
+			info,
+			pending: new Map(),
+			dialogPolicy: opts.dialogs,
+			kindTag: browser.kind.kind,
+			cmuxAttachedSurface: attachedSurface,
+		};
+		tabs.set(name, tab);
+		return { tab, created: true };
+	} catch (error) {
+		if (ownsSurface && surfaceId) {
+			await browser.client.request("surface.close", { surface_id: surfaceId }).catch(() => undefined);
+		}
+		throw error;
+	}
+}
+
 export async function runInTab(name: string, opts: RunInTabOptions): Promise<RunResultOk> {
 	return await runInTabWithSnapshot(
 		name,
 		{ code: opts.code, timeoutMs: opts.timeoutMs, signal: opts.signal, session: opts.session },
-		{ cwd: opts.session.cwd, browserScreenshotDir: expandBrowserScreenshotDir(opts.session) },
+		{
+			cwd: opts.session.cwd,
+			browserScreenshotDir: expandBrowserScreenshotDir(opts.session),
+			excludeWebP: webpExclusionForModel(opts.session.getActiveModel?.()),
+		},
 	);
 }
 
@@ -193,6 +358,19 @@ async function runInTabWithSnapshot(
 		toolCalls: new Map(),
 	};
 	tab.pending.set(id, pending);
+	if (tab.backend === "cmux") {
+		try {
+			return await runCmuxCode(tab.cmuxTab, {
+				code: opts.code,
+				timeoutMs: opts.timeoutMs,
+				signal: opts.signal,
+				session: pending.session,
+				snapshot,
+			});
+		} finally {
+			tab.pending.delete(id);
+		}
+	}
 	const abort = (): void => {
 		tab.worker.send({ type: "abort", id });
 		for (const ctrl of pending.toolCalls.values()) ctrl.abort(opts.signal?.reason);
@@ -200,7 +378,14 @@ async function runInTabWithSnapshot(
 	if (opts.signal?.aborted) abort();
 	else opts.signal?.addEventListener("abort", abort, { once: true });
 	try {
-		tab.worker.send({ type: "run", id, name, code: opts.code, timeoutMs: opts.timeoutMs, session: snapshot });
+		tab.worker.send({
+			type: "run",
+			id,
+			name,
+			code: opts.code,
+			timeoutMs: opts.timeoutMs,
+			session: snapshot,
+		});
 		return await raceWithTimeout(
 			promise,
 			opts.timeoutMs + GRACE_MS,
@@ -223,12 +408,35 @@ export async function releaseTab(name: string, opts: ReleaseTabOptions = {}): Pr
 	tab.state = "dead";
 	const closeError = new ToolError(`Tab ${JSON.stringify(name)} was closed`);
 	for (const [id, pending] of tab.pending) {
-		try {
-			tab.worker.send({ type: "abort", id });
-		} catch {}
+		if (tab.backend === "worker") {
+			try {
+				tab.worker.send({ type: "abort", id });
+			} catch {}
+		}
+		for (const ctrl of pending.toolCalls.values()) ctrl.abort(closeError);
 		pending.reject(closeError);
 	}
 	tab.pending.clear();
+	if (tab.backend === "cmux") {
+		let nonLastCloseError: unknown;
+		if (wasAlive && tab.cmuxOwnsSurface) {
+			try {
+				await tab.browser.client.request("surface.close", { surface_id: tab.targetId });
+			} catch (err) {
+				if (isLastSurfaceCloseError(err)) {
+					logger.debug("Leaving cmux browser surface open because it is the last surface in the workspace", {
+						error: err instanceof Error ? err.message : String(err),
+					});
+				} else {
+					nonLastCloseError = err;
+				}
+			}
+		}
+		await releaseBrowser(tab.browser, { kill: opts.kill ?? false });
+		tabs.delete(name);
+		if (nonLastCloseError) throw nonLastCloseError;
+		return true;
+	}
 	let forced = false;
 	if (wasAlive) {
 		try {
@@ -259,7 +467,12 @@ export async function dropHeadlessTabs(): Promise<void> {
 	for (const name of names) await releaseTab(name);
 }
 
-async function buildInitPayload(browser: BrowserHandle, opts: AcquireTabOptions): Promise<WorkerInitPayload> {
+function isLastSurfaceCloseError(err: unknown): boolean {
+	const message = err instanceof Error ? err.message : String(err);
+	return /last/i.test(message);
+}
+
+async function buildInitPayload(browser: PuppeteerBrowserHandle, opts: AcquireTabOptions): Promise<WorkerInitPayload> {
 	const safeDir = getPuppeteerDir();
 	const browserWSEndpoint = browser.browser.wsEndpoint();
 	if (!browserWSEndpoint) throw new ToolError("Browser websocket endpoint is unavailable");
@@ -286,7 +499,7 @@ async function buildInitPayload(browser: BrowserHandle, opts: AcquireTabOptions)
 	};
 }
 
-function handleTabMessage(tab: TabSession, msg: WorkerOutbound): void {
+function handleTabMessage(tab: WorkerTabSession, msg: WorkerOutbound): void {
 	if (msg.type === "result") {
 		const pending = tab.pending.get(msg.id);
 		if (!pending) return;
@@ -309,7 +522,10 @@ function handleTabMessage(tab: TabSession, msg: WorkerOutbound): void {
 	if (msg.type === "log") logWorkerMessage(msg);
 }
 
-async function dispatchToolCall(tab: TabSession, msg: Extract<WorkerOutbound, { type: "tool-call" }>): Promise<void> {
+async function dispatchToolCall(
+	tab: WorkerTabSession,
+	msg: Extract<WorkerOutbound, { type: "tool-call" }>,
+): Promise<void> {
 	const pending = tab.pending.get(msg.runId);
 	if (!pending?.session.cwd) {
 		safeSend(tab, {
@@ -345,7 +561,7 @@ async function dispatchToolCall(tab: TabSession, msg: Extract<WorkerOutbound, { 
 	}
 }
 
-function safeSend(tab: TabSession, msg: WorkerInbound): void {
+function safeSend(tab: WorkerTabSession, msg: WorkerInbound): void {
 	if (tab.state !== "alive") return;
 	try {
 		tab.worker.send(msg);
@@ -374,13 +590,18 @@ async function forceKillTab(name: string, reason: string): Promise<void> {
 	const error = new ToolError(reason);
 	for (const pending of tab.pending.values()) pending.reject(error);
 	tab.pending.clear();
+	if (tab.backend === "cmux") {
+		await releaseBrowser(tab.browser, { kill: false });
+		tabs.delete(name);
+		return;
+	}
 	await tab.worker.terminate().catch(() => undefined);
 	if (tab.kindTag === "headless") await closeOrphanTarget(tab);
 	await releaseBrowser(tab.browser, { kill: false });
 	tabs.delete(name);
 }
 
-async function closeOrphanTarget(tab: TabSession): Promise<void> {
+async function closeOrphanTarget(tab: WorkerTabSession): Promise<void> {
 	for (const target of tab.browser.browser.targets()) {
 		if ((await targetIdForTarget(target).catch(() => "")) !== tab.targetId) continue;
 		const page = await target.page().catch(() => null);
@@ -389,7 +610,7 @@ async function closeOrphanTarget(tab: TabSession): Promise<void> {
 	}
 }
 
-async function waitForClosed(tab: TabSession): Promise<void> {
+async function waitForClosed(tab: WorkerTabSession): Promise<void> {
 	const { promise, resolve } = Promise.withResolvers<void>();
 	const unsubscribe = tab.worker.onMessage(msg => {
 		if (msg.type === "closed") resolve();
@@ -462,8 +683,9 @@ async function raceWithTimeout<T>(
 
 async function spawnTabWorker(): Promise<WorkerHandle> {
 	try {
-		const worker = isCompiledBinary()
-			? new Worker("./packages/coding-agent/src/tools/browser/tab-worker-entry.ts", { type: "module" })
+		const hostEntry = workerHostEntry();
+		const worker = hostEntry
+			? new Worker(hostEntry, { type: "module", argv: ["__omp_worker_tab"] })
 			: new Worker(new URL("./tab-worker-entry.ts", import.meta.url).href, { type: "module" });
 		return wrapBunWorker(worker);
 	} catch (err) {

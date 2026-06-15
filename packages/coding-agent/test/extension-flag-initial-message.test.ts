@@ -1,10 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { parseArgs } from "../src/cli/args";
-import { applyExtensionFlags, type ExtensionFlagSink } from "../src/cli/extension-flags";
-import { buildInitialMessage } from "../src/cli/initial-message";
-import { ExtensionRuntime, loadExtensionFromFactory } from "../src/extensibility/extensions/loader";
-import { ExtensionRunner } from "../src/extensibility/extensions/runner";
-import { EventBus } from "../src/utils/event-bus";
+import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
+import { applyExtensionFlags, type ExtensionFlagSink } from "@oh-my-pi/pi-coding-agent/cli/extension-flags";
+import { buildInitialMessage } from "@oh-my-pi/pi-coding-agent/cli/initial-message";
+import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 
 // Regression coverage for extension-registered flags leaking into the initial
 // prompt. The CLI parses argv twice: once at startup (before extensions load,
@@ -52,6 +52,18 @@ describe("extension flags vs initial message", () => {
 		const parsed = parseArgs(["--spawn-peer=--print", "hello"], extFlags);
 		expect(parsed.unknownFlags.get("spawn-peer")).toBe("--print");
 		expect(parsed.print).toBeUndefined();
+		expect(parsed.messages).toEqual(["hello"]);
+	});
+	it("keeps standalone -- as end-of-options after a string extension flag", () => {
+		const parsed = parseArgs(["--spawn-peer", "--", "--model", "opus", "hello"], extFlags);
+		expect(parsed.unknownFlags.has("spawn-peer")).toBe(false);
+		expect(parsed.model).toBeUndefined();
+		expect(parsed.messages).toEqual(["--model", "opus", "hello"]);
+	});
+	it("consumes literal -- string values only in equals form", () => {
+		const parsed = parseArgs(["--spawn-peer=--", "--model", "opus", "hello"], extFlags);
+		expect(parsed.unknownFlags.get("spawn-peer")).toBe("--");
+		expect(parsed.model).toBe("opus");
 		expect(parsed.messages).toEqual(["hello"]);
 	});
 	it("treats an @-prefixed string value as the flag's value, not a file arg (P1#1)", () => {

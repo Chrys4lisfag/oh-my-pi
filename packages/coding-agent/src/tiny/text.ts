@@ -51,16 +51,81 @@ export function formatTitleUserMessage(message: string): string {
  */
 const FILLER_TITLE_TOKENS = new Set<string>([
 	// greetings
-	"hi", "hii", "hiii", "hiya", "hey", "heya", "hello", "helo", "hullo", "yo", "ya",
-	"sup", "wassup", "whatsup", "howdy", "greetings", "hola", "ciao", "aloha", "gm", "gn",
-	"good", "morning", "afternoon", "evening", "night", "day",
+	"hi",
+	"hii",
+	"hiii",
+	"hiya",
+	"hey",
+	"heya",
+	"hello",
+	"helo",
+	"hullo",
+	"yo",
+	"ya",
+	"sup",
+	"wassup",
+	"whatsup",
+	"howdy",
+	"greetings",
+	"hola",
+	"ciao",
+	"aloha",
+	"gm",
+	"gn",
+	"good",
+	"morning",
+	"afternoon",
+	"evening",
+	"night",
+	"day",
 	// politeness / acknowledgement
-	"thanks", "thank", "thx", "ty", "tysm", "cheers", "please", "pls", "plz",
-	"ok", "okay", "okey", "k", "kk", "yep", "yes", "yeah", "yup", "nope", "no", "nah",
-	"sure", "cool", "nice", "great", "awesome", "perfect", "lol", "lmao", "haha", "hehe",
+	"thanks",
+	"thank",
+	"thx",
+	"ty",
+	"tysm",
+	"cheers",
+	"please",
+	"pls",
+	"plz",
+	"ok",
+	"okay",
+	"okey",
+	"k",
+	"kk",
+	"yep",
+	"yes",
+	"yeah",
+	"yup",
+	"nope",
+	"no",
+	"nah",
+	"sure",
+	"cool",
+	"nice",
+	"great",
+	"awesome",
+	"perfect",
+	"lol",
+	"lmao",
+	"haha",
+	"hehe",
 	// poking the agent / fillers
-	"test", "tests", "testing", "ping", "pong", "there", "you", "u",
-	"hmm", "hmmm", "um", "uh", "so", "well", "anyway",
+	"test",
+	"tests",
+	"testing",
+	"ping",
+	"pong",
+	"there",
+	"you",
+	"u",
+	"hmm",
+	"hmmm",
+	"um",
+	"uh",
+	"so",
+	"well",
+	"anyway",
 ]);
 
 const TITLE_WORD = /[\p{L}\p{N}]+/gu;
@@ -96,5 +161,9 @@ export function normalizeGeneratedTitle(value: string | null | undefined): strin
 		.replace(/[.!?]$/, "")
 		.trim();
 	if (!title || title.toLowerCase() === NO_TITLE_SENTINEL) return null;
-	return title;
+	return titleCase(title);
+}
+
+function titleCase(value: string): string {
+	return value.replace(/\b\p{Ll}/gu, c => c.toUpperCase());
 }

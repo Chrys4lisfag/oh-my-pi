@@ -1,15 +1,18 @@
 import { describe, expect, it } from "bun:test";
 import type { Tool, ToolCall } from "@oh-my-pi/pi-ai/types";
 import {
+	adaptSchemaForStrict,
 	enforceStrictSchema,
 	isJsonSchemaValueValid,
 	isValidJsonSchema,
+	sanitizeSchemaForOpenAIResponses,
 	sanitizeSchemaForStrictMode,
+	toolWireSchema,
 	tryEnforceStrictSchema,
 	zodToWireSchema,
 } from "@oh-my-pi/pi-ai/utils/schema";
 import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
-import * as z from "zod/v4";
+import { z } from "zod/v4";
 
 describe("sanitizeSchemaForStrictMode", () => {
 	it("infers object type, strips non-structural keywords, and converts const to enum", () => {
@@ -84,6 +87,68 @@ describe("sanitizeSchemaForStrictMode", () => {
 		expect(nullVariant).toEqual({ type: "null" });
 		expect((objectVariant as Record<string, unknown>).required).toEqual(["data"]);
 		expect((objectVariant as Record<string, unknown>).properties).toEqual({ data: { type: "string" } });
+	});
+
+	it("distributes enum values to matching nullable type-array branches", () => {
+		const sanitized = sanitizeSchemaForStrictMode({
+			type: ["string", "null"],
+			enum: ["javascript", "python", null],
+			description: "guide",
+		});
+
+		expect(sanitized).toEqual({
+			anyOf: [
+				{ enum: ["javascript", "python"], type: "string" },
+				{ enum: [null], type: "null" },
+			],
+			description: "guide",
+		});
+	});
+
+	it("drops type-array branches that cannot satisfy enum constraints", () => {
+		const sanitized = sanitizeSchemaForStrictMode({
+			type: ["string", "null"],
+			enum: ["javascript", "python"],
+		});
+
+		expect(sanitized).toEqual({
+			enum: ["javascript", "python"],
+			type: "string",
+		});
+	});
+
+	it("keeps OpenAI Responses strict schemas valid for nullable MCP enum parameters", () => {
+		const guideEnum = ["javascript", "python"];
+		const raw = {
+			type: "object",
+			properties: {
+				guide: {
+					anyOf: [{ type: "string", enum: guideEnum, description: "guide" }, { type: "null" }],
+					default: null,
+					description: "guide",
+				},
+			},
+			required: ["guide"],
+			additionalProperties: false,
+		};
+
+		const wired = toolWireSchema({
+			name: "mcp__sentry_search_docs",
+			description: "",
+			parameters: structuredClone(raw),
+		});
+		const responses = sanitizeSchemaForOpenAIResponses(wired);
+		const strict = adaptSchemaForStrict(responses, true);
+		const properties = strict.schema.properties as Record<string, Record<string, unknown>>;
+
+		expect(strict.strict).toBe(true);
+		expect(properties.guide).toEqual({
+			anyOf: [
+				{ enum: ["javascript", "python"], type: "string" },
+				{ enum: [null], type: "null" },
+			],
+			description: "guide (default: null)",
+		});
 	});
 
 	it("keeps existing anyOf constraints inside each normalized type variant", () => {
@@ -439,6 +504,87 @@ describe("enforceStrictSchema", () => {
 		expect((properties.requiredText.type as string) === "string").toBe(true);
 		const optionalVariants = (properties.optionalCount.anyOf as Array<{ type?: string }>).map(v => v.type);
 		expect(optionalVariants).toEqual(["number", "null"]);
+	});
+
+	it("flattens optional union schemas instead of nesting anyOf wrappers", () => {
+		const schema = zodToWireSchema(
+			z.object({
+				paths: z.union([z.string(), z.array(z.string())]).optional(),
+			}),
+		);
+
+		const strict = enforceStrictSchema(schema);
+		const properties = strict.properties as Record<string, Record<string, unknown>>;
+		const branches = properties.paths.anyOf as Array<Record<string, unknown>>;
+
+		expect(branches.map(branch => branch.type)).toEqual(["string", "array", "null"]);
+		expect(branches.some(branch => Array.isArray(branch.anyOf))).toBe(false);
+	});
+
+	it("wraps constrained optional anyOf schemas so null is not blocked by sibling constraints", () => {
+		const strict = enforceStrictSchema({
+			type: "object",
+			properties: {
+				choice: {
+					type: "string",
+					anyOf: [{ enum: ["a"] }, { enum: ["b"] }],
+				},
+			},
+		});
+		const properties = strict.properties as Record<string, Record<string, unknown>>;
+		const branches = properties.choice.anyOf as Array<Record<string, unknown>>;
+
+		expect(branches).toHaveLength(2);
+		expect(branches[0].type).toBe("string");
+		expect(Array.isArray(branches[0].anyOf)).toBe(true);
+		expect(branches[1]).toEqual({ type: "null" });
+	});
+
+	it("splices natively nested pure unions into the parent anyOf", () => {
+		const strict = enforceStrictSchema({
+			type: "object",
+			properties: {
+				value: {
+					anyOf: [
+						{ anyOf: [{ type: "string" }, { type: "number" }], description: "inner union" },
+						{ type: "boolean" },
+					],
+				},
+				optionalValue: {
+					anyOf: [{ anyOf: [{ type: "string" }, { type: "number" }] }, { type: "boolean" }],
+				},
+			},
+			required: ["value"],
+		});
+		const properties = strict.properties as Record<string, Record<string, unknown>>;
+
+		const valueBranches = properties.value.anyOf as Array<Record<string, unknown>>;
+		expect(valueBranches.map(branch => branch.type)).toEqual(["string", "number", "boolean"]);
+		expect(properties.value.description).toBe("inner union");
+
+		// Optional property: splice happens first, then the nullable append stays flat.
+		const optionalBranches = properties.optionalValue.anyOf as Array<Record<string, unknown>>;
+		expect(optionalBranches.map(branch => branch.type)).toEqual(["string", "number", "boolean", "null"]);
+		expect(optionalBranches.some(branch => Array.isArray(branch.anyOf))).toBe(false);
+	});
+
+	it("does not splice anyOf branches that carry sibling constraints", () => {
+		const strict = enforceStrictSchema({
+			type: "object",
+			properties: {
+				value: {
+					anyOf: [{ type: "string", anyOf: [{ enum: ["a"] }, { enum: ["b"] }] }, { type: "number" }],
+				},
+			},
+			required: ["value"],
+		});
+		const properties = strict.properties as Record<string, Record<string, unknown>>;
+		const branches = properties.value.anyOf as Array<Record<string, unknown>>;
+
+		// `anyOf` is conjunctive with siblings — spreading would drop `type: "string"`.
+		expect(branches).toHaveLength(2);
+		expect(branches[0].type).toBe("string");
+		expect(Array.isArray(branches[0].anyOf)).toBe(true);
 	});
 
 	it("never emits undefined as a schema type", () => {

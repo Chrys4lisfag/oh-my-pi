@@ -2,6 +2,654 @@
 
 ## [Unreleased]
 
+## [16.0.1] - 2026-06-15
+
+### Added
+
+- Added Umans AI Coding Plan API-key login support and `UMANS_AI_CODING_PLAN_API_KEY` environment fallback ([#2636](https://github.com/can1357/oh-my-pi/pull/2636) by [@oldschoola](https://github.com/oldschoola)).
+
+### Fixed
+
+- Fixed OpenAI Responses, Azure OpenAI Responses, and Codex Responses providers ignoring async `onPayload` replacement bodies. Provider payload hooks can now transform the actual request body sent upstream, matching the Anthropic/Gemini replacement contract.
+- Fixed OpenAI-compatible chat-completions streams that send object-shaped tool arguments in fragments by deep-merging nested objects and task arrays instead of replacing earlier chunks. ([#2617](https://github.com/can1357/oh-my-pi/issues/2617))
+- Fixed OpenAI Responses strict-mode tool schema normalization for nullable enum MCP parameters so enum constraints are distributed to matching `anyOf` branches instead of being copied onto the `null` branch. ([#1835](https://github.com/can1357/oh-my-pi/issues/1835))
+- Fixed Cursor provider formatting tool errors with the same `[Tool Result]` prefix as successful results, causing Composer models to misinterpret error messages (e.g. "Pattern must not be empty") as directives over long conversations. Errors now use a `[Tool Error]` prefix so the model can distinguish failures from successes in the prompt history. ([#1853](https://github.com/can1357/oh-my-pi/pull/1853))
+- Fixed `validateToolArguments` silently accepting JSON-encoded array strings (e.g. `'["a","b"]'`) against `union(string, array<string>)` schemas — providers that double-serialize tool-call arguments (Z.AI / GLM) caused tools like `search` to receive the literal `["a","b"]` as a single path, producing zero matches (single element) or glob parse errors (multi-element). A new pre-validation pass parses JSON-array-shaped strings when the schema explicitly accepts both shapes. ([#1788](https://github.com/can1357/oh-my-pi/issues/1788))
+- Fixed Anthropic thinking summaries that arrive wrapped in literal `<thinking>` tags so advisor/raw transcript dumps do not render nested thinking tags ([#2695](https://github.com/can1357/oh-my-pi/issues/2695)).
+
+## [16.0.0] - 2026-06-15
+
+### Breaking Changes
+
+- Renamed the public dialect entrypoint from `@oh-my-pi/pi-ai/grammar` to `@oh-my-pi/pi-ai/dialect`.
+- Renamed grammar dialect identifiers from `ToolCallSyntax` to `Dialect`, renamed the `Grammar` interface to `DialectDefinition`, and renamed `Grammar.syntax` to `DialectDefinition.dialect`.
+- Added `DialectDefinition.renderThinking` and `DialectDefinition.renderTranscript` so dialect implementations serialize complete native chat transcripts, not just tool call/result blocks.
+
+### Added
+
+- Added `renderTranscript` method to dialect definitions for serializing complete native chat transcripts
+- Added `renderThinking` method to dialect definitions for rendering thinking/reasoning blocks
+- Added support for 11 dialect implementations: Anthropic, DeepSeek, Gemini, Gemma, GLM, Harmony, Hermes, Kimi, Pi-native, Qwen3, and XML
+- Added `createInbandScanner` factory function to instantiate dialect-specific scanners
+- Added `getDialectDefinition` function to retrieve dialect implementations by name
+- Added `renderToolCatalog` and `renderInbandToolPrompt` functions for tool catalog rendering
+- Added `renderToolInventory` function to generate human-readable per-tool documentation with examples
+- Added `renderToolExamples` function to render tool usage examples in the model's native dialect
+- Added `encodeInbandToolHistory` function to encode tool call history in dialect-specific format
+- Added `wrapInbandToolStream` function to process streaming responses with in-band tool call parsing
+- Added `ThinkingInbandScanner` for parsing thinking/reasoning blocks across dialects
+- Added `OwnedStream` class for managing dialect-aware streaming with tool call events
+- Added in-band thinking channels to every dialect that was missing one: `gemini` (a ```` ```thinking ```` fence mirroring ```` ```tool_code ````), `gemma` (its native `<|channel>thought…<channel|>` reasoning channel), `kimi` (`<think>…</think>`), and `pi` (`<thinking>…</thinking>`). Each scanner now parses reasoning into thinking events instead of leaking chain-of-thought into the visible reply, and every dialect's `renderThinking` is a real channel that round-trips back through its scanner (no passthrough renderers).
+
+### Changed
+
+- Moved public dialect entrypoint from `@oh-my-pi/pi-ai/grammar` to `@oh-my-pi/pi-ai/dialect` in package exports
+- Updated internal imports in `stream-markup-healing.ts` to use new dialect module path
+- Changed `renderToolInventory` to demote a tool description's own markdown headers by one level when it contains a top-level `# ` header, so they nest under the wrapping `# Tool: <name>` heading instead of reading as sibling sections. Descriptions that already start at `##` and headers inside fenced code blocks are left untouched.
+
+### Fixed
+
+- Fixed Gemini, Gemma, Kimi, and Pi in-band scanners to respect `parseThinking: false`, leaving private reasoning markers in visible text when parsing is disabled
+- Fixed thinking-channel parsing for streaming Gemini, Gemma, Kimi, and Pi outputs so split or partial `<thinking>` blocks no longer leak into visible replies
+- Fixed in-band thinking finalization and Kimi stream-healing interactions so leaked `<think>` blocks are preserved when structured tool calls are present, not duplicated when explicit reasoning is present, and closed on stream flush.
+
+### Removed
+
+- Removed `src/grammar/factory.ts` (replaced by `src/dialect/factory.ts`)
+- Removed `src/grammar/rendering.ts` (functionality moved to `src/dialect/rendering.ts`)
+- Removed `src/grammar/xml.ts` (replaced by `src/dialect/xml.ts`)
+
+## [15.13.3] - 2026-06-15
+
+### Added
+
+- Added the `gemini` in-band tool-call syntax with Python-style ```tool_code``` blocks and `default_api` invocations
+- Added the `gemma` token-delimited in-band tool-call syntax using `<|tool_call>` and `<|tool_response>` blocks
+- Added `gemini` and `gemma` to owned stream tool-result token detection so their tool responses are recognized
+- Fixed truncated Gemini and Gemma tool blocks from being emitted as plain text during streaming
+- Added the Azure OpenAI provider definition (`azure`) to the registry; `AZURE_OPENAI_API_KEY` resolves as its env-var API key via the catalog provider table.
+
+### Changed
+
+- Gemini tool-call examples now render without the `default_api.` namespace prefix, keeping `<example>` blocks concise. The live wire format still uses `default_api.` per the Gemini grammar.
+
+### Fixed
+
+- Fixed duplicate tool call projections by deduplicating provider-native `toolCall` events against in-band `tool_code` calls and keeping only the first real channel
+- Dropped nameless native `toolCall` events so they no longer appear as surfaced tool calls in owned-mode streams
+- Fixed truncated Gemini and Gemma tool blocks from being emitted as plain text during streaming
+- Fixed Gemini/Gemma in-band tool-call parsing around Python comments, raw/unicode string literals, and Gemma close-token text inside string values.
+
+## [15.13.2] - 2026-06-15
+
+### Added
+
+- Added `jsonSchemaToTypeScript` to `@oh-my-pi/pi-ai/utils/schema` to render JSON Schema argument shapes as compact, human-readable TypeScript-style signatures
+- Added the generic `ToolExample` type (`ToolCallExample`/`ToolCompareExample`/`ToolNoteExample`, parameterized over a tool's argument shape) and an `examples` property on the `Tool` interface for defining tool-call examples once as data.
+- Added `renderToolExamples` (via `@oh-my-pi/pi-ai/grammar`) to render a tool's examples into an `<examples>` block in the model's native tool-call syntax, with an optional `_i` intent-field placeholder injected when intent tracing is active.
+- Added per-grammar `renderToolCall` rendering of a single tool-call invocation (the inner element only, without the parallel-call block envelope), distinct from `renderAssistantToolCalls` which renders a complete block of one or more parallel calls.
+- Added a `GrammarRenderOptions.example` flag to `renderToolCall`: when set, the invocation renders as the bare payload — Harmony emits just the JSON arguments, dropping the verbose `<|start|>…<|message|>…<|call|>` envelope — so `renderToolExamples` keeps `<examples>` blocks legible.
+- Added an `abortOnFabrication` parameter to `wrapInbandToolStream` (default `true`): when `false`, a fabricated in-band tool-result continuation is discarded without aborting the provider request instead of cutting the turn short.
+- Added `@oh-my-pi/pi-ai/utils/harmony-leak` export with helpers to detect, audit, and recover GPT-5 Harmony tool-call header leaks
+- Added the `@oh-my-pi/pi-ai/grammar` public entrypoint for grammar factories, prompt/call rendering, in-band scanning, history encoding, and related typed utilities
+- Added a unified in-band tool-call grammar engine with syntax-owned scanners, prompts, history rendering, tool-result rendering, and stream adaptation for GLM, Hermes/Qwen, Kimi, XML/Anthropic, DeepSeek, Harmony, and pi-native formats.
+
+### Changed
+
+- Changed Harmony in-band tool-call rendering to omit the `<|constrain|>json` marker before the payload in `commentary` channel calls
+- Changed tool inventory rendering to present each tool’s `Parameters` section as a simplified TypeScript-style signature derived from its wire schema
+- Added raw in-band tool-call block capture to parsed owned tool calls so debugging can inspect the exact model-emitted call syntax.
+- Moved the canonical `ToolCallSyntax` union to `@oh-my-pi/pi-catalog/identity` and re-exported it from `@oh-my-pi/pi-ai/grammar` so the catalog can own the syntax vocabulary without an `@oh-my-pi/pi-ai` runtime import; all existing import paths are unchanged.
+- Made tool-call argument validation more lenient for schema-directed scalar coercions, including object/array stringification and 0/1 boolean coercion.
+- Changed `renderToolInventory` (the verbose system-prompt inventory and `/dump`) to render each tool as a `# Tool: <name>` markdown section instead of a `<tool name="…">…</tool>` wrapper.
+
+### Fixed
+
+- Fixed Harmony leak handling support by adding `recoverHarmonyToolCall` plus leak-detection workflows for contaminated assistant messages so recoverable tool-call arguments can be safely truncated and retried
+- Fixed false-positive gating in Harmony leak heuristics using signal-based checks so unrelated text containing `to=functions...` is not treated as leaked tool-call markup
+- Routed Kimi, DeepSeek DSML, and plain thinking markup healing through the shared in-band scanners so provider leak repair and owned tool calling parse the same wire formats.
+- Fixed Cursor provider (`cursor-agent` API) streaming dropping large MCP tool-call arguments — most visibly the built-in `task` tool's `tasks` array on multi-subagent dispatches, which failed downstream schema validation with `tasks: Invalid input: expected array, received undefined`. Two upstream behaviors were fighting the stream handler in `packages/ai/src/providers/cursor.ts`: (1) `args_text_delta` carries the *cumulative* args text so far per `agent.proto`, but the handler concatenated each snapshot onto the buffer, garbling the JSON; (2) `tool_call_completed` carries an `McpArgs` map that omits oversized parameters entirely and downgrades unparsable values to their raw string fallback, but the handler unconditionally overwrote the streamed args with that map. The handler now strips the already-buffered prefix from each `args_text_delta` snapshot (falling back to append when the snapshot doesn't extend the buffer) and merges the decoded `McpArgs` map into the streamed args — preserving streamed keys the completion frame omits and the structured value when the completion frame downgrades to a string. ([#2615](https://github.com/can1357/oh-my-pi/issues/2615))
+- Fixed Codex Responses stream mis-routing interleaved `function_call_arguments.delta` events when more than one tool call was open concurrently. The runtime tracked a singleton `currentItem`/`currentBlock`, so every delta — regardless of `item_id` — was appended to whichever item was most recently added, and `output_item.done` for the earlier call then overwrote a sibling's stored arguments (visible as `tasks: Invalid input: expected array, received undefined` on the `task` tool). Open items are now keyed by `item_id` with `output_index` fallback; deltas/done events route to the matching block, late deltas whose item already closed are dropped instead of corrupting a sibling, and `toolcall_*` stream events emit the right `contentIndex` per call ([#2619](https://github.com/can1357/oh-my-pi/issues/2619)).
+
+## [15.13.1] - 2026-06-15
+
+### Fixed
+
+- Fixed the auth-broker (`OMP_AUTH_BROKER_URL`) rejecting OAuth credentials that carry provider-specific extension fields (e.g. an MCP server's `tokenUrl`/`clientId`/`clientSecret`/`resource` embedded for self-contained token refresh): the OAuth credential wire schema was `.strict()`, so `POST /v1/credential` failed with `400 unrecognized_keys` and a broker-backed MCP reauth reported success while the reloaded credential lacked its refresh material and could no longer refresh. The OAuth wire schema now uses `.loose()` to preserve unknown fields — matching the field-preserving local SQLite store — so extra OAuth fields round-trip through broker set->get (envelope and API-key schemas stay strict).
+
+## [15.13.0] - 2026-06-14
+
+### Fixed
+
+- Fixed OpenAI Responses/Realtime SSE stream handler crashing with "Error Code undefined: undefined" when parsing error events with nested error details by falling back to the nested error object fields.
+- Fixed OpenAI-compatible providers that reject forced `tool_choice` on thinking-required models by downgrading unsupported forced choices to `auto` while keeping tools available ([#2546](https://github.com/can1357/oh-my-pi/issues/2546)).
+- Fixed GitHub Copilot Anthropic transport (`api.githubcopilot.com/v1/messages`) returning `400 tools.0.custom.eager_input_streaming: Extra inputs are not permitted` on every tool-bearing turn by stopping the emission of the per-tool `eager_input_streaming` flag and the `fine-grained-tool-streaming-2025-05-14` beta header on the Copilot transport — the proxy whitelists neither ([#2558](https://github.com/can1357/oh-my-pi/issues/2558)).
+- Disabled Bun's native ~300s pre-response `fetch` timeout in every streaming provider (OpenAI completions/responses, Azure responses, Anthropic, Codex SSE, Bedrock, Gemini CLI, Ollama). The configurable first-event/idle/SDK watchdogs (`PI_STREAM_FIRST_EVENT_TIMEOUT_MS`, `PI_OPENAI_STREAM_IDLE_TIMEOUT_MS`, `compat.streamIdleTimeoutMs`) were silently capped by Bun's hidden ceiling, so cold large-context streams (e.g. self-hosted vLLM at multi-hundred-K prompts) died at exactly 300s with `TimeoutError: The operation timed out.` Direct callers of `./providers/{amazon-bedrock,google-gemini-cli,ollama,openai-codex-responses}` (which bypass `register-builtins`' iterator-level watchdog) now install a pre-response `AbortSignal.timeout(firstEventTimeoutMs)` alongside the disable, so a stalled upstream still fails within the configured budget instead of hanging forever ([#2422](https://github.com/can1357/oh-my-pi/issues/2422))
+- Fixed Gemini / Antigravity streams (Google Cloud Code Assist API) creating a trailing empty text block and emitting redundant `text_start`/`text_delta`/`text_end` events at the end of the turn when the final SSE chunk contains an empty text part (`text: ""`). The parser now ignores empty text parts, preserving the active transcript block state and ensuring proper nesting and rendering of subsequent background jobs or new turns.
+- Preserved terminal Google `thoughtSignature`s by still extracting and applying the signature on the active block even when the text part is empty or undefined.
+- Stopped Gemini Antigravity sessions (`gemini-3*` / Claude under Cloud Code Assist) from leaking system rule reminders and personality preambles into the final response, by appending an explicit 'do not output rule checks' instruction to the injected system parts.
+- Fixed Gemini / Antigravity streams (Google Cloud Code Assist API) letting a `functionCall` part's own `thoughtSignature` clobber the preceding text or thinking block's signature on `think → tool` and `text → tool` turns. A signed function-call part has `text: undefined`, so it fell into the terminal-signature branch while the prior block was still active; that branch now skips function-call parts, leaving the tool call's signature on the tool call where it belongs and preventing corrupted signatures on same-model replay.
+- Fixed MiniMax-M3 OpenAI-compatible streams rendering reasoning twice when the same chunk carried both `<think>…</think>` content and structured `reasoning_content`; structured reasoning now wins and cumulative MiniMax reasoning snapshots are collapsed to deltas using a per-signature snapshot tracker that survives the `</think>`-to-text block transition (so post-answer cumulative snapshots don't reinstate a duplicate thinking block). ([#2433](https://github.com/can1357/oh-my-pi/issues/2433))
+
+## [15.12.6] - 2026-06-14
+
+### Changed
+
+- Bumped Z.AI (GLM Coding Plan) API key validation probe to glm-5.2.
+
+### Fixed
+
+- Fixed tool schema conversion for non-Cloud Code Assist Google Gemini models by normalizing parameters with `normalizeSchemaForGoogle` to prevent un-normalized schema properties (such as `additionalProperties: false` or type arrays) from causing Gemini API errors.
+- Fixed OpenAI-family request builders dropping forced named `tool_choice` directives when the named tool is absent from the serialized `tools` array, preventing spec-strict providers from rejecting self-inconsistent requests. ([#1701](https://github.com/can1357/oh-my-pi/issues/1701))
+
+## [15.12.4] - 2026-06-13
+
+### Added
+
+- Added `GITLAB_CLIENT_ID` and `GITLAB_REDIRECT_URI` env-var overrides for the GitLab Duo OAuth login flow so users running with their own GitLab OAuth application can replace the bundled credentials when GitLab rejects the bundled `client_id`'s redirect URI. Setting `GITLAB_REDIRECT_URI` also disables the random-port fallback (strict OAuth providers reject mismatched URIs anyway). ([#2424](https://github.com/can1357/oh-my-pi/issues/2424))
+- Added `AuthStorage.listStoredCredentials()` and `AuthStorage.removeCredential()` for per-account credential management.
+
+### Changed
+
+- Replaced the OpenAI SDK client usage in `openai-completions`, `openai-responses`, `azure-openai-responses`, and `openai-codex-responses` with the new internal `postOpenAIStream` OpenAI-wire JSON/SSE transport
+
+### Fixed
+
+- Fixed streaming providers to cancel upstream model requests when the client closes the response body, so interrupted SSE sessions stop instead of continuing in the background
+- Fixed: provider request builders treat unknown `model.maxTokens` (`null`) as "no model cap" instead of coercing to `0` via `Math.min`; Anthropic falls back to the 64k Claude-Code cap for its required `max_tokens`.
+- Fixed transient stream failures on OpenAI-compatible providers by retrying HTTP 408/429/5xx responses and transient network errors with Retry-After/quota-hint aware backoff
+- Fixed SSE stream handling for OpenAI-compatible responses by parsing wire-level JSON frames directly and honoring `[DONE]` termination
+- Fixed stream error handling for OpenAI-compatible providers by preserving structured HTTP status/headers and response body details from failed requests for retry and strict-tool fallback logic
+- Fixed OpenAI-compat streams ending with a bare `finish_reason: "error"` (gateways like OpenRouter reporting upstream failures, e.g. Gemini `MALFORMED_FUNCTION_CALL`) surfacing as a non-retryable `Provider finish_reason: error`. The reason is now mapped to `Provider returned error finish_reason`, which the session retry classifier recognizes as transient, so the turn auto-retries instead of stopping with a pinned error banner.
+- Fixed `SqliteAuthCredentialStore.open()` crashing with `SQLITE_BUSY_RECOVERY` (errno 261) when several `omp --session` panes restore concurrently after an unclean shutdown: `PRAGMA busy_timeout = 5000` now runs as a standalone statement BEFORE `PRAGMA journal_mode=WAL` (the first lock-taking statement during WAL recovery), and `open()` retries the BUSY family — `SQLITE_BUSY`, `SQLITE_BUSY_RECOVERY`, `SQLITE_BUSY_SNAPSHOT`, `SQLITE_BUSY_TIMEOUT` — with bounded exponential backoff. The exhausted-retry error message includes the DB path. Exported `isSqliteBusyError(err)` for callers that need the same classifier ([#2421](https://github.com/can1357/oh-my-pi/issues/2421)).
+- Fixed MiniMax-M3 OpenAI-compatible streams rendering reasoning twice when the same chunk carried both `<think>…</think>` content and structured `reasoning_content`; structured reasoning now wins and cumulative MiniMax reasoning snapshots are collapsed to deltas. ([#2433](https://github.com/can1357/oh-my-pi/issues/2433))
+- Fixed Gemini turns silently halting the agent when the model returned `finishReason: STOP` with only an empty (or whitespace-only) text part and no tool call — the well-known "empty response" failure. All Google surfaces (public Generative Language `streamGoogle`, Vertex `streamGoogleVertex`, and Cloud Code Assist `google-gemini-cli`/`google-antigravity`) now classify such a turn as empty via the shared `hasMeaningfulGoogleContent` check and retry it up to `MAX_EMPTY_STREAM_RETRIES` times before surfacing an error. The Cloud Code Assist path previously had an empty-stream retry that never fired for this case (its `hasContent` flag counted an empty-string text part as content), and the public/Vertex path had no retry at all; the retry now emits a single `start` event so no duplicate partial message leaks downstream.
+
+## [15.12.1] - 2026-06-12
+
+### Added
+
+- Added the optional `ToolResultMessage.useless` flag: tools can declare a finished result contextually useless (zero matches, elapsed wait) so compaction passes may elide it once consumed. Never serialized to provider wire formats and never set together with `isError`.
+
+## [15.12.0] - 2026-06-12
+
+### Fixed
+
+- Fixed Anthropic requests bypassing lone-surrogate sanitization after payload hooks or Anthropic-origin tool-call replay: the model itself can emit unpaired surrogate escapes in its own tool-argument JSON (streamed out fine, then rejected with `400 The request body is not valid JSON` on every subsequent request, bricking the session). The final Anthropic payload is now deep-sanitized with `toWellFormed()` immediately before SDK serialization; the pass is identity-preserving, so well-formed arguments stay byte-identical and prompt-cache prefixes are unaffected.
+
+## [15.11.8] - 2026-06-12
+
+### Breaking Changes
+
+- Removed the Codex SSE stateful transport path, so SSE turns no longer send `previous_response_id` with delta input and now always send the full transcript
+
+### Changed
+
+- Scoped `x-codex-turn-state` handling to within-turn continuations so only tool-loop follow-ups include the turn-state header and new user turns start without it
+
+### Removed
+
+- Removed the `statefulResponses` option from `OpenAICodexResponsesOptions`, and SSE stateful mode is no longer controlled by the `PI_CODEX_STATEFUL`-style flag
+
+### Fixed
+
+- Fixed the platform OpenAI Responses and Codex websocket stale-chain classifiers missing the "Unsupported parameter: previous_response_id" rejection phrasing (FastAPI-style `detail` body with no `error.code`), so a chained turn now falls back to a full-transcript replay instead of surfacing the 400
+- Fixed the HTTP-400 raw-request dump for Codex SSE to record the body actually sent on the wire instead of the pre-transport request body, which made chained-request failures look like the rejected parameter was never sent
+
+## [15.11.7] - 2026-06-12
+
+### Added
+
+- Added `requestModelId` and `thinking.suppress` options to `google-gemini-cli` so collapsed effort-tier variants serialize their per-effort upstream wire id, and thinking-off requests on models with `thinking.suppressWhenOff` send an explicit `thinkingConfig` (`includeThoughts: false` with `thinkingLevel: "MINIMAL"` or `thinkingBudget: 0`) — Cloud Code Assist re-applies the per-id baked server default when the config is omitted, silently thinking and billing the tokens
+- Added mandatory-reasoning clamping: models baked with `thinking.requiresEffort` floor omitted or disabled reasoning to the lowest supported effort in every api mapping, and `disableReasoning` no longer emits OpenRouter `reasoning: { enabled: false }` for them — fixes `omp bench` and utility requests 400ing with "Reasoning is mandatory for this endpoint and cannot be disabled" on OpenRouter Gemini 3.x
+
+### Changed
+
+- Changed `google-gemini-cli` request mapping to route per-request wire ids via `resolveWireModelId`: the session effort picks the backing variant id (collapsed `gemini-3.5-flash` at high → `gemini-3.5-flash-low`; claude pairs route off → bare id, efforts → `-thinking`) while `AssistantMessage.model` and usage attribution stay on the logical id. A thinking budget clamped to zero now falls through to the thinking-off path (off routing plus suppression) instead of only disabling thinking
+- Changed `openai-completions` and `anthropic-messages` to serialize per-request wire ids via `resolveWireModelId`, so collapsed `X`/`X-thinking` pairs on aggregators and custom providers switch to the thinking SKU when reasoning is enabled (previously only `google-gemini-cli` routed effort-tier variants)
+
+### Fixed
+
+- Fixed `google-gemini-cli` ignoring `Model.requestModelId` when serializing the request model id
+
+## [15.11.5] - 2026-06-12
+
+### Added
+
+- Added `AuthStorage.listUsageHistory` to retrieve historical usage snapshots with optional `provider` and `sinceMs` filtering
+- Added durable usage-history persistence in the sqlite auth store so successful usage reports are recorded as time-series snapshots of limit utilization for later trend inspection
+- Added `AuthStorage.redeemResetCredit` to redeem stored OpenAI Codex saved rate-limit reset credits for a target account by `credentialId`, `accountId`, or `email`
+- Added `listCodexResetCredits` and `consumeCodexResetCredit` exports for OpenAI Codex saved reset-credit listing and redemption
+- Added `resetCredits` with `availableCount` to `UsageReport` so OpenAI Codex usage data now exposes redeemable rate-limit resets
+- Added `openai-codex-reset` exports via package barrel for out-of-band tooling usage
+- Added a one-shot request-debug target that writes the next provider HTTP request JSON to an explicit path.
+
+### Changed
+
+- Changed `AuthStorage.redeemResetCredit` to invalidate cached usage data after a successful redemption so the next usage report reflects the reset immediately
+
+### Fixed
+
+- Fixed temporary credential block state so redeemed reset credits immediately make the affected account selectable again after `redeemResetCredit` succeeds
+- Fixed one-shot request-debug path handling so an explicit request log target is consumed after the next request and no longer affects subsequent calls
+- Fixed explicit request-debug path mode to create missing parent directories before writing request logs
+- Fixed explicit request-debug mode to overwrite existing `.res.log` files for the requested path instead of failing when they already exist
+- Fixed OpenAI Responses `previous_response_id` chaining on Zero Data Retention orgs: the in-provider retry classifier missed the ZDR-specific 400 ("Previous response cannot be used for this organization due to Zero Data Retention"), so chained turns kept failing every other request after a brief recovery — the chain was reset but not disabled, so the next successful full-replay turn re-armed it. The ZDR phrasing is now classified categorically: one strike disables chaining for the session (skipping the three-strike circuit breaker) and the in-call retry drops `store: true`/`previous_response_id` and replays the full transcript instead ([#2341](https://github.com/can1357/oh-my-pi/issues/2341)).
+
+## [15.11.4] - 2026-06-12
+
+### Added
+
+- Codex/Responses providers now map `end_turn: false` on the terminal stream event (Codex backend signal for "response ended, turn didn't" — commentary-only progress updates) to `stopDetails: { type: "pause_turn" }` with stopReason `"stop"`, so the agent loop can re-sample instead of ending the turn. Wired in `openai-codex-responses` and `processResponsesStream` (`openai-responses`/`azure-openai-responses`); inert for backends that never send the field.
+- Added Codex upstream protocol features to `openai-codex-responses` (tracking codex-rs as of June 2026): `onModerationMetadata` callback surfacing `response.metadata` → `openai_chatgpt_moderation_metadata` on both transports; `reasoningContext` option emitting `reasoning.context` (`auto`/`current_turn`/`all_turns`); `clientMetadata` option emitting `client_metadata` in the request body (canonical `x-codex-turn-metadata` envelope) without breaking the websocket append fast-path; and an opt-in `responsesLite` mode mirroring codex-rs — lite header on HTTP requests and the websocket upgrade, `ws_request_header_*` marker in `response.create` client metadata, lite-keyed socket pooling, image-detail stripping, forced serial tool calls, and `reasoning.context: all_turns` default. Dormant until OpenAI flips `use_responses_lite` in the model catalog.
+- Added `withOAuthAccess` — the `withAuth` counterpart for OAuth-access consumers: runs an operation through the central a/b/c auth-retry policy (resolve → force-refresh same account → rotate to a sibling) while handing the attempt the full `OAuthAccess` (bearer plus `accountId`/`projectId`/`enterpriseUrl` identity metadata). Use it instead of hand-rolled `getOAuthAccess` + fetch flows so 401s and usage-limits rotate credentials instead of failing the call.
+- Added `ProviderHttpError` — a typed HTTP error carrying `status`, `headers`, and `code` — replacing the ad-hoc `as Error & { status?... }` / `Object.assign` hacks at provider throw sites, with per-provider subclasses `CodexApiError`, `AuthGatewayError`, `GoogleApiError`, `GeminiCliApiError`, `OllamaApiError`, and `BedrockApiError`; `AnthropicApiError` now extends it. Google, Gemini CLI, Ollama, and Bedrock HTTP errors now also carry response headers, so server-suggested `retry-after` delays are visible to retry classification on those paths. The internal `withHttpStatus` helper was removed.
+- Added stateful SSE turn chaining for OpenAI Codex (on by default; disable with `PI_CODEX_STATEFUL=0` or `statefulResponses: false`): SSE requests now reuse `previous_response_id` with delta-only input instead of replaying the full transcript, mirroring the websocket fast-path via a shared transport-aware builder. Any history mutation or option change falls back to a full replay; a server-side `previous_response_not_found` (HTTP or in-stream) resets the chain and retries the turn with full context, and three consecutive stale failures disable chaining for the session.
+- Added stateful `previous_response_id` chaining to the platform OpenAI Responses provider (`openai-responses`): on by default against the official api.openai.com endpoint (forces `store: true`, which chaining requires), off for other Responses endpoints; override with `statefulResponses` or `PI_OPENAI_STATEFUL`. Chain detection compares the wire form of the conversation arguments alone — per-turn trailing scaffolding such as the GPT-5 "Juice: 0" developer item is excluded from the append-baseline prefix check and re-appended to the delta — and a rejected/stale previous response falls back to a one-shot full replay with the same circuit breaker.
+- Added `AuthStorage.getOAuthAccountIdentity()` and the `OAuthAccountIdentity` type — a read-only lookup returning the `accountId`/`email`/`projectId` of the OAuth credential a session is currently routed to, for display and metadata paths.
+
+### Changed
+
+- The GPT-5 "Juice: 0" no-reasoning developer item in `applyResponsesReasoningParams` is now gated on the resolved `compat.requiresJuiceZeroHack` flag (auto-detected from GPT-5-family model names by `@oh-my-pi/pi-catalog`, overridable per model) instead of an inline model-name check.
+
+### Fixed
+
+- Fixed websocket append fast-path to remain usable when only `client_metadata` changes between turns
+- Fixed `onModerationMetadata` handling so exceptions thrown by callback observers no longer terminate the response stream
+- Fixed local SQLite OAuth credential caches returning a stale Anthropic access token after another `omp` process refreshed and persisted the same row. `AuthStorage` now syncs the selected row from storage before returning or force-refreshing OAuth credentials, so concurrent sessions pick up peer-rotated tokens instead of surfacing a one-turn `401 Invalid authentication credentials`.
+- Fixed forced OAuth preflight refresh failures being swallowed silently in credential selection; they now emit a debug log (`OAuth preflight refresh failed`) so stale-refresh-token replays from concurrent sessions are diagnosable.
+
+## [15.11.3] - 2026-06-11
+
+### Fixed
+
+- Fixed GitHub Copilot long-context model requests to use the upstream `requestModelId` when calling Anthropic, OpenAI Responses, and OpenAI Completions APIs
+- Fixed GitHub Copilot model enablement to deduplicate catalog variants by upstream model ID when enabling all models
+
+## [15.11.2] - 2026-06-11
+
+### Fixed
+
+- Fixed Anthropic encoding of error tool results with whitespace-only content so requests no longer 400 with `tool_result: content cannot be empty if is_error is true`
+
+## [15.11.1] - 2026-06-11
+
+### Changed
+
+- Exported `resolveAnthropicMetadataUserId` so non-streaming Anthropic Messages consumers (e.g. the coding-agent web search provider) can produce the same Claude-Code-shaped `metadata.user_id` as the main streaming path.
+
+### Fixed
+
+- Preserved Anthropic `stop_details` on assistant messages so refusal and sensitive classifier stops remain structurally visible to callers. ([#2290](https://github.com/can1357/oh-my-pi/issues/2290))
+- Fixed OpenAI Responses, Azure OpenAI Responses, and OpenAI Completions streams hanging until the 120s idle watchdog errored the turn when a provider delivers the terminal frame but never sends `[DONE]` nor closes the connection. `processResponsesStream` now breaks out of the event loop on `response.completed`/`response.incomplete` (mirroring the Codex websocket/SSE terminal break), and the completions consumer breaks once `finish_reason` plus a usage payload arrived — or, for hosts that never send usage, ends the stream cleanly via a short post-finish grace window (`iterateWithTerminalGrace`) that aborts the transport to release the socket.
+
+## [15.11.0] - 2026-06-10
+
+### Added
+
+- Added optional `ImageContent.detail` (`"auto" | "low" | "high" | "original"`): an OpenAI resolution hint forwarded by the `openai-responses` serializers (default stays `auto`) and by `openai-completions` for the values Chat Completions supports. `"original"` preserves native resolution — required for snapcompact frames, whose pixel-font glyphs do not survive the default downscale. Providers without a detail knob ignore the field.
+
+### Fixed
+
+- Fixed OpenRouter DeepSeek V4 strict tool schemas nesting `anyOf` inside the nullable wrapper for optional unions, which produced a branch without `type` and triggered OpenRouter's `Invalid tool parameters schema : field anyOf: missing field type` 400. ([#2270](https://github.com/can1357/oh-my-pi/issues/2270))
+- Hardened strict tool-schema handling beyond the optional-union case: `enforceStrictSchema` now splices natively nested pure unions into the parent `anyOf` (only when the inner node carries no constraining siblings, since sibling keywords are conjunctive with `anyOf`), so source schemas with nested unions no longer produce type-less `anyOf` branches that strict upstream validators reject. ([#2270](https://github.com/can1357/oh-my-pi/issues/2270))
+- Made the openai-completions non-strict retry reachable for `"mixed"` strict mode (previously gated to `all_strict`, i.e. Cerebras only) and taught it to recognize upstream tool-schema validation 400s (`Invalid tool parameters schema …`, `Invalid schema for function …`). A matching rejection now retries the request with base (non-strict) schemas and persists `strictToolsDisabled` on the provider session, so later requests skip the doomed strict attempt instead of paying a 400 + retry round-trip each turn. ([#2270](https://github.com/can1357/oh-my-pi/issues/2270))
+- Cross-model `anthropic-messages → anthropic-messages` continuations now preserve prior assistant turns' reasoning chains end-to-end: every prior `thinking`/`redactedThinking` block survives (not just the latest surviving assistant), and third-party ↔ third-party replays keep their signatures intact so the reasoning chain stays signed for the next turn. Signatures are stripped (and any `redacted_thinking` sibling without a native landing spot is dropped) only when an official Anthropic endpoint is on either end of the replay — official Anthropic cryptographically binds reasoning signatures to its key+session+model, while compatible reasoning endpoints (Z.AI, DeepSeek, custom anthropic-messages providers configured via `models.yaml`) treat them as opaque continuation hints. Source-side official detection uses the canonical catalog provider id `"anthropic"` (assistant messages carry no `baseUrl`); target-side detection reuses the baked `compat.officialEndpoint` flag. Latest-turn byte-for-byte behavior (Anthropic's "thinking blocks in the latest assistant message cannot be modified" rule) and existing aborted/errored last-block sanitization are unchanged. ([#2257](https://github.com/can1357/oh-my-pi/issues/2257), [#2265](https://github.com/can1357/oh-my-pi/issues/2265))
+
+## [15.10.12] - 2026-06-10
+
+### Added
+
+- Added `antigravityRankingStrategy` and registered it for `google-antigravity` in `DEFAULT_RANKING_STRATEGIES`, so new sessions are routed to OAuth credentials with quota headroom for the requested model backend (lowest relevant `remainingFraction` counter as the sole ranked window, 24h `windowDefaults` matching `daily-cloudcode-pa.googleapis.com` resets). Without it, the existing `antigravityUsageProvider` data never reached credential selection. ([#2198](https://github.com/can1357/oh-my-pi/issues/2198))
+
+### Changed
+
+- Updated MiniMax and MiniMax Token Plan defaults to `MiniMax-M3` and refreshed Token Plan login copy/links ([#1725](https://github.com/can1357/oh-my-pi/issues/1725)).
+
+### Fixed
+
+- Fixed OpenAI Responses and Azure OpenAI Responses streams silently surfacing incomplete output as successful when a custom/proxy provider drops the connection without sending a terminal `response.completed`/`response.incomplete` event. Both providers now detect premature stream closure and throw with `stopReason: "error"` ([#2184](https://github.com/can1357/oh-my-pi/pull/2184))
+- Fixed `isUsageLimitError` missing Antigravity / Cloud Code Assist's `Individual quota reached` 429 phrasing. The `USAGE_LIMIT_PATTERN` only knew `quota.?exceeded` / `limit_reached`, so `auth-retry` and `AuthStorage.markUsageLimitReached` treated the response as a terminal provider error and pinned sessions to the exhausted OAuth account instead of rotating to a sibling credential. The pattern now also matches `quota.?reached`. ([#2198](https://github.com/can1357/oh-my-pi/issues/2198))
+- Scoped Antigravity usage blocking and ranking by model family (`gemini-*`/`gemma-*` → Google, `claude-*` → Anthropic, `gpt-*`/`openai/*` → OpenAI), so an exhausted Gemini counter no longer makes a healthy Claude/OpenAI Antigravity credential unavailable until reset. ([#2198](https://github.com/can1357/oh-my-pi/issues/2198))
+- Fixed no-model Antigravity credential lookups (e.g. image-provider discovery) inheriting provider-wide exhaustion: `scopeLimits` now returns no limits without a concrete backend counter, and `blockScope` always returns a counter scope so missing model context can never fall through to AuthStorage's provider-wide block bucket. ([#2198](https://github.com/can1357/oh-my-pi/issues/2198))
+
+## [15.10.11] - 2026-06-10
+
+### Breaking Changes
+
+- The model catalog moved to the new `@oh-my-pi/pi-catalog` package. Deep subpath exports `@oh-my-pi/pi-ai/models.json`, `/models`, `/model-cache`, `/model-manager`, `/model-thinking`, `/effort`, `/provider-models*`, `/utils/discovery*`, `/providers/openai-codex/constants`, `/providers/google-gemini-headers`, and `/providers/openai-completions-compat` are gone — import the `@oh-my-pi/pi-catalog` equivalents (`/models.json`, `/models`, `/model-cache`, `/model-manager`, `/model-thinking`, `/effort`, `/provider-models*`, `/discovery*`, `/wire/codex`, `/wire/gemini-headers`, `/compat/openai`). The pi-ai root barrel re-exports only the model/effort *types* its own signatures use (`Model`, `Api`, `ThinkingConfig`, `Effort`, `Usage`, compat interfaces) — catalog *values* (`getBundledModel(s)`, `calculateCost`, `modelsAreEqual`, `clampThinkingLevelForModel`, `DEFAULT_MODEL_PER_PROVIDER`, …) must be imported from `@oh-my-pi/pi-catalog`.
+- `ProviderDefinition` is now auth-only: `defaultModel`, `createModelManagerOptions`, `catalogDiscovery`, `dynamicModelsAuthoritative`, `allowUnauthenticated`, and `specialModelManager` moved to pi-catalog's `CATALOG_PROVIDERS` table, and `KnownProviderId` was replaced by pi-catalog's `KnownProvider` (registry completeness is enforced by a compile-time check against that union). The pure GitHub Copilot key/endpoint helpers moved from `registry/oauth/github-copilot` to `@oh-my-pi/pi-catalog/wire/github-copilot`.
+
+### Added
+
+- Exported `wrapFetchForCch` so non-streaming OAuth callers (e.g. the web-search provider) can patch the Claude Code billing-header `cch` attestation into their request bodies instead of shipping the `cch=00000` placeholder.
+
+### Changed
+
+- Reduced idle-watchdog churn on the token hot path: the abort promise/listener is created once per stream instead of per yielded item, the deadline uses a persistent re-armed timer instead of a `setTimeout` create/destroy pair per delta, and the persistent race promises are re-minted every 1024 items so per-race reaction records cannot accumulate for the stream's whole life.
+- Memoized Anthropic many-image downscaling by content-block identity, so long sessions with stable message objects no longer re-decode and re-encode every oversized image on each request and retry.
+- Tool-argument validation errors now truncate embedded argument strings at 256 chars per field — a failed `write`-class call no longer echoes hundreds of KB of payload back to the model as the error message.
+- Auth storage no longer issues per-boot no-op writes: the schema-version row is only rewritten when the recorded version actually changes, and the credential identity-key backfill skips rows whose derived identity is null — reopening a current-schema database now performs zero write transactions
+- Plain provider env-var names moved to the catalog table: registry defs dropped their 48 `envKeys` literals (including the pure `$pickenv` pickers for `huggingface`/`qwen-portal`/`xai-oauth`), `getEnvApiKey` now derives those fallbacks from `CATALOG_PROVIDERS[].envVars`, and `envKeys` remains only for computed resolvers (Anthropic Foundry, Vertex ADC, Bedrock credential chains) and non-catalog providers (`kagi`, `tavily`, `parallel`, `perplexity`)
+- Protocol handlers are now pure `model.compat` readers — the per-request `resolve*Compat`/`detect*Compat` calls (anthropic ×11, responses ×3, completions wrappers), inline `strictResponsesPairing` host detection, the OpenCode `reasoning_content` mutation block, and all `resolvedBaseUrl` threading are gone. Compat is materialized once at model build time (`@oh-my-pi/pi-catalog` `buildModel`); the OpenCode thinking-mode quirk is a precomputed `compat.whenThinking` pointer swap, and request-time base-URL overrides only feed the HTTP client. Behavior is unchanged (the Anthropic `supportsLongCacheRetention` official-endpoint gate is folded into detection).
+- Providers now read baked thinking/wire metadata instead of re-parsing model ids per request: the Anthropic handler gates sampling params on `model.compat.supportsSamplingParams` and adaptive `display` on `model.thinking.supportsDisplay` (Bedrock too), adaptive effort tiers come from the baked `thinking.effortMap`, the Google `thinkingLevel` map is static, and effort-dial-less reasoners (`thinking: undefined`, e.g. `xai-oauth/grok-build`) short-circuit `resolveOpenAiReasoningEffort` without the removed `modelOmitsReasoningEffort` predicate.
+- Anthropic streaming retries now use a 10-retry budget with the Anthropic-compatible 0.5s exponential backoff capped at 8s with jitter; server `retry-after` hints still win, and retryable pre-content failures such as 502s no longer stop after three tries.
+
+### Fixed
+
+- Fixed Ollama chat requests honoring `omitMaxOutputTokens`, sending `think: false` when reasoning is explicitly disabled, and preserving HTTP 400 response bodies in surfaced errors.
+- Fixed `AuthStorage.markUsageLimitReached` collapsing "every sibling is momentarily blocked" into "no sibling exists": it now returns `UsageLimitMarkResult` with the earliest sibling block expiry (`retryAtMs`), so retry layers can wait out a short-lived block (60s post-401, 5-min usage-probe) instead of adopting the provider's multi-hour retry-after. `rotateSessionCredential` and the auth-gateway adapt to the new shape.
+- Fixed Gemini streaming silently presenting truncated or blocked output as a successful `stop`: in-band `{"error":{...}}` events and `promptFeedback.blockReason` chunks were never inspected, and a stream ending without any `finishReason` kept the initialized `stop` — all three now surface as errors (both the API-key and gemini-cli/Antigravity consumers), and the `toolUse` stop-reason override no longer masks `SAFETY`/`MALFORMED_FUNCTION_CALL` finishes that arrive after a valid tool call.
+- Fixed Gemini/Bedrock error finishes reporting "An unknown error occurred": the raw finish/stop reason (`MALFORMED_FUNCTION_CALL`, `RECITATION`, `guardrail_intervened`, …) is now recorded into the surfaced error message.
+- Fixed the Anthropic provider retry loop ignoring server `retry-after` on 429/529 — it now waits `max(headerDelay, backoff)` instead of hammering a rate-limited endpoint three times within ~14s of guaranteed failures.
+- Fixed in-stream Anthropic SSE `error` events being thrown as raw JSON envelopes; the structured `error.type`/`message` is parsed out, keeping retry classification on the typed token instead of accidental regex hits.
+- Fixed transparent-reconnect tolerance duplicating content behind replaying proxies: after a duplicate `message_start`, replayed `content_block_start` events for already-closed indexes are now consumed silently instead of appending duplicate text/tool calls.
+- Fixed the Anthropic gateway accepting malformed known-type content blocks (e.g. `{type:"text", text:123}`) through the unknown-block catch-all, corrupting history and surfacing later as an opaque TypeError — they now fail validation with a clean 400. The gateway's encode stream also emits `ping` keepalives every 15s and a complete `message_start`/`message_delta`/`message_stop` envelope when the inner stream ends without a terminal event, so strict clients no longer classify slow or empty streams as protocol errors.
+- Fixed dotted-version Claude ids (`claude-opus-4.7`/`4.8` on GitHub Copilot, Vercel AI Gateway, Zenmux) missing adaptive thinking `display` support — streamed reasoning stayed hidden on those entries because the display predicate only matched dash-form ids (same failure class as #1373).
+- Fixed the Mistral `requiresThinkingAsText` replay path calling `.unshift()` on string assistant content — an unconditional TypeError that failed any same-model history turn carrying both thinking and text.
+- Fixed the Responses gateway stripping `encrypted_content` from inbound reasoning items (strip-mode schema), which broke codex-style stateless replay; the schema is now loose, restoring the symmetry the outbound encoder already preserved. Composite internal `callId|itemId` ids are also split before hitting the wire so third-party clients that validate `call_id` charsets no longer reject them.
+- Ported the shared unfinished-tool-call sweep to the codex `response.completed` handler, so a lost `output_item.done` can no longer persist a tool call with stale `{}` arguments and transient parser fields into session history.
+- Fixed live text freezing until item completion when a lossy proxy drops `content_part.added`: the missing part is now synthesized on the first `output_text`/`refusal` delta (shared and codex decoders).
+- Fixed interleaved `content`/`tool_calls` deltas fragmenting a tool call into a truncated call plus a nameless phantom: text/thinking transitions no longer finish open tool-call blocks, so index-only continuation deltas re-find them.
+- Fixed the Azure chat-completions path ignoring `AZURE_OPENAI_DEPLOYMENT_NAME_MAP` (only the Responses provider honored it), producing opaque 404s when deployment names differ from catalog model ids.
+- Fixed the chat gateway discarding inbound assistant `reasoning_content`, which fed DeepSeek/Kimi exact-replay upstreams a placeholder instead of the model's actual reasoning; it now round-trips as a thinking block, and `toolcall_end` emits a corrective id/name chunk when the streamed start carried empty values.
+- Fixed the auth retry loop minting OAuth tokens and firing a doomed request after the caller aborted, and stopped masking resolver failures (broker/network/refresh errors) as "No API key" — the actual cause is preserved.
+- Fixed `EventStream.end()` without a terminal result leaving `.result()` pending forever (reachable via extension streams and the lazy wrapper); it now rejects with a synthesized error.
+- Fixed the Copilot retry wrapper blind-retrying every retryable error with fixed 400ms delays: 429/5xx now honor `Retry-After` (capped at 30s) and other statuses are not retried, while status-less transport blips keep the linear retry.
+- Fixed the OpenAI completions error path ending the stream without closing open text/thinking/tool-call blocks, leaving consumers with orphaned block lifecycles on every stream error or idle-timeout abort.
+- Fixed DSML hold-back freezing display on any bare `<` in model output for up to 256 chars: idle-state holding now only triggers on a strict DSML section-open prefix, and blowing the 1MB parameter cap no longer leaks the closing envelope tags as visible text; a capped parameter value also carries an explicit `…[parameter truncated]` marker instead of executing the tool with silently corrupted input.
+- Fixed schema normalization blanking DAG-shared subtrees to `{}`: the visited-set cycle guard treated a subschema object reused across two properties as a cycle; path-tracking `enter`/`exit` now allows sharing while still short-circuiting true cycles, frozen input schemas no longer throw, and the path counter no longer leaks depth on the cycle branch (which made every later normalization of the same object misreport a cycle).
+- Fixed shared in-flight Google token refreshes being bound to the first caller's `AbortSignal`, failing every concurrent waiter when one parallel Vertex call was cancelled; callers now race their own signal against a detached refresh, which is bounded by its own 30s timeout so a hung fetch cannot pin the in-flight slot until process restart.
+- Fixed Gemini <3 multimodal tool results breaking the single-function-response-turn invariant for parallel tool calls (image turns are buffered and flushed after the merged functionResponse turn), and the gemini-cli consumer now defaults missing `functionCall.args` to `{}` like the shared consumer.
+- Fixed Bedrock dropping `toolConfig` entirely when `toolChoice` is `"none"` while history still contains tool blocks — the Converse API rejects such requests, so tool specs are kept and only the choice is omitted.
+- Fixed AWS credential handling serving expired credentials until process restart: cache entries are invalidated on 401/403, file-sourced session-token credentials get a 5-minute TTL, and concurrent first requests single-flight instead of spawning duplicate `credential_process`/SSO fetches — the shared resolution is detached from the first caller's abort signal (one cancelled request no longer fails every waiter) and bounded by its own 30s timeout. The eventstream reader also cancels the response body on abnormal exit instead of leaving the HTTP connection draining.
+- Fixed an unbounded, zero-backoff Codex WebSocket reconnect loop on `websocket_connection_limit_reached`: the no-content reconnect path never consulted the retry budget and never waited, hammering the endpoint forever when the limit is account-scoped. Reconnects are now budgeted and delayed like every other WS retry path, falling back to a single SSE replay when exhausted.
+- Fixed the Codex whitespace-loop breaker not observing degenerate frames that arrive after their item closed (or before it opened) — those frames count as stream progress, so the idle watchdogs never fired and the turn hung forever, which is exactly the failure mode the breaker exists for. Whitespace-loop recovery now also refuses to replay the turn once a `toolcall_end` was delivered, surfacing the error instead of re-emitting the same tool calls.
+- Fixed the two remaining Codex retry paths (WS mid-stream reconnect and the empty-content SSE fallback) leaking blockless native output items (e.g. `web_search_call`) from the failed attempt into the replayed turn's `providerPayload` and append baseline.
+- Fixed Codex WebSocket failure handling closing whatever connection currently occupies the session slot — including a concurrent caller's in-flight CONNECTING handshake, whose rejection (`websocket closed before open`) is classified fatal and disabled WebSockets for the whole session. Failure cleanup now skips CONNECTING sockets and the pool re-joins replacement handshakes (bounded).
+- Fixed the Codex request transformer not repairing orphan `custom_tool_call_output` items (only `function_call_output` was folded into an assistant note) — a compaction splice that dropped an `apply_patch` call while keeping its result produced a hard 400 on the default GPT-5 Codex toolset.
+- Fixed `processResponsesStream` finalizing reasoning items via a bare `itemId` content scan instead of the routed entry: with id-less reasoning items (local hosts), every `output_item.done` matched the FIRST thinking block — the second item's text clobbered it and the second block was never finalized or signed.
+- Fixed `processResponsesStream` dropping tool calls and message text whose `output_item.added` event was lost (lossy proxies): `toolcall_end` was emitted with a dangling contentIndex while the call never entered `message.content`, so the agent loop silently never executed it. The done handler now synthesizes the missing block; still-open tool-call blocks are also final-parsed at `response.completed` so the `toolUse` override cannot hand the agent stale `{}` arguments.
+- Fixed `response.incomplete` with `incomplete_details.reason: "content_filter"` being reported as a token-cap truncation (`stopReason: "length"`) — the agent loop's length recovery then asked the model to "shorten" a filtered prompt. Content-filtered turns now surface as errors; usage is also populated from `response.failed` events, and an unknown terminal status degrades to `"stop"` with a logged anomaly instead of throwing away a fully-streamed response.
+- Fixed Copilot `premiumRequests` accounting being dropped from failed/cancelled responses: `populateResponsesUsageFromResponse` replaced `usage` wholesale and the error path threw before the success-path re-apply. The populate now preserves the field.
+- Fixed `deduplicateToolCallIds` suffixing the whole composite Responses id (`callId|itemId`) — `normalizeResponsesToolCallId` extracts the first segment as the wire `call_id` at encode time, so both copies collapsed back onto one `call_id` and the request carried duplicate call/output pairs. The suffix and length budget now apply per segment.
+- Gated native history payload replay on api + model id in both Responses providers: after a mid-session model switch, reasoning items carrying encrypted content minted by the previous model were replayed verbatim under the new model. Replay now falls back to block re-encode (which already strips foreign signatures), matching `transformMessages`' same-model trust rule.
+- Fixed Azure OpenAI Responses requests omitting `store: false` while requesting `reasoning.encrypted_content` (stateless-only per OpenAI), replaying custom tool calls paired with mismatched `function_call_output` items (customCallIds was never threaded through), letting the SDK's internal retries (maxRetries 5) silently re-POST inside the explicit first-event deadline, and sending a `prompt_cache_key` when the caller opted out via `cacheRetention: "none"`.
+- Fixed strict-pairing Responses backends (Azure, Copilot) silently discarding tool results whose call is absent from history — the result is now folded into an assistant note (same shape as orphan-output repair) so the model keeps the information.
+- Fixed the OpenAI Responses first-event watchdog staying armed across the `onResponse` notification callback (a slow callback aborted an already-connected stream), Copilot transient-model retries re-attempting on an already-aborted signal (instant dead retry surfacing the scheduler's AbortError), Codex `reasoningSummary: null` being coerced to `"auto"` (the documented omit-summary contract was unreachable), nested Codex error codes (`response.error.code`) being invisible to the connection-limit/previous-response recovery matchers, and the session id leaking unredacted into `PI_CODEX_DEBUG` logs via the `x-client-request-id` header.
+- Fixed `processResponsesStream` (shared by `openai-responses` and `azure-openai-responses`) ignoring the terminal `response.incomplete` event: a max-output-tokens-truncated response ended with `stopReason: "stop"`, zero usage, and no cost instead of `"length"` with the reported token counts. `response.incomplete` is now handled alongside `response.completed` and counts as stream progress for the idle watchdogs.
+- Fixed custom tool-call content blocks keeping the transient `partialJson` accumulation buffer (and a potentially stale `arguments.input`) after `response.output_item.done` in the shared Responses stream processor — the function_call branch already cleaned these up.
+- Fixed two OpenAI Codex stream-retry paths (whitespace-loop recovery and retryable provider errors) leaking native output items from the abandoned attempt into the replayed turn's `providerPayload` — stale reasoning items completed before the failure were re-sent as history input on subsequent requests alongside the retry's own items.
+- Fixed the Codex WebSocket queue wiping already-received frames when a transport error arrived: a `response.completed` queued just before an eager server close was discarded, turning a finished response into a spurious `websocket closed` failure and a full request replay. Errors now append behind pending data frames.
+- Fixed concurrent `getOrCreateCodexWebSocketConnection` callers (prewarm racing the first request) tearing down each other's in-flight handshake — closing a CONNECTING socket rejected the other caller with a fatal `websocket closed before open`, disabling WebSockets for the entire session. Callers now join the pending handshake.
+- Stopped the Codex connection-limit recovery from replaying a turn over SSE after a `toolcall_end` had already been delivered to the consumer (`canSafelyReplayWebsocketOverSse` guard was bypassed, re-emitting the same tool calls); the error now surfaces instead.
+- Extended the Codex whitespace-only argument-delta circuit breaker to `custom_tool_call_input.delta` frames, which counted as stream progress and could keep a degenerate response alive forever with no cap on buffer growth.
+- Fixed Codex stream failures during transport open reporting a synthetic request dump (empty URL/body) instead of the real request, and a `response.created` event resetting the recorded time-to-first-token.
+- Fixed the Codex WebSocket connect watchdog timer leaking (pinning the event loop for up to 10s) when the request signal aborted before or during the handshake.
+- Fixed OpenRouter-hosted Anthropic adaptive reasoning models (Claude Fable/Mythos 5 and Opus 4.6+) so the catalog exposes `xhigh`; Fable/Mythos and Opus 4.7+ requests now map user `high`/`xhigh` onto OpenRouter's Anthropic `xhigh`/`max` effort scale.
+- Fixed an unknown Anthropic `stop_reason` failing the whole turn after the response had fully streamed. `mapStopReason` threw on unrecognized values, and since the reason arrives on the trailing `message_delta` the error was unretryable — the live `model_context_window_exceeded` stop reason (default on Sonnet 4.5+) hit this path. It now maps to `length`, and any future unknown reason degrades to a logged anomaly plus a normal `stop` instead of an error.
+- Stopped clamping API-key Anthropic requests to Claude Code's 64k output cap. The `CLAUDE_CODE_MAX_OUTPUT_TOKENS` clamp exists to match the OAuth wire fingerprint, but `buildParams` applied it unconditionally, silently halving the output budget of 128k-output models (e.g. Opus 4.8) for API-key callers. OAuth requests keep the clamp.
+- Stopped a successful strict-tools fallback from shipping `errorMessage` on a `stopReason: "stop"` assistant message. After a grammar-too-large 400 triggered the non-strict retry, the original 400 text was kept on the final message even when the retry succeeded — consumers that treat `errorMessage` presence as failure (e.g. balance probes) misclassified the turn, and the stale text suppressed later refusal explanations. The fallback is now logged instead.
+- Fixed model-supplied `User-Agent` headers being silently dropped on non-OAuth Anthropic requests. `enforcedHeaderKeys` filtered the header out of `modelHeaders` in every branch but only the OAuth branch set one back; the Cloudflare-gateway, bearer-gateway, and `X-Api-Key` branches now forward the caller's value verbatim.
+- Stopped sending the `fast-mode-2026-02-01` beta header once a session has learned the endpoint+model rejects fast mode (`fastModeDisabled` provider state), matching the already-dropped `speed` param.
+- Stopped `buildAnthropicHeaders` defaulting API-key requests onto the full Claude Code OAuth beta list (`oauth-2025-04-20`, `claude-code-20250219`, …). The `claudeCodeBetas` default is now OAuth-gated, matching the streaming path — the web-search header builder was the only caller hitting the default, so API-key search requests now carry just their own betas (e.g. `web-search-2025-03-05`). An empty `anthropic-beta` header is omitted entirely instead of being sent as an empty string.
+- Fixed image-bearing `developer` messages being upgraded to mid-conversation `system` turns on Opus 4.8+/Fable/Mythos 5. System content is text-only on the wire, so a developer turn carrying image blocks in an upgrade-eligible position produced a 400; it now stays a `user` message.
+- Fixed a spliced reconnect's second envelope overwriting the completed Anthropic message: `message_delta` was not gated by the terminal-stop flag (content events and duplicate `message_start` were), so the splice's `stop_reason`/usage replaced the finished turn's — a `tool_use` turn could be relabeled `stop`, and the harness then never executed the streamed tool calls. Post-terminal deltas are now logged as envelope anomalies and skipped.
+- Fixed a `ping` arriving before `message_start` consuming the Anthropic first-event watchdog: the stall was then classified as a terminal mid-stream idle timeout instead of a retryable first-event timeout. Pings no longer count as the first item but still refresh the idle deadline once content is flowing.
+- Fixed Anthropic-compatible proxies that omit `usage`/`delta` objects from `message_start`/`message_delta`/`content_block_*` envelopes crashing the turn with an unretryable `TypeError`; the missing payloads now degrade to logged envelope anomalies like every other malformed-frame case.
+- Fixed `applyPromptCaching` placing `cache_control` on `thinking`/`redacted_thinking` blocks — Anthropic rejects that with a 400. A thinking-only assistant turn inside the trailing cache window (e.g. followed by the synthetic `Continue.` pad) no longer receives a breakpoint.
+- Fixed consecutive `assistant` params reaching the wire when an empty user/developer turn between two assistant turns was dropped by the converter (e.g. an empty "nudge" submission after a length-truncated reply); Anthropic 400s on non-alternating assistant turns, and the broken triple replayed on every subsequent request. A `user: "Continue."` separator is now inserted, mirroring the trailing-prefill fallback.
+- Fixed `supportsAdaptiveThinkingDisplay` misparsing bare dated Opus ids: `claude-opus-4-20250514` (Opus 4.0) parsed as minor `20250514` ≥ 4.7, which silently dropped the `interleaved-thinking-2025-05-14` beta for API-key Opus 4.0 requests.
+- Fixed `output_config.effort` shipping without the `effort-2025-11-24` beta on thinking-off requests against adaptive-only Claude models (the effort:"low" pin), and the mid-conversation `system` role shipping without `mid-conversation-system-2026-04-07` on API-key and OAuth-utility requests; both betas are now added whenever the request can carry the corresponding field.
+- Fixed GitHub Copilot anthropic-messages requests going out with no `Content-Type` and no `anthropic-version` header — the copilot branch builds its headers from scratch and Bun's fetch does not default `Content-Type` for string bodies. Both headers are now pinned to match every other branch.
+- Fixed Anthropic client/provider retry multiplication: with the first-event watchdog disabled (`PI_STREAM_FIRST_EVENT_TIMEOUT_MS=0`), the client's internal `maxRetries: 5` reactivated and stacked with the provider loop's 3 retries — up to 24 wire attempts with double backoff. The provider now pins per-request `maxRetries: 0` unconditionally.
+- Fixed `AnthropicMessagesClient` spreading `fetchOptions` after the core request fields, letting a caller-supplied `signal`/`method`/`body` silently disconnect the timeout controller or corrupt the request. Transport extras (TLS) still pass through; core fields now always win.
+- Fixed Foundry mTLS/CA material being cached for the process lifetime when the env vars point at files: the cache key now folds in the file mtime so on-disk certificate rotation takes effect.
+- Fixed the Claude Code fingerprint version drifting across surfaces: the usage endpoint (`claude-cli/2.1.160`) and OAuth bootstrap (`claude-code/2.1.160`) pinned a stale version while `/v1/messages` reported 2.1.165; both now derive from `claudeCodeVersion`.
+- Fixed a system prompt that merely *mentions* `x-anthropic-billing-header:` mid-text suppressing the entire Claude Code system-block injection (billing header, instruction, and cch attestation); the resumed-session guard now anchors with `startsWith`.
+- Fixed lone surrogates in cross-API tool-call arguments reaching Anthropic's strict UTF-8 validation: replayed OpenAI/Google-origin `tool_use.input` string leaves are now deep-sanitized with `toWellFormed()`, while same-API Anthropic arguments stay byte-identical to keep prompt-cache prefixes stable.
+- Bounded the many-image resize fan-out to 4 concurrent decodes (it previously decoded every oversized image at once, two encode pipelines each — multi-GB transient memory at the 20+-image threshold that activates the feature).
+- Fixed `mergeHeaders` merging case-sensitively on the Copilot/client-options path, where a miscased user-configured header (e.g. `authorization` next to the synthesized `Authorization`) survived as two keys that the `Headers` constructor joins comma-separated on the wire.
+- Hardened the Anthropic stream lifecycle: prologue failures (e.g. a malformed Copilot credential in `buildCopilotDynamicHeaders`) and error-finalization failures now surface as an `error` event instead of an unhandled rejection that left `stream.result()` hanging forever; the spurious "cch billing placeholder not patched" warning no longer fires when the placeholder only appears in user content.
+
+### Removed
+
+- Removed the dead `iterateUntilAbort` helper (superseded by `iterateWithIdleTimeout`); it leaked the upstream iterator when the consumer abandoned mid-yield and had no production call sites.
+
+## [15.10.10] - 2026-06-09
+
+### Added
+
+- Exported `wrapFetchForCch` so non-streaming OAuth callers (e.g. the web-search provider) can patch the Claude Code billing-header `cch` attestation into their request bodies instead of shipping the `cch=00000` placeholder.
+
+### Fixed
+
+- Fixed an unbounded, zero-backoff Codex WebSocket reconnect loop on `websocket_connection_limit_reached`: the no-content reconnect path never consulted the retry budget and never waited, hammering the endpoint forever when the limit is account-scoped. Reconnects are now budgeted and delayed like every other WS retry path, falling back to a single SSE replay when exhausted.
+- Fixed the Codex whitespace-loop breaker not observing degenerate frames that arrive after their item closed (or before it opened) — those frames count as stream progress, so the idle watchdogs never fired and the turn hung forever, which is exactly the failure mode the breaker exists for. Whitespace-loop recovery now also refuses to replay the turn once a `toolcall_end` was delivered, surfacing the error instead of re-emitting the same tool calls.
+- Fixed the two remaining Codex retry paths (WS mid-stream reconnect and the empty-content SSE fallback) leaking blockless native output items (e.g. `web_search_call`) from the failed attempt into the replayed turn's `providerPayload` and append baseline.
+- Fixed Codex WebSocket failure handling closing whatever connection currently occupies the session slot — including a concurrent caller's in-flight CONNECTING handshake, whose rejection (`websocket closed before open`) is classified fatal and disabled WebSockets for the whole session. Failure cleanup now skips CONNECTING sockets and the pool re-joins replacement handshakes (bounded).
+- Fixed the Codex request transformer not repairing orphan `custom_tool_call_output` items (only `function_call_output` was folded into an assistant note) — a compaction splice that dropped an `apply_patch` call while keeping its result produced a hard 400 on the default GPT-5 Codex toolset.
+- Fixed `processResponsesStream` finalizing reasoning items via a bare `itemId` content scan instead of the routed entry: with id-less reasoning items (local hosts), every `output_item.done` matched the FIRST thinking block — the second item's text clobbered it and the second block was never finalized or signed.
+- Fixed `processResponsesStream` dropping tool calls and message text whose `output_item.added` event was lost (lossy proxies): `toolcall_end` was emitted with a dangling contentIndex while the call never entered `message.content`, so the agent loop silently never executed it. The done handler now synthesizes the missing block; still-open tool-call blocks are also final-parsed at `response.completed` so the `toolUse` override cannot hand the agent stale `{}` arguments.
+- Fixed `response.incomplete` with `incomplete_details.reason: "content_filter"` being reported as a token-cap truncation (`stopReason: "length"`) — the agent loop's length recovery then asked the model to "shorten" a filtered prompt. Content-filtered turns now surface as errors; usage is also populated from `response.failed` events, and an unknown terminal status degrades to `"stop"` with a logged anomaly instead of throwing away a fully-streamed response.
+- Fixed Copilot `premiumRequests` accounting being dropped from failed/cancelled responses: `populateResponsesUsageFromResponse` replaced `usage` wholesale and the error path threw before the success-path re-apply. The populate now preserves the field.
+- Fixed `deduplicateToolCallIds` suffixing the whole composite Responses id (`callId|itemId`) — `normalizeResponsesToolCallId` extracts the first segment as the wire `call_id` at encode time, so both copies collapsed back onto one `call_id` and the request carried duplicate call/output pairs. The suffix and length budget now apply per segment.
+- Gated native history payload replay on api + model id in both Responses providers: after a mid-session model switch, reasoning items carrying encrypted content minted by the previous model were replayed verbatim under the new model. Replay now falls back to block re-encode (which already strips foreign signatures), matching `transformMessages`' same-model trust rule.
+- Fixed Azure OpenAI Responses requests omitting `store: false` while requesting `reasoning.encrypted_content` (stateless-only per OpenAI), replaying custom tool calls paired with mismatched `function_call_output` items (customCallIds was never threaded through), letting the SDK's internal retries (maxRetries 5) silently re-POST inside the explicit first-event deadline, and sending a `prompt_cache_key` when the caller opted out via `cacheRetention: "none"`.
+- Fixed strict-pairing Responses backends (Azure, Copilot) silently discarding tool results whose call is absent from history — the result is now folded into an assistant note (same shape as orphan-output repair) so the model keeps the information.
+- Fixed the OpenAI Responses first-event watchdog staying armed across the `onResponse` notification callback (a slow callback aborted an already-connected stream), Copilot transient-model retries re-attempting on an already-aborted signal (instant dead retry surfacing the scheduler's AbortError), Codex `reasoningSummary: null` being coerced to `"auto"` (the documented omit-summary contract was unreachable), nested Codex error codes (`response.error.code`) being invisible to the connection-limit/previous-response recovery matchers, and the session id leaking unredacted into `PI_CODEX_DEBUG` logs via the `x-client-request-id` header.
+- Fixed `processResponsesStream` (shared by `openai-responses` and `azure-openai-responses`) ignoring the terminal `response.incomplete` event: a max-output-tokens-truncated response ended with `stopReason: "stop"`, zero usage, and no cost instead of `"length"` with the reported token counts. `response.incomplete` is now handled alongside `response.completed` and counts as stream progress for the idle watchdogs.
+- Fixed custom tool-call content blocks keeping the transient `partialJson` accumulation buffer (and a potentially stale `arguments.input`) after `response.output_item.done` in the shared Responses stream processor — the function_call branch already cleaned these up.
+- Fixed two OpenAI Codex stream-retry paths (whitespace-loop recovery and retryable provider errors) leaking native output items from the abandoned attempt into the replayed turn's `providerPayload` — stale reasoning items completed before the failure were re-sent as history input on subsequent requests alongside the retry's own items.
+- Fixed the Codex WebSocket queue wiping already-received frames when a transport error arrived: a `response.completed` queued just before an eager server close was discarded, turning a finished response into a spurious `websocket closed` failure and a full request replay. Errors now append behind pending data frames.
+- Fixed concurrent `getOrCreateCodexWebSocketConnection` callers (prewarm racing the first request) tearing down each other's in-flight handshake — closing a CONNECTING socket rejected the other caller with a fatal `websocket closed before open`, disabling WebSockets for the entire session. Callers now join the pending handshake.
+- Stopped the Codex connection-limit recovery from replaying a turn over SSE after a `toolcall_end` had already been delivered to the consumer (`canSafelyReplayWebsocketOverSse` guard was bypassed, re-emitting the same tool calls); the error now surfaces instead.
+- Extended the Codex whitespace-only argument-delta circuit breaker to `custom_tool_call_input.delta` frames, which counted as stream progress and could keep a degenerate response alive forever with no cap on buffer growth.
+- Fixed Codex stream failures during transport open reporting a synthetic request dump (empty URL/body) instead of the real request, and a `response.created` event resetting the recorded time-to-first-token.
+- Fixed the Codex WebSocket connect watchdog timer leaking (pinning the event loop for up to 10s) when the request signal aborted before or during the handshake.
+- Fixed OpenRouter-hosted Anthropic adaptive reasoning models (Claude Fable/Mythos 5 and Opus 4.6+) so the catalog exposes `xhigh`; Fable/Mythos and Opus 4.7+ requests now map user `high`/`xhigh` onto OpenRouter's Anthropic `xhigh`/`max` effort scale.
+- Fixed an unknown Anthropic `stop_reason` failing the whole turn after the response had fully streamed. `mapStopReason` threw on unrecognized values, and since the reason arrives on the trailing `message_delta` the error was unretryable — the live `model_context_window_exceeded` stop reason (default on Sonnet 4.5+) hit this path. It now maps to `length`, and any future unknown reason degrades to a logged anomaly plus a normal `stop` instead of an error.
+- Stopped clamping API-key Anthropic requests to Claude Code's 64k output cap. The `CLAUDE_CODE_MAX_OUTPUT_TOKENS` clamp exists to match the OAuth wire fingerprint, but `buildParams` applied it unconditionally, silently halving the output budget of 128k-output models (e.g. Opus 4.8) for API-key callers. OAuth requests keep the clamp.
+- Stopped a successful strict-tools fallback from shipping `errorMessage` on a `stopReason: "stop"` assistant message. After a grammar-too-large 400 triggered the non-strict retry, the original 400 text was kept on the final message even when the retry succeeded — consumers that treat `errorMessage` presence as failure (e.g. balance probes) misclassified the turn, and the stale text suppressed later refusal explanations. The fallback is now logged instead.
+- Fixed model-supplied `User-Agent` headers being silently dropped on non-OAuth Anthropic requests. `enforcedHeaderKeys` filtered the header out of `modelHeaders` in every branch but only the OAuth branch set one back; the Cloudflare-gateway, bearer-gateway, and `X-Api-Key` branches now forward the caller's value verbatim.
+- Stopped sending the `fast-mode-2026-02-01` beta header once a session has learned the endpoint+model rejects fast mode (`fastModeDisabled` provider state), matching the already-dropped `speed` param.
+- Stopped `buildAnthropicHeaders` defaulting API-key requests onto the full Claude Code OAuth beta list (`oauth-2025-04-20`, `claude-code-20250219`, …). The `claudeCodeBetas` default is now OAuth-gated, matching the streaming path — the web-search header builder was the only caller hitting the default, so API-key search requests now carry just their own betas (e.g. `web-search-2025-03-05`). An empty `anthropic-beta` header is omitted entirely instead of being sent as an empty string.
+- Fixed image-bearing `developer` messages being upgraded to mid-conversation `system` turns on Opus 4.8+/Fable/Mythos 5. System content is text-only on the wire, so a developer turn carrying image blocks in an upgrade-eligible position produced a 400; it now stays a `user` message.
+- Fixed a spliced reconnect's second envelope overwriting the completed Anthropic message: `message_delta` was not gated by the terminal-stop flag (content events and duplicate `message_start` were), so the splice's `stop_reason`/usage replaced the finished turn's — a `tool_use` turn could be relabeled `stop`, and the harness then never executed the streamed tool calls. Post-terminal deltas are now logged as envelope anomalies and skipped.
+- Fixed a `ping` arriving before `message_start` consuming the Anthropic first-event watchdog: the stall was then classified as a terminal mid-stream idle timeout instead of a retryable first-event timeout. Pings no longer count as the first item but still refresh the idle deadline once content is flowing.
+- Fixed Anthropic-compatible proxies that omit `usage`/`delta` objects from `message_start`/`message_delta`/`content_block_*` envelopes crashing the turn with an unretryable `TypeError`; the missing payloads now degrade to logged envelope anomalies like every other malformed-frame case.
+- Fixed `applyPromptCaching` placing `cache_control` on `thinking`/`redacted_thinking` blocks — Anthropic rejects that with a 400. A thinking-only assistant turn inside the trailing cache window (e.g. followed by the synthetic `Continue.` pad) no longer receives a breakpoint.
+- Fixed consecutive `assistant` params reaching the wire when an empty user/developer turn between two assistant turns was dropped by the converter (e.g. an empty "nudge" submission after a length-truncated reply); Anthropic 400s on non-alternating assistant turns, and the broken triple replayed on every subsequent request. A `user: "Continue."` separator is now inserted, mirroring the trailing-prefill fallback.
+- Fixed `supportsAdaptiveThinkingDisplay` misparsing bare dated Opus ids: `claude-opus-4-20250514` (Opus 4.0) parsed as minor `20250514` ≥ 4.7, which silently dropped the `interleaved-thinking-2025-05-14` beta for API-key Opus 4.0 requests.
+- Fixed `output_config.effort` shipping without the `effort-2025-11-24` beta on thinking-off requests against adaptive-only Claude models (the effort:"low" pin), and the mid-conversation `system` role shipping without `mid-conversation-system-2026-04-07` on API-key and OAuth-utility requests; both betas are now added whenever the request can carry the corresponding field.
+- Fixed GitHub Copilot anthropic-messages requests going out with no `Content-Type` and no `anthropic-version` header — the copilot branch builds its headers from scratch and Bun's fetch does not default `Content-Type` for string bodies. Both headers are now pinned to match every other branch.
+- Fixed Anthropic client/provider retry multiplication: with the first-event watchdog disabled (`PI_STREAM_FIRST_EVENT_TIMEOUT_MS=0`), the client's internal `maxRetries: 5` reactivated and stacked with the provider loop's 3 retries — up to 24 wire attempts with double backoff. The provider now pins per-request `maxRetries: 0` unconditionally.
+- Fixed `AnthropicMessagesClient` spreading `fetchOptions` after the core request fields, letting a caller-supplied `signal`/`method`/`body` silently disconnect the timeout controller or corrupt the request. Transport extras (TLS) still pass through; core fields now always win.
+- Fixed Foundry mTLS/CA material being cached for the process lifetime when the env vars point at files: the cache key now folds in the file mtime so on-disk certificate rotation takes effect.
+- Fixed the Claude Code fingerprint version drifting across surfaces: the usage endpoint (`claude-cli/2.1.160`) and OAuth bootstrap (`claude-code/2.1.160`) pinned a stale version while `/v1/messages` reported 2.1.165; both now derive from `claudeCodeVersion`.
+- Fixed a system prompt that merely *mentions* `x-anthropic-billing-header:` mid-text suppressing the entire Claude Code system-block injection (billing header, instruction, and cch attestation); the resumed-session guard now anchors with `startsWith`.
+- Fixed lone surrogates in cross-API tool-call arguments reaching Anthropic's strict UTF-8 validation: replayed OpenAI/Google-origin `tool_use.input` string leaves are now deep-sanitized with `toWellFormed()`, while same-API Anthropic arguments stay byte-identical to keep prompt-cache prefixes stable.
+- Bounded the many-image resize fan-out to 4 concurrent decodes (it previously decoded every oversized image at once, two encode pipelines each — multi-GB transient memory at the 20+-image threshold that activates the feature).
+- Fixed `mergeHeaders` merging case-sensitively on the Copilot/client-options path, where a miscased user-configured header (e.g. `authorization` next to the synthesized `Authorization`) survived as two keys that the `Headers` constructor joins comma-separated on the wire.
+- Hardened the Anthropic stream lifecycle: prologue failures (e.g. a malformed Copilot credential in `buildCopilotDynamicHeaders`) and error-finalization failures now surface as an `error` event instead of an unhandled rejection that left `stream.result()` hanging forever; the spurious "cch billing placeholder not patched" warning no longer fires when the placeholder only appears in user content.
+
+## [15.10.9] - 2026-06-09
+
+### Added
+
+- Added `antigravityRankingStrategy` and registered it as the default `CredentialRankingStrategy` for `google-antigravity`, so multi-account selection consumes the per-counter Antigravity usage reports (sorted ascending by `remainingFraction` in `fetchAntigravityUsage`) before falling back to round-robin — preventing the exhausted-counter credential from being chosen first when an unblocked sibling has headroom ([#2187](https://github.com/can1357/oh-my-pi/issues/2187)).
+- Added Claude Fable 5 to the first-party Anthropic catalog, seeded directly via `ANTHROPIC_CURATED_FALLBACK_MODELS` rather than waiting on models.dev (1M context / 128k output, adaptive thinking, $10/$50 per MTok). The model parser recognizes the `fable` kind so effort tiers (low→max), adaptive thinking, and Opus-4.7-style sampling restrictions apply; token limits and pricing are pinned in `applyAnthropicCatalogPolicy`.
+
+### Fixed
+
+- Fixed `google-antigravity` not rotating to another stored OAuth account when Cloud Code Assist returns `429 You have exhausted your capacity on this model. Your quota will reset after …`. `parseRateLimitReason` matched the literal `capacity` before the `quota will reset` suffix and downgraded the failure to `MODEL_CAPACITY_EXHAUSTED` (45–75 s backoff), and `isUsageLimitError` returned false for the same message — so `markUsageLimitReached` was never invoked and the agent kept hammering the exhausted credential while the retry layer bailed on the multi-hour `retry-after`. Both paths now treat the Antigravity phrasing as `QUOTA_EXHAUSTED` / usage-limit, blocking the current credential until reset and letting the session pick an unblocked sibling ([#2187](https://github.com/can1357/oh-my-pi/issues/2187)).
+- Fixed OpenRouter Anthropic chat-completions requests placing `cache_control` on empty assistant tool-call content. The cache marker now skips empty text and attaches to the most recent non-empty text part, avoiding HTTP 400 payloads with `{type:"text", text:"", cache_control:...}`.
+- Fixed Fable-only Anthropic request shaping to cover Claude Mythos 5, and added Mythos 5 to the first-party Anthropic catalog seed. Adaptive display, sampling suppression, mid-conversation system messages, forced-tool-choice downgrade, and Bedrock adaptive metadata now handle both model families.
+- Fixed adaptive-only Claude models (Opus 4.6+, Sonnet 4.6+, Fable/Mythos 5) returning HTTP 400 `"thinking.type.disabled" is not supported for this model` whenever thinking was turned off (utility calls and forced-tool turns route through the disable path). These models accept only `thinking.type: "adaptive"`; the request builder now omits the thinking field and pins the lowest adaptive effort instead of emitting `type: "disabled"`.
+- Widened the OpenAI-completions first-event watchdog floor from 120s to 300s for DeepSeek V4 reasoning models hosted on the official DeepSeek API. The reasoner emits no SSE bytes until its private chain-of-thought finishes, which routinely takes longer than the generic 100s first-event budget under load — every chat then aborted with `OpenAI completions stream timed out while waiting for the first event` and silently retried. Mirrors the existing GLM coding-plan widening ([#2177](https://github.com/can1357/oh-my-pi/issues/2177)).
+
+## [15.10.8] - 2026-06-09
+
+### Added
+
+- Added optional `fetch` transport override (`fetch?: FetchImpl`) to Google, Ollama, and OpenAI-compatible model-manager options so dynamic model discovery and metadata lookups can use a caller-supplied HTTP client instead of only global `fetch`
+- Added optional `fetch` on OAuth controller and API-key validation/login flows so token exchange, refresh, and device/PKCE login requests can be routed through a custom `fetch` implementation
+- Added optional `fetch` support to usage polling context, allowing usage providers to execute usage checks using an injected HTTP client
+- Added `AssistantMessage.upstreamProvider`, capturing the upstream provider an aggregator routed the request to (OpenRouter reports it via a top-level `provider` field on every chunk, e.g. `"Anthropic"`). Surfaced from the OpenAI-completions stream alongside `responseId`.
+
+### Fixed
+
+- Fixed a degenerate OpenAI Codex stream (the model emits whitespace-only `function_call_arguments.delta` frames forever — commonly seen right after a `todo` tool call) terminating the turn with an error instead of recovering. The whitespace-loop circuit-breaker now (a) stops aborting the shared per-request `AbortController` — `requestSignal` is an `AbortSignal.any` over it, so aborting latched it and made every reopen on the reused `requestSetup` impossible — and (b) drops the half-built junk tool call and replays the request from scratch, bounded by `CODEX_WHITESPACE_LOOP_RETRY_LIMIT` (2). Sampling nondeterminism usually clears the loop on a fresh attempt; once the budget is exhausted the error is surfaced as before, but without the junk tool call polluting the message.
+- Capped requested output tokens at 64k (`OPENAI_MAX_OUTPUT_TOKENS`, mirroring Anthropic's `CLAUDE_CODE_MAX_OUTPUT_TOKENS`) on OpenAI-family wires with a known upstream output cap — the `openai-completions` request builder (non-OpenRouter) and the shared responses sampling helper (`openai-responses`, `azure-openai-responses`). A model's catalog `maxTokens` often tracks its context window rather than the upstream's per-request output cap, so requesting the full ceiling 400'd (e.g. `z-ai/glm-4.7` asking for 131072 output exceeded the upstream's 131072-token *total* context). Output is now `min(requested, model.maxTokens, 64000)`.
+- Stopped sending `max_tokens`/`max_completion_tokens` on OpenRouter (`openrouter.ai`) completions requests. OpenRouter filters out any upstream whose advertised output cap is below the requested `max_tokens`, so a value derived from the catalog (which reflects the highest-cap provider) silently excluded lower-cap upstreams — `provider.order: ["cerebras"]` for `z-ai/glm-4.7` fell through to DeepInfra because Cerebras's ~40k output cap is below the request, while `only: ["cerebras"]` (no fallback target) bypassed the filter and worked. Omitting the field lets each upstream self-cap and keeps provider routing (`only`/`order`) honored. Kimi via OpenRouter stays exempt — it derives TPM rate limits from `max_tokens`.
+
+## [15.10.7] - 2026-06-08
+
+### Fixed
+
+- Fixed first-party Anthropic requests returning HTTP 400 "Invalid `signature` in `thinking` block" after interrupting the model during its visible output. `transformMessages` stripped the signature from every `thinking` block of an `aborted`/`error` turn, including blocks that had already finished streaming — Anthropic delivers a block's signature at `content_block_stop` before the next block starts, so a thinking block followed by `text`/`tool_use` is fully signed. The valid signature was then replayed empty (`signature: ""`), which signature-enforcing Anthropic rejects, including when the provider is routed through an LLM gateway baseUrl. Only the single mid-stream block at the abort point is now treated as untrustworthy; completed thinking blocks keep their replayable signatures ([#2144](https://github.com/can1357/oh-my-pi/issues/2144)).
+- Pinned a regression test against issue [#2123](https://github.com/can1357/oh-my-pi/issues/2123): OAuth requests to adaptive-thinking Claude Opus models (4.6+) ship a `context_management.edits[clear_thinking_20251015]` block paired with the `thinking` field, but the eager-todo prelude (and other paths that force `tool_choice` to `tool`/`any` on the first user turn) route through `disableThinkingIfToolChoiceForced`, which would strip `params.thinking` while leaving the orphan `context_management` behind. The Anthropic API then rejected the request with `400 ... clear_thinking_20251015 strategy requires thinking to be enabled or adaptive`. The fix that lands in [15.10.5] now drops both fields together; the new test locks the contract so the strategy can never outlive its enabling `thinking` payload again.
+- Fixed Antigravity usage counters so exhausted Google/Gemini quota renders as `0% free` while separate Anthropic/OpenAI-backed Antigravity model counters remain visible independently, without replaying stale pre-fix cached usage reports.
+
+## [15.10.6] - 2026-06-08
+
+### Added
+
+- Added AIML API as an OpenAI-compatible provider preset with `AIMLAPI_API_KEY` discovery ([#2105](https://github.com/can1357/oh-my-pi/issues/2105)).
+
+## [15.10.5] - 2026-06-08
+
+### Breaking Changes
+
+- Renamed the OAuth subpath export `@oh-my-pi/pi-ai/utils/oauth` → `@oh-my-pi/pi-ai/oauth` (and `@oh-my-pi/pi-ai/utils/oauth/*` → `@oh-my-pi/pi-ai/oauth/*`, e.g. `oauth/types`, `oauth/callback-server`, `oauth/openai-codex`) after relocating the OAuth implementation out of `utils/oauth/` into `registry/oauth/`. The high-level OAuth API (`getOAuthProviders`, `refreshOAuthToken`, `getOAuthApiKey`, `registerOAuthProvider`, `unregisterOAuthProviders`, `getOAuthProvider`) and the `OAuth*` types stay exported from the package root, unchanged.
+
+### Changed
+
+- Changed Anthropic retry handling to avoid retrying 4xx responses other than 408 and 429
+- Optimized the Anthropic `cch` attestation patch to locate the billing-header placeholder with native `Buffer.indexOf` (memmem) instead of a hand-rolled byte loop. The marker sits ~99% through the body (`messages` serializes before `system`), so the old scan walked almost the entire payload; output bytes are unchanged but the patch is ~7.5x faster (563µs -> 75µs on a 1MB body).
+- Refactored provider configuration to a single-source registry (`registry/`, renamed from `provider-registry/` with its `providers/` subdir flattened up). The `KnownProvider`/`OAuthProvider` type unions, `PROVIDER_DESCRIPTORS`, `DEFAULT_MODEL_PER_PROVIDER`, the `serviceProviderMap` env-key fallbacks, the `/login` provider list (`builtInOAuthProviders`), and the `refreshOAuthToken`/`AuthStorage.login` dispatch are all derived from it. Provider defs live directly under `registry/`; thin provider-specific login flows are inlined into the def file, while heavier provider-local OAuth flows and the shared OAuth flow infra (`callback-server`, `pkce`, `google-oauth-shared`, `types`, runtime `index`) now live together under `registry/oauth/` (previously split across `provider-registry/providers/oauth/` and `utils/oauth/`). The non-OAuth API-key paste/validation helpers (`api-key-login`, `api-key-validation`) sit beside the defs in `registry/`. Adding a provider that reuses an existing wire API is now one new provider def plus one registry entry in the common case. Exposes `PROVIDER_REGISTRY`, `getProviderDefinition`, `ProviderDefinition`, and `PASTE_CODE_LOGIN_PROVIDERS`.
+
+### Fixed
+
+- Disabled OpenAI Codex Responses stream obfuscation by sending `stream_options.include_obfuscation=false`, reducing raw WebSocket/SSE debug noise and bandwidth.
+- Interrupted OpenAI Codex Responses streams that emit long runs of whitespace-only tool-call argument deltas, preventing degenerate WebSocket/SSE responses from filling the raw stream buffer indefinitely.
+- Preserved streaming responses when Anthropic emits unrecognized content_block envelopes by ignoring unknown blocks and continuing to emit known content
+- Applied cache control to the most recent tool result block when building Anthropic OAuth payloads without a preceding text block, enabling ephemeral caching for tool-result-only messages
+- Kept Anthropic sampling parameters (temperature, top_p, top_k) when thinking is explicitly disabled
+- Fixed raw Anthropic SSE handling by parsing event frames with strict JSON parsing and matching event-type validation, surfacing malformed frames as stream errors instead of repairing them
+- Fixed Anthropic stream envelope handling to reject duplicate `content_block_start` indexes and block deltas/stops for unopened blocks, preventing malformed envelope states from producing partial output
+- Fixed Anthropic image conversion to normalize `image/jpg` to `image/jpeg` and emit a placeholder for unsupported image MIME types
+- Fixed Anthropic thinking request preparation by clamping `max_tokens` to provider/model limits and adjusting thinking budgets to a valid value
+- Fixed Anthropic request shaping around forced tool choice, unsigned thinking replay, prompt-cache marker placement, non-Anthropic bearer gateways, Foundry TLS loading, and strict tool-schema normalization so malformed or incompatible request payloads are rejected locally or shaped consistently before streaming
+- Fixed the Anthropic stream parser shipping a truncated tool call as a completed turn. When a transport drop cut the SSE stream mid-`tool_use` and a transparent reconnect spliced a fresh message envelope onto the same stream, the duplicate `message_start` was deduped but the orphaned tool block — which never received its `content_block_stop` — survived in the assistant message with its seed `{}` (or partially-parsed) arguments. The terminal stop signal from the reconnect then let it flow through as a normal tool call, so e.g. a `read` dispatched with `{}` failed downstream validation (`path: expected string, received undefined`). The parser now treats any tool block left open at stream end as a truncated envelope and routes it through the existing retry/error path instead of emitting bogus arguments.
+- Fixed the Zhipu Coding Plan login prompt advertising a misleading `sk-...` placeholder. Zhipu API keys are formatted `<id>.<secret>` (no `sk-` prefix), so the placeholder now matches the actual format instead of suggesting the wrong shape. ([#2106](https://github.com/can1357/oh-my-pi/issues/2106))
+- Fixed Moonshot `kimi-k2.6` (and any future `kimi-k2.x`) discovered via `MOONSHOT_API_KEY` stalling on first turn with no output. The `moonshotModelManagerOptions` discovery mapper only marked ids containing `"thinking"` as `reasoning: true`, so dynamic `kimi-k2.6` entries fell through with `reasoning: false`; the openai-completions z.ai branch was then skipped and the request reached Moonshot with no `thinking` parameter at all. Moonshot K2.6 requires an explicit `thinking: {type}` field (the same native-API wire shape #1838 introduced `thinking.keep` for), so the server held the stream silently. The mapper now stamps `reasoning: true`, vision input, and default `thinking` metadata on every `kimi-k2.x` id, restoring the explicit `thinking: {type: "disabled"|"enabled"}` wire body the Moonshot endpoint expects. ([#2113](https://github.com/can1357/oh-my-pi/issues/2113))
+
+## [15.10.4] - 2026-06-08
+
+### Added
+
+- Added `anthropic-client-platform` (`desktop_app`) and `anthropic-client-version` (`1.11187.4`) headers to the Anthropic request fingerprint for OAuth sessions
+
+### Changed
+
+- Changed non-built-in tool names sent to Anthropic from `proxy_` prefixing to `_` prefixing (for example `bash` to `_bash`) while built-in tool names remain unchanged
+- Updated the Anthropic OAuth stealth fingerprint to track Claude Code 2.1.165: `claudeCodeVersion` bumped to `2.1.165` (flows into both the `cc_version` billing header and the `claude-cli/<version>` user-agent), `claudeCodeSystemInstruction` changed to `"You are a Claude agent, built on Anthropic's Claude Agent SDK."`, and the billing-header `cc_entrypoint` changed from `cli` to `local-agent`.
+- Clamped the Anthropic request `max_tokens` to `Math.min(CLAUDE_CODE_MAX_OUTPUT_TOKENS, options.maxTokens || model.maxTokens)` (64k) so OAuth requests match Claude Code's requested output cap instead of sending the model's full ceiling (e.g. 128k for Opus 4.8).
+
+## [15.10.3] - 2026-06-08
+
+### Removed
+
+- Removed the synthetic `<turn-aborted>` developer guidance note that `transformMessages` injected after an aborted/errored assistant turn (and its `turn-aborted-guidance.md` prompt). The per-call synthetic `"aborted"` tool results already tell the model the turn's tools were terminated, so the extra "verify current state before retrying" note was redundant — and it biased the model toward second-guessing a deliberate user interrupt when the turn was resumed.
+- Removed the legacy Anthropic first-user-message skip for `<system-reminder>` blocks now that synthetic reminders no longer travel as user messages.
+
+## [15.10.2] - 2026-06-08
+
+### Added
+
+- Added support for `impersonated_service_account` Application Default Credentials (ADC) in Vertex AI to enable chained impersonation without failing via 401 `invalid_client`.
+- Added `AuthStorage.getCredentialOrigin(provider)` (returning a structured `CredentialOrigin` / `CredentialOriginKind`) and `getEnvApiKeyName(provider)`, so callers can render where a provider's auth comes from — runtime override, config, stored OAuth/api-key, env var (with the backing variable name), or fallback resolver — without parsing the prose of `describeCredentialSource`.
+
+### Changed
+
+- Changed `onSseEvent` recording for OpenAI Responses, Azure OpenAI Responses, OpenAI Completions, and Anthropic stream providers to emit reconstructed SSE events from decoded SDK stream items instead of wrapping raw fetch responses
+- Changed OpenAI Completions SSE diagnostics to include `event: "chat.completion.chunk"` in `onSseEvent` records for chunked responses
+- Changed the default Anthropic model in `DEFAULT_MODEL_PER_PROVIDER` from `claude-sonnet-4-6` to `claude-opus-4-6`, so sessions that fall back to the provider default (no configured `default` role, no `--model`, no restored session) now start on Claude Opus 4.6.
+
+### Fixed
+
+- Fixed duplicate upstream `tool_call_id` values collapsing distinct tool calls during message transformation, preserving one call/result pairing per emitted tool call before provider replay and keeping generated duplicate IDs distinct after OpenAI/Mistral wire-length caps. ([#2055](https://github.com/can1357/oh-my-pi/issues/2055))
+- Fixed the Anthropic provider retrying persistent account usage/quota limits (e.g. `429 "This request would exceed your account's rate limit"`, `usage_limit_reached`) as if they were transient. Because the error text contains "rate limit", `isProviderRetryableError` matched it and the stream retry loop looped through its 2s/4s/8s backoff (then the `streamSimple` a/b/c policy re-minted the credential and ran the whole thing again) before surfacing the failure — even though the server's `retry-after` parked the account for minutes-to-hours. These errors are now recognized via `isUsageLimitError` and surfaced immediately to the credential-rotation layer, so e.g. `omp dry-balance --bench` reports a rate-limited account as failed at once instead of appearing to hang.
+- Fixed MiniMax-compatible OpenAI-completions hosts losing tool-call argument content when `function.arguments` is streamed as an object across more than one delta. The accumulator added in #1776 wrote `block.partialArgs = rawArgs` per chunk, so every chunk but the last was overwritten — for an `edit` call this surfaced as a tail-slice of the patch text being applied (e.g. a single-line `replace 91..91:` body extending the deletion across the surrounding rows). Chunks are now shallow-merged; for shared string keys, `startsWith` distinguishes cumulative restatements (take the latest) from per-chunk-delta fragments (concatenate). Per-chunk `toolcall_delta` emission for the object branch is suppressed (the previous code emitted `JSON.stringify(rawArgs)` per chunk, which fed downstream concat consumers — `packages/agent/src/proxy.ts`, `openai-chat-server`, `openai-responses-server`, `anthropic-messages-server` — an invalid sequence like `{"input":"a"}{"input":"b"}`); the merged object is flushed instead as a single concat-safe delta in `finishToolCallBlock` before `toolcall_end`, so accumulators reconstruct the args correctly. The single-chunk shape covered by the existing #1776 regression test stays correct end-to-end. ([#2080](https://github.com/can1357/oh-my-pi/issues/2080))
+- Fixed the OpenAI Responses compatibility server misrouting late `toolcall_delta` events for earlier parallel tool calls after a later `toolcall_start`. The encoder now keeps OpenFunctionCall state by content index, allocates output indexes at item start, and closes each tool item by its own `toolcall_end`, preserving deferred MiniMax object-argument flushes for the matching call. ([#2080](https://github.com/can1357/oh-my-pi/issues/2080))
+
+## [15.10.1] - 2026-06-07
+
+### Breaking Changes
+
+- Removed the `onAuthError` option from stream request options and shifted auth retry handling to resolver-based `apiKey` behavior, requiring callers using custom auth-retry hooks to migrate
+
+### Added
+
+- Added `ApiKeyResolver` and `ApiKey` auth helpers, including `isApiKeyResolver`, `isAuthRetryableError`, `resolveApiKeyOnce`, and `withAuth`, and exported them from the package root
+- Added support for a function-valued `apiKey` in `SimpleStreamOptions` so a single stream request can refresh or rotate credentials during retry
+- Added `forceRefresh` credential option to `AuthStorage.getApiKey` and `rotateSessionCredential` support for session-level credential rotation after auth failures
+- Added `AuthStorage.resolver(provider, options)` method that builds an `ApiKeyResolver` implementing the a/b/c auth-retry policy directly on the storage instance
+
+### Changed
+
+- Changed gateway and stream auth flows to share the a/b/c retry policy, refreshing the same session credential first and then switching to a sibling credential on repeated auth failures
+
+### Fixed
+
+- Fixed streaming auth retries to handle `401` and usage-limit errors before replay-unsafe content is emitted, including failures surfaced only via `errorStatus`
+- Fixed tool argument validation to coerce singleton non-string values into arrays when the schema expects an array, preventing Anthropic-compatible models that emit `todo.ops` as an object from getting stuck in repeated validation-error loops. ([#2026](https://github.com/can1357/oh-my-pi/issues/2026))
+- Fixed streaming retries to buffer and suppress partial `start` events from failed auth attempts so only clean retried events are delivered
+- Fixed the HTTP 400 raw-request dumper (`appendRawHttpRequestDumpFor400`) littering the real `~/.omp/logs/http-400-requests` directory during tests. Provider suites exercise the 400 error path with mocked `fetch` responses, which the dumper could not distinguish from genuine failures; it now skips persistence under the Bun test runner (`isBunTestRuntime()`).
+- Fixed Anthropic Opus requests unnecessarily forcing `tool_choice.disable_parallel_tool_use`, allowing Claude Opus to use the provider's default parallel tool-calling behavior again.
+- Fixed parallel `function_call` items losing arguments against llama.cpp's OpenAI Responses endpoint (`/v1/responses`), where every call but the last finalized with `{}` and the agent rejected them with `path: Invalid input: expected string, received undefined`. llama.cpp's `to_json_oaicompat_resp` emits `output_item.added` with only `item.call_id` (no `item.id`, no `output_index`) while the matching `function_call_arguments.delta` carries `item_id: "fc_<call_id>"`. `processResponsesStream` now registers function-call and custom-tool-call items under `item.call_id` as a secondary lookup key (alongside `item.id`/`output_index`) so identifier-deviant hosts route deltas and done events to the right block. ([#2015](https://github.com/can1357/oh-my-pi/issues/2015))
+- Fixed `PI_REQ_DEBUG` response recording truncating the captured body when a streamed response was cancelled mid-flight. The response tee in `wrapResponse` could call `FileRequestDebugResponseLog.close()` from both the `cancel` callback and the resumed `pull` (which observes `done` once the source reader is cancelled); the second caller saw the handle already nulled and returned before the first caller's pending write flushed, so the `.res.log` lost the already-buffered chunk. `close()` now memoizes its flush-and-close promise so every caller awaits the same completion.
+
+## [15.10.0] - 2026-06-06
+
+### Added
+
+- Added a dependency-free `@oh-my-pi/pi-ai/effort` module exporting the `Effort` enum and `THINKING_EFFORTS`, split out of `model-thinking` so hot-path consumers can import the thinking levels without pulling in `model-thinking` and its provider-compat dependency graph. The package barrel still re-exports both names, so existing imports are unaffected.
+
+### Fixed
+
+- Fixed Antigravity usage provider emitting one bar per model instead of deduplicating by tier — a single account's 15+ model entries now collapse to one bar per tier, matching the shared-quota reality of the upstream API.
+- Fixed Antigravity usage reports missing `email` and `accountId` in metadata, so the `/usage` display and the deduplicator can associate reports with their credentials.
+- Fixed usage-report dedup ignoring `projectId` for Google Cloud providers, preventing duplicate credential entries from being recognized as the same account.
+- Fixed Cloud Code Assist (Antigravity / Gemini CLI) rejecting the `github` tool with HTTP 400 when the `pr` parameter schema contained `anyOf: [string, array]`. The CCA mixed-type combiner collapse picked the first non-null type (`string`) but indiscriminately copied type-specific keys from variant branches — `items` from the array variant leaked onto the string-typed result, producing `{type: "string", items: {...}}` which Google's API rejects as invalid. The collapse now filters merged variant fields against the winning type's allowed key set. ([#2002](https://github.com/can1357/oh-my-pi/pull/2002))
+- Fixed OpenAI Responses-family providers (Codex, OpenAI Responses, Azure Responses) rejecting requests with `400 No tool output found for function call …` after the user branched/navigated the session tree to a node that ends on a tool call (the tool-result child is dropped from the reconstructed history) or after a turn was aborted/crashed between the call streaming and its result persisting. The converters now synthesize a placeholder `function_call_output`/`custom_tool_call_output` immediately after any unpaired `function_call`/`custom_tool_call`, symmetric to the existing orphan-output repair, so the model still sees the call and can recover instead of the whole request 400ing.
+- Fixed Anthropic-compatible reasoning endpoints losing prior-turn reasoning on continuation requests when they emit unsigned `thinking` blocks. `convertAnthropicMessages` treated unknown endpoints as signature-enforcing and demoted unsigned reasoning to `type: "text"`, which destabilized tool-call argument serialization on the next turn — the upstream symptom behind the `args?.ops?.map is not a function` crash reported against the `todo` tool. Official `api.anthropic.com` keeps the conservative text fallback; non-official `anthropic-messages` reasoning models now replay unsigned reasoning as native `type: "thinking"` ([#2005](https://github.com/can1357/oh-my-pi/issues/2005)).
+
+## [15.9.67] - 2026-06-06
+
+### Fixed
+
+- Fixed llama.cpp/OpenAI Responses parallel tool calls losing arguments when `function_call_arguments.done` events omit `output_index` and `item_id`, by routing those identifierless final-argument events through the open function calls in item order. ([#1970](https://github.com/can1357/oh-my-pi/issues/1970))
+- Fixed local Ollama (`openai-responses`) turns failing with HTTP 400 `invalid reasoning value: "minimal"` when a discovered model ran with `minimal` (or `xhigh`) thinking. Ollama's OpenAI-compatible `reasoning.effort` only accepts `high|medium|low|max|none`, so discovered reasoning-capable Ollama models now carry a `compat.reasoningEffortMap` remapping `minimal → low` and `xhigh → max`; non-reasoning models are left untouched.
+
+## [15.9.2] - 2026-06-05
+
+### Added
+
+- Added an AES-256-GCM auth-broker snapshot cache module and `RemoteAuthCredentialStoreOptions.onSnapshot` so broker clients can persist broker-sourced full snapshots without blocking startup on every run.
+- Added `Model.omitMaxOutputTokens` so providers (notably Ollama proxies fronting cloud catalogs) can suppress `max_output_tokens` (Responses) and `max_tokens`/`max_completion_tokens` (Completions) on the wire while still using the catalog `maxTokens` for local budgeting. Without it, `applyCommonResponsesSamplingParams` unconditionally sent the catalog cap and HTTP-400'd against upstream APIs whose true output limit was unknown to OMP. ([#1881](https://github.com/can1357/oh-my-pi/issues/1881))
+
+### Changed
+
+- Changed usage-ranked OAuth credential selection to pick deterministic session-sticky weighted buckets instead of always choosing the top-ranked account, capping the best account at 2x the baseline session likelihood while keeping equal-priority accounts evenly balanced.
+
+### Fixed
+
+- Fixed parallel `function_call` items on the OpenAI Responses API losing arguments on every call except the last when the upstream server interleaves their stream events (observed against llama.cpp and other local Responses-compat hosts). `processResponsesStream` no longer routes `function_call_arguments.{delta,done}`, `output_item.done`, content_part/text/refusal/reasoning events through a singleton `currentItem`/`currentBlock` reference; it now tracks every open item in registries keyed by `output_index` and `item_id` so each event is folded into the matching block and the emitted `toolcall_end` carries the correct `contentIndex`. ([#1880](https://github.com/can1357/oh-my-pi/issues/1880))
+
+## [15.9.1] - 2026-06-04
+
 ### Added
 
 - Added regional Xiaomi Token Plan login/provider entries (`xiaomi-token-plan-sgp`, `xiaomi-token-plan-ams`, `xiaomi-token-plan-cn`) so `omp login` can store token-plan keys against the selected region. ([#1846](https://github.com/can1357/oh-my-pi/issues/1846))
@@ -172,7 +820,6 @@
 ### Added
 
 - `SimpleStreamOptions.openrouterVariant` (`"nitro"`, `"floor"`, `"online"`, `"exacto"`, …) — when set, appends `:<variant>` to OpenRouter model IDs at request time, leaving ids that already carry an explicit `:suffix` untouched. Plumbed through `openai-completions` and the pi-native gateway forwarder.
-
 - xAI Grok OAuth (SuperGrok Subscription) provider in `/login`. Loopback PKCE flow on `127.0.0.1:56121`; the token unlocks Grok-4.x chat. Ported from NousResearch/hermes-agent (MIT).
 - OpenRouter provider in `/login`. API-key paste flow validated against `https://openrouter.ai/api/v1/auth/key` (the `/models` endpoint is public and cannot validate auth). The pasted key is stored under the existing `openrouter` provider id used by `OPENROUTER_API_KEY`.
 - `XAI_OAUTH_TOKEN` environment variable accepted as a headless fallback for the xAI Grok OAuth provider.
@@ -205,14 +852,11 @@
 - Added `PI_CODEX_WEBSOCKET_PING_INTERVAL_MS` to configure the interval for Codex WebSocket protocol ping heartbeats
 - Added `PI_CODEX_WEBSOCKET_PONG_TIMEOUT_MS` to configure the Codex WebSocket pong timeout used to detect unresponsive connections
 - Added `PI_CODEX_WEBSOCKET_MESSAGE_QUEUE_CAPACITY` to configure the maximum buffered Codex WebSocket inbound queue size before transport fallback
-- Added `parseStreamingJsonThrottled` to `@oh-my-pi/pi-ai/utils/json-parse` — a per-delta wrapper around `parseStreamingJson` that skips re-parses until the buffer has grown by `minGrowthBytes` (default 256). Wired into the streaming hot path of every provider's tool-call argument accumulator (`anthropic`, `amazon-bedrock`, `openai-completions`, `openai-codex-responses`, `openai-responses-shared`) so per-delta cost is O(N) in total buffer length instead of O(N²). Each provider's `toolcall_end` still runs a final unthrottled parse, so the published `block.arguments` is unchanged.
-- Added named-tool routing support to Google providers: `GoogleSharedStreamOptions.toolChoice` and `GoogleGeminiCliOptions.toolChoice` now accept `{ mode: "ANY"; allowedFunctionNames: [string, ...string[]] }` in addition to the string forms. `mapGoogleToolChoice` converts `ToolChoice` objects of shape `{ type: "tool" | "function", name }` to the wire form. Mirrors the equivalent Anthropic mapper.
 
 ### Changed
 
 - Improved Codex WebSocket timeout diagnostics to include last event type and time since last progress event
 - Enhanced Codex WebSocket error classification to recognize ping, pong, send, and queue-overflow failures as retryable
-- Changed `mapGoogleToolChoice` to be exported from `@oh-my-pi/pi-ai/stream` so callers can build the wire-shape allow-list directly without re-deriving it.
 
 ### Fixed
 
@@ -221,7 +865,6 @@
 - Fixed Codex WebSocket pong timeout detection by tracking pong events and failing the connection when no pong is received within the configured timeout
 - Fixed Anthropic streaming to suppress hallucinated meta-prompt thinking blocks (the recent "I don't see any current rewritten thinking..." regression). When the marker phrase `rewritten thinking` appears in a streamed thinking summary the block is collapsed to a plain `Thinking...` placeholder and its signature is dropped so subsequent turns can't re-anchor on the garbled chain.
 - Fixed Codex WebSocket silent stalls by adding protocol pings, inbound queue bounding, clearer idle-timeout diagnostics, and SDK retry clamping for first-event timeouts.
-- Fixed Synthetic model discovery to treat the provider `/models` response as authoritative so deprecated bundled IDs are pruned from the runtime cache, and changed Synthetic login validation to avoid probing a specific model ([#1417](https://github.com/can1357/oh-my-pi/issues/1417)).
 
 ## [15.5.0] - 2026-05-26
 
@@ -345,10 +988,6 @@
 
 - Added DeepSeek to the built-in API-key login provider catalog so `omp login deepseek` stores a reusable `DEEPSEEK_API_KEY` credential for the bundled DeepSeek models.
 
-### Fixed
-
-- Fixed `openai-responses` requests intermittently 400ing with `No tool call found for function call output with call_id …` after an aborted turn or a locally-rejected tool call (e.g. argument-validation failure). `convertConversationMessages` now folds orphan `function_call_output` / `custom_tool_call_output` items — those whose matching `function_call` was wiped by an earlier `dt: false` snapshot splice or never landed in any persisted provider payload — into assistant text notes, preserving the payload while keeping the request grammatically valid ([#1351](https://github.com/can1357/oh-my-pi/issues/1351)).
-
 ## [15.2.4] - 2026-05-22
 
 ### Fixed
@@ -401,7 +1040,6 @@
 ### Fixed
 
 - Fixed Anthropic fast mode (`serviceTier: "priority"`) looping on 429 `rate_limit_error: "Extra usage is required for fast mode."` for accounts without the extra-usage entitlement. `isAnthropicFastModeUnsupportedError` now matches the 429 phrasing in addition to the 400 `invalid_request_error` "does not support the `speed` parameter" case, so the provider drops `speed: "fast"` on the in-turn retry, sets `providerSessionState.fastModeDisabled` for the remainder of the session, and surfaces `disabledFeatures: ["priority"]` to the caller instead of retrying with the same payload until `PROVIDER_MAX_RETRIES` is exhausted.
-- Fixed MiniMax Coding Plan CN streaming `<think>...</think>` reasoning as visible assistant text. The OpenAI-compatible stream parser now enables the existing MiniMax tag parser for both `minimax-code` and `minimax-code-cn`, so CN responses become structured `thinking` blocks instead of raw text. ([#1203](https://github.com/can1357/oh-my-pi/issues/1203))
 
 ## [15.1.6] - 2026-05-19
 
@@ -418,7 +1056,6 @@
 
 ### Fixed
 
-- Fixed OpenCode-Go and OpenCode-Zen chat-completions replay to omit stored reasoning fields on Kimi assistant tool-call messages, avoiding provider 400s for rejected `messages[].reasoning` payloads. ([#1157](https://github.com/can1357/oh-my-pi/issues/1157))
 - Fixed OpenAI Responses and Codex tool schema normalization to emit `properties: {}` for no-argument object schemas without rewriting literal payloads. ([#1147](https://github.com/can1357/oh-my-pi/issues/1147))
 - Fixed Anthropic 400 (`unexpected tool_use_id found in tool_result blocks ... Each tool_result block must have a corresponding tool_use block in the previous message`) when handoff/compaction folds an assistant `tool_use` into the handoff summary string but leaves the matching user-side `tool_result` message in the history. `transformMessages` now indexes every `tool_use` id surviving the first pass and drops orphan `tool_result` messages whose originator was compacted away, preserving the text payload as a user-level `<stale-tool-result>` note so the model still sees what the tool returned. The note is emitted with `role: "user"` rather than `role: "developer"` so providers that elevate developer-role messages (Ollama: `developer` → `system`; OpenAI chat-completions reasoning models: `developer` → `developer`) cannot lift stale tool output to an instruction-priority tier above the surrounding user/developer messages.
 - Fixed streaming authentication retry to trigger when a provider emits a 401 `error` event after a `start` event but before any replay-unsafe content is emitted
@@ -607,11 +1244,6 @@
 
 - Fixed OAuth credentials being silently disabled when two omp processes (or any two `AuthStorage` instances sharing a `agent.db`) race on token refresh. Anthropic rotates refresh tokens on every use, so the loser's `invalid_grant` response previously soft-deleted the row that the winner just rotated, forcing the user to `/login` again. `#tryOAuthCredential` now re-reads the row from disk before declaring a definitive failure: if the persisted `refresh` differs from the snapshot it tried, the peer-rotated credential is reloaded and the request retries against the fresh token instead of disabling the live row.
 - Closed a remaining race window in OAuth refresh-failure handling: between re-reading the credential row to check for peer rotation and the subsequent soft-delete, another process could still complete a refresh and rotate the row, leaving us to disable the freshly-rotated credential by `id`. The disable now runs as a single CAS update conditioned on the row's `data` still matching the snapshot we tried to refresh, and on `disabled_cause IS NULL`. If the CAS reports 0 rows changed (peer rotation, or row already disabled by a concurrent failure on the same snapshot), we reload from disk and retry instead of mutating the wrong row or emitting a spurious `credential_disabled` event.
-- Lazy built-in provider streams now enforce the shared idle watchdog and abort stalled provider requests, so session auto-retry can continue after transient network drops instead of remaining stuck. Caller aborts still terminate as aborted.
-
-### Changed
-
-- Lowered the default steady-state stream idle timeout from 120s to 30s while preserving the existing environment overrides.
 
 ## [14.9.3] - 2026-05-10
 
@@ -624,7 +1256,6 @@
 ### Fixed
 
 - Fixed silent forwarding of image content (for example Python plot output rendered in the terminal) to models without vision support, which produced opaque 404 errors from upstream. Image blocks are now stripped and replaced with a `[image omitted: model does not support vision]` placeholder for non-vision models, including tool-result payloads ([#967](https://github.com/can1357/oh-my-pi/issues/967), [#968](https://github.com/can1357/oh-my-pi/issues/968)).
-
 - Added `AuthStorage` `onCredentialDisabled` callback (sync or async) so embedders can react when a credential is automatically disabled (e.g. OAuth refresh fails with `invalid_grant`) — useful for surfacing a banner or auto-launching a re-login flow instead of letting the credential silently disappear. Sync throws and async rejections are both caught and logged so a misbehaving subscriber cannot break the disable path.
 - Added Anthropic OAuth `account.uuid` and `account.email_address` extraction from the `/v1/oauth/token` exchange and refresh responses; both `AnthropicOAuthFlow.exchangeToken()` and `refreshAnthropicToken()` now populate `OAuthCredentials.{accountId, email}` so downstream consumers can attribute requests to the authenticated account without a separate `/api/oauth/profile` round-trip.
 - Added `onSseEvent` stream diagnostics so HTTP SSE providers can expose raw SSE frames without changing parsed model output.
@@ -642,7 +1273,6 @@
 
 - Fixed Gemini 3 Pro thinking metadata so `medium` effort is rejected with the expected error instead of being silently accepted: `ThinkingConfig` now carries an optional explicit `levels` list that survives `expandEffortRange`, letting non-contiguous supported sets (e.g. `[low, high]`) round-trip through enrichment.
 - Fixed Kimi Code OAuth expiry handling to refresh access tokens 5 minutes before server expiry, avoiding daily 401s from using tokens right up to the cutoff.
-- Fixed OpenAI Responses custom tool replay to preserve custom tool call item IDs with the `ctc_` prefix instead of rewriting them as `fc_` function-call IDs ([#977](https://github.com/can1357/oh-my-pi/issues/977)).
 
 ## [14.7.6] - 2026-05-07
 
@@ -906,7 +1536,6 @@
 - Fixed shell execution failure responses to preserve all result fields when sanitizing, preventing truncated metadata in stream results
 - Fixed context overflow detection to recognize `model_context_window_exceeded` from z.ai / GLM providers, preventing infinite retry loops when context window is exceeded ([#638](https://github.com/can1357/oh-my-pi/issues/638))
 - Fixed strict tool schema enforcement to preserve `additionalProperties: false` and required keys for reused nested object schemas, preventing invalid `todo_write` function schemas in Codex/OpenAI requests
-- Fixed GitHub Copilot reasoning regressions by preserving GPT-5.x / Claude 4.x reasoning controls instead of stripping them from requests ([#773](https://github.com/can1357/oh-my-pi/issues/773))
 
 ## [14.1.0] - 2026-04-11
 
@@ -969,7 +1598,6 @@
 - Fixed Gemini 2.5 Pro context window detection in GitHub Copilot model limits test
 - Fixed Claude Opus 4.6 context window detection in GitHub Copilot model limits test
 - Fixed Anthropic streaming to suppress transient SDK console errors for malformed SSE keep-alive frames so the TUI only shows surfaced provider errors
-
 - Added environment-based credential fallback for the OpenAI Codex provider.
 
 ## [13.17.6] - 2026-04-01
@@ -1347,8 +1975,6 @@
 - Fixed OpenAI Codex streaming to properly include service_tier in SSE payloads
 - Fixed type safety in OpenAI responses by removing unsafe type casts on image content blocks
 - Fixed credential purging to respect disabled credentials when deduplicating by email
-- Fixed API-key provider re-login to replace the active stored key instead of appending stale credentials that were still selected first
-- Fixed Kagi login guidance to use the correct `KG_...` key format and mention Search API beta access requirements
 
 ## [13.9.2] - 2026-03-05
 
@@ -1373,7 +1999,7 @@
 - Removed `THINKING_LEVELS`, `ALL_THINKING_LEVELS`, `ALL_THINKING_MODES`, `THINKING_MODE_DESCRIPTIONS`, and `THINKING_MODE_LABELS` exports
 - Renamed `formatThinking()` to `getThinkingMetadata()` with changed return type from string to `ThinkingMetadata` object
 - Renamed `getAvailableThinkingLevel()` to `getAvailableThinkingLevels()` and added default parameter
-- Renamed `getAvailableEffort()` to `getAvailableEfforts()` and added default parameter
+- Renamed `getAvailableThinkingEffort()` to `getAvailableThinkingEfforts()` and added default parameter
 
 ### Added
 
@@ -1383,17 +2009,17 @@
 
 ### Added
 
-- Exported new thinking module with `Effort`, `ThinkingLevel`, and `ThinkingMode` types for managing reasoning effort levels
-- Added `getAvailableEffort()` function to determine supported thinking effort levels based on model capabilities
-- Added `parseEffort()`, `parseThinkingLevel()`, and `parseThinkingMode()` functions for parsing thinking configuration strings
+- Exported new thinking module with `ThinkingEffort`, `ThinkingLevel`, and `ThinkingMode` types for managing reasoning effort levels
+- Added `getAvailableThinkingEffort()` function to determine supported thinking effort levels based on model capabilities
+- Added `parseThinkingEffort()`, `parseThinkingLevel()`, and `parseThinkingMode()` functions for parsing thinking configuration strings
 - Added `THINKING_LEVELS`, `ALL_THINKING_LEVELS`, and `ALL_THINKING_MODES` constants for iterating over available thinking options
 - Added `THINKING_MODE_DESCRIPTIONS` and `THINKING_MODE_LABELS` for displaying thinking modes in user interfaces
 - Added `formatThinking()` function to format thinking modes as compact display labels
 
 ### Changed
 
-- Refactored thinking level handling to distinguish between `Effort` (provider-level, no "off") and `ThinkingLevel` (user-facing, includes "off")
-- Updated `ThinkingBudgets` type to use `Effort` instead of `ThinkingLevel` for more precise token budget configuration
+- Refactored thinking level handling to distinguish between `ThinkingEffort` (provider-level, no "off") and `ThinkingLevel` (user-facing, includes "off")
+- Updated `ThinkingBudgets` type to use `ThinkingEffort` instead of `ThinkingLevel` for more precise token budget configuration
 - Improved reasoning option handling to explicitly support "off" value for disabling reasoning across all providers
 - Simplified thinking effort mapping logic by centralizing provider-specific clamping behavior
 
@@ -2184,7 +2810,7 @@
 
 ### Changed
 
-- Replaced direct `Bun.env` access with `getEnv()` utility from `@oh-my-pi/pi-utils` for consistent environment variable handling across all providers
+- Replaced direct `process.env` access with `getEnv()` utility from `@oh-my-pi/pi-utils` for consistent environment variable handling across all providers
 - Updated environment variable names from `OMP_*` prefix to `PI_*` prefix for consistency (e.g., `OMP_CODING_AGENT_DIR` → `PI_CODING_AGENT_DIR`)
 
 ### Removed
@@ -2211,13 +2837,13 @@
 
 ### Added
 
-- Added `getEnv()` function to retrieve environment variables from Bun.env, cwd/.env, or ~/.env
+- Added `getEnv()` function to retrieve environment variables from process.env, cwd/.env, or ~/.env
 - Added support for reading .env files from home directory and current working directory
 - Added support for `exa` and `perplexity` as known providers in `getEnvApiKey()`
 
 ### Changed
 
-- Changed `getEnvApiKey()` to check Bun.env, cwd/.env, and ~/.env files in order of precedence
+- Changed `getEnvApiKey()` to check process.env, cwd/.env, and ~/.env files in order of precedence
 - Refactored provider API key resolution to use a declarative service provider map
 
 ## [9.2.2] - 2026-01-31
@@ -2423,7 +3049,7 @@
 - Replaced custom sleep implementations with Bun.sleep and abortableSleep
 - Simplified SSE stream parsing using readLines utility
 - Updated test framework from vitest to bun:test
-- Replaced temp directory creation with TempDir API
+- Replaced temp directory creation with createTempDirSync utility
 - Changed credential storage from auth.json to ~/.omp/agent/agent.db
 - Changed CLI command examples from npx to bunx
 - Refactored OAuth flows to use common callback server base class
@@ -2466,8 +3092,8 @@
 
 ### Changed
 
-- Updated environment variable prefix from PI* to OMP* for better consistency
-- Added automatic migration for legacy PI* environment variables to OMP* equivalents
+- Updated environment variable prefix from PI_ to OMP_ for better consistency
+- Added automatic migration for legacy PI_ environment variables to OMP_ equivalents
 - Adjusted Bedrock Claude thinking budgets to reserve output tokens when maxTokens is too low
 
 ### Fixed
@@ -2584,7 +3210,7 @@
 
 - Changed Cursor debug logging to use structured JSONL format with automatic MCP argument decoding
 - Changed MCP tool argument decoding to use protobuf Value schema for improved type handling
-- Changed tool advertisement to filter Cursor native tools (bash, read, write, delete, ls, grep, lsp) instead of only exposing mcp\_ prefixed tools
+- Changed tool advertisement to filter Cursor native tools (bash, read, write, delete, ls, grep, lsp) instead of only exposing mcp_ prefixed tools
 
 ### Fixed
 
@@ -2666,6 +3292,222 @@
 ### Added
 
 - Enhanced error messages to include retry-after timing information from API rate limit headers
+
+## [3.20.0] - 2026-01-06
+
+### Added
+
+- Added support for kwaipilot/kat-coder-pro model via OpenRouter
+- Added OpenAI Codex responses provider with OAuth login support for ChatGPT Plus/Pro accounts
+- Added Google Vertex AI provider (Gemini via Vertex) with Application Default Credentials support
+
+### Changed
+
+- Updated model specifications including context windows, max tokens, and pricing for multiple OpenRouter models
+
+### Removed
+
+- Removed alibaba/tongyi-deepresearch-30b-a3b:free model from OpenRouter
+- Removed nousresearch/hermes-4-405b model from OpenRouter
+- Removed tngtech/tng-r1t-chimera:free model from OpenRouter
+
+## [3.15.0] - 2026-01-05
+
+### Changed
+
+- Made `isError` field optional in `ToolResultMessage` interface, defaulting to non-error state
+
+## [3.5.1337] - 2026-01-03
+
+### Added
+
+- Added localhost URL detection for OpenAI-compatible provider auto-configuration
+
+## [1.337.1] - 2026-01-02
+
+### Changed
+
+- Forked to @oh-my-pi scope with unified versioning across all packages
+
+### Fixed
+
+- **Gemini CLI rate limit handling**: Added automatic retry with server-provided delay for 429 errors
+
+## [1.337.0] - 2026-01-02
+
+Initial release under @oh-my-pi scope. See previous releases at [badlogic/pi-mono](https://github.com/badlogic/pi-mono).
+
+## [0.50.1] - 2026-01-26
+
+### Fixed
+
+- Fixed OpenCode Zen model generation to exclude deprecated models ([#970](https://github.com/badlogic/pi-mono/pull/970) by [@DanielTatarkin](https://github.com/DanielTatarkin))
+
+## [0.50.0] - 2026-01-26
+
+### Added
+
+- Added OpenRouter provider routing support for custom models via `openRouterRouting` compat field ([#859](https://github.com/badlogic/pi-mono/pull/859) by [@v01dpr1mr0s3](https://github.com/v01dpr1mr0s3))
+- Added `azure-openai-responses` provider support for Azure OpenAI Responses API. ([#890](https://github.com/badlogic/pi-mono/pull/890) by [@markusylisiurunen](https://github.com/markusylisiurunen))
+- Added HTTP proxy environment variable support for API requests ([#942](https://github.com/badlogic/pi-mono/pull/942) by [@haoqixu](https://github.com/haoqixu))
+- Added `createAssistantMessageEventStream()` factory function for use in extensions.
+- Added `resetApiProviders()` to clear and re-register built-in API providers.
+
+### Changed
+
+- Refactored API streaming dispatch to use an API registry with provider-owned `streamSimple` mapping.
+- Moved environment API key resolution to `env-api-keys.ts` and re-exported it from the package entrypoint.
+- Azure OpenAI Responses provider now uses base URL configuration with deployment-aware model mapping and no longer includes service tier handling.
+
+### Fixed
+
+- Fixed Bun runtime detection for dynamic imports in browser-compatible modules (stream.ts, openai-codex-responses.ts, openai-codex.ts) ([#922](https://github.com/badlogic/pi-mono/pull/922) by [@dannote](https://github.com/dannote))
+- Fixed streaming functions to use `model.api` instead of hardcoded API types
+- Fixed Google providers to default tool call arguments to an empty object when omitted
+- Fixed OpenAI Responses streaming to handle `arguments.done` events on OpenAI-compatible endpoints ([#917](https://github.com/badlogic/pi-mono/pull/917) by [@williballenthin](https://github.com/williballenthin))
+- Fixed OpenAI Codex Responses tool strictness handling after the shared responses refactor
+- Fixed Azure OpenAI Responses streaming to guard deltas before content parts and correct metadata and handoff gating
+- Fixed OpenAI completions tool-result image batching after consecutive tool results ([#902](https://github.com/badlogic/pi-mono/pull/902) by [@terrorobe](https://github.com/terrorobe))
+
+## [0.49.3] - 2026-01-22
+
+### Added
+
+- Added `headers` option to `StreamOptions` for custom HTTP headers in API requests. Supported by all providers except Amazon Bedrock (which uses AWS SDK auth). Headers are merged with provider defaults and `model.headers`, with `options.headers` taking precedence.
+- Added `originator` option to `loginOpenAICodex()` for custom OAuth client identification
+- Browser compatibility for pi-ai: replaced top-level Node.js imports with dynamic imports for browser environments ([#873](https://github.com/badlogic/pi-mono/issues/873))
+
+### Fixed
+
+- Fixed OpenAI Responses API 400 error "function_call without required reasoning item" when switching between models (same provider, different model). The fix omits the `id` field for function_calls from different models to avoid triggering OpenAI's reasoning/function_call pairing validation ([#886](https://github.com/badlogic/pi-mono/issues/886))
+
+## [0.49.2] - 2026-01-19
+
+### Added
+
+- Added AWS credential detection for ECS/Kubernetes environments: `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, `AWS_CONTAINER_CREDENTIALS_FULL_URI`, `AWS_WEB_IDENTITY_TOKEN_FILE` ([#848](https://github.com/badlogic/pi-mono/issues/848))
+
+### Fixed
+
+- Fixed OpenAI Responses 400 error "reasoning without following item" by skipping errored/aborted assistant messages entirely in transform-messages.ts ([#838](https://github.com/badlogic/pi-mono/pull/838))
+
+### Removed
+
+- Removed `strictResponsesPairing` compat option (no longer needed after the transform-messages fix)
+
+## [0.49.1] - 2026-01-18
+
+### Added
+
+- Added `OpenAIResponsesCompat` interface with `strictResponsesPairing` option for Azure OpenAI Responses API, which requires strict reasoning/message pairing in history replay ([#768](https://github.com/badlogic/pi-mono/pull/768) by [@nicobako](https://github.com/nicobako))
+
+### Changed
+
+- Split `OpenAICompat` into `OpenAICompletionsCompat` and `OpenAIResponsesCompat` for type-safe API-specific compat settings
+
+### Fixed
+
+- Fixed tool call ID normalization for cross-provider handoffs (e.g., Codex to Antigravity Claude) ([#821](https://github.com/badlogic/pi-mono/issues/821))
+
+## [0.49.0] - 2026-01-17
+
+### Changed
+
+- OpenAI Codex responses now use the context system prompt directly in the instructions field.
+
+### Fixed
+
+- Fixed orphaned tool results after errored assistant messages causing Codex API errors. When an assistant message has `stopReason: "error"`, its tool calls are now excluded from pending tool tracking, preventing synthetic tool results from being generated for calls that will be dropped by provider-specific converters. ([#812](https://github.com/badlogic/pi-mono/issues/812))
+- Fixed Bedrock Claude max_tokens handling to always exceed thinking budget tokens, preventing compaction failures. ([#797](https://github.com/badlogic/pi-mono/pull/797) by [@pjtf93](https://github.com/pjtf93))
+- Fixed Claude Code tool name normalization to match the Claude Code tool list case-insensitively and remove invalid mappings.
+
+## [0.48.0] - 2026-01-16
+
+### Fixed
+
+- Fixed OpenAI-compatible provider feature detection to use `model.provider` in addition to URL, allowing custom base URLs (e.g., proxies) to work correctly with provider-specific settings ([#774](https://github.com/badlogic/pi-mono/issues/774))
+- Fixed Gemini 3 context loss when switching from providers without thought signatures: unsigned tool calls are now converted to text with anti-mimicry notes instead of being skipped
+- Fixed string numbers in tool arguments not being coerced to numbers during validation ([#786](https://github.com/badlogic/pi-mono/pull/786) by [@dannote](https://github.com/dannote))
+- Fixed Bedrock tool call IDs to use only alphanumeric characters, avoiding API errors from invalid characters ([#781](https://github.com/badlogic/pi-mono/pull/781) by [@pjtf93](https://github.com/pjtf93))
+- Fixed empty error assistant messages (from 429/500 errors) breaking the tool_use to tool_result chain by filtering them in `transformMessages`
+
+## [0.47.0] - 2026-01-16
+
+### Fixed
+
+- Fixed OpenCode provider's `/v1` endpoint to use `system` role instead of `developer` role, fixing `400 Incorrect role information` error for models using `openai-completions` API ([#755](https://github.com/badlogic/pi-mono/pull/755) by [@melihmucuk](https://github.com/melihmucuk))
+- Added retry logic to OpenAI Codex provider for transient errors (429, 5xx, connection failures). Uses exponential backoff with up to 3 retries. ([#733](https://github.com/badlogic/pi-mono/issues/733))
+
+## [0.46.0] - 2026-01-15
+
+### Added
+
+- Added MiniMax China (`minimax-cn`) provider support ([#725](https://github.com/badlogic/pi-mono/pull/725) by [@tallshort](https://github.com/tallshort))
+- Added `gpt-5.2-codex` models for GitHub Copilot and OpenCode Zen providers ([#734](https://github.com/badlogic/pi-mono/pull/734) by [@aadishv](https://github.com/aadishv))
+
+### Fixed
+
+- Avoid unsigned Gemini 3 tool calls ([#741](https://github.com/badlogic/pi-mono/pull/741) by [@roshanasingh4](https://github.com/roshanasingh4))
+- Fixed signature support for non-Anthropic models in Amazon Bedrock provider ([#727](https://github.com/badlogic/pi-mono/pull/727) by [@unexge](https://github.com/unexge))
+
+## [0.45.7] - 2026-01-13
+
+### Fixed
+
+- Fixed OpenAI Responses timeout option handling ([#706](https://github.com/badlogic/pi-mono/pull/706) by [@markusylisiurunen](https://github.com/markusylisiurunen))
+- Fixed Bedrock tool call conversion to apply message transforms ([#707](https://github.com/badlogic/pi-mono/pull/707) by [@pjtf93](https://github.com/pjtf93))
+
+## [0.45.6] - 2026-01-13
+
+### Fixed
+
+- Export `parseStreamingJson` from main package for tsx dev mode compatibility
+
+## [0.45.4] - 2026-01-13
+
+### Added
+
+- Added Vercel AI Gateway provider with model discovery and `AI_GATEWAY_API_KEY` env support ([#689](https://github.com/badlogic/pi-mono/pull/689) by [@timolins](https://github.com/timolins))
+
+### Fixed
+
+- Fixed z.ai thinking/reasoning: z.ai uses `thinking: { type: "enabled" }` instead of OpenAI's `reasoning_effort`. Added `thinkingFormat` compat flag to handle this. ([#688](https://github.com/badlogic/pi-mono/issues/688))
+
+## [0.45.0] - 2026-01-13
+
+### Added
+
+- MiniMax provider support with M2 and M2.1 models via Anthropic-compatible API ([#656](https://github.com/badlogic/pi-mono/pull/656) by [@dannote](https://github.com/dannote))
+- Add Amazon Bedrock provider with prompt caching for Claude models (experimental, tested with Anthropic Claude models only) ([#494](https://github.com/badlogic/pi-mono/pull/494) by [@unexge](https://github.com/unexge))
+- Added `serviceTier` option for OpenAI Responses requests ([#672](https://github.com/badlogic/pi-mono/pull/672) by [@markusylisiurunen](https://github.com/markusylisiurunen))
+- **Anthropic caching on OpenRouter**: Interactions with Anthropic models via OpenRouter now set a 5-minute cache point using Anthropic-style `cache_control` breakpoints on the last assistant or user message. ([#584](https://github.com/badlogic/pi-mono/pull/584) by [@nathyong](https://github.com/nathyong))
+- **Google Gemini CLI provider improvements**: Added Antigravity endpoint fallback (tries daily sandbox then prod when `baseUrl` is unset), header-based retry delay parsing (`Retry-After`, `x-ratelimit-reset`, `x-ratelimit-reset-after`), stable `sessionId` derivation from first user message for cache affinity, empty SSE stream retry with backoff, and `anthropic-beta` header for Claude thinking models ([#670](https://github.com/badlogic/pi-mono/pull/670) by [@kim0](https://github.com/kim0))
+
+## [0.43.0] - 2026-01-11
+
+### Fixed
+
+- Fixed Google provider thinking detection: `isThinkingPart()` now only checks `thought === true`, not `thoughtSignature`. Per Google docs, `thoughtSignature` is for context replay and can appear on any part type. Also removed `id` field from `functionCall`/`functionResponse` (rejected by Vertex AI and Cloud Code Assist), and added `textSignature` round-trip for multi-turn reasoning context. ([#631](https://github.com/badlogic/pi-mono/pull/631) by [@theBucky](https://github.com/theBucky))
+
+## [0.42.3] - 2026-01-10
+
+### Changed
+
+- OpenAI Codex: switched to bundled system prompt matching opencode, changed originator to "pi", simplified prompt handling
+
+## [0.42.2] - 2026-01-10
+
+### Added
+
+- Added `GOOGLE_APPLICATION_CREDENTIALS` env var support for Vertex AI credential detection (standard for CI/production).
+- Added `supportsUsageInStreaming` compatibility flag for OpenAI-compatible providers that reject `stream_options: { include_usage: true }`. Defaults to `true`. Set to `false` in model config for providers like gatewayz.ai. ([#596](https://github.com/badlogic/pi-mono/pull/596) by [@XesGaDeus](https://github.com/XesGaDeus))
+- Improved Google model pricing info ([#588](https://github.com/badlogic/pi-mono/pull/588) by [@aadishv](https://github.com/aadishv))
+
+### Fixed
+
+- Fixed `os.homedir()` calls at module load time; now resolved lazily when needed.
+- Fixed OpenAI Responses tool strict flag to use a boolean for LM Studio compatibility ([#598](https://github.com/badlogic/pi-mono/pull/598) by [@gnattu](https://github.com/gnattu))
+- Fixed Google Cloud Code Assist OAuth for paid subscriptions: properly handles long-running operations for project provisioning, supports `GOOGLE_CLOUD_PROJECT` / `GOOGLE_CLOUD_PROJECT_ID` env vars for paid tiers, and handles VPC-SC affected users ([#582](https://github.com/badlogic/pi-mono/pull/582) by [@cmf](https://github.com/cmf))
 
 ## [0.42.0] - 2026-01-09
 
@@ -2760,7 +3602,7 @@
 
 ### Breaking Changes
 
-- **Agent API moved**: All agent functionality (`agentLoop`, `agentLoopContinue`, `AgentContext`, `AgentEvent`, `AgentTool`, `AgentToolResult`, etc.) has moved to `@mariozechner/pi-agent-core`. Import from that package instead of `@oh-my-pi/pi-ai`.
+- **Agent API moved**: All agent functionality (`agentLoop`, `agentLoopContinue`, `AgentContext`, `AgentEvent`, `AgentTool`, `AgentToolResult`, etc.) has moved to `@oh-my-pi/pi-agent-core`. Import from that package instead of `@oh-my-pi/pi-ai`.
 
 ### Added
 
@@ -2776,7 +3618,6 @@
 ### Fixed
 
 - **OpenAI completions empty content blocks**: Empty text or thinking blocks in assistant messages are now filtered out before sending to the OpenAI completions API, preventing validation errors. ([#344](https://github.com/badlogic/pi-mono/pull/344) by [@default-anton](https://github.com/default-anton))
-- **Thinking token duplication**: Fixed thinking content duplication with chutes.ai provider. The provider was returning thinking content in both `reasoning_content` and `reasoning` fields, causing each chunk to be processed twice. Now only the first non-empty reasoning field is used.
 - **zAi provider API mapping**: Fixed zAi models to use `openai-completions` API with correct base URL (`https://api.z.ai/api/coding/paas/v4`) instead of incorrect Anthropic API mapping. ([#344](https://github.com/badlogic/pi-mono/pull/344), [#358](https://github.com/badlogic/pi-mono/pull/358) by [@default-anton](https://github.com/default-anton))
 
 ## [0.28.0] - 2025-12-25
@@ -2806,11 +3647,8 @@
 ### Fixed
 
 - **Gemini multimodal tool results**: Fixed images in tool results causing flaky/broken responses with Gemini models. For Gemini 3, images are now nested inside `functionResponse.parts` per the [docs](https://ai.google.dev/gemini-api/docs/function-calling#multimodal). For older models (which don't support multimodal function responses), images are sent in a separate user message.
-
 - **Queued message steering**: When `getQueuedMessages` is provided, the agent loop now checks for queued user messages after each tool call and skips remaining tool calls in the current assistant message when a queued message arrives (emitting error tool results).
-
 - **Double API version path in Google provider URL**: Fixed Gemini API calls returning 404 after baseUrl support was added. The SDK was appending its default apiVersion to baseUrl which already included the version path. ([#251](https://github.com/badlogic/pi-mono/pull/251) by [@shellfyred](https://github.com/shellfyred))
-
 - **Anthropic SDK retries disabled**: Re-enabled SDK-level retries (default 2) for transient HTTP failures. ([#252](https://github.com/badlogic/pi-mono/issues/252))
 
 ## [0.23.5] - 2025-12-19
@@ -2818,17 +3656,13 @@
 ### Added
 
 - **Gemini 3 Flash thinking support**: Extended thinking level support for Gemini 3 Flash models (MINIMAL, LOW, MEDIUM, HIGH) to match Pro models' capabilities. ([#212](https://github.com/badlogic/pi-mono/pull/212) by [@markusylisiurunen](https://github.com/markusylisiurunen))
-
 - **GitHub Copilot thinking models**: Added thinking support for additional Copilot models (o3-mini, o1-mini, o1-preview). ([#234](https://github.com/badlogic/pi-mono/pull/234) by [@aadishv](https://github.com/aadishv))
 
 ### Fixed
 
 - **Gemini tool result format**: Fixed tool result format for Gemini 3 Flash Preview which strictly requires `{ output: value }` for success and `{ error: value }` for errors. Previous format using `{ result, isError }` was rejected by newer Gemini models. Also improved type safety by removing `as any` casts. ([#213](https://github.com/badlogic/pi-mono/issues/213), [#220](https://github.com/badlogic/pi-mono/pull/220))
-
 - **Google baseUrl configuration**: Google provider now respects `baseUrl` configuration for custom endpoints or API proxies. ([#216](https://github.com/badlogic/pi-mono/issues/216), [#221](https://github.com/badlogic/pi-mono/pull/221) by [@theBucky](https://github.com/theBucky))
-
 - **GitHub Copilot vision requests**: Added `Copilot-Vision-Request` header when sending images to GitHub Copilot models. ([#222](https://github.com/badlogic/pi-mono/issues/222))
-
 - **GitHub Copilot X-Initiator header**: Fixed X-Initiator logic to check last message role instead of any message in history. This ensures proper billing when users send follow-up messages. ([#209](https://github.com/badlogic/pi-mono/issues/209))
 
 ## [0.22.3] - 2025-12-16
@@ -2836,9 +3670,7 @@
 ### Added
 
 - **Image limits test suite**: Added comprehensive tests for provider-specific image limitations (max images, max size, max dimensions). Discovered actual limits: Anthropic (100 images, 5MB, 8000px), OpenAI (500 images, ≥25MB), Gemini (~2500 images, ≥40MB), Mistral (8 images, ~15MB), OpenRouter (~40 images context-limited, ~15MB). ([#120](https://github.com/badlogic/pi-mono/pull/120))
-
 - **Tool result streaming**: Added `tool_execution_update` event and optional `onUpdate` callback to `AgentTool.execute()` for streaming tool output during execution. Tools can now emit partial results (e.g., bash stdout) that are forwarded to subscribers. ([#44](https://github.com/badlogic/pi-mono/issues/44))
-
 - **X-Initiator header for GitHub Copilot**: Added X-Initiator header handling for GitHub Copilot provider to ensure correct call accounting (agent calls are not deducted from quota). Sets initiator based on last message role. ([#200](https://github.com/badlogic/pi-mono/pull/200) by [@kim0](https://github.com/kim0))
 
 ### Changed
@@ -2872,9 +3704,7 @@ _Dedicated to Peter's shoulder ([@steipete](https://twitter.com/steipete))_
 ### Fixed
 
 - **GitHub Copilot gpt-5 models**: Fixed API selection for gpt-5 models to use `openai-responses` instead of `openai-completions` (gpt-5 models are not accessible via completions endpoint)
-
 - **GitHub Copilot cross-model context handoff**: Fixed context handoff failing when switching between GitHub Copilot models using different APIs (e.g., gpt-5 to claude-sonnet-4). Tool call IDs from OpenAI Responses API were incompatible with other models. ([#198](https://github.com/badlogic/pi-mono/issues/198))
-
 - **Gemini 3 Pro thinking levels**: Thinking level configuration now works correctly for Gemini 3 Pro models. Previously all levels mapped to -1 (minimal thinking). Now LOW/MEDIUM/HIGH properly control test-time computation. ([#176](https://github.com/badlogic/pi-mono/pull/176) by [@markusylisiurunen](https://github.com/markusylisiurunen))
 
 ## [0.18.2] - 2025-12-11
@@ -2892,9 +3722,7 @@ _Dedicated to Peter's shoulder ([@steipete](https://twitter.com/steipete))_
 ### Fixed
 
 - Fixed Mistral 400 errors after aborted assistant messages by skipping empty assistant messages (no content, no tool calls) ([#165](https://github.com/badlogic/pi-mono/issues/165))
-
 - Removed synthetic assistant bridge message after tool results for Mistral (no longer required as of Dec 2025) ([#165](https://github.com/badlogic/pi-mono/issues/165))
-
 - Fixed bug where `ANTHROPIC_API_KEY` environment variable was deleted globally after first OAuth token usage, causing subsequent prompts to fail ([#164](https://github.com/badlogic/pi-mono/pull/164))
 
 ## [0.17.0] - 2025-12-09
@@ -2903,9 +3731,7 @@ _Dedicated to Peter's shoulder ([@steipete](https://twitter.com/steipete))_
 
 - **`agentLoopContinue` function**: Continue an agent loop from existing context without adding a new user message. Validates that the last message is `user` or `toolResult`. Useful for retry after context overflow or resuming from manually-added tool results.
 - Added `validateToolCall(tools, toolCall)` helper that finds the tool by name and validates arguments.
-
 - **OpenAI compatibility overrides**: Added `compat` field to `Model` for `openai-completions` API, allowing explicit configuration of provider quirks (`supportsStore`, `supportsDeveloperRole`, `supportsReasoningEffort`, `maxTokensField`). Falls back to URL-based detection if not set. Useful for LiteLLM, custom proxies, and other non-standard endpoints. ([#133](https://github.com/badlogic/pi-mono/issues/133), thanks @fink-andreas for the initial idea and PR)
-
 - **xhigh reasoning level**: Added `xhigh` to `ReasoningEffort` type for OpenAI codex-max models. For non-OpenAI providers (Anthropic, Google), `xhigh` is automatically mapped to `high`. ([#143](https://github.com/badlogic/pi-mono/issues/143))
 
 ### Breaking Changes
@@ -2931,7 +3757,6 @@ _Dedicated to Peter's shoulder ([@steipete](https://twitter.com/steipete))_
 ### Fixed
 
 - **OpenAI Token Counting**: Fixed `usage.input` to exclude cached tokens for OpenAI providers. Previously, `input` included cached tokens, causing double-counting when calculating total context size via `input + cacheRead`. Now `input` represents non-cached input tokens across all providers, making `input + output + cacheRead + cacheWrite` the correct formula for total context size.
-
 - **Fixed Claude Opus 4.5 cache pricing** (was 3x too expensive)
   - Corrected cache_read: $1.50 → $0.50 per MTok
   - Corrected cache_write: $18.75 → $6.25 per MTok

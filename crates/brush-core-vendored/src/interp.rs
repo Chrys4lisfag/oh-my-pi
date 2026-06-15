@@ -380,10 +380,10 @@ async fn spawn_async_ao_list_as_job<'a, SE: extensions::ShellExtensions>(
 		async_params.set_fd(openfiles::OpenFiles::STDIN_FD, null);
 	}
 
-	let job = if should_try_spawn_pipeline_as_job(ao_list, shell, &async_params).await? {
-		match try_spawn_pipeline_as_job(&ao_list.first, ao_list.to_string(), shell, &async_params)
-			.await?
-		{
+	let direct_pipeline =
+		background_process_pipeline_for_async_job(ao_list, shell, &async_params).await?;
+	let job = if let Some(pipeline) = direct_pipeline {
+		match try_spawn_pipeline_as_job(&pipeline, ao_list.to_string(), shell, &async_params).await? {
 			Some(job) => job,
 			None => spawn_async_ao_list_in_task(ao_list, shell, &async_params),
 		}
@@ -394,47 +394,98 @@ async fn spawn_async_ao_list_as_job<'a, SE: extensions::ShellExtensions>(
 	Ok(shell.jobs_mut().add_as_current(job))
 }
 
-async fn should_try_spawn_pipeline_as_job<SE: extensions::ShellExtensions>(
+enum BackgroundProcessPipeline {
+	Direct,
+	Wrapper(ast::Pipeline),
+	Internal,
+}
+
+async fn background_process_pipeline_for_async_job<SE: extensions::ShellExtensions>(
 	ao_list: &ast::AndOrList,
 	shell: &mut Shell<SE>,
 	params: &ExecutionParameters,
-) -> Result<bool, error::Error> {
+) -> Result<Option<ast::Pipeline>, error::Error> {
 	if !ao_list.additional.is_empty() {
-		return Ok(false);
+		return Ok(None);
 	}
 
-	let pipeline = &ao_list.first;
+	let mut pipeline = ao_list.first.clone();
+	for _ in 0..8 {
+		match classify_background_process_pipeline(&pipeline, shell, params).await? {
+			BackgroundProcessPipeline::Direct => return Ok(Some(pipeline)),
+			BackgroundProcessPipeline::Wrapper(unwrapped) => pipeline = unwrapped,
+			BackgroundProcessPipeline::Internal => return Ok(None),
+		}
+	}
+
+	Ok(None)
+}
+
+async fn classify_background_process_pipeline<SE: extensions::ShellExtensions>(
+	pipeline: &ast::Pipeline,
+	shell: &mut Shell<SE>,
+	params: &ExecutionParameters,
+) -> Result<BackgroundProcessPipeline, error::Error> {
 	if pipeline.bang {
-		return Ok(false);
+		return Ok(BackgroundProcessPipeline::Internal);
 	}
 
 	let [ast::Command::Simple(simple_cmd)] = pipeline.seq.as_slice() else {
-		return Ok(false);
+		return Ok(BackgroundProcessPipeline::Internal);
 	};
 	let Some(command_word) = simple_cmd.word_or_name.as_ref() else {
-		return Ok(false);
+		return Ok(BackgroundProcessPipeline::Internal);
 	};
 
 	let expanded = expansion::full_expand_and_split_word(shell, params, command_word).await?;
 	let [command_name] = expanded.as_slice() else {
-		return Ok(false);
+		return Ok(BackgroundProcessPipeline::Internal);
 	};
 
 	if shell.aliases().contains_key(command_name) {
-		return Ok(false);
+		return Ok(BackgroundProcessPipeline::Internal);
 	}
-	if shell
-		.builtins()
-		.get(command_name.as_str())
-		.is_some_and(|registration| !registration.disabled)
+	if let Some(registration) = shell.builtins().get(command_name.as_str())
+		&& !registration.disabled
 	{
-		return Ok(false);
+		return if registration.transparent_background_wrapper {
+			Ok(unwrap_transparent_background_wrapper(pipeline)
+				.map_or(BackgroundProcessPipeline::Internal, BackgroundProcessPipeline::Wrapper))
+		} else {
+			Ok(BackgroundProcessPipeline::Internal)
+		};
 	}
 	if shell.funcs().get(command_name.as_str()).is_some() {
-		return Ok(false);
+		return Ok(BackgroundProcessPipeline::Internal);
 	}
 
-	Ok(true)
+	Ok(BackgroundProcessPipeline::Direct)
+}
+
+fn unwrap_transparent_background_wrapper(pipeline: &ast::Pipeline) -> Option<ast::Pipeline> {
+	let [ast::Command::Simple(simple_cmd)] = pipeline.seq.as_slice() else {
+		return None;
+	};
+	let mut unwrapped = simple_cmd.clone();
+	let suffix = unwrapped.suffix.as_mut()?;
+	let operand_index = suffix
+		.0
+		.iter()
+		.position(|item| matches!(item, CommandPrefixOrSuffixItem::Word(_)))?;
+	let CommandPrefixOrSuffixItem::Word(operand_word) = suffix.0.remove(operand_index) else {
+		return None;
+	};
+
+	unwrapped.word_or_name = Some(operand_word);
+	if suffix.0.is_empty() {
+		unwrapped.suffix = None;
+	}
+
+	Some(ast::Pipeline {
+		timed: pipeline.timed.clone(),
+		bang: pipeline.bang,
+		seq: vec![ast::Command::Simple(unwrapped)],
+	})
 }
 
 async fn try_spawn_pipeline_as_job<SE: extensions::ShellExtensions>(
@@ -1766,7 +1817,7 @@ async fn apply_assignment(
 						existing_value.assign_at_index(array_index, s, assignment.append)?;
 					},
 					ShellValueLiteral::Array(_) => {
-						return error::unimp("replacing an array item with an array");
+						return Err(error::ErrorKind::AssigningListToArrayMember.into());
 					},
 				}
 			} else {
@@ -1796,7 +1847,7 @@ async fn apply_assignment(
 				ShellValue::indexed_array_from_literals(ArrayLiteral(vec![(Some(array_index), s)]))
 			},
 			ShellValueLiteral::Array(_) => {
-				return error::unimp("cannot assign list to array member");
+				return Err(error::ErrorKind::AssigningListToArrayMember.into());
 			},
 		}
 	} else {
@@ -1917,7 +1968,10 @@ pub(crate) async fn setup_redirect(
 						ast::IoFileRedirectKind::DuplicateInput => 0,
 						ast::IoFileRedirectKind::DuplicateOutput => 1,
 						_ => {
-							return error::unimp("unexpected redirect kind");
+							return Err(error::ErrorKind::InternalError(format!(
+								"unexpected redirect kind for file descriptor target: {kind:?}"
+							))
+							.into());
 						},
 					};
 
@@ -1937,7 +1991,10 @@ pub(crate) async fn setup_redirect(
 						ast::IoFileRedirectKind::DuplicateInput => 0,
 						ast::IoFileRedirectKind::DuplicateOutput => 1,
 						_ => {
-							return error::unimp("unexpected redirect kind");
+							return Err(error::ErrorKind::InternalError(format!(
+								"unexpected redirect kind for duplicate target: {kind:?}"
+							))
+							.into());
 						},
 					};
 
@@ -2008,7 +2065,12 @@ pub(crate) async fn setup_redirect(
 
 							params.open_files.set_fd(fd_num, target_file);
 						},
-						_ => return error::unimp("invalid process substitution"),
+						_ => {
+							return Err(error::ErrorKind::InternalError(format!(
+								"process substitution used with invalid redirect kind: {kind:?}"
+							))
+							.into());
+						},
 					}
 				},
 			}
@@ -2113,6 +2175,16 @@ fn setup_process_substitution(
 	let mut child_params = params.clone();
 	child_params.process_group_policy = ProcessGroupPolicy::SameProcessGroup;
 
+	// Starting at 63 (a.k.a. 64-1)--and decrementing--look for an
+	// available fd before starting the substitution command.
+	let mut candidate_fd_num = 63;
+	while params.open_files.contains_fd(candidate_fd_num) {
+		candidate_fd_num -= 1;
+		if candidate_fd_num == 0 {
+			return Err(error::ErrorKind::TooManyOpenFiles.into());
+		}
+	}
+
 	// Set up pipe so we can connect to the command.
 	let (reader, writer) = std::io::pipe()?;
 	let (reader, writer) = (reader.into(), writer.into());
@@ -2139,15 +2211,6 @@ fn setup_process_substitution(
 			.await;
 	});
 
-	// Starting at 63 (a.k.a. 64-1)--and decrementing--look for an
-	// available fd.
-	let mut candidate_fd_num = 63;
-	while params.open_files.contains_fd(candidate_fd_num) {
-		candidate_fd_num -= 1;
-		if candidate_fd_num == 0 {
-			return error::unimp("no available file descriptors");
-		}
-	}
 
 	Ok((candidate_fd_num, target_file))
 }

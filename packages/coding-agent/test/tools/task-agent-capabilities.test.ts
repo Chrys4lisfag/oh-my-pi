@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { Settings } from "../../src/config/settings";
-import { isReadOnlyAgent, TaskTool } from "../../src/task";
-import { loadBundledAgents } from "../../src/task/agents";
-import * as discoveryModule from "../../src/task/discovery";
-import type { AgentDefinition } from "../../src/task/types";
-import type { ToolSession } from "../../src/tools";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { isReadOnlyAgent, TaskTool } from "@oh-my-pi/pi-coding-agent/task";
+import { loadBundledAgents } from "@oh-my-pi/pi-coding-agent/task/agents";
+import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
+import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
 function createSession(overrides: Partial<Record<string, unknown>> = {}): ToolSession {
 	return {
@@ -33,6 +33,16 @@ describe("task agent capability descriptions", () => {
 		expect(isReadOnlyAgent(agentByName(agents, "explore"))).toBe(true);
 		for (const name of ["task", "quick_task", "plan", "reviewer", "oracle", "designer"]) {
 			expect(isReadOnlyAgent(agentByName(agents, name))).toBe(false);
+		}
+	});
+
+	it("disables read summarization for explore and librarian, leaves other agents summarizing", () => {
+		const agents = loadBundledAgents();
+
+		expect(agentByName(agents, "explore").readSummarize).toBe(false);
+		expect(agentByName(agents, "librarian").readSummarize).toBe(false);
+		for (const name of ["task", "quick_task", "plan", "reviewer", "oracle", "designer"]) {
+			expect(agentByName(agents, name).readSummarize).toBeUndefined();
 		}
 	});
 

@@ -8,13 +8,15 @@
  * from `@oh-my-pi/hashline`; the only coding-agent-specific concern here
  * is wiring it onto the per-session owner object.
  */
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { InMemorySnapshotStore } from "@oh-my-pi/hashline";
 import { normalizeToLF } from "./normalize";
 
 /**
  * Upper bound on the file size we snapshot. A section tag is a content hash of
  * the *whole* file, so minting one means holding the full normalized text in
- * the store. Files above this cap emit no `¶path#tag` header — line-anchored
+ * the store. Files above this cap emit no `[path#tag]` header — line-anchored
  * editing of multi-megabyte files is out of scope under the full-content model.
  */
 export const SNAPSHOT_MAX_BYTES = 4 * 1024 * 1024;
@@ -31,6 +33,36 @@ interface FileSnapshotStoreOwner {
 export function getFileSnapshotStore(session: FileSnapshotStoreOwner): InMemorySnapshotStore {
 	if (!session.fileSnapshotStore) session.fileSnapshotStore = new InMemorySnapshotStore();
 	return session.fileSnapshotStore;
+}
+
+/**
+ * Canonicalize an absolute path into the stable key the snapshot store uses.
+ *
+ * Different code paths reach the snapshot store via different path forms:
+ * `read local://foo.md` records under the file's `fs.realpath` (the local
+ * protocol handler resolves symlinks); a subsequent `edit` may address the
+ * same artifact via `local://foo.md`, whose resolver does NOT realpath, or
+ * via the absolute path returned in the `[path#tag]` header. macOS adds the
+ * same hazard at the working-tree level (`/tmp/...` vs `/private/tmp/...`).
+ * Collapsing every key through `realpath` makes those forms fuse onto one
+ * snapshot entry, so a freshly-minted tag is never rejected as stale just
+ * because the lookup spelled the same file differently.
+ *
+ * Non-existent paths (new-file writes) fall back to a realpath of the parent
+ * directory + basename, then to the input. This keeps creates and updates on
+ * the same canonical key.
+ */
+export function canonicalSnapshotKey(absolutePath: string): string {
+	try {
+		return fs.realpathSync.native(absolutePath);
+	} catch {
+		try {
+			const parent = fs.realpathSync.native(path.dirname(absolutePath));
+			return path.join(parent, path.basename(absolutePath));
+		} catch {
+			return absolutePath;
+		}
+	}
 }
 
 /**
@@ -52,8 +84,51 @@ export async function recordFileSnapshot(
 		const file = Bun.file(absolutePath);
 		if (file.size > SNAPSHOT_MAX_BYTES) return undefined;
 		const normalized = normalizeToLF(await file.text());
-		return getFileSnapshotStore(session).record(absolutePath, normalized);
+		return getFileSnapshotStore(session).record(canonicalSnapshotKey(absolutePath), normalized);
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * Leading line-number prefix the hashline/summary/grep formatters stamp on
+ * every displayed body line: `NN:` or a collapsed summary `NN-MM:` from `read`,
+ * optionally preceded by a grep `*` (match) / space (context) marker from
+ * `search`/`ast-grep`. Anchored at line start, so source content after the
+ * colon never matches.
+ */
+const HASHLINE_LINE_PREFIX = /^[ *]?(\d+)(?:-(\d+))?:/;
+
+/**
+ * The 1-indexed file lines a hashline-formatted body actually displayed.
+ * Single `NN:` rows contribute that line; a collapsed summary `NN-MM:` row
+ * (a `{ .. }` brace pair) contributes only its boundary lines `NN` and `MM` —
+ * the elided interior was never shown, so editing inside it must be rejected.
+ */
+export function parseSeenLinesFromHashlineBody(body: string): number[] {
+	const seen: number[] = [];
+	for (const row of body.split("\n")) {
+		const match = HASHLINE_LINE_PREFIX.exec(row);
+		if (!match) continue;
+		seen.push(Number(match[1]));
+		if (match[2] !== undefined) seen.push(Number(match[2]));
+	}
+	return seen;
+}
+
+/**
+ * Attach the lines a read displayed to the snapshot it minted, so the patcher
+ * can reject edits anchored on lines the model never saw. Best-effort: a no-op
+ * when the body has no numbered rows or the snapshot already aged out. `tag`
+ * must be the tag returned when this exact content was recorded.
+ */
+export function recordSeenLinesFromBody(
+	session: FileSnapshotStoreOwner,
+	absolutePath: string,
+	tag: string,
+	body: string,
+): void {
+	const seen = parseSeenLinesFromHashlineBody(body);
+	if (seen.length === 0) return;
+	getFileSnapshotStore(session).recordSeenLines(canonicalSnapshotKey(absolutePath), tag, seen);
 }

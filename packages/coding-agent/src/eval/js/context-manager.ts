@@ -1,13 +1,10 @@
-import { isCompiledBinary, logger, Snowflake } from "@oh-my-pi/pi-utils";
+import { logger, Snowflake, workerHostEntry } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "../../tools";
 import { ToolAbortError, ToolError } from "../../tools/tool-errors";
 import { callSessionTool, type JsStatusEvent } from "./tool-bridge";
 import { WorkerCore } from "./worker-core";
-// Worker entry. See `tab-supervisor.ts` for the rationale behind the
-// literal-string + `new URL(import.meta.url)` hybrid: the literal is what
-// Bun's `--compile` bundler discovers, the `new URL` form is what makes dev
-// runs portable across cwds. The worker is registered as an additional
-// `--compile` entrypoint in `scripts/build-binary.ts`.
+// Coding-agent binary/bundle workers route through the CLI entrypoint with a
+// hidden argv mode, so compiled/npm builds only need one JavaScript entry.
 import type {
 	JsDisplayOutput,
 	RunErrorPayload,
@@ -30,6 +27,8 @@ interface WorkerHandle {
 	mode: "worker" | "inline";
 	send(msg: WorkerInbound): void;
 	onMessage(handler: (msg: WorkerOutbound) => void): () => void;
+	onError(handler: (error: Error) => void): () => void;
+	close(): Promise<boolean>;
 	terminate(): Promise<void>;
 }
 
@@ -52,14 +51,38 @@ interface JsSession {
 
 const sessions = new Map<string, JsSession>();
 const startingSessions = new Map<string, Promise<JsSession>>();
-const resettingSessions = new Set<string>();
-const READY_TIMEOUT_MS_DEFAULT = 5_000;
+const resettingSessions = new Map<string, Promise<void>>();
+// Worker startup (module-graph import + WorkerCore construction) is infrastructure
+// cost, not user compute. Floor it independently of Bun's 5s default per-test timeout
+// so a slow cold-start under load isn't aborted mid-init — terminating a still-
+// initializing Bun worker triggers the same kind of terminate-race that motivates
+// avoiding `vm.runInContext` (see shared/indirect-eval.ts), here surfacing as a
+// SIGILL/SIGSEGV. Callers that pass a larger per-cell budget still dominate.
+const WORKER_INIT_TIMEOUT_MS = 15_000;
+const WORKER_CLOSE_TIMEOUT_MS = 1_000;
+// Active graceful-close grace period before a worker that ack'd `close` but never
+// emitted its `close` event is force-terminated. Defaults to the production floor;
+// tests override it (and restore it) to exercise the close-timeout -> terminate
+// path without a real wall-clock wait.
+let workerCloseTimeoutMs: number = WORKER_CLOSE_TIMEOUT_MS;
+
+/**
+ * Test-only seam: override the graceful-close grace period (ms). Returns the
+ * previous value so callers can restore it. Production always uses
+ * {@link WORKER_CLOSE_TIMEOUT_MS}; never call this outside tests.
+ */
+export function setWorkerCloseTimeoutMsForTests(ms: number): number {
+	const previous = workerCloseTimeoutMs;
+	workerCloseTimeoutMs = ms;
+	return previous;
+}
 
 export async function executeInVmContext(options: {
 	sessionKey: string;
 	sessionId: string;
 	cwd: string;
 	session: ToolSession;
+	localRoots?: Record<string, string>;
 	reset?: boolean;
 	code: string;
 	filename: string;
@@ -67,21 +90,32 @@ export async function executeInVmContext(options: {
 	runState: VmRunState;
 }): Promise<{ value: unknown }> {
 	if (options.reset) {
-		if (resettingSessions.has(options.sessionKey)) {
-			throw new ToolError("JS context reset already in progress");
+		// Coalesce concurrent resets: an existing in-flight reset already
+		// produces a fresh context, so a follow-up `reset: true` cell should
+		// just wait for it rather than failing the user-visible call.
+		const inFlight = resettingSessions.get(options.sessionKey);
+		if (inFlight) await inFlight.catch(() => undefined);
+		else {
+			const resetPromise = resetVmContext(options.sessionKey);
+			resettingSessions.set(
+				options.sessionKey,
+				resetPromise.then(() => undefined),
+			);
+			try {
+				await resetPromise;
+			} finally {
+				resettingSessions.delete(options.sessionKey);
+			}
 		}
-		resettingSessions.add(options.sessionKey);
-		try {
-			await resetVmContext(options.sessionKey);
-		} finally {
-			resettingSessions.delete(options.sessionKey);
-		}
-	} else if (resettingSessions.has(options.sessionKey)) {
-		throw new ToolError("JS context reset in progress");
+	} else {
+		// Internal coordination: wait for any in-flight reset to settle and
+		// then run on the freshly-rebuilt context.
+		const inFlight = resettingSessions.get(options.sessionKey);
+		if (inFlight) await inFlight.catch(() => undefined);
 	}
 	const session = await acquireSession(
 		options.sessionKey,
-		{ cwd: options.cwd, sessionId: options.sessionId },
+		{ cwd: options.cwd, sessionId: options.sessionId, localRoots: options.localRoots },
 		options.timeoutMs,
 	);
 	return await runOnce(session, options);
@@ -91,7 +125,7 @@ export async function resetVmContext(sessionKey: string): Promise<void> {
 	const session = sessions.get(sessionKey) ?? (await startingSessions.get(sessionKey)?.catch(() => undefined));
 	if (!session) return;
 	sessions.delete(sessionKey);
-	await killSession(session, new ToolError("JS context reset"));
+	await killSession(session, new ToolError("JS context reset"), { force: false });
 }
 
 export async function disposeAllVmContexts(): Promise<void> {
@@ -104,7 +138,28 @@ export async function disposeAllVmContexts(): Promise<void> {
 		if (!all.includes(result.value)) all.push(result.value);
 	}
 	sessions.clear();
-	await Promise.all(all.map(session => killSession(session, new ToolError("JS context disposed"))));
+	await Promise.all(all.map(session => killSession(session, new ToolError("JS context disposed"), { force: false })));
+}
+
+/**
+ * Smoke probe: spawn the JS eval worker through the worker-host entry and prove
+ * it answers the `init` handshake on a real worker thread (not the inline
+ * fallback). Catches the silent worker-load and init-message-drop regressions
+ * that otherwise strand every cell on the init timeout in a distribution build —
+ * the failure mode that motivated `installWorkerInbox`. Wired into
+ * `omp --smoke-test` so binary / source / tarball installs all exercise it.
+ */
+export async function smokeTestJsEvalWorker(): Promise<void> {
+	const worker = spawnJsWorker();
+	const session: JsSession = { sessionKey: "smoke", worker, state: "alive", pending: new Map() };
+	try {
+		await initWorker(session, { cwd: process.cwd(), sessionId: "smoke" }, WORKER_INIT_TIMEOUT_MS);
+		if (worker.mode !== "worker") {
+			throw new Error("JS eval worker smoke fell back to the inline worker (real worker failed to start)");
+		}
+	} finally {
+		await worker.terminate().catch(() => undefined);
+	}
 }
 
 async function runOnce(
@@ -113,6 +168,7 @@ async function runOnce(
 		sessionId: string;
 		cwd: string;
 		session: ToolSession;
+		localRoots?: Record<string, string>;
 		code: string;
 		filename: string;
 		runState: VmRunState;
@@ -137,7 +193,7 @@ async function runOnce(
 		// Cancel any in-flight tool calls first.
 		for (const ctrl of pending.toolCalls.values()) ctrl.abort(abortError);
 		// Hard-kill the worker — only way to interrupt synchronous user code.
-		void killSessionFor(session, abortError);
+		void killSessionFor(session, abortError, { force: true });
 	};
 
 	if (options.runState.signal?.aborted) {
@@ -152,7 +208,7 @@ async function runOnce(
 			runId,
 			code: options.code,
 			filename: options.filename,
-			snapshot: { cwd: options.cwd, sessionId: options.sessionId },
+			snapshot: { cwd: options.cwd, sessionId: options.sessionId, localRoots: options.localRoots },
 		});
 		return await promise;
 	} finally {
@@ -168,47 +224,94 @@ async function acquireSession(sessionKey: string, snapshot: SessionSnapshot, tim
 	if (starting) return await starting;
 
 	const startup = (async (): Promise<JsSession> => {
-		const worker = await spawnJsWorker();
+		// The message listener must be attached synchronously after `new Worker`:
+		// Bun drops messages posted before a listener exists, and WorkerCore emits
+		// `ready` from its constructor on load. `spawnJsWorker` + `initWorker` run with
+		// no intervening await, so `ready` can never race the attach.
+		const worker = spawnJsWorker();
 		const session: JsSession = {
 			sessionKey,
 			worker,
 			state: "alive",
 			pending: new Map(),
 		};
-		const { promise: readyPromise, resolve: resolveReady, reject: rejectReady } = Promise.withResolvers<void>();
-		let resolved = false;
-		const unsubscribe = worker.onMessage(msg => {
-			if (!resolved && msg.type === "ready") {
-				resolved = true;
-				resolveReady();
-				return;
-			}
-			if (!resolved && msg.type === "init-failed") {
-				resolved = true;
-				rejectReady(errorFromPayload(msg.error));
-				return;
-			}
-			handleSessionMessage(session, msg);
-		});
+		// Init headroom is the fixed infrastructure floor; the caller's per-cell timeout
+		// dominates when larger so users can grant more by raising `timeout` on a cell.
+		const readyTimeoutMs = Math.max(WORKER_INIT_TIMEOUT_MS, timeoutMs ?? 0);
 		try {
-			// Cold-start can exceed 5s on slow hosts. Let the caller's per-cell timeout dominate so
-			// users can grant more headroom when they raise `timeout` on a cell.
-			const readyTimeoutMs = Math.max(READY_TIMEOUT_MS_DEFAULT, timeoutMs ?? 0);
-			await raceWithTimeout(readyPromise, readyTimeoutMs, "Timed out initializing JS eval worker");
-			worker.send({ type: "init", snapshot });
-			sessions.set(sessionKey, session);
-			return session;
+			await initWorker(session, snapshot, readyTimeoutMs);
 		} catch (error) {
-			unsubscribe();
+			// Worker-thread crash/load failures surface asynchronously via the worker
+			// `error` event — after `spawnJsWorker`'s synchronous try/catch already
+			// returned — so the only signal is the rejected handshake. Retry on the
+			// inline worker so a broken module graph fails fast instead of stalling
+			// every cell on the init timeout and then dying with exitCode 1.
 			await worker.terminate().catch(() => undefined);
-			throw error;
+			if (worker.mode === "inline") throw error;
+			logger.warn("JS eval worker init failed; retrying with inline worker (no sync-loop guard)", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			const inline = spawnInlineWorker();
+			session.worker = inline;
+			session.state = "alive";
+			try {
+				await initWorker(session, snapshot, readyTimeoutMs);
+			} catch (inlineError) {
+				await inline.terminate().catch(() => undefined);
+				throw inlineError;
+			}
 		}
+		sessions.set(sessionKey, session);
+		return session;
 	})();
 	startingSessions.set(sessionKey, startup);
 	try {
 		return await startup;
 	} finally {
 		if (startingSessions.get(sessionKey) === startup) startingSessions.delete(sessionKey);
+	}
+}
+
+async function initWorker(session: JsSession, snapshot: SessionSnapshot, timeoutMs: number): Promise<void> {
+	const worker = session.worker;
+	const { promise: readyPromise, resolve: resolveReady, reject: rejectReady } = Promise.withResolvers<void>();
+	let resolved = false;
+	const unsubscribeMessage = worker.onMessage(msg => {
+		if (!resolved && msg.type === "ready") {
+			resolved = true;
+			resolveReady();
+			return;
+		}
+		if (!resolved && msg.type === "init-failed") {
+			resolved = true;
+			rejectReady(errorFromPayload(msg.error));
+			return;
+		}
+		handleSessionMessage(session, msg);
+	});
+	const unsubscribeError = worker.onError(error => {
+		if (!resolved) {
+			resolved = true;
+			rejectReady(error);
+			return;
+		}
+		// Worker died after a successful handshake: tear the session down so the
+		// in-flight run (and the next acquire) fail fast instead of hanging on a
+		// worker that will never reply.
+		void killSessionFor(session, error, { force: true });
+	});
+	try {
+		// Attach listeners and send init before awaiting ready. The worker now
+		// emits ready only in response to init, so this ordering is race-free.
+		worker.send({ type: "init", snapshot });
+		await raceWithTimeout(readyPromise, timeoutMs, "Timed out initializing JS eval worker");
+	} catch (error) {
+		// Handshake failed (timeout, init-failed, or worker error): drop both listeners
+		// so the abandoned worker can't keep routing messages into a session the caller
+		// is about to discard or retry on the inline fallback.
+		unsubscribeMessage();
+		unsubscribeError();
+		throw error;
 	}
 }
 
@@ -277,14 +380,14 @@ function settlePending(session: JsSession, msg: Extract<WorkerOutbound, { type: 
 	pending.reject(errorFromPayload(msg.error));
 }
 
-async function killSessionFor(session: JsSession, error: Error): Promise<void> {
+async function killSessionFor(session: JsSession, error: Error, options: { force: boolean }): Promise<void> {
 	if (sessions.get(session.sessionKey) === session) {
 		sessions.delete(session.sessionKey);
 	}
-	await killSession(session, error);
+	await killSession(session, error, options);
 }
 
-async function killSession(session: JsSession, error: Error): Promise<void> {
+async function killSession(session: JsSession, error: Error, options: { force: boolean }): Promise<void> {
 	if (session.state === "dead") return;
 	session.state = "dead";
 	for (const pending of session.pending.values()) {
@@ -294,6 +397,11 @@ async function killSession(session: JsSession, error: Error): Promise<void> {
 		pending.reject(error);
 	}
 	session.pending.clear();
+	if (options.force) {
+		await session.worker.terminate().catch(() => undefined);
+		return;
+	}
+	if (await session.worker.close().catch(() => false)) return;
 	await session.worker.terminate().catch(() => undefined);
 }
 
@@ -356,10 +464,11 @@ async function raceWithTimeout<T>(promise: Promise<T>, timeoutMs: number, reason
 	}
 }
 
-async function spawnJsWorker(): Promise<WorkerHandle> {
+function spawnJsWorker(): WorkerHandle {
 	try {
-		const worker = isCompiledBinary()
-			? new Worker("./packages/coding-agent/src/eval/js/worker-entry.ts", { type: "module" })
+		const hostEntry = workerHostEntry();
+		const worker = hostEntry
+			? new Worker(hostEntry, { type: "module", argv: ["__omp_worker_js_eval"] })
 			: new Worker(new URL("./worker-entry.ts", import.meta.url).href, { type: "module" });
 		return wrapBunWorker(worker);
 	} catch (err) {
@@ -381,10 +490,59 @@ function wrapBunWorker(worker: Worker): WorkerHandle {
 			worker.addEventListener("message", wrap);
 			return () => worker.removeEventListener("message", wrap);
 		},
+		onError(handler) {
+			const onError = (event: ErrorEvent): void => handler(errorFromWorkerEvent(event));
+			const onMessageError = (event: MessageEvent): void =>
+				handler(new ToolError(`JS eval worker message error: ${String(event.data)}`));
+			worker.addEventListener("error", onError);
+			worker.addEventListener("messageerror", onMessageError);
+			return () => {
+				worker.removeEventListener("error", onError);
+				worker.removeEventListener("messageerror", onMessageError);
+			};
+		},
+		async close() {
+			const { promise: closed, resolve } = Promise.withResolvers<boolean>();
+			let settled = false;
+			let sawClosedAck = false;
+			let sawWorkerExit = false;
+			let timeout: NodeJS.Timeout | undefined;
+			let unsubscribe = (): void => {};
+			const finish = (value: boolean): void => {
+				if (settled) return;
+				settled = true;
+				if (timeout) clearTimeout(timeout);
+				unsubscribe();
+				worker.removeEventListener("close", onClose);
+				resolve(value);
+			};
+			const finishIfClosed = (): void => {
+				if (sawClosedAck && sawWorkerExit) finish(true);
+			};
+			const onClose = (): void => {
+				sawWorkerExit = true;
+				finishIfClosed();
+			};
+			unsubscribe = this.onMessage(msg => {
+				if (msg.type !== "closed") return;
+				sawClosedAck = true;
+				finishIfClosed();
+			});
+			worker.addEventListener("close", onClose);
+			timeout = setTimeout(() => finish(false), workerCloseTimeoutMs);
+			worker.postMessage({ type: "close" } satisfies WorkerInbound);
+			return await closed;
+		},
 		async terminate() {
 			worker.terminate();
 		},
 	};
+}
+
+function errorFromWorkerEvent(event: ErrorEvent): Error {
+	if (event.error instanceof Error) return event.error;
+	if (event.message) return new Error(event.message);
+	return new Error("Unknown JS eval worker error");
 }
 
 /**
@@ -416,6 +574,28 @@ function spawnInlineWorker(): WorkerHandle {
 		onMessage: handler => {
 			hostListeners.add(handler);
 			return () => hostListeners.delete(handler);
+		},
+		onError: () => () => {},
+		async close() {
+			const { promise: closed, resolve } = Promise.withResolvers<boolean>();
+			let settled = false;
+			let timeout: NodeJS.Timeout | undefined;
+			let unsubscribe = (): void => {};
+			const finish = (value: boolean): void => {
+				if (settled) return;
+				settled = true;
+				if (timeout) clearTimeout(timeout);
+				unsubscribe();
+				hostListeners.clear();
+				workerListeners.clear();
+				resolve(value);
+			};
+			unsubscribe = this.onMessage(msg => {
+				if (msg.type === "closed") finish(true);
+			});
+			this.send({ type: "close" });
+			timeout = setTimeout(() => finish(false), workerCloseTimeoutMs);
+			return await closed;
 		},
 		async terminate() {
 			hostListeners.clear();

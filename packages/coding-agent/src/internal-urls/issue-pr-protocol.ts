@@ -23,11 +23,12 @@ import {
 	getOrFetchIssue,
 	getOrFetchPr,
 	getOrFetchPrDiff,
+	githubIssueJsonWithStateReasonFallback,
 	type PrDiffFile,
 	parsePositiveDecimalInt,
 	resolveDefaultRepoMemoized,
 } from "../tools/gh";
-import { formatFreshnessNote } from "../tools/github-cache";
+import { type CacheStatus, formatFreshnessNote } from "../tools/github-cache";
 import * as git from "../utils/git";
 import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext } from "./types";
 
@@ -71,17 +72,24 @@ function parseListOptions(url: InternalUrl, scheme: Scheme, repo: string | undef
 	const stateRaw = url.searchParams.get("state");
 	const allowedStates: ParsedList["state"][] =
 		scheme === "pr" ? ["open", "closed", "merged", "all"] : ["open", "closed", "all"];
-	const state = (
-		stateRaw && (allowedStates as string[]).includes(stateRaw) ? stateRaw : "open"
-	) as ParsedList["state"];
+	if (stateRaw !== null && !(allowedStates as string[]).includes(stateRaw)) {
+		// Reject instead of silently falling back to "open": a typo'd state
+		// would otherwise return the open list, indistinguishable from "no
+		// matches for the requested state".
+		throw new Error(`Invalid ${scheme}:// list state '${stateRaw}'. Expected one of: ${allowedStates.join(", ")}.`);
+	}
+	const state = (stateRaw ?? "open") as ParsedList["state"];
 
 	const limitRaw = url.searchParams.get("limit");
 	let limit = LIST_LIMIT_DEFAULT;
 	if (limitRaw !== null) {
 		const parsed = parsePositiveDecimalInt(limitRaw);
-		if (parsed !== undefined) {
-			limit = Math.min(parsed, LIST_LIMIT_MAX);
+		if (parsed === undefined) {
+			throw new Error(
+				`Invalid ${scheme}:// list limit '${limitRaw}'. Expected a positive integer (max ${LIST_LIMIT_MAX}).`,
+			);
 		}
+		limit = Math.min(parsed, LIST_LIMIT_MAX);
 	}
 	return {
 		kind: "list",
@@ -287,7 +295,7 @@ async function fetchAndRenderList(
 	const cwd = resolveCwd(context);
 	const fields =
 		scheme === "issue"
-			? ["number", "title", "state", "stateReason", "author", "labels", "createdAt", "updatedAt", "url"]
+			? ["number", "title", "state", "author", "labels", "createdAt", "updatedAt", "url"]
 			: [
 					"number",
 					"title",
@@ -316,9 +324,14 @@ async function fetchAndRenderList(
 	if (options.author) args.push("--author", options.author);
 	if (options.label) args.push("--label", options.label);
 
-	const items = await git.github.json<Array<IssueListItem | PrListItem>>(cwd, args, context?.signal, {
-		repoProvided: true,
-	});
+	const items =
+		scheme === "issue"
+			? await githubIssueJsonWithStateReasonFallback<Array<IssueListItem>>(cwd, args, context?.signal, {
+					repoProvided: true,
+				})
+			: await git.github.json<Array<PrListItem>>(cwd, args, context?.signal, {
+					repoProvided: true,
+				});
 	const header =
 		scheme === "issue"
 			? `# Issues in ${repo} (${options.state}, up to ${options.limit})`
@@ -342,7 +355,7 @@ interface BuildSingleArgs {
 	scheme: Scheme;
 	parsed: ParsedSingle;
 	rendered: string;
-	status: "miss" | "fresh" | "stale" | "disabled";
+	status: CacheStatus;
 	fetchedAt: number;
 	/** Resolved repo (post short-form expansion) — used for the PR-only diff hint. */
 	repo?: string;
@@ -364,11 +377,15 @@ function buildSingleResource({
 		const diffUrl = repoSegment ? `pr://${repoSegment}/${parsed.number}/diff` : `pr://${parsed.number}/diff`;
 		notes.push(`Diff: ${diffUrl}`);
 	}
+	const content =
+		status === "stale"
+			? `> WARNING: Live GitHub refresh failed; this ${scheme} content is cached and may be stale.\n\n${rendered}`
+			: rendered;
 	return {
 		url: url.href,
-		content: rendered,
+		content,
 		contentType: "text/markdown",
-		size: Buffer.byteLength(rendered, "utf-8"),
+		size: Buffer.byteLength(content, "utf-8"),
 		notes,
 	};
 }

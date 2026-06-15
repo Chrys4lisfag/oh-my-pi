@@ -1,12 +1,17 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, setDefaultTimeout, vi } from "bun:test";
 import * as path from "node:path";
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
+import { executeJs, type JsResult } from "@oh-my-pi/pi-coding-agent/eval/js/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import * as z from "zod/v4";
-import { disposeAllVmContexts } from "../../src/eval/js/context-manager";
-import { executeJs, type JsResult } from "../../src/eval/js/executor";
+import { z } from "zod/v4";
+
+// JS eval cold-starts a Bun worker; under --isolate + high CI concurrency that startup
+// can exceed Bun's 5s default per-test timeout, flaking the suite. Give the worker-backed
+// tests headroom above the worker-init floor (context-manager WORKER_INIT_TIMEOUT_MS).
+setDefaultTimeout(20_000);
 
 function createTool(
 	name: string,
@@ -85,6 +90,29 @@ describe("executeJs", () => {
 		});
 		expect(resetResult.exitCode).toBe(0);
 		expect(resetResult.output.trim()).toBe("undefined");
+	});
+
+	it("parallel() barriers until every thunk settles and throws the lowest-index error", async () => {
+		const result = await executeJs(
+			[
+				"const settled = [];",
+				"try {",
+				"	await parallel([",
+				"		async () => { await new Promise(r => setTimeout(r, 30)); settled.push('slow'); },",
+				"		async () => { settled.push('bad1'); throw new Error('bad1'); },",
+				"		async () => { settled.push('bad2'); throw new Error('bad2'); },",
+				"	]);",
+				"	return 'no-throw';",
+				"} catch (err) {",
+				"	return JSON.stringify([err.message, settled.sort()]);",
+				"}",
+			].join("\n"),
+			{ sessionId, session, sessionFile },
+		);
+		expect(result.exitCode).toBe(0);
+		// Every thunk ran to completion (the slow one was not orphaned by the
+		// early rejections), and the lowest-index error propagated.
+		expect(JSON.parse(result.output.trim())).toEqual(["bad1", ["bad1", "bad2", "slow"]]);
 	});
 
 	it("persists bindings from cells that contain nested returns", async () => {
@@ -283,8 +311,11 @@ describe("executeJs", () => {
 		const result = await executeJs(
 			[
 				"const full = await read('config.json');",
-				"const sliced = await read('config.json', { offset: 2, limit: 1 });",
-				"return { isString: typeof full === 'string', full, sliced };",
+				"const objectSliced = await read('config.json', { offset: 2, limit: 1 });",
+				"const positionalSliced = await read('config.json', 3, 1);",
+				"const nullOffsetLimit = await read('config.json', null, 2);",
+				"const undefinedOffsetLimit = await read('config.json', undefined, 1);",
+				"return { isString: typeof full === 'string', full, objectSliced, positionalSliced, nullOffsetLimit, undefinedOffsetLimit };",
 			].join("\n"),
 			{
 				sessionId,
@@ -294,23 +325,58 @@ describe("executeJs", () => {
 		);
 
 		expect(result.exitCode).toBe(0);
-		expect(getStatusEvents(result)).toHaveLength(2);
+		expect(getStatusEvents(result)).toHaveLength(5);
 		expect(getJsonData(result)).toEqual({
 			isString: true,
 			full: '{\n  "name": "demo",\n  "enabled": true\n}',
-			sliced: '  "name": "demo",',
+			objectSliced: '  "name": "demo",',
+			positionalSliced: '  "enabled": true',
+			nullOffsetLimit: '{\n  "name": "demo",',
+			undefinedOffsetLimit: "{",
 		});
 	});
 
-	it("rejects protocol paths and directory reads from native read()", async () => {
-		const protocolResult = await executeJs("await read('agent://demo');", {
-			sessionId,
-			session,
-			sessionFile,
+	it("delegates URI reads through the read tool with positional slicing", async () => {
+		const execute = vi.fn(async (_toolCallId: string, args: unknown): Promise<AgentToolResult> => {
+			const record = args as { path: string };
+			return { content: [{ type: "text", text: record.path.endsWith(":1-1400") ? "wide" : "limited" }] };
 		});
-		expect(protocolResult.exitCode).toBe(1);
-		expect(protocolResult.output).toContain("Protocol paths are not supported");
+		const toolSession: ToolSession = {
+			...session,
+			getToolByName: name => (name === "read" ? createTool("read", execute) : undefined),
+		};
 
+		const result = await executeJs(
+			[
+				"const wide = await read('artifact://15:raw', 1, 1400);",
+				"const limited = await read('artifact://15:raw', null, 2);",
+				"return { wide, limited };",
+			].join("\n"),
+			{
+				sessionId,
+				session: toolSession,
+				sessionFile,
+			},
+		);
+
+		expect(result.exitCode).toBe(0);
+		expect(getStatusEvents(result)).toHaveLength(2);
+		expect(getJsonData(result)).toEqual({ wide: "wide", limited: "limited" });
+		expect(execute).toHaveBeenNthCalledWith(
+			1,
+			expect.stringMatching(/^js-read-/),
+			{ path: "artifact://15:raw:1-1400", _i: "js prelude" },
+			expect.any(AbortSignal),
+		);
+		expect(execute).toHaveBeenNthCalledWith(
+			2,
+			expect.stringMatching(/^js-read-/),
+			{ path: "artifact://15:raw:1-2", _i: "js prelude" },
+			expect.any(AbortSignal),
+		);
+	});
+
+	it("rejects directory reads from native read()", async () => {
 		const directoryResult = await executeJs("await read('.');", {
 			sessionId,
 			session,

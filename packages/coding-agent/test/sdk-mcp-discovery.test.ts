@@ -1,16 +1,19 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import { AuthStorage, Effort, getBundledModel, type Model } from "@oh-my-pi/pi-ai";
+import { AuthStorage, Effort, type Model } from "@oh-my-pi/pi-ai";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { CustomTool } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/types";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { TOOL_DISCOVERY_AUTO_THRESHOLD } from "@oh-my-pi/pi-coding-agent/tool-discovery/mode";
 import { Snowflake } from "@oh-my-pi/pi-utils";
-import * as z from "zod/v4";
+import { z } from "zod/v4";
 
 function createMcpCustomTool(name: string, serverName: string, mcpToolName: string): CustomTool {
 	return {
@@ -27,37 +30,53 @@ function createMcpCustomTool(name: string, serverName: string, mcpToolName: stri
 }
 
 function createReasoningModel(): Model<"openai-responses"> {
-	return {
+	return buildModel({
 		id: "mock-reasoning",
 		name: "mock-reasoning",
 		api: "openai-responses",
 		provider: "openai",
 		baseUrl: "https://example.invalid",
 		reasoning: true,
-		thinking: { mode: "effort", minLevel: Effort.Medium, maxLevel: Effort.High },
+		thinking: { mode: "effort", efforts: [Effort.Medium, Effort.High] },
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 8192,
 		maxTokens: 2048,
-	};
+	});
 }
 
 const oldSessionMtime = new Date("2000-01-01T00:00:00.000Z");
 
 describe("createAgentSession MCP discovery prompt gating", () => {
 	let tempDir: string;
+	let registryDir: string;
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
 
-	beforeEach(async () => {
-		tempDir = path.join(os.tmpdir(), `pi-sdk-mcp-discovery-${Snowflake.next()}`);
-		fs.mkdirSync(tempDir, { recursive: true });
-		authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+	// Immutable across tests: ModelRegistry's constructor eagerly loads the bundled
+	// model catalog (~120ms). The tests pass models explicitly and never mutate the
+	// registry (refreshInBackground is skipped when modelRegistry is supplied, and
+	// extension source sync is empty under disableExtensionDiscovery), so build it once.
+	beforeAll(async () => {
+		registryDir = path.join(os.tmpdir(), `pi-sdk-mcp-discovery-registry-${Snowflake.next()}`);
+		fs.mkdirSync(registryDir, { recursive: true });
+		authStorage = await AuthStorage.create(path.join(registryDir, "auth.db"));
 		modelRegistry = new ModelRegistry(authStorage);
 	});
 
-	afterEach(() => {
+	afterAll(() => {
 		authStorage.close();
+		if (registryDir && fs.existsSync(registryDir)) {
+			fs.rmSync(registryDir, { recursive: true, force: true });
+		}
+	});
+
+	beforeEach(() => {
+		tempDir = path.join(os.tmpdir(), `pi-sdk-mcp-discovery-${Snowflake.next()}`);
+		fs.mkdirSync(tempDir, { recursive: true });
+	});
+
+	afterEach(() => {
 		if (tempDir && fs.existsSync(tempDir)) {
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -88,6 +107,34 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		);
 	});
 
+	it("default auto discovery hides MCP tools once the total tool set is too large", async () => {
+		const mcpTools = Array.from({ length: TOOL_DISCOVERY_AUTO_THRESHOLD + 1 }, (_, index) =>
+			createMcpCustomTool(`mcp__auto_tool_${index}`, "auto", `tool_${index}`),
+		);
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			modelRegistry,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({}),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			customTools: mcpTools,
+		});
+
+		const activeNames = session.getActiveToolNames();
+		expect(session.isToolDiscoveryEnabled()).toBe(true);
+		expect(activeNames).toContain("search_tool_bm25");
+		expect(activeNames).not.toContain("mcp__auto_tool_0");
+		expect(session.getDiscoverableTools({ source: "mcp" })).toHaveLength(TOOL_DISCOVERY_AUTO_THRESHOLD + 1);
+	});
+
 	it("advertises discovery guidance for builtin-only tools.discoveryMode all sessions", async () => {
 		const { session } = await createAgentSession({
 			cwd: tempDir,
@@ -110,6 +157,103 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		expect(session.getActiveToolNames()).not.toContain("find");
 		expect(prompt).toContain("call `search_tool_bm25` before concluding no such tool exists");
 		expect(searchTool?.description).toContain("Total discoverable tools available:");
+	});
+
+	it("exposes task under tools.discoveryMode all when task.eager is preferred", async () => {
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			modelRegistry,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "tools.discoveryMode": "all", "task.eager": "preferred" }),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+
+		expect(session.getActiveToolNames()).toContain("task");
+		const prompt = session.systemPrompt.join("\n");
+		expect(prompt).toContain("# Eager Tasks");
+		// `preferred` renders the soft delegation nudge, not the hard MUST/ONLY wording.
+		expect(prompt).toContain("Delegation is preferred here");
+		expect(prompt).toContain("batch them into one parallel");
+		expect(prompt).not.toContain("you MUST fan the work out");
+		await session.dispose();
+	});
+
+	it("uses hard delegation wording in the Eager Tasks section when task.eager is always", async () => {
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			modelRegistry,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "tools.discoveryMode": "all", "task.eager": "always" }),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+
+		const prompt = session.systemPrompt.join("\n");
+		expect(prompt).toContain("# Eager Tasks");
+		expect(prompt).toContain("you MUST fan the work out");
+		expect(prompt).toContain("Batch independent slices");
+		expect(prompt).not.toContain("Delegation is preferred here");
+		await session.dispose();
+	});
+
+	it("omits batch guidance from the Eager Tasks section when task.batch is disabled", async () => {
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			modelRegistry,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "tools.discoveryMode": "all", "task.eager": "preferred", "task.batch": false }),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+
+		const prompt = session.systemPrompt.join("\n");
+		expect(prompt).toContain("# Eager Tasks");
+		expect(prompt).not.toContain("batch them into one parallel");
+		await session.dispose();
+	});
+
+	it("hides task under tools.discoveryMode all when task.eager is default", async () => {
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			modelRegistry,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "tools.discoveryMode": "all" }),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+
+		expect(session.getActiveToolNames()).not.toContain("task");
+		expect(session.systemPrompt.join("\n")).not.toContain("# Eager Tasks");
+		await session.dispose();
 	});
 
 	it("preserves explicitly requested MCP tools in discovery mode", async () => {
@@ -202,7 +346,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 
 		const searchTool = session.agent.state.tools.find(tool => tool.name === "search_tool_bm25");
 		expect(searchTool?.description).toContain("Total discoverable tools available: 1.");
-		expect(searchTool?.description).toContain("- `server_name`");
+		expect(searchTool?.description).toContain("Discoverable MCP servers in this session: github (1 tool).");
 	});
 
 	it("prunes deactivated builtin discoveries so they can be rediscovered", async () => {

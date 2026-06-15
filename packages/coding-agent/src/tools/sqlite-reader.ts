@@ -5,10 +5,20 @@ import { ToolError } from "./tool-errors";
 const SQLITE_MAGIC = new Uint8Array([
 	0x53, 0x51, 0x4c, 0x69, 0x74, 0x65, 0x20, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x20, 0x33, 0x00,
 ]);
+
+export function looksLikeSqlite(bytes: Uint8Array): boolean {
+	if (bytes.byteLength < SQLITE_MAGIC.byteLength) return false;
+	for (const [index, byte] of SQLITE_MAGIC.entries()) {
+		if (bytes[index] !== byte) return false;
+	}
+	return true;
+}
 const SQLITE_PATH_PATTERN = /\.(?:sqlite3?|db3?)(?=(?::|\?|$))/gi;
 const DEFAULT_QUERY_LIMIT = 20;
 const DEFAULT_SCHEMA_SAMPLE_LIMIT = 5;
 const MAX_QUERY_LIMIT = 500;
+/** Row cap for raw `?q=` SQL — protects against `SELECT *` on multi-million-row tables. */
+export const MAX_RAW_QUERY_ROWS = 1000;
 const MAX_RENDER_WIDTH = 120;
 const MAX_COLUMN_WIDTH = 40;
 const MIN_COLUMN_WIDTH = 1;
@@ -443,18 +453,7 @@ export function parseSqlitePathCandidates(filePath: string): SqlitePathCandidate
 
 export async function isSqliteFile(absolutePath: string): Promise<boolean> {
 	try {
-		const bytes = await Bun.file(absolutePath).slice(0, SQLITE_MAGIC.byteLength).bytes();
-		if (bytes.length !== SQLITE_MAGIC.byteLength) {
-			return false;
-		}
-
-		for (const [index, byte] of SQLITE_MAGIC.entries()) {
-			if (bytes[index] !== byte) {
-				return false;
-			}
-		}
-
-		return true;
+		return looksLikeSqlite(await Bun.file(absolutePath).slice(0, SQLITE_MAGIC.byteLength).bytes());
 	} catch {
 		return false;
 	}
@@ -662,15 +661,25 @@ export function getRowByRowId(db: Database, table: string, key: string): Record<
 		.get(binding);
 }
 
-export function executeReadQuery(db: Database, sql: string): { columns: string[]; rows: Record<string, unknown>[] } {
+export function executeReadQuery(
+	db: Database,
+	sql: string,
+): { columns: string[]; rows: Record<string, unknown>[]; truncated: boolean } {
 	const statement = db.prepare<SqliteRow, []>(sql);
 	if (statement.paramsCount > 0) {
 		throw new ToolError("SQLite raw queries do not support bound parameters");
 	}
-	return {
-		columns: [...statement.columnNames],
-		rows: statement.all(),
-	};
+	const columns = [...statement.columnNames];
+	const rows: SqliteRow[] = [];
+	let truncated = false;
+	for (const row of statement.iterate()) {
+		if (rows.length >= MAX_RAW_QUERY_ROWS) {
+			truncated = true;
+			break;
+		}
+		rows.push(row);
+	}
+	return { columns, rows, truncated };
 }
 
 export function insertRow(db: Database, table: string, data: Record<string, unknown>): void {

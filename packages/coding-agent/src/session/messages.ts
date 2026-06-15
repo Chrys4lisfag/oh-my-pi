@@ -8,8 +8,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import {
 	type BranchSummaryMessage,
 	type CompactionSummaryMessage,
-	renderBranchSummaryContext,
-	renderCompactionSummaryContext,
+	convertMessageToLlm,
 } from "@oh-my-pi/pi-agent-core/compaction/messages";
 import type {
 	AssistantMessage,
@@ -17,33 +16,44 @@ import type {
 	Message,
 	MessageAttribution,
 	TextContent,
-	ToolResultMessage,
+	UserMessage,
 } from "@oh-my-pi/pi-ai";
+import { prompt } from "@oh-my-pi/pi-utils";
+import userInterjectionTemplate from "../prompts/steering/user-interjection.md" with { type: "text" };
 
 export {
 	type BranchSummaryMessage,
 	type CompactionSummaryMessage,
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
+	createCustomMessage,
 } from "@oh-my-pi/pi-agent-core/compaction/messages";
 
 import type { OutputMeta } from "../tools/output-meta";
 import { formatOutputNotice } from "../tools/output-meta";
 
 export const SKILL_PROMPT_MESSAGE_TYPE = "skill-prompt";
+export const LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE = "lsp-late-diagnostic";
+export const BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE = "background-tan-dispatch";
+
+/** Details persisted on a `/tan` background-dispatch breadcrumb. */
+export interface BackgroundTanDispatchDetails {
+	jobId: string;
+	work: string;
+	/** Forked clone session file, named `<agentId>.jsonl`; the Agent Hub reads its transcript. */
+	sessionFile: string;
+}
 
 export interface SkillPromptDetails {
 	name: string;
 	path: string;
 	args?: string;
 	lineCount: number;
-	/** Internal: tag used by AgentSession to remove the pending-display chip
-	 *  from `#steeringMessages` / `#followUpMessages` when the agent consumes
-	 *  this message. Not surfaced to renderers; the `__` prefix signals
-	 *  "private". Optional — non-streaming skill prompts never set it. Stripped
-	 *  from persisted `details` by `SessionManager.appendCustomMessageEntry`
-	 *  via the `INTERNAL_DETAILS_FIELDS` allowlist below. */
-	__pendingDisplayTag?: string;
+	/** Internal: compact label shown for a queued custom message. Optional —
+	 *  non-streaming skill prompts never set it. Stripped from persisted
+	 *  `details` by `SessionManager.appendCustomMessageEntry` via the
+	 *  `INTERNAL_DETAILS_FIELDS` allowlist below. */
+	__queueChipText?: string;
 }
 
 /** Sentinel value for `AssistantMessage.errorMessage` indicating that the abort
@@ -55,7 +65,7 @@ export interface SkillPromptDetails {
  *
  *  Consumers: `AgentSession.#handleAgentEvent` (stamper) writes this value;
  *  `EventController.#handleMessageEnd`, `AssistantMessageComponent`,
- *  `ui-helpers.addMessageToChat` (renderers), `SessionObserverOverlay
+ *  `ui-helpers.addMessageToChat` (renderers), `AgentHubOverlayComponent
  *  #buildTranscriptLines`, `runPrintMode`, and `AcpAgent#replayAssistantMessage`
  *  (fallback error emission) read it via `isSilentAbort`. */
 export const SILENT_ABORT_MARKER = "__omp.silent_abort__";
@@ -67,12 +77,46 @@ export function isSilentAbort(errorMessage: string | undefined): boolean {
 	return errorMessage === SILENT_ABORT_MARKER;
 }
 
-/** Extract the optional `__pendingDisplayTag` field from a CustomMessage's
+/** Reason threaded through `AbortController.abort(reason)` when the user aborts
+ *  the turn with Esc (see `AgentSession.abort`). The agent keeps it on the
+ *  aborted assistant message's `errorMessage` so queued follow-ups/tool-result
+ *  placeholders can distinguish a deliberate interrupt from a bare lifecycle
+ *  abort, but interactive renderers suppress this redundant transcript line. */
+export const USER_INTERRUPT_LABEL = "Interrupted by user";
+
+export function isUserInterruptAbort(errorMessage: string | undefined): boolean {
+	return errorMessage === USER_INTERRUPT_LABEL;
+}
+
+export function shouldRenderAbortReason(errorMessage: string | undefined): boolean {
+	return !isSilentAbort(errorMessage) && !isUserInterruptAbort(errorMessage);
+}
+
+/** Sentinel `errorMessage` the agent stamps on any abort that carried no custom
+ *  reason (bare `abort()`). Renderers treat it as "no specific reason given". */
+const GENERIC_ABORT_SENTINEL = "Request was aborted";
+
+/** Resolve the operator-facing label for an aborted assistant turn. A custom
+ *  abort reason threaded onto `errorMessage` is returned verbatim; aborts with
+ *  no threaded reason fall back to the retry-aware generic label. Call
+ *  `shouldRenderAbortReason` before rendering when user interrupts should stay
+ *  visually quiet. */
+export function resolveAbortLabel(errorMessage: string | undefined, retryAttempt = 0): string {
+	if (errorMessage && errorMessage !== GENERIC_ABORT_SENTINEL && !isSilentAbort(errorMessage)) {
+		return errorMessage;
+	}
+	if (retryAttempt > 0) {
+		return `Aborted after ${retryAttempt} retry attempt${retryAttempt > 1 ? "s" : ""}`;
+	}
+	return "Operation aborted";
+}
+
+/** Extract the optional `__queueChipText` field from a CustomMessage's
  *  `details` blob. Safe over `unknown`; returns undefined when the field is
  *  absent or non-string. */
-export function readPendingDisplayTag(details: unknown): string | undefined {
+export function readQueueChipText(details: unknown): string | undefined {
 	if (typeof details !== "object" || details === null) return undefined;
-	const candidate = (details as { __pendingDisplayTag?: unknown }).__pendingDisplayTag;
+	const candidate = (details as { __queueChipText?: unknown }).__queueChipText;
 	return typeof candidate === "string" ? candidate : undefined;
 }
 
@@ -81,7 +125,7 @@ export function readPendingDisplayTag(details: unknown): string | undefined {
  *  the CustomMessageEntry to disk. Scoped intentionally narrow: only fields
  *  declared here are stripped. Adding a new entry is a deliberate, reviewed
  *  change — unrelated future payload fields are never silently dropped. */
-export const INTERNAL_DETAILS_FIELDS = ["__pendingDisplayTag"] as const;
+export const INTERNAL_DETAILS_FIELDS = ["__queueChipText"] as const;
 
 /** Return a `details` copy with every key in `INTERNAL_DETAILS_FIELDS`
  *  removed. Returns the input unchanged when there is nothing to strip
@@ -105,13 +149,81 @@ export function stripInternalDetailsFields<T>(details: T | undefined): T | undef
 	return cleaned as T;
 }
 
-function getPrunedToolResultContent(message: ToolResultMessage): (TextContent | ImageContent)[] {
-	if (message.prunedAt === undefined) {
-		return message.content;
+function isSteeringUserMessage(message: AgentMessage | undefined): message is UserMessage & { steering: true } {
+	return message?.role === "user" && message.steering === true;
+}
+
+function userMessageWithoutSteering(message: UserMessage): UserMessage {
+	const { steering, ...rest } = message;
+	void steering;
+	return rest;
+}
+
+function renderSteeringEnvelope(message: string): string {
+	return prompt.render(userInterjectionTemplate, { message });
+}
+
+function getArrayContentText(content: (TextContent | ImageContent)[]): string {
+	let firstText: string | undefined;
+	let textParts: string[] | undefined;
+	for (const part of content) {
+		if (part.type !== "text") continue;
+		if (firstText === undefined) {
+			firstText = part.text;
+			continue;
+		}
+		if (textParts === undefined) {
+			textParts = [firstText];
+		}
+		textParts.push(part.text);
 	}
-	const textBlocks = message.content.filter((content): content is TextContent => content.type === "text");
-	const text = textBlocks.map(block => block.text).join("") || "[Output truncated]";
-	return [{ type: "text", text }];
+	return textParts === undefined ? (firstText ?? "") : textParts.join("\n");
+}
+
+function getArrayContentImages(content: (TextContent | ImageContent)[]): ImageContent[] {
+	let images: ImageContent[] | undefined;
+	for (const part of content) {
+		if (part.type !== "image") continue;
+		if (images === undefined) images = [];
+		images.push(part);
+	}
+	return images ?? [];
+}
+
+function wrapSteeringUserMessage(message: UserMessage): UserMessage {
+	if (typeof message.content === "string") {
+		if (message.content.length === 0) return message;
+		return { ...userMessageWithoutSteering(message), content: renderSteeringEnvelope(message.content) };
+	}
+
+	const text = getArrayContentText(message.content);
+	if (text.length === 0) return message;
+	const content: (TextContent | ImageContent)[] = [{ type: "text", text: renderSteeringEnvelope(text) }];
+	content.push(...getArrayContentImages(message.content));
+	return { ...userMessageWithoutSteering(message), content };
+}
+
+export function wrapSteeringForModel(messages: AgentMessage[]): AgentMessage[] {
+	const last = messages[messages.length - 1];
+	if (!isSteeringUserMessage(last)) return messages;
+
+	let firstSteer = messages.length - 1;
+	while (firstSteer > 0 && isSteeringUserMessage(messages[firstSteer - 1])) {
+		firstSteer--;
+	}
+
+	let wrappedMessages: AgentMessage[] | undefined;
+	for (let i = firstSteer; i < messages.length; i++) {
+		const message = messages[i];
+		if (!isSteeringUserMessage(message)) continue;
+		const wrappedMessage = wrapSteeringUserMessage(message);
+		if (wrappedMessage === message) continue;
+		if (wrappedMessages === undefined) {
+			wrappedMessages = messages.slice();
+		}
+		wrappedMessages[i] = wrappedMessage;
+	}
+	return wrappedMessages ?? messages;
 }
 
 /** Result of filtering image blocks out of a `(TextContent | ImageContent)[]` array. */
@@ -363,26 +475,6 @@ export function sanitizeRehydratedOpenAIResponsesAssistantMessage(message: Assis
 	};
 }
 
-/** Convert CustomMessageEntry to AgentMessage format */
-export function createCustomMessage(
-	customType: string,
-	content: string | (TextContent | ImageContent)[],
-	display: boolean,
-	details: unknown | undefined,
-	timestamp: string,
-	attribution?: MessageAttribution,
-): CustomMessage {
-	return {
-		role: "custom",
-		customType,
-		content,
-		display,
-		details,
-		attribution,
-		timestamp: new Date(timestamp).getTime(),
-	};
-}
-
 /**
  * Transform AgentMessages (including custom types) to LLM-compatible Messages.
  *
@@ -415,77 +507,38 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						attribution: "user",
 						timestamp: m.timestamp,
 					};
-				case "custom":
-				case "hookMessage": {
-					const content = typeof m.content === "string" ? [{ type: "text" as const, text: m.content }] : m.content;
-					const role = "user";
-					const attribution = m.attribution;
-					return {
-						role,
-						content,
-						attribution,
-						timestamp: m.timestamp,
-					};
-				}
-				case "branchSummary":
-					return {
-						role: "user",
-						content: [
-							{
-								type: "text" as const,
-								text: renderBranchSummaryContext(m.summary),
-							},
-						],
-						attribution: "agent",
-						timestamp: m.timestamp,
-					};
-				case "compactionSummary":
-					return {
-						role: "user",
-						content: [
-							{
-								type: "text" as const,
-								text: renderCompactionSummaryContext(m.summary),
-							},
-						],
-						attribution: "agent",
-						providerPayload: m.providerPayload,
-						timestamp: m.timestamp,
-					};
 				case "fileMention": {
 					const fileContents = m.files
 						.map(file => {
 							const inner = file.content ? `\n${file.content}\n` : "\n";
 							return `<file path="${file.path}">${inner}</file>`;
 						})
-						.join("\n\n");
-					const content: (TextContent | ImageContent)[] = [
-						{ type: "text" as const, text: `<system-reminder>\n${fileContents}\n</system-reminder>` },
-					];
+						.join("\n");
+					const content: (TextContent | ImageContent)[] = [{ type: "text" as const, text: fileContents }];
 					for (const file of m.files) {
 						if (file.image) {
 							content.push(file.image);
 						}
 					}
 					return {
-						role: "user",
+						role: "developer",
 						content,
 						attribution: "user",
 						timestamp: m.timestamp,
 					};
 				}
+				case "custom":
+				case "hookMessage":
+				case "branchSummary":
+				case "compactionSummary":
 				case "user":
-					return { ...m, attribution: m.attribution ?? "user" };
 				case "developer":
-					return { ...m, attribution: m.attribution ?? "agent" };
 				case "assistant":
-					return m;
 				case "toolResult":
-					return {
-						...m,
-						content: getPrunedToolResultContent(m as ToolResultMessage),
-						attribution: m.attribution ?? "agent",
-					};
+					// Core roles share one transformer with agent-core —
+					// duplicating them here is how snapcompact frames once
+					// silently fell off the provider request.
+					return convertMessageToLlm(m);
 				default:
 					m satisfies never;
 					return undefined;

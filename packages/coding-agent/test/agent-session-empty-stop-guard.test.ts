@@ -51,6 +51,22 @@ function emptyStop(): MockResponse {
 	};
 }
 
+function orphanedToolUseStop(): MockResponse {
+	return {
+		content: [{ type: "thinking", thinking: "I should call a tool next." }],
+		stopReason: "toolUse",
+		usage: { output: 1, cacheRead: 100 },
+	};
+}
+
+function thinkingOnlyStop(): MockResponse {
+	return {
+		content: [{ type: "thinking", thinking: "I should inspect the next file." }],
+		stopReason: "stop",
+		usage: { output: 1, cacheRead: 100 },
+	};
+}
+
 async function createHarness(
 	responses: MockResponse[],
 	settingsOverrides: SettingsOverrides = {},
@@ -65,7 +81,7 @@ async function createHarness(
 		"compaction.enabled": false,
 		"retry.enabled": false,
 		"todo.enabled": false,
-		"todo.eager": false,
+		"todo.eager": "default",
 		"todo.reminders": false,
 		...settingsOverrides,
 	});
@@ -111,26 +127,23 @@ function emptyAssistantStops(messages: AgentMessage[]): AgentMessage[] {
 			message.stopReason === "stop" &&
 			!message.content.some(content => {
 				if (content.type === "text") return content.text.trim().length > 0;
-				if (content.type === "thinking") return content.thinking.trim().length > 0;
 				return content.type === "toolCall";
 			}),
 	);
 }
-
 function reminderMessages(messages: AgentMessage[]): AgentMessage[] {
-	return messages.filter(
-		message =>
-			message.role === "developer" &&
-			(typeof message.content === "string"
-				? message.content.includes("previous assistant turn ended with no text")
-				: message.content.some(
-						content =>
-							content.type === "text" && content.text.includes("previous assistant turn ended with no text"),
-					)),
-	);
+	const isEmptyStopRetryReminder = (text: string): boolean =>
+		text.includes("<system-reminder>") || text.includes("<system-injection>");
+
+	return messages.filter(message => {
+		if (message.role !== "developer") return false;
+		return typeof message.content === "string"
+			? isEmptyStopRetryReminder(message.content)
+			: message.content.some(content => content.type === "text" && isEmptyStopRetryReminder(content.text));
+	});
 }
 
-async function expectPromptCompletes(prompt: Promise<void>): Promise<void> {
+async function expectPromptCompletes(prompt: Promise<boolean>): Promise<void> {
 	await Promise.race([
 		prompt,
 		Bun.sleep(1_000).then(() => {
@@ -179,6 +192,61 @@ describe("AgentSession empty stop guard", () => {
 		).toHaveLength(1);
 	});
 
+	it("retries a tool-use stop that has no tool call or text", async () => {
+		const { session, mock } = await createHarness([
+			recordCall("orphan", "call-record-orphan"),
+			orphanedToolUseStop(),
+			{ content: ["finished after orphaned tool-use retry"], stopReason: "stop" },
+		]);
+
+		await session.prompt("record orphan");
+		await session.waitForIdle();
+
+		expect(mock.calls).toHaveLength(3);
+		expect(assistantText(session.agent.state.messages)).toContain("finished after orphaned tool-use retry");
+		expect(reminderMessages(session.agent.state.messages)).toHaveLength(1);
+	});
+
+	it("retries a stop that only contains thinking", async () => {
+		const { session, mock } = await createHarness([
+			recordCall("thinking", "call-record-thinking"),
+			thinkingOnlyStop(),
+			{ content: ["finished after thinking-only retry"], stopReason: "stop" },
+		]);
+
+		await session.prompt("record thinking");
+		await session.waitForIdle();
+
+		expect(mock.calls).toHaveLength(3);
+		expect(assistantText(session.agent.state.messages)).toContain("finished after thinking-only retry");
+		expect(reminderMessages(session.agent.state.messages)).toHaveLength(1);
+		expect(emptyAssistantStops(session.agent.state.messages)).toHaveLength(0);
+	});
+
+	it("removes orphaned tool-use stops even when retry cap is hit", async () => {
+		const { session, mock } = await createHarness([
+			recordCall("gamma", "call-record-gamma"),
+			orphanedToolUseStop(),
+			orphanedToolUseStop(),
+			orphanedToolUseStop(),
+			orphanedToolUseStop(),
+		]);
+		await session.prompt("record gamma");
+		await session.waitForIdle();
+		expect(mock.calls).toHaveLength(5);
+		expect(reminderMessages(session.agent.state.messages)).toHaveLength(3);
+		const activeBranchMessages = session.sessionManager
+			.getBranch()
+			.filter(entry => entry.type === "message")
+			.map(entry => entry.message as AgentMessage);
+		const orphanedToolUseStops = activeBranchMessages.filter(
+			message =>
+				message.role === "assistant" &&
+				message.stopReason === "toolUse" &&
+				!message.content.some(content => content.type === "toolCall"),
+		);
+		expect(orphanedToolUseStops).toHaveLength(0);
+	});
 	it("caps empty stop retries at three attempts", async () => {
 		const { session, mock } = await createHarness([
 			recordCall("beta", "call-record-beta"),

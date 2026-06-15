@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { CURSOR_MARKER } from "../src/tui";
+import { CURSOR_MARKER } from "@oh-my-pi/pi-tui/tui";
 import {
 	compositeExpectedLineAt,
 	cursorInsertionIndex,
@@ -51,7 +51,7 @@ describe("render stress oracle helpers", () => {
 			width: 10,
 			row: 6,
 			col: 29,
-			maxHeight: undefined,
+			maxHeight: 8,
 		});
 	});
 

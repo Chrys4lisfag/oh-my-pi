@@ -15,6 +15,7 @@
  */
 import { type AssistantMessage, completeSimple, Effort, type Model } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
+
 import type { ModelRegistry } from "../config/model-registry";
 import { resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
@@ -82,7 +83,7 @@ async function classifyOnline(input: string, deps: ClassifyDifficultyDeps): Prom
 			messages: [{ role: "user", content: input, timestamp: Date.now() }],
 		},
 		{
-			apiKey,
+			apiKey: deps.registry.resolver(model, deps.sessionId),
 			maxTokens,
 			disableReasoning: true,
 			metadata,

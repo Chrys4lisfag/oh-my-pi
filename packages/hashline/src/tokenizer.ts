@@ -3,25 +3,28 @@
  *
  * Format shape:
  * ```
- * ¶path/to/file.ts#0A3
- * replace 5..7:
+ * [path/to/file.ts#1A2B]
+ * replace 5.=7:
  * +literal new line
  * ```
  */
 import {
 	describeAnchorExamples,
-	HL_BLOCK_KEYWORD,
+	HL_DELETE_BLOCK_KEYWORD,
 	HL_DELETE_KEYWORD,
 	HL_FILE_HASH_LENGTH,
 	HL_FILE_HASH_SEP,
 	HL_FILE_PREFIX,
+	HL_FILE_SUFFIX,
 	HL_HEADER_COLON,
 	HL_INSERT_AFTER,
+	HL_INSERT_AFTER_BLOCK_KEYWORD,
 	HL_INSERT_BEFORE,
 	HL_INSERT_HEAD,
 	HL_INSERT_KEYWORD,
 	HL_INSERT_TAIL,
 	HL_PAYLOAD_REPLACE,
+	HL_REPLACE_BLOCK_KEYWORD,
 	HL_REPLACE_KEYWORD,
 } from "./format";
 import { ABORT_MARKER, BEGIN_PATCH_MARKER, END_PATCH_MARKER } from "./messages";
@@ -37,6 +40,7 @@ const CHAR_SPACE = 32;
 const CHAR_DOT = 46;
 const CHAR_HYPHEN = 45;
 const CHAR_ELLIPSIS = 0x2026;
+const CHAR_EQUALS = 61;
 
 const CHAR_UPPER_A = 65;
 const CHAR_UPPER_F = 70;
@@ -45,6 +49,7 @@ const CHAR_LOWER_F = 102;
 const CHAR_PAYLOAD_REPLACE = HL_PAYLOAD_REPLACE.charCodeAt(0);
 const CHAR_COLON = HL_HEADER_COLON.charCodeAt(0);
 const FILE_PREFIX_LENGTH = HL_FILE_PREFIX.length;
+const FILE_SUFFIX_LENGTH = HL_FILE_SUFFIX.length;
 
 function isDigitCode(code: number): boolean {
 	return code >= CHAR_ZERO && code <= CHAR_NINE;
@@ -137,7 +142,7 @@ export function parseLid(raw: string, lineNum: number): Anchor {
 	if (number === null || skipWhitespace(raw, number.nextIndex, end) !== end) {
 		throw new Error(
 			`line ${lineNum}: expected a line number such as ${describeAnchorExamples("119")}; ` +
-				`got ${JSON.stringify(raw)}. Use ${HL_FILE_PREFIX}PATH${HL_FILE_HASH_SEP}hash from your latest read for file-version binding.`,
+				`got ${JSON.stringify(raw)}. Use ${HL_FILE_PREFIX}PATH${HL_FILE_HASH_SEP}hash${HL_FILE_SUFFIX} from your latest read for file-version binding.`,
 		);
 	}
 	return { line: number.line };
@@ -163,7 +168,11 @@ function scanRangeSeparator(line: string, index: number, end: number): number | 
 			consumedSeparator = true;
 			continue;
 		}
-		if (code === CHAR_DOT && cursor + 1 < end && line.charCodeAt(cursor + 1) === CHAR_DOT) {
+		if (
+			code === CHAR_DOT &&
+			cursor + 1 < end &&
+			(line.charCodeAt(cursor + 1) === CHAR_DOT || line.charCodeAt(cursor + 1) === CHAR_EQUALS)
+		) {
 			cursor += 2;
 			consumedSeparator = true;
 			continue;
@@ -202,6 +211,7 @@ export type BlockTarget =
 	| { kind: "delete_block"; anchor: Anchor }
 	| { kind: "insert_before"; anchor: Anchor }
 	| { kind: "insert_after"; anchor: Anchor }
+	| { kind: "insert_after_block"; anchor: Anchor }
 	| { kind: "bof" }
 	| { kind: "eof" };
 
@@ -215,7 +225,7 @@ function scanKeyword(line: string, index: number, end: number, keyword: string):
 	const next = index + keyword.length;
 	if (next < end) {
 		const code = line.charCodeAt(next);
-		if (!isWhitespaceCode(code) && code !== CHAR_COLON) return null;
+		if (!isWhitespaceCode(code) && code !== CHAR_COLON && code !== CHAR_DOT) return null;
 	}
 	return next;
 }
@@ -226,7 +236,8 @@ function consumeOptionalColon(line: string, index: number, end: number): number 
 }
 
 function scanInsertTarget(line: string, index: number, end: number): TargetScan | null {
-	const cursor = skipWhitespace(line, index, end);
+	if (index >= end || line.charCodeAt(index) !== CHAR_DOT) return null;
+	const cursor = skipWhitespace(line, index + 1, end);
 	const beforeEnd = scanKeyword(line, cursor, end, HL_INSERT_BEFORE);
 	if (beforeEnd !== null) {
 		const anchor = scanLineNumber(line, skipWhitespace(line, beforeEnd, end), end);
@@ -250,20 +261,19 @@ function scanInsertTarget(line: string, index: number, end: number): TargetScan 
 
 function scanHunkAnchor(line: string, start: number, end: number): TargetScan | null {
 	const cursor = skipWhitespace(line, start, end);
+
+	// `replace_block N:` — resolve N to a tree-sitter block range at apply time.
+	const replaceBlockEnd = scanKeyword(line, cursor, end, HL_REPLACE_BLOCK_KEYWORD);
+	if (replaceBlockEnd !== null) {
+		const anchor = scanLineNumber(line, skipWhitespace(line, replaceBlockEnd, end), end);
+		if (anchor === null) return null;
+		return {
+			target: { kind: "block", anchor: { line: anchor.line } },
+			nextIndex: consumeOptionalColon(line, anchor.nextIndex, end),
+		};
+	}
 	const replaceEnd = scanKeyword(line, cursor, end, HL_REPLACE_KEYWORD);
 	if (replaceEnd !== null) {
-		// `replace block N:` — resolve N to a tree-sitter block range at apply
-		// time. Try the `block` sub-keyword before falling back to a literal
-		// `replace N..M:` range.
-		const blockEnd = scanKeyword(line, skipWhitespace(line, replaceEnd, end), end, HL_BLOCK_KEYWORD);
-		if (blockEnd !== null) {
-			const anchor = scanLineNumber(line, skipWhitespace(line, blockEnd, end), end);
-			if (anchor === null) return null;
-			return {
-				target: { kind: "block", anchor: { line: anchor.line } },
-				nextIndex: consumeOptionalColon(line, anchor.nextIndex, end),
-			};
-		}
 		const range = scanHeaderRange(line, replaceEnd, end, true);
 		if (range === null) return null;
 		return {
@@ -271,24 +281,35 @@ function scanHunkAnchor(line: string, start: number, end: number): TargetScan | 
 			nextIndex: consumeOptionalColon(line, range.nextIndex, end),
 		};
 	}
+	// `delete_block N` — resolve N to a tree-sitter block range at apply time
+	// and delete its whole span. Like `delete N.=M`, it takes no body and no
+	// trailing colon.
+	const deleteBlockEnd = scanKeyword(line, cursor, end, HL_DELETE_BLOCK_KEYWORD);
+	if (deleteBlockEnd !== null) {
+		const anchor = scanLineNumber(line, skipWhitespace(line, deleteBlockEnd, end), end);
+		if (anchor === null) return null;
+		const next = skipWhitespace(line, anchor.nextIndex, end);
+		if (next < end && line.charCodeAt(next) === CHAR_COLON) return null;
+		return { target: { kind: "delete_block", anchor: { line: anchor.line } }, nextIndex: next };
+	}
 	const deleteEnd = scanKeyword(line, cursor, end, HL_DELETE_KEYWORD);
 	if (deleteEnd !== null) {
-		// `delete block N` — resolve N to a tree-sitter block range at apply
-		// time and delete its whole span. Like `delete N..M`, it takes no body
-		// and no trailing colon.
-		const blockEnd = scanKeyword(line, skipWhitespace(line, deleteEnd, end), end, HL_BLOCK_KEYWORD);
-		if (blockEnd !== null) {
-			const anchor = scanLineNumber(line, skipWhitespace(line, blockEnd, end), end);
-			if (anchor === null) return null;
-			const next = skipWhitespace(line, anchor.nextIndex, end);
-			if (next < end && line.charCodeAt(next) === CHAR_COLON) return null;
-			return { target: { kind: "delete_block", anchor: { line: anchor.line } }, nextIndex: next };
-		}
 		const range = scanHeaderRange(line, deleteEnd, end, true);
 		if (range === null) return null;
 		const next = skipWhitespace(line, range.nextIndex, end);
 		if (next < end && line.charCodeAt(next) === CHAR_COLON) return null;
 		return { target: { kind: "delete", range: range.range }, nextIndex: next };
+	}
+	// `insert_after_block N:` — insert after the last line of the tree-sitter
+	// block at N.
+	const insertAfterBlockEnd = scanKeyword(line, cursor, end, HL_INSERT_AFTER_BLOCK_KEYWORD);
+	if (insertAfterBlockEnd !== null) {
+		const anchor = scanLineNumber(line, skipWhitespace(line, insertAfterBlockEnd, end), end);
+		if (anchor === null) return null;
+		return {
+			target: { kind: "insert_after_block", anchor: { line: anchor.line } },
+			nextIndex: consumeOptionalColon(line, anchor.nextIndex, end),
+		};
 	}
 	const insertEnd = scanKeyword(line, cursor, end, HL_INSERT_KEYWORD);
 	if (insertEnd !== null) return scanInsertTarget(line, insertEnd, end);
@@ -312,28 +333,44 @@ function tryParseHunkHeader(line: string): ParsedHunkHeader | null {
 function tryParseHeader(line: string): { path: string; fileHash?: string } | null {
 	if (!line.startsWith(HL_FILE_PREFIX)) return null;
 	const end = trimEndIndex(line);
-	let index = FILE_PREFIX_LENGTH;
-	if (index >= end) return null;
-	const pathStart = index;
-	while (index < end) {
-		const code = line.charCodeAt(index);
-		if (code === CHAR_HASH || code === CHAR_SPACE || code === CHAR_TAB) break;
-		index++;
-	}
-	if (index === pathStart) return null;
-	const path = line.slice(pathStart, index);
+	if (FILE_PREFIX_LENGTH + FILE_SUFFIX_LENGTH >= end) return null;
+	if (!line.endsWith(HL_FILE_SUFFIX, end)) return null;
+	const bodyEnd = end - FILE_SUFFIX_LENGTH;
+	if (FILE_PREFIX_LENGTH >= bodyEnd) return null;
+
+	// The snapshot tag, when present, is the trailing `#XXXX` block inside the
+	// bracketed header. We detect it from the suffix so the path may
+	// legitimately contain whitespace (e.g. `OneDrive - Company/file.ts`).
+	let pathEnd = bodyEnd;
 	let fileHash: string | undefined;
-	if (index < end && line.charCodeAt(index) === CHAR_HASH) {
-		const hashStart = index + 1;
-		const hashEnd = hashStart + HL_FILE_HASH_LENGTH;
-		if (hashEnd > end) return null;
-		for (let probe = hashStart; probe < hashEnd; probe++) {
-			if (!isHexDigitCode(line.charCodeAt(probe))) return null;
+	const trailingHashStart = bodyEnd - HL_FILE_HASH_LENGTH - 1;
+	if (trailingHashStart >= FILE_PREFIX_LENGTH && line.charCodeAt(trailingHashStart) === CHAR_HASH) {
+		let allHex = true;
+		for (let probe = trailingHashStart + 1; probe < bodyEnd; probe++) {
+			if (!isHexDigitCode(line.charCodeAt(probe))) {
+				allHex = false;
+				break;
+			}
 		}
-		fileHash = line.slice(hashStart, hashEnd).toUpperCase();
-		index = hashEnd;
+		if (allHex) {
+			pathEnd = trailingHashStart;
+			fileHash = line.slice(trailingHashStart + 1, bodyEnd).toUpperCase();
+		}
 	}
-	if (skipWhitespace(line, index, end) !== end) return null;
+
+	// The hashline header grammar uses `#` as the path/tag separator and
+	// does not allow `#` inside filenames. Anything `#` left in the path
+	// body — short tags (`#1A2`), non-hex tags (`#1A2G`), over-long tags
+	// (`#1A2B5`), stale-tag copy-paste (`#1A2B copied from read`), or
+	// line-suffixed tags (`#1A2B:42`) — means the header is malformed.
+	// Surface the focused diagnostic instead of silently mis-routing the
+	// edit or reporting a missing tag downstream.
+	for (let i = FILE_PREFIX_LENGTH; i < pathEnd; i++) {
+		if (line.charCodeAt(i) === CHAR_HASH) return null;
+	}
+
+	if (pathEnd === FILE_PREFIX_LENGTH) return null;
+	const path = line.slice(FILE_PREFIX_LENGTH, pathEnd);
 	return fileHash !== undefined ? { path, fileHash } : { path };
 }
 

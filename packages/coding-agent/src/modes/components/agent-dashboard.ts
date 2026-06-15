@@ -7,7 +7,7 @@
  *
  * Controls:
  * - Up/Down or j/k: move selection
- * - Tab / Shift+Tab: switch source tab
+ * - Tab / Shift+Tab or Left/Right: switch source tab
  * - Space: enable/disable selected agent
  * - Enter: edit model override for selected agent
  * - N: start agent creation flow
@@ -27,6 +27,7 @@ import {
 	matchesKey,
 	padding,
 	replaceTabs,
+	ScrollView,
 	Spacer,
 	Text,
 	truncateToWidth,
@@ -97,6 +98,9 @@ const SOURCE_LABEL: Record<AgentSource, string> = {
 	user: "User",
 	bundled: "Bundled",
 };
+
+const LIST_FOOTER =
+	" ↑/↓: navigate  Space: toggle  Enter: model override  N: new agent  ←/→: source  Ctrl+R: reload  Esc: close";
 
 const IDENTIFIER_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+){1,5}$/;
 function joinPatterns(patterns: string[]): string {
@@ -190,7 +194,7 @@ class AgentListPane implements Component {
 		private readonly maxVisible: number,
 	) {}
 
-	render(width: number): string[] {
+	render(width: number): readonly string[] {
 		const lines: string[] = [];
 		const searchPrefix = theme.fg("muted", "Search: ");
 		const searchText = this.searchQuery || theme.fg("dim", "type to filter");
@@ -202,9 +206,12 @@ class AgentListPane implements Component {
 			return lines;
 		}
 
+		const overflow = this.agents.length > this.maxVisible;
+		const rowWidth = Math.max(0, width - (overflow ? 1 : 0));
 		const start = this.scrollOffset;
 		const end = Math.min(start + this.maxVisible, this.agents.length);
 
+		const rows: string[] = [];
 		for (let i = start; i < end; i++) {
 			const agent = this.agents[i];
 			const selected = i === this.selectedIndex;
@@ -221,12 +228,17 @@ class AgentListPane implements Component {
 				line = theme.fg("dim", line);
 			}
 
-			lines.push(truncateToWidth(line, width));
+			rows.push(truncateToWidth(line, rowWidth));
 		}
 
-		if (this.agents.length > this.maxVisible) {
-			lines.push(theme.fg("muted", `  (${this.selectedIndex + 1}/${this.agents.length})`));
-		}
+		const sv = new ScrollView(rows, {
+			height: rows.length,
+			scrollbar: "auto",
+			totalRows: this.agents.length,
+			theme: { track: t => theme.fg("muted", t), thumb: t => theme.fg("accent", t) },
+		});
+		sv.setScrollOffset(this.scrollOffset);
+		lines.push(...sv.render(width));
 
 		return lines;
 	}
@@ -243,7 +255,7 @@ class AgentInspectorPane implements Component {
 		private readonly effectiveResolution: ModelResolution | undefined,
 	) {}
 
-	render(width: number): string[] {
+	render(width: number): readonly string[] {
 		if (!this.agent) {
 			return [theme.fg("muted", "Select an agent"), theme.fg("dim", "to inspect settings")];
 		}
@@ -302,12 +314,12 @@ class TwoColumnBody implements Component {
 		private readonly maxHeight: number,
 	) {}
 
-	render(width: number): string[] {
+	render(width: number): readonly string[] {
 		const leftWidth = Math.floor(width * 0.5);
 		const rightWidth = width - leftWidth - 3;
 		const leftLines = this.leftPane.render(leftWidth);
 		const rightLines = this.rightPane.render(rightWidth);
-		const lineCount = Math.min(this.maxHeight, Math.max(leftLines.length, rightLines.length));
+		const lineCount = this.maxHeight;
 		const out: string[] = [];
 		const separator = theme.fg("dim", ` ${theme.boxSharp.vertical} `);
 
@@ -339,6 +351,8 @@ export class AgentDashboard extends Container {
 	#loading = true;
 	#loadError: string | null = null;
 	#notice: string | null = null;
+	#builtRows = -1;
+	#builtCols = -1;
 
 	#editInput: Input | null = null;
 	#editingAgentName: string | null = null;
@@ -466,8 +480,49 @@ export class AgentDashboard extends Container {
 		this.#clampSelection();
 	}
 
+	/** Live terminal height so the dashboard tracks resize while open. */
+	#terminalRows(): number {
+		return process.stdout.rows || this.terminalHeight || 24;
+	}
+
+	#noticeBlockLines(): number {
+		if (!this.#notice) return 0;
+		return wrapTextWithAnsi(theme.fg("success", replaceTabs(this.#notice)), this.#uiWidth()).length + 1;
+	}
+
+	#footerLines(): number {
+		return Math.max(1, wrapTextWithAnsi(theme.fg("dim", LIST_FOOTER), this.#uiWidth()).length);
+	}
+
+	/** Height budget for the two-column body, sized to the live terminal. */
+	#computeBodyHeight(): number {
+		// Chrome around the body: top border + title + tab bar + spacer (4),
+		// optional notice block, then spacer + footer + bottom border.
+		const chrome = 4 + this.#noticeBlockLines() + 1 + this.#footerLines() + 1;
+		return Math.max(5, this.#terminalRows() - chrome);
+	}
+
 	#getMaxVisibleItems(): number {
-		return Math.max(5, this.terminalHeight - 14);
+		// List pane chrome inside the body: search line, blank line, count line.
+		return Math.max(3, this.#computeBodyHeight() - 3);
+	}
+
+	override render(width: number): readonly string[] {
+		// Rebuild when terminal geometry changes so the full-screen overlay
+		// re-fits on resize.
+		if (this.#terminalRows() !== this.#builtRows || this.#uiWidth() !== this.#builtCols) {
+			this.#buildLayout();
+		}
+		const lines = super.render(width);
+		// Pad to the full viewport so every state (list, edit, create) covers the
+		// screen as a true full-screen view instead of letting the transcript peek
+		// through below it. Copy before padding — the container's render result is
+		// component-owned and must not be mutated.
+		const rows = this.#terminalRows();
+		if (lines.length >= rows) return lines;
+		const padded = lines.slice();
+		while (padded.length < rows) padded.push("");
+		return padded;
 	}
 
 	#clampSelection(): void {
@@ -560,7 +615,7 @@ export class AgentDashboard extends Container {
 		const editor = new Editor(getEditorTheme());
 		editor.setBorderVisible(false);
 		editor.setPromptGutter("> ");
-		editor.setMaxHeight(Math.max(3, Math.min(8, this.terminalHeight - 12)));
+		editor.setMaxHeight(Math.max(3, Math.min(8, this.#terminalRows() - 12)));
 		editor.disableSubmit = true;
 		editor.onChange = value => {
 			this.#createDescription = value;
@@ -595,6 +650,11 @@ export class AgentDashboard extends Container {
 		this.#createInput.handleInput("\n");
 		this.#createDescription = this.#createInput.getExpandedText();
 		this.#buildLayout();
+	}
+
+	#shouldSubmitCreateDescription(data: string): boolean {
+		if (matchesKey(data, "ctrl+enter")) return true;
+		return process.platform === "win32" && data === "\n" && this.#createDescription.trim().length > 0;
 	}
 
 	async #generateAgentFromDescription(rawDescription: string): Promise<void> {
@@ -818,7 +878,7 @@ export class AgentDashboard extends Container {
 		this.addChild(new Text(theme.fg("muted", "Describe what the new agent should do:"), 0, 0));
 		this.addChild(new Spacer(1));
 		if (this.#createInput) {
-			this.#createInput.setMaxHeight(Math.max(3, Math.min(8, this.terminalHeight - 12)));
+			this.#createInput.setMaxHeight(Math.max(3, Math.min(8, this.#terminalRows() - 12)));
 			this.addChild(this.#createInput);
 		}
 		this.addChild(new Spacer(1));
@@ -828,7 +888,7 @@ export class AgentDashboard extends Container {
 			this.addChild(new Text(theme.fg("accent", "Generating agent specification..."), 0, 0));
 			if (this.#createStreamingText) {
 				this.addChild(new Spacer(1));
-				const maxPreview = Math.max(3, this.terminalHeight - 18);
+				const maxPreview = Math.max(3, this.#terminalRows() - 18);
 				const contentWidth = Math.max(20, this.#uiWidth() - 4);
 				const wrappedLines: string[] = [];
 				for (const raw of this.#createStreamingText.split("\n")) {
@@ -993,22 +1053,15 @@ export class AgentDashboard extends Container {
 				effectivePatterns,
 				effectiveResolution,
 			);
-			const bodyHeight = Math.max(5, this.terminalHeight - 8);
+			const bodyHeight = this.#computeBodyHeight();
 			this.addChild(new TwoColumnBody(listPane, inspector, bodyHeight));
 			this.addChild(new Spacer(1));
-			this.addChild(
-				new Text(
-					theme.fg(
-						"dim",
-						" ↑/↓: navigate  Space: toggle  Enter: model override  N: new agent  Tab: source  Ctrl+R: reload  Esc: close",
-					),
-					0,
-					0,
-				),
-			);
+			this.addChild(new Text(theme.fg("dim", LIST_FOOTER), 0, 0));
 		}
 
 		this.addChild(new DynamicBorder());
+		this.#builtRows = this.#terminalRows();
+		this.#builtCols = this.#uiWidth();
 	}
 
 	handleInput(data: string): void {
@@ -1049,10 +1102,7 @@ export class AgentDashboard extends Container {
 				}
 				return;
 			}
-			if (
-				!this.#createGenerating &&
-				(matchesKey(data, "ctrl+enter") || (data.charCodeAt(0) === 10 && data.length > 1))
-			) {
+			if (!this.#createGenerating && this.#shouldSubmitCreateDescription(data)) {
 				this.#submitCreateDescription();
 				return;
 			}
@@ -1100,11 +1150,11 @@ export class AgentDashboard extends Container {
 			return;
 		}
 
-		if (matchesKey(data, "tab")) {
+		if (matchesKey(data, "tab") || matchesKey(data, "right")) {
 			this.#switchTab(1);
 			return;
 		}
-		if (matchesKey(data, "shift+tab")) {
+		if (matchesKey(data, "shift+tab") || matchesKey(data, "left")) {
 			this.#switchTab(-1);
 			return;
 		}

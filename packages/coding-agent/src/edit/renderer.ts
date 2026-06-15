@@ -2,9 +2,9 @@
  * Edit tool renderer and LSP batching helpers.
  */
 
-import { HL_FILE_PREFIX } from "@oh-my-pi/hashline";
+import { HL_FILE_PREFIX, HL_FILE_SUFFIX } from "@oh-my-pi/hashline";
 import type { Component } from "@oh-my-pi/pi-tui";
-import { Text, visibleWidth, wrapTextWithAnsi } from "@oh-my-pi/pi-tui";
+import { sliceWithWidth, visibleWidth, wrapTextWithAnsi } from "@oh-my-pi/pi-tui";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { FileDiagnosticsResult } from "../lsp";
@@ -12,20 +12,22 @@ import { renderDiff as renderDiffColored } from "../modes/components/diff";
 import { getLanguageFromPath, type Theme } from "../modes/theme/theme";
 import type { OutputMeta } from "../tools/output-meta";
 import {
+	cachedRenderedString,
+	createRenderedStringCache,
 	formatDiagnostics,
-	formatDiffStats,
 	formatExpandHint,
 	formatStatusIcon,
-	formatTitle,
 	getDiffStats,
 	getLspBatchRequest,
+	invalidateRenderedStringCache,
 	type LspBatchRequest,
 	PREVIEW_LIMITS,
+	type RenderedStringCache,
 	replaceTabs,
 	shortenPath,
 	truncateDiffByHunk,
 } from "../tools/render-utils";
-import { fileHyperlink, Hasher, type RenderCache, renderStatusLine, truncateToWidth } from "../tui";
+import { fileHyperlink, framedBlock, Hasher, type RenderCache, renderStatusLine, truncateToWidth } from "../tui";
 import type { EditMode } from "../utils/edit-mode";
 import type { DiffError, DiffResult } from "./diff";
 import { type ApplyPatchEntry, expandApplyPatchToEntries, expandApplyPatchToPreviewEntries } from "./modes/apply-patch";
@@ -140,6 +142,26 @@ export interface EditRenderContext {
 }
 
 const EDIT_STREAMING_PREVIEW_LINES = 12;
+
+function plainDiffRender(diffText: string): string {
+	return diffText;
+}
+
+/**
+ * Lazily grown per-file preview cache slots: the file count of a streaming
+ * multi-file patch is discovered mid-stream, so a fixed-size array would
+ * silently bypass caching for late files.
+ */
+function previewCacheAt(caches: RenderedStringCache[] | undefined, index: number): RenderedStringCache | undefined {
+	if (!caches) return undefined;
+	let cache = caches[index];
+	if (cache === undefined) {
+		cache = createRenderedStringCache();
+		caches[index] = cache;
+	}
+	return cache;
+}
+
 const CALL_TEXT_PREVIEW_LINES = 6;
 const CALL_TEXT_PREVIEW_WIDTH = 80;
 
@@ -179,46 +201,129 @@ function countEditFiles(edits: EditRenderEntry[]): number {
 	return new Set(edits.map(edit => filePathFromEditEntry(edit.path)).filter(Boolean)).size;
 }
 
-function countLines(text: string): number {
-	if (!text) return 0;
-	return text.split("\n").length;
-}
-
 function getOperationTitle(op: Operation | undefined): string {
 	return op === "create" ? "Create" : op === "delete" ? "Delete" : "Edit";
+}
+
+interface EditPathDisplayOptions {
+	rename?: string;
+	firstChangedLine?: number;
+	linkPath?: string;
+	renameLinkPath?: string;
+	maxPathWidth?: number;
+}
+
+function truncateEditTitlePath(displayPath: string, maxWidth: number | undefined): string {
+	if (maxWidth === undefined) return displayPath;
+	const width = visibleWidth(displayPath);
+	const safeMaxWidth = Math.max(0, Math.floor(maxWidth));
+	if (width <= safeMaxWidth) return displayPath;
+
+	const contentWidth = safeMaxWidth - 1;
+	if (contentWidth <= 0) return "…";
+
+	const headWidth = Math.floor(contentWidth / 2);
+	const tailWidth = contentWidth - headWidth;
+	const head = sliceWithWidth(displayPath, 0, headWidth, true).text;
+	const tail = sliceWithWidth(displayPath, Math.max(0, width - tailWidth), tailWidth, true).text;
+	return `${head}…${tail}`;
+}
+
+function formatEditTitlePath(pathValue: string, maxWidth?: number): string {
+	return truncateEditTitlePath(replaceTabs(shortenPath(pathValue), pathValue), maxWidth);
 }
 
 function formatEditPathDisplay(
 	rawPath: string,
 	uiTheme: Theme,
-	options?: { rename?: string; firstChangedLine?: number },
-): string {
+	options?: EditPathDisplayOptions,
+): { text: string; pathWidth: number } {
+	// `rawPath`/`rename` are shown (cwd-relative) but the OSC 8 link targets the
+	// absolute path when known — a relative `rawPath` would otherwise yield a
+	// `file:///rel` URI that resolves against filesystem root instead of cwd.
+	const linkTarget = options?.linkPath || rawPath;
+	const lineLink = options?.firstChangedLine ? { line: options.firstChangedLine } : undefined;
+	const primaryDisplay = rawPath ? formatEditTitlePath(rawPath, options?.maxPathWidth) : "…";
 	let pathDisplay = rawPath
-		? fileHyperlink(rawPath, uiTheme.fg("accent", shortenPath(rawPath)))
-		: uiTheme.fg("toolOutput", "…");
-
-	if (options?.firstChangedLine) {
-		pathDisplay += uiTheme.fg("warning", `:${options.firstChangedLine}`);
-	}
+		? fileHyperlink(linkTarget, uiTheme.fg("accent", primaryDisplay), lineLink)
+		: uiTheme.fg("toolOutput", primaryDisplay);
+	let pathWidth = visibleWidth(primaryDisplay);
 
 	if (options?.rename) {
-		pathDisplay += ` ${uiTheme.fg("dim", "→")} ${fileHyperlink(options.rename, uiTheme.fg("accent", shortenPath(options.rename)))}`;
+		const renameTarget = options.renameLinkPath || options.rename;
+		const renameDisplay = formatEditTitlePath(options.rename, options.maxPathWidth);
+		pathDisplay += ` ${uiTheme.fg("dim", "→")} ${fileHyperlink(renameTarget, uiTheme.fg("accent", renameDisplay))}`;
+		pathWidth += visibleWidth(renameDisplay);
 	}
 
-	return pathDisplay;
+	return { text: pathDisplay, pathWidth };
 }
 
 function formatEditDescription(
 	rawPath: string,
 	uiTheme: Theme,
-	options?: { rename?: string; firstChangedLine?: number },
-): { language: string; description: string } {
+	options?: EditPathDisplayOptions,
+): { language: string; description: string; pathWidth: number } {
 	const language = getLanguageFromPath(rawPath) ?? "text";
 	const icon = uiTheme.fg("muted", uiTheme.getLangIcon(language));
+	const pathDisplay = formatEditPathDisplay(rawPath, uiTheme, options);
 	return {
 		language,
-		description: `${icon} ${formatEditPathDisplay(rawPath, uiTheme, options)}`,
+		description: `${icon} ${pathDisplay.text}`,
+		pathWidth: pathDisplay.pathWidth,
 	};
+}
+
+function editHeaderLabelBudget(width: number, uiTheme: Theme): number {
+	const leftGlyphs = `${uiTheme.boxSharp.topLeft}${uiTheme.boxSharp.horizontal.repeat(3)}`;
+	return Math.max(0, width - visibleWidth(leftGlyphs) - visibleWidth(uiTheme.boxSharp.topRight) - 2);
+}
+
+function renderEditHeader(
+	width: number,
+	uiTheme: Theme,
+	options: {
+		icon: "pending" | "success" | "error";
+		iconOverride?: string;
+		op?: Operation;
+		rawPath: string;
+		rename?: string;
+		firstChangedLine?: number;
+		linkPath?: string;
+		statsSuffix?: string;
+		extraSuffix?: string;
+	},
+): string {
+	const title = getOperationTitle(options.op);
+	const descriptionOptions: EditPathDisplayOptions = {
+		rename: options.rename,
+		firstChangedLine: options.firstChangedLine,
+		linkPath: options.linkPath,
+	};
+	const formatted = formatEditDescription(options.rawPath, uiTheme, descriptionOptions);
+	const suffix = `${options.statsSuffix ?? ""}${options.extraSuffix ?? ""}`;
+	const buildHeader = (description: string): string =>
+		renderStatusLine(
+			{
+				icon: options.icon,
+				iconOverride: options.iconOverride,
+				title,
+				description,
+			},
+			uiTheme,
+		) + suffix;
+
+	const header = buildHeader(formatted.description);
+	const overflow = visibleWidth(header) - editHeaderLabelBudget(width, uiTheme);
+	if (overflow <= 0 || formatted.pathWidth <= 1) return header;
+
+	const pathCount = Math.max(1, (options.rawPath ? 1 : 0) + (options.rename ? 1 : 0));
+	const fittedPathWidth = Math.max(1, Math.floor((formatted.pathWidth - overflow) / pathCount));
+	const fitted = formatEditDescription(options.rawPath, uiTheme, {
+		...descriptionOptions,
+		maxPathWidth: fittedPathWidth,
+	});
+	return buildHeader(fitted.description);
 }
 
 function renderPlainTextPreview(text: string, uiTheme: Theme, filePath?: string): string {
@@ -232,45 +337,61 @@ function renderPlainTextPreview(text: string, uiTheme: Theme, filePath?: string)
 	}
 	return preview.trimEnd();
 }
-
-function formatStreamingDiff(diff: string, rawPath: string, uiTheme: Theme, label = "streaming"): string {
+function formatStreamingDiff(
+	diff: string,
+	rawPath: string,
+	uiTheme: Theme,
+	expanded: boolean,
+	label = "streaming",
+	spinnerFrame?: number,
+	cache?: RenderedStringCache,
+): string {
 	if (!diff) return "";
-	// "Cursor" tail window: pin the last EDIT_STREAMING_PREVIEW_LINES rows to the
-	// bottom of the diff so freshly streamed changes stay on screen, and accept
-	// the trailing rows "from the back" once the diff outgrows the window. The
-	// whole-file diff is recomputed on every streamed chunk and its Myers
-	// alignment is not monotonic in payload length, so a hunk-aware window that
-	// kept whole change segments gained and lost rows tick to tick — the box
-	// stuttered, and the earlier high-water fix traded that for a half-empty
-	// rectangle. A strict fixed-height window keeps the box steady and always
-	// full of real diff context instead of blank padding.
-	const allLines = diff.replace(/\n+$/u, "").split("\n");
-	const hiddenLines = Math.max(0, allLines.length - EDIT_STREAMING_PREVIEW_LINES);
-	const visible = hiddenLines > 0 ? allLines.slice(hiddenLines) : allLines;
-	let text = "\n\n";
-	if (hiddenLines > 0) {
-		const hiddenHunks = getDiffStats(allLines.slice(0, hiddenLines).join("\n")).hunks;
-		const remainder: string[] = [];
-		if (hiddenHunks > 0) remainder.push(`${hiddenHunks} more hunks`);
-		remainder.push(`${hiddenLines} more lines`);
-		text += `${uiTheme.fg("dim", `… (${remainder.join(", ")} above)`)}\n`;
+	let text = cachedRenderedString(cache, uiTheme, expanded, rawPath, diff, () => {
+		// Collapsed uses a "Cursor" tail window: pin the last
+		// EDIT_STREAMING_PREVIEW_LINES rows to the bottom so freshly streamed changes
+		// stay on screen. The whole-file diff is recomputed on every streamed chunk
+		// and its Myers alignment is not monotonic in payload length, so a hunk-aware
+		// window stutters as rows move between hunks. Expanded deliberately lifts that
+		// cap for the approval-time full view.
+		const allLines = diff.replace(/\n+$/u, "").split("\n");
+		const hiddenLines = expanded ? 0 : Math.max(0, allLines.length - EDIT_STREAMING_PREVIEW_LINES);
+		const visible = hiddenLines > 0 ? allLines.slice(hiddenLines) : allLines;
+		let rendered = "\n\n";
+		if (hiddenLines > 0) {
+			const hiddenHunks = getDiffStats(allLines.slice(0, hiddenLines).join("\n")).hunks;
+			const remainder: string[] = [];
+			if (hiddenHunks > 0) remainder.push(`${hiddenHunks} more hunks`);
+			remainder.push(`${hiddenLines} more lines`);
+			rendered += `${uiTheme.fg("dim", `… (${remainder.join(", ")} above)`)}\n`;
+		}
+		rendered += renderDiffColored(visible.join("\n"), { filePath: rawPath });
+		return rendered;
+	});
+	// The animated glyph rides this trailing line — inside the transcript's
+	// volatile-tail holdback — never the block header: an animating head row
+	// pins the native-scrollback commit boundary at the top of the block, so a
+	// tall expanded preview could never scroll-append mid-stream.
+	const spinner = spinnerFrame !== undefined ? `${formatStatusIcon("running", uiTheme, spinnerFrame)} ` : "";
+	// Expanded approval previews hide the "(preview)" label (#1992) but keep
+	// the animated glyph when one is active so the volatile tail stays live.
+	const hideLabel = expanded && label === "preview";
+	if (spinner || !hideLabel) {
+		text += `\n${hideLabel ? spinner.trimEnd() : `${spinner}${uiTheme.fg("dim", `(${label})`)}`}`;
 	}
-	text += renderDiffColored(visible.join("\n"), { filePath: rawPath });
-	text += uiTheme.fg("dim", `\n(${label})`);
 	return text;
 }
 
-function formatMetadataLine(lineCount: number | null, language: string | undefined, uiTheme: Theme): string {
-	const icon = uiTheme.getLangIcon(language);
-	if (lineCount !== null) {
-		return uiTheme.fg("dim", `${icon} ${lineCount} lines`);
-	}
-	return uiTheme.fg("dim", `${icon}`);
-}
-
-function formatMultiFileStreamingDiff(previews: PerFileDiffPreview[], uiTheme: Theme): string {
+function formatMultiFileStreamingDiff(
+	previews: PerFileDiffPreview[],
+	uiTheme: Theme,
+	expanded: boolean,
+	spinnerFrame?: number,
+	caches?: RenderedStringCache[],
+): string {
 	const parts: string[] = [];
-	for (const preview of previews) {
+	for (let index = 0; index < previews.length; index++) {
+		const preview = previews[index]!;
 		if (!preview.diff && !preview.error) continue;
 		const header = uiTheme.fg("dim", `\n\n── ${shortenPath(preview.path)} ──`);
 		if (preview.error) {
@@ -278,7 +399,14 @@ function formatMultiFileStreamingDiff(previews: PerFileDiffPreview[], uiTheme: T
 			continue;
 		}
 		if (preview.diff) {
-			parts.push(`${header}${formatStreamingDiff(preview.diff, preview.path, uiTheme, "preview")}`);
+			// Only the last file's preview carries the animated streaming glyph;
+			// earlier files have settled and must stay byte-stable so their rows
+			// can commit to native scrollback mid-stream.
+			const isLast = index === previews.length - 1;
+			const cache = previewCacheAt(caches, index);
+			parts.push(
+				`${header}${formatStreamingDiff(preview.diff, preview.path, uiTheme, expanded, "preview", isLast ? spinnerFrame : undefined, cache)}`,
+			);
 		}
 	}
 	return parts.join("");
@@ -289,16 +417,20 @@ function getCallPreview(
 	rawPath: string,
 	uiTheme: Theme,
 	renderContext: EditRenderContext | undefined,
+	expanded: boolean,
+	spinnerFrame?: number,
+	caches?: RenderedStringCache[],
 ): string {
 	const multi = renderContext?.perFileDiffPreview;
 	if (multi && multi.length > 1 && multi.some(p => p.diff || p.error)) {
-		return formatMultiFileStreamingDiff(multi, uiTheme);
+		return formatMultiFileStreamingDiff(multi, uiTheme, expanded, spinnerFrame, caches);
 	}
+	const cache = previewCacheAt(caches, 0);
 	if (args.previewDiff) {
-		return formatStreamingDiff(args.previewDiff, rawPath, uiTheme, "preview");
+		return formatStreamingDiff(args.previewDiff, rawPath, uiTheme, expanded, "preview", spinnerFrame, cache);
 	}
 	if (args.diff && args.op) {
-		return formatStreamingDiff(args.diff, rawPath, uiTheme);
+		return formatStreamingDiff(args.diff, rawPath, uiTheme, expanded, "streaming", spinnerFrame, cache);
 	}
 	if (args.diff) {
 		return renderPlainTextPreview(args.diff, uiTheme, rawPath);
@@ -328,12 +460,12 @@ function normalizeHashlineInputPreviewPath(rawPath: string): string {
 }
 
 function parseHashlineInputPreviewHeader(line: string): string | null {
-	if (!line.startsWith(HL_FILE_PREFIX)) return null;
-	// Mirror hashline/input.ts: strip every leading file marker so canonical
-	// `¶ PATH` headers and stray `¶¶ PATH` / `¶¶¶PATH` runs render clean paths.
-	let prefixEnd = 0;
-	while (prefixEnd < line.length && line[prefixEnd] === HL_FILE_PREFIX) prefixEnd++;
-	const body = line.slice(prefixEnd).trim();
+	const trimmed = line.trimEnd();
+	if (!trimmed.startsWith(HL_FILE_PREFIX)) return null;
+	// Keep streaming previews tolerant while the closing bracket is still
+	// being generated; the parser enforces the final `[path#TAG]` shape.
+	const bodyEnd = trimmed.endsWith(HL_FILE_SUFFIX) ? trimmed.length - HL_FILE_SUFFIX.length : trimmed.length;
+	const body = trimmed.slice(HL_FILE_PREFIX.length, bodyEnd).trim();
 	const previewPath = normalizeHashlineInputPreviewPath(body);
 	return previewPath.length > 0 ? previewPath : null;
 }
@@ -383,38 +515,41 @@ function getApplyPatchRenderSummary(
 	}
 }
 
+function formatDiffStatsSuffix(diff: string, uiTheme: Theme): string {
+	const { added, removed } = getDiffStats(diff);
+	if (added === 0 && removed === 0) return "";
+	const stats = [
+		added > 0 ? uiTheme.fg("toolDiffAdded", `+${added}`) : undefined,
+		removed > 0 ? uiTheme.fg("toolDiffRemoved", `-${removed}`) : undefined,
+	].filter(value => value !== undefined);
+	return ` ${uiTheme.fg("dim", uiTheme.format.bracketLeft)}${stats.join(uiTheme.fg("dim", "/"))}${uiTheme.fg("dim", uiTheme.format.bracketRight)}`;
+}
 function renderDiffSection(
 	diff: string,
 	rawPath: string,
 	expanded: boolean,
 	uiTheme: Theme,
 	renderDiffFn: (t: string, o?: { filePath?: string }) => string,
+	cache?: RenderedStringCache,
 ): string {
-	let text = "";
-	const diffStats = getDiffStats(diff);
-	text += `\n${uiTheme.fg("dim", uiTheme.format.bracketLeft)}${formatDiffStats(
-		diffStats.added,
-		diffStats.removed,
-		diffStats.hunks,
-		uiTheme,
-	)}${uiTheme.fg("dim", uiTheme.format.bracketRight)}`;
+	return cachedRenderedString(cache, uiTheme, expanded, rawPath, diff, () => {
+		const {
+			text: truncatedDiff,
+			hiddenHunks,
+			hiddenLines,
+		} = expanded
+			? { text: diff, hiddenHunks: 0, hiddenLines: 0 }
+			: truncateDiffByHunk(diff, PREVIEW_LIMITS.DIFF_COLLAPSED_HUNKS, PREVIEW_LIMITS.DIFF_COLLAPSED_LINES);
 
-	const {
-		text: truncatedDiff,
-		hiddenHunks,
-		hiddenLines,
-	} = expanded
-		? { text: diff, hiddenHunks: 0, hiddenLines: 0 }
-		: truncateDiffByHunk(diff, PREVIEW_LIMITS.DIFF_COLLAPSED_HUNKS, PREVIEW_LIMITS.DIFF_COLLAPSED_LINES);
-
-	text += `\n\n${renderDiffFn(truncatedDiff, { filePath: rawPath })}`;
-	if (!expanded && (hiddenHunks > 0 || hiddenLines > 0)) {
-		const remainder: string[] = [];
-		if (hiddenHunks > 0) remainder.push(`${hiddenHunks} more hunks`);
-		if (hiddenLines > 0) remainder.push(`${hiddenLines} more lines`);
-		text += uiTheme.fg("toolOutput", `\n… (${remainder.join(", ")}) ${formatExpandHint(uiTheme)}`);
-	}
-	return text;
+		let text = `\n${renderDiffFn(truncatedDiff, { filePath: rawPath })}`;
+		if (!expanded && (hiddenHunks > 0 || hiddenLines > 0)) {
+			const remainder: string[] = [];
+			if (hiddenHunks > 0) remainder.push(`${hiddenHunks} more hunks`);
+			if (hiddenLines > 0) remainder.push(`${hiddenLines} more lines`);
+			text += uiTheme.fg("toolOutput", `\n… (${remainder.join(", ")}) ${formatExpandHint(uiTheme)}`);
+		}
+		return text;
+	});
 }
 
 function wrapEditRendererLine(line: string, width: number): string[] {
@@ -444,6 +579,11 @@ function wrapEditRendererLine(line: string, width: number): string[] {
 
 export const editToolRenderer = {
 	mergeCallAndResult: true,
+	// Pending preview is a TAIL window of the streamed diff ("… N more lines
+	// above" + last rows); the result render re-anchors the block top-first, so
+	// committing the preview's settled head would strand a stale call-box
+	// fragment in native scrollback.
+	provisionalPendingPreview: true,
 
 	renderCall(
 		args: EditRenderArgs,
@@ -469,24 +609,48 @@ export const editToolRenderer = {
 			"";
 		const rename = editArgs.rename || firstEdit?.rename || firstEdit?.move || firstApplyPatchEntry?.rename;
 		const op = editArgs.op || firstEdit?.op || firstApplyPatchEntry?.op;
-		const { description } = formatEditDescription(rawPath, uiTheme, { rename });
-		const spinner =
-			options?.spinnerFrame !== undefined ? formatStatusIcon("running", uiTheme, options.spinnerFrame) : "";
-		let text = `${formatTitle(getOperationTitle(op), uiTheme)} ${spinner ? `${spinner} ` : ""}${description}`;
-		// Show file count hint for multi-file edits
 		let fileCount = hashlineInputSummary?.entries.length ?? applyPatchSummary?.entries.length ?? 0;
 		if (Array.isArray(editArgs.edits)) {
 			fileCount = countEditFiles(editArgs.edits);
 		}
-		if (fileCount > 1) {
-			text += uiTheme.fg("dim", ` (+${fileCount - 1} more)`);
-		}
-		text += getCallPreview(editArgs, rawPath, uiTheme, renderContext);
-		if (applyPatchSummary?.error) {
-			text += `\n\n${uiTheme.fg("error", truncateToWidth(replaceTabs(applyPatchSummary.error, rawPath), CALL_TEXT_PREVIEW_WIDTH))}`;
-		}
-
-		return new Text(text, 0, 0);
+		const callPreviewCaches: RenderedStringCache[] = [];
+		return framedBlock(uiTheme, width => {
+			// Static pending icon, never the animated glyph: the header is the
+			// head row of the framed block, and native-scrollback commits are
+			// prefix-only — an animating head row would pin the commit boundary
+			// at the top and keep a tall expanded preview from scroll-appending
+			// mid-stream. The liveness cue rides the trailing "(preview)" /
+			// "(streaming)" line instead.
+			const header = renderEditHeader(width, uiTheme, {
+				icon: "pending",
+				op,
+				rawPath,
+				rename,
+				extraSuffix: fileCount > 1 ? uiTheme.fg("dim", ` (+${fileCount - 1} more)`) : undefined,
+			});
+			let body = getCallPreview(
+				editArgs,
+				rawPath,
+				uiTheme,
+				renderContext,
+				options.expanded,
+				options?.spinnerFrame,
+				callPreviewCaches,
+			);
+			if (applyPatchSummary?.error) {
+				body += `\n${uiTheme.fg("error", truncateToWidth(replaceTabs(applyPatchSummary.error, rawPath), Math.max(1, width - 2)))}`;
+			}
+			const bodyLines = body ? body.split("\n") : [];
+			while (bodyLines.length > 0 && bodyLines[0].trim() === "") bodyLines.shift();
+			return {
+				header,
+				sections: bodyLines.length > 0 ? [{ lines: bodyLines }] : [],
+				state: applyPatchSummary?.error ? "error" : "pending",
+				borderColor: applyPatchSummary?.error ? "error" : "borderMuted",
+				width,
+				contentPaddingLeft: 0,
+			};
+		});
 	},
 
 	renderResult(
@@ -528,11 +692,6 @@ function renderSingleFileResult(
 		"";
 	const op = args?.op || firstEdit?.op || details?.op;
 	const rename = args?.rename || firstEdit?.rename || firstEdit?.move || details?.move;
-	const { language } = formatEditDescription(rawPath, uiTheme, { rename });
-
-	const editTextSource = args?.newText ?? args?.oldText ?? args?.diff ?? args?.patch;
-	const metadataLineCount = editTextSource ? countLines(editTextSource) : null;
-	const metadataLine = op !== "delete" ? `\n${formatMetadataLine(metadataLineCount, language, uiTheme)}` : "";
 
 	const displayErrorText = isError && details && "displayErrorText" in details ? details.displayErrorText : undefined;
 	const errorText = isError
@@ -541,61 +700,70 @@ function renderSingleFileResult(
 			(result.content?.find(c => c.type === "text")?.text ?? "")
 		: "";
 
-	let cached: RenderCache | undefined;
+	let diffSectionRenderDiffFn: ((t: string, o?: { filePath?: string }) => string) | undefined;
+	const diffSectionCache = createRenderedStringCache();
 
-	return {
-		render(width) {
-			const { expanded, renderContext } = options;
-			const editDiffPreview = renderContext?.editDiffPreview;
-			const renderDiffFn = renderContext?.renderDiff ?? ((t: string) => t);
-			const key = new Hasher().bool(expanded).u32(width).digest();
-			if (cached?.key === key) return cached.lines;
+	return framedBlock(uiTheme, width => {
+		const { expanded, renderContext } = options;
+		const editDiffPreview = renderContext?.editDiffPreview;
+		const renderDiffFn = renderContext?.renderDiff ?? plainDiffRender;
 
-			const firstChangedLine =
-				(editDiffPreview && "firstChangedLine" in editDiffPreview ? editDiffPreview.firstChangedLine : undefined) ||
-				(details && !isError ? details.firstChangedLine : undefined);
-			const { description } = formatEditDescription(rawPath, uiTheme, { rename, firstChangedLine });
+		if (diffSectionRenderDiffFn !== renderDiffFn) {
+			diffSectionRenderDiffFn = renderDiffFn;
+			invalidateRenderedStringCache(diffSectionCache);
+		}
+		const firstChangedLine =
+			(editDiffPreview && "firstChangedLine" in editDiffPreview ? editDiffPreview.firstChangedLine : undefined) ||
+			(details && !isError ? details.firstChangedLine : undefined);
+		const linkPath = details && "path" in details ? details.path : undefined;
 
-			const header = renderStatusLine(
-				{
-					icon: isError ? "error" : "success",
-					title: getOperationTitle(op),
-					description,
-				},
-				uiTheme,
+		// Change stats ride inline on the header bar next to the path.
+		const previewDiff = editDiffPreview && !("error" in editDiffPreview) ? editDiffPreview.diff : undefined;
+		const headerDiff = isError ? undefined : details?.diff || previewDiff;
+		const statsSuffix = headerDiff ? formatDiffStatsSuffix(headerDiff, uiTheme) : "";
+		const header = renderEditHeader(width, uiTheme, {
+			icon: isError ? "error" : "success",
+			iconOverride: !isError && !options.isPartial ? uiTheme.styledSymbol("tool.edit", "accent") : undefined,
+			op,
+			rawPath,
+			rename,
+			firstChangedLine,
+			linkPath,
+			statsSuffix,
+		});
+
+		let body = "";
+		if (isError) {
+			if (errorText) body = uiTheme.fg("error", replaceTabs(errorText, rawPath));
+		} else if (details?.diff) {
+			body = renderDiffSection(details.diff, rawPath, expanded, uiTheme, renderDiffFn, diffSectionCache);
+		} else if (editDiffPreview) {
+			if ("error" in editDiffPreview) body = uiTheme.fg("error", replaceTabs(editDiffPreview.error, rawPath));
+			else if (editDiffPreview.diff)
+				body = renderDiffSection(editDiffPreview.diff, rawPath, expanded, uiTheme, renderDiffFn, diffSectionCache);
+		}
+		if (details?.diagnostics) {
+			body += formatDiagnostics(details.diagnostics, expanded, uiTheme, (fp: string) =>
+				uiTheme.getLangIcon(getLanguageFromPath(fp)),
 			);
-			let text = header;
-			text += metadataLine;
+		}
 
-			if (isError) {
-				if (errorText) {
-					text += `\n\n${uiTheme.fg("error", replaceTabs(errorText, rawPath))}`;
-				}
-			} else if (details?.diff) {
-				text += renderDiffSection(details.diff, rawPath, expanded, uiTheme, renderDiffFn);
-			} else if (editDiffPreview) {
-				if ("error" in editDiffPreview) {
-					text += `\n\n${uiTheme.fg("error", replaceTabs(editDiffPreview.error, rawPath))}`;
-				} else if (editDiffPreview.diff) {
-					text += renderDiffSection(editDiffPreview.diff, rawPath, expanded, uiTheme, renderDiffFn);
-				}
-			}
+		// Diff lines self-wrap with a continuation gutter; pre-wrap to the frame's
+		// inner width so renderOutputBlock's generic wrap is a no-op. Edit frames
+		// use a flush left border because code-frame gutters already provide padding.
+		const innerWidth = Math.max(1, width - 2);
+		const bodyLines = body.length > 0 ? body.split("\n").flatMap(line => wrapEditRendererLine(line, innerWidth)) : [];
+		while (bodyLines.length > 0 && bodyLines[0].trim() === "") bodyLines.shift();
 
-			if (details?.diagnostics) {
-				text += formatDiagnostics(details.diagnostics, expanded, uiTheme, (fp: string) =>
-					uiTheme.getLangIcon(getLanguageFromPath(fp)),
-				);
-			}
-
-			const lines =
-				width > 0 ? text.split("\n").flatMap(line => wrapEditRendererLine(line, width)) : text.split("\n");
-			cached = { key, lines };
-			return lines;
-		},
-		invalidate() {
-			cached = undefined;
-		},
-	};
+		return {
+			header,
+			sections: bodyLines.length > 0 ? [{ lines: bodyLines }] : [],
+			state: isError ? "error" : options.isPartial ? "pending" : "success",
+			borderColor: isError ? "error" : "borderMuted",
+			width,
+			contentPaddingLeft: 0,
+		};
+	});
 }
 
 function renderMultiFileResult(
@@ -650,7 +818,7 @@ function renderMultiFileResult(
 		},
 		invalidate() {
 			cached = undefined;
-			for (const c of fileComponents) c.invalidate();
+			for (const c of fileComponents) c.invalidate?.();
 		},
 	};
 }

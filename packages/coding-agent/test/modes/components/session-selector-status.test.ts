@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { SessionSelectorComponent } from "../../../src/modes/components/session-selector";
-import { initTheme, theme } from "../../../src/modes/theme/theme";
-import type { SessionInfo, SessionStatus } from "../../../src/session/session-manager";
+import { SessionSelectorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/session-selector";
+import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import type { SessionInfo, SessionStatus } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 
 beforeAll(async () => {
 	await initTheme();
@@ -34,6 +34,9 @@ function renderPlain(sessions: SessionInfo[]): string {
 		() => {},
 		() => {},
 		() => {},
+		// Tall viewport so every asserted row is inside the visible window; these
+		// tests cover status formatting, not the viewport-fit window sizing.
+		{ getTerminalRows: () => 100 },
 	);
 	// Strip ANSI so assertions target the visible glyph/label, not theme colors.
 	return selector

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { shimmerText } from "../../../src/modes/theme/shimmer";
-import type { Theme } from "../../../src/modes/theme/theme";
+import * as settingsModule from "@oh-my-pi/pi-coding-agent/config/settings";
+import { shimmerText } from "@oh-my-pi/pi-coding-agent/modes/theme/shimmer";
+import type { Theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 
 const testTheme = {
 	bold(text: string): string {
@@ -25,7 +26,10 @@ describe("shimmerText", () => {
 	});
 
 	it("uses a supplied raw ANSI color for the shimmer crest", () => {
-		vi.spyOn(Date, "now").mockReturnValue(667);
+		vi.spyOn(settingsModule, "isSettingsInitialized").mockReturnValue(false);
+		// t chosen so the fixed-velocity band (30 cells/s) crest sits on the char:
+		// pos = (333/1000)*30 ≈ 10 = CLASSIC_PADDING, i.e. centered on index 0.
+		vi.spyOn(Date, "now").mockReturnValue(333);
 
 		const rendered = shimmerText("x", testTheme, {
 			low: "dim",

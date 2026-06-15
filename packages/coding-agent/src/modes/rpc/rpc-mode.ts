@@ -10,8 +10,11 @@
  * - Events: AgentSessionEvent objects streamed as they occur
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
-import { getOAuthProviders } from "@oh-my-pi/pi-ai/utils/oauth";
+import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
+import { isZodSchema, zodToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { $env, readJsonl, Snowflake } from "@oh-my-pi/pi-utils";
+import { reset as resetCapabilities } from "../../capability";
+import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
 	type ExtensionUIContext,
 	type ExtensionUIDialogOptions,
@@ -19,11 +22,18 @@ import {
 	type ExtensionWidgetOptions,
 	getExtensionUISelectOptionLabel,
 } from "../../extensibility/extensions";
+import { buildSkillPromptMessage } from "../../extensibility/skills";
+import { loadSlashCommands } from "../../extensibility/slash-commands";
 import { type Theme, theme } from "../../modes/theme/theme";
 import type { AgentSession } from "../../session/agent-session";
+import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
+import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
+import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
+import type { EventBus } from "../../utils/event-bus";
 import { initializeExtensions } from "../runtime-init";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
+import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
 import type {
 	RpcCommand,
 	RpcExtensionUIRequest,
@@ -35,6 +45,7 @@ import type {
 	RpcHostUriRequest,
 	RpcResponse,
 	RpcSessionState,
+	RpcSubagentSubscriptionLevel,
 } from "./rpc-types";
 
 // Re-export types for consumers
@@ -55,6 +66,185 @@ type RpcOutput = (
 		| RpcHostUriCancelRequest
 		| object,
 ) => void;
+
+export type RpcSessionChangeCommand = Extract<
+	RpcCommand,
+	{ type: "new_session" } | { type: "switch_session" } | { type: "branch" }
+>;
+
+export type RpcSessionChangeResult =
+	| { type: "new_session"; data: { cancelled: boolean } }
+	| { type: "switch_session"; data: { cancelled: boolean } }
+	| { type: "branch"; data: { text: string; cancelled: boolean } };
+
+export type RpcSessionChangeSession = Pick<AgentSession, "newSession" | "switchSession" | "branch">;
+
+export type RpcSkillCommandSession = Pick<AgentSession, "promptCustomMessage" | "skills" | "skillsSettings">;
+export type RpcSkillCommandResult = { agentInvoked: true };
+
+export async function tryRunRpcSkillCommand(
+	session: RpcSkillCommandSession,
+	text: string,
+): Promise<RpcSkillCommandResult | false> {
+	if (!text.startsWith("/skill:")) return false;
+	if (!session.skillsSettings?.enableSkillCommands) return false;
+	const spaceIndex = text.indexOf(" ");
+	const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
+	const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1).trim();
+	const skillName = commandName.slice("skill:".length);
+	const skill = session.skills.find(candidate => candidate.name === skillName);
+	if (!skill) return false;
+	const built = await buildSkillPromptMessage(skill, args);
+	await session.promptCustomMessage({
+		customType: SKILL_PROMPT_MESSAGE_TYPE,
+		content: built.message,
+		display: true,
+		details: built.details,
+		attribution: "user",
+	});
+	return { agentInvoked: true };
+}
+
+export function reportLocalOnlyPromptResult(input: {
+	id: string | undefined;
+	prompt: Promise<boolean>;
+	output: (obj: object) => void;
+	onError: (error: Error) => void;
+	hasExtensionAgentMessageTask?: () => boolean;
+	waitForExtensionAgentMessageTasks?: () => Promise<void>;
+}): void {
+	void input.prompt
+		.then(async agentInvoked => {
+			if (agentInvoked) return;
+			await input.waitForExtensionAgentMessageTasks?.();
+			if (!input.hasExtensionAgentMessageTask?.()) {
+				input.output({ type: "prompt_result", id: input.id, agentInvoked: false });
+			}
+		})
+		.catch(error => {
+			input.onError(error instanceof Error ? error : new Error(String(error)));
+		});
+}
+
+type RpcExtensionUserMessageScope = {
+	hasAgentMessageTask: boolean;
+	pendingAgentMessageTasks: Set<Promise<void>>;
+};
+
+/**
+ * Tracks extension-originated messages while an RPC prompt is executing.
+ * A slash command can resolve the outer prompt as local-only while also
+ * scheduling agent work through pi.sendUserMessage() or pi.sendMessage()
+ * with triggerTurn; that prompt must not report agentInvoked:false to the host.
+ */
+export class RpcExtensionUserMessageTracker {
+	#activePromptScopes = new Set<RpcExtensionUserMessageScope>();
+
+	markAgentMessageTask(): void {
+		for (const scope of this.#activePromptScopes) {
+			scope.hasAgentMessageTask = true;
+		}
+	}
+
+	trackAgentMessageTask(task: Promise<unknown>): void {
+		for (const scope of this.#activePromptScopes) {
+			this.#trackAgentMessageTaskForScope(scope, task);
+		}
+	}
+
+	#trackAgentMessageTaskForScope(scope: RpcExtensionUserMessageScope, task: Promise<unknown>): void {
+		const scopedTask = task.then(
+			() => {
+				scope.hasAgentMessageTask = true;
+			},
+			() => {},
+		);
+		scope.pendingAgentMessageTasks.add(scopedTask);
+		void scopedTask.finally(() => {
+			scope.pendingAgentMessageTasks.delete(scopedTask);
+		});
+	}
+
+	async #waitForAgentMessageTasks(scope: RpcExtensionUserMessageScope): Promise<void> {
+		while (scope.pendingAgentMessageTasks.size > 0) {
+			await Promise.allSettled(Array.from(scope.pendingAgentMessageTasks));
+		}
+	}
+
+	watchPrompt<T>(startPrompt: () => Promise<T>): {
+		prompt: Promise<T>;
+		hasAgentMessageTask: () => boolean;
+		waitForAgentMessageTasks: () => Promise<void>;
+	} {
+		const scope: RpcExtensionUserMessageScope = {
+			hasAgentMessageTask: false,
+			pendingAgentMessageTasks: new Set(),
+		};
+		this.#activePromptScopes.add(scope);
+		let prompt: Promise<T>;
+		try {
+			prompt = startPrompt();
+		} catch (error) {
+			this.#activePromptScopes.delete(scope);
+			throw error;
+		}
+		return {
+			prompt: prompt.finally(() => {
+				this.#activePromptScopes.delete(scope);
+			}),
+			hasAgentMessageTask: () => scope.hasAgentMessageTask,
+			waitForAgentMessageTasks: () => this.#waitForAgentMessageTasks(scope),
+		};
+	}
+}
+
+export function watchAndReportLocalOnlyPromptResult(input: {
+	id: string | undefined;
+	startPrompt: () => Promise<boolean>;
+	output: (obj: object) => void;
+	onError: (error: Error) => void;
+	extensionUserMessageTracker: RpcExtensionUserMessageTracker;
+}): void {
+	const trackedPrompt = input.extensionUserMessageTracker.watchPrompt(input.startPrompt);
+	reportLocalOnlyPromptResult({
+		id: input.id,
+		prompt: trackedPrompt.prompt,
+		output: input.output,
+		onError: input.onError,
+		hasExtensionAgentMessageTask: trackedPrompt.hasAgentMessageTask,
+		waitForExtensionAgentMessageTasks: trackedPrompt.waitForAgentMessageTasks,
+	});
+}
+
+export type RpcSubagentResetRegistry = Pick<RpcSubagentRegistry, "clear">;
+
+export async function handleRpcSessionChange(
+	session: RpcSessionChangeSession,
+	command: RpcSessionChangeCommand,
+	subagentRegistry?: RpcSubagentResetRegistry,
+): Promise<RpcSessionChangeResult> {
+	switch (command.type) {
+		case "new_session": {
+			const options = command.parentSession ? { parentSession: command.parentSession } : undefined;
+			const cancelled = !(await session.newSession(options));
+			if (!cancelled) subagentRegistry?.clear();
+			return { type: "new_session", data: { cancelled } };
+		}
+
+		case "switch_session": {
+			const cancelled = !(await session.switchSession(command.sessionPath));
+			if (!cancelled) subagentRegistry?.clear();
+			return { type: "switch_session", data: { cancelled } };
+		}
+
+		case "branch": {
+			const result = await session.branch(command.entryId);
+			if (!result.cancelled) subagentRegistry?.clear();
+			return { type: "branch", data: { text: result.selectedText, cancelled: result.cancelled } };
+		}
+	}
+	throw new Error("Unsupported RPC session change command");
+}
 
 function normalizeHostToolDefinitions(tools: RpcHostToolDefinition[]): RpcHostToolDefinition[] {
 	return tools.map((tool, index) => {
@@ -97,6 +287,10 @@ function shouldEmitRpcTitles(): boolean {
 	if (!raw) return false;
 	const normalized = raw.trim().toLowerCase();
 	return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+}
+
+function isSubagentSubscriptionLevel(value: unknown): value is RpcSubagentSubscriptionLevel {
+	return value === "off" || value === "progress" || value === "events";
 }
 
 export function requestRpcEditor(
@@ -169,6 +363,7 @@ export function requestRpcEditor(
 export async function runRpcMode(
 	session: AgentSession,
 	setToolUIContext?: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
+	eventBus?: EventBus,
 ): Promise<never> {
 	// Signal to RPC clients that the server is ready to accept commands
 	// Suppress terminal notifications: they write \x07 (BEL) or OSC sequences directly to
@@ -198,9 +393,12 @@ export async function runRpcMode(
 		return { id, type: "response", command, success: false, error: message };
 	};
 
+	const extensionUserMessageTracker = new RpcExtensionUserMessageTracker();
+
 	const pendingExtensionRequests = new Map<string, PendingExtensionRequest>();
 	const hostToolBridge = new RpcHostToolBridge(output);
 	const hostUriBridge = new RpcHostUriBridge(output);
+	const subagentRegistry = eventBus ? new RpcSubagentRegistry(eventBus, output) : undefined;
 
 	// Shutdown request flag (wrapped in object to allow mutation with const)
 	const shutdownState = { requested: false };
@@ -453,6 +651,9 @@ export async function runRpcMode(
 		onShutdown: () => {
 			shutdownState.requested = true;
 		},
+		trackAgentInvokingMessage: task => {
+			extensionUserMessageTracker.trackAgentMessageTask(task);
+		},
 		uiContext: rpcUiContext,
 	});
 
@@ -460,6 +661,24 @@ export async function runRpcMode(
 	session.subscribe(event => {
 		output(event);
 	});
+
+	const getAvailableCommands = async () => buildAvailableSlashCommands(session);
+	const reloadPluginState = async () => {
+		const cwd = session.sessionManager.getCwd();
+		const projectPath = await resolveActiveProjectRegistryPath(cwd);
+		clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
+		resetCapabilities();
+		session.setSlashCommands(await loadSlashCommands({ cwd }));
+		await session.refreshSshTool({ activateIfAvailable: true });
+		await emitAvailableCommandsUpdate();
+	};
+	const emitAvailableCommandsUpdate = async () => {
+		output({ type: "available_commands_update", commands: await getAvailableCommands() });
+	};
+	session.subscribeCommandMetadataChanged(() => {
+		void emitAvailableCommandsUpdate();
+	});
+	await emitAvailableCommandsUpdate();
 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
@@ -471,15 +690,53 @@ export async function runRpcMode(
 			// =================================================================
 
 			case "prompt": {
+				const skillResult = await tryRunRpcSkillCommand(session, command.message);
+				if (skillResult) {
+					return success(id, "prompt", skillResult);
+				}
+				const builtinResult = await executeAcpBuiltinSlashCommand(command.message, {
+					session,
+					sessionManager: session.sessionManager,
+					settings: session.settings,
+					cwd: session.sessionManager.getCwd(),
+					output: text => output({ type: "command_output", text }),
+					refreshCommands: emitAvailableCommandsUpdate,
+					reloadPlugins: reloadPluginState,
+					notifyTitleChanged: async () => {
+						output({ type: "session_info_update", title: session.sessionName, sessionId: session.sessionId });
+					},
+					notifyConfigChanged: async () => {
+						output({ type: "config_update", model: session.model, thinkingLevel: session.thinkingLevel });
+					},
+				});
+				if (builtinResult !== false) {
+					if ("prompt" in builtinResult) {
+						watchAndReportLocalOnlyPromptResult({
+							id,
+							startPrompt: () => session.prompt(builtinResult.prompt, { images: command.images }),
+							output,
+							onError: promptError => output(error(id, "prompt", promptError.message)),
+							extensionUserMessageTracker,
+						});
+						return success(id, "prompt");
+					}
+					return success(id, "prompt", { agentInvoked: false });
+				}
+
 				// Don't await - events will stream
 				// Extension commands are executed immediately, file prompt templates are expanded
 				// If streaming and streamingBehavior specified, queues via steer/followUp
-				session
-					.prompt(command.message, {
-						images: command.images,
-						streamingBehavior: command.streamingBehavior,
-					})
-					.catch(e => output(error(id, "prompt", e.message)));
+				watchAndReportLocalOnlyPromptResult({
+					id,
+					startPrompt: () =>
+						session.prompt(command.message, {
+							images: command.images,
+							streamingBehavior: command.streamingBehavior,
+						}),
+					output,
+					onError: promptError => output(error(id, "prompt", promptError.message)),
+					extensionUserMessageTracker,
+				});
 				return success(id, "prompt");
 			}
 
@@ -494,22 +751,24 @@ export async function runRpcMode(
 			}
 
 			case "abort": {
-				await session.abort();
+				await session.abort({ reason: USER_INTERRUPT_LABEL });
 				return success(id, "abort");
 			}
 
 			case "abort_and_prompt": {
-				await session.abort();
+				await session.abort({ reason: USER_INTERRUPT_LABEL });
 				session
 					.prompt(command.message, { images: command.images })
 					.catch(e => output(error(id, "abort_and_prompt", e.message)));
 				return success(id, "abort_and_prompt");
 			}
 
-			case "new_session": {
-				const options = command.parentSession ? { parentSession: command.parentSession } : undefined;
-				const cancelled = !(await session.newSession(options));
-				return success(id, "new_session", { cancelled });
+			case "new_session":
+			case "switch_session":
+			case "branch": {
+				const result = await handleRpcSessionChange(session, command, subagentRegistry);
+				if (!result.data.cancelled) await emitAvailableCommandsUpdate();
+				return success(id, result.type, result.data);
 			}
 
 			// =================================================================
@@ -536,11 +795,16 @@ export async function runRpcMode(
 					dumpTools: session.agent.state.tools.map(tool => ({
 						name: tool.name,
 						description: tool.description,
-						parameters: tool.parameters,
+						parameters: isZodSchema(tool.parameters) ? zodToWireSchema(tool.parameters) : tool.parameters,
+						examples: tool.examples,
 					})),
 					contextUsage: session.getContextUsage(),
 				};
 				return success(id, "get_state", state);
+			}
+
+			case "get_available_commands": {
+				return success(id, "get_available_commands", { commands: await getAvailableCommands() });
 			}
 
 			case "set_todos": {
@@ -561,6 +825,44 @@ export async function runRpcMode(
 					return success(id, "set_host_uri_schemes", { schemes });
 				} catch (err) {
 					return error(id, "set_host_uri_schemes", err instanceof Error ? err.message : String(err));
+				}
+			}
+
+			case "set_subagent_subscription": {
+				if (!subagentRegistry) {
+					return error(id, "set_subagent_subscription", "Subagent event bus is unavailable");
+				}
+				if (!isSubagentSubscriptionLevel(command.level)) {
+					return error(
+						id,
+						"set_subagent_subscription",
+						`Invalid subagent subscription level: ${String(command.level)}`,
+					);
+				}
+				subagentRegistry.setSubscriptionLevel(command.level);
+				return success(id, "set_subagent_subscription", { level: subagentRegistry.getSubscriptionLevel() });
+			}
+
+			case "get_subagents": {
+				if (!subagentRegistry) {
+					return error(id, "get_subagents", "Subagent event bus is unavailable");
+				}
+				return success(id, "get_subagents", { subagents: subagentRegistry.getSubagents() });
+			}
+
+			case "get_subagent_messages": {
+				if (!subagentRegistry) {
+					return error(id, "get_subagent_messages", "Subagent event bus is unavailable");
+				}
+				try {
+					if (command.fromByte !== undefined && !Number.isFinite(command.fromByte)) {
+						return error(id, "get_subagent_messages", "fromByte must be a finite number");
+					}
+					const sessionFile = subagentRegistry.resolveSessionFile(command);
+					const transcript = await readRpcSubagentTranscript(sessionFile, command.fromByte);
+					return success(id, "get_subagent_messages", transcript);
+				} catch (err) {
+					return error(id, "get_subagent_messages", err instanceof Error ? err.message : String(err));
 				}
 			}
 
@@ -681,16 +983,6 @@ export async function runRpcMode(
 			case "export_html": {
 				const path = await session.exportToHtml(command.outputPath);
 				return success(id, "export_html", { path });
-			}
-
-			case "switch_session": {
-				const cancelled = !(await session.switchSession(command.sessionPath));
-				return success(id, "switch_session", { cancelled });
-			}
-
-			case "branch": {
-				const result = await session.branch(command.entryId);
-				return success(id, "branch", { text: result.selectedText, cancelled: result.cancelled });
 			}
 
 			case "get_branch_messages": {
@@ -850,13 +1142,15 @@ export async function runRpcMode(
 
 			// Check for deferred shutdown request (idle between commands)
 			await checkShutdownRequested();
-		} catch (e: any) {
-			output(error(undefined, "parse", `Failed to parse command: ${e.message}`));
+		} catch (e: unknown) {
+			const message = e instanceof Error ? e.message : String(e);
+			output(error(undefined, "parse", `Failed to parse command: ${message}`));
 		}
 	}
 
 	// stdin closed — RPC client is gone, exit cleanly
 	hostToolBridge.rejectAllPending("RPC client disconnected before host tool execution completed");
 	hostUriBridge.clear("RPC client disconnected before host URI request completed");
+	subagentRegistry?.dispose();
 	process.exit(0);
 }

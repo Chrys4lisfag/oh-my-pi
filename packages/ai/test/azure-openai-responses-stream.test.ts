@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { type AzureOpenAIResponsesOptions, streamAzureOpenAIResponses } from "../src/providers/azure-openai-responses";
-import type { Context, Model, Tool } from "../src/types";
+import {
+	type AzureOpenAIResponsesOptions,
+	streamAzureOpenAIResponses,
+} from "@oh-my-pi/pi-ai/providers/azure-openai-responses";
+import type { Context, FetchImpl, Model, ModelSpec, Tool } from "@oh-my-pi/pi-ai/types";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
-const originalFetch = global.fetch;
-
-const azureModel: Model<"azure-openai-responses"> = {
+const azureModel: Model<"azure-openai-responses"> = buildModel({
 	id: "gpt-5-mini",
 	name: "GPT-5 Mini",
 	api: "azure-openai-responses",
@@ -15,7 +17,7 @@ const azureModel: Model<"azure-openai-responses"> = {
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	contextWindow: 400000,
 	maxTokens: 128000,
-};
+});
 
 function createAbortedSignal(): AbortSignal {
 	const controller = new AbortController();
@@ -76,7 +78,6 @@ async function captureAzurePayload(
 }
 
 afterEach(() => {
-	global.fetch = originalFetch;
 	vi.restoreAllMocks();
 });
 
@@ -94,11 +95,51 @@ describe("azure openai responses streaming", () => {
 		]);
 	});
 
+	it("sends an async onPayload replacement body", async () => {
+		let capturedBody: Record<string, unknown> | undefined;
+		const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+			capturedBody = typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : undefined;
+			return createSseResponse([
+				{
+					type: "response.completed",
+					response: {
+						status: "completed",
+						usage: {
+							input_tokens: 1,
+							output_tokens: 1,
+							total_tokens: 2,
+							input_tokens_details: { cached_tokens: 0 },
+						},
+					},
+				},
+			]);
+		});
+
+		const result = await streamAzureOpenAIResponses(
+			azureModel,
+			{ messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }] },
+			{
+				apiKey: "test-key",
+				fetch: fetchMock as unknown as typeof fetch,
+				azureBaseUrl: azureModel.baseUrl,
+				azureApiVersion: "v1",
+				onPayload: async payload => ({
+					...(payload as Record<string, unknown>),
+					input: [{ role: "user", content: [{ type: "input_text", text: "replacement" }] }],
+				}),
+			},
+		).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(capturedBody?.input).toEqual([{ role: "user", content: [{ type: "input_text", text: "replacement" }] }]);
+	});
+
 	it("uses developer role for Azure Responses reasoning model system prompts", async () => {
-		const reasoningModel: Model<"azure-openai-responses"> = {
+		const reasoningModel: Model<"azure-openai-responses"> = buildModel({
 			...azureModel,
 			reasoning: true,
-		};
+			compat: azureModel.compatConfig,
+		} as ModelSpec<"azure-openai-responses">);
 		const payload = await captureAzurePayload(
 			{
 				systemPrompt: ["Reasoning instruction", "Second instruction"],
@@ -172,7 +213,7 @@ describe("azure openai responses streaming", () => {
 	});
 
 	it("surfaces nested response.failed provider errors", async () => {
-		global.fetch = vi.fn(async () =>
+		const fetchMock: FetchImpl = vi.fn(async () =>
 			createSseResponse([
 				{
 					type: "response.failed",
@@ -181,12 +222,12 @@ describe("azure openai responses streaming", () => {
 					},
 				},
 			]),
-		) as unknown as typeof fetch;
+		);
 
 		const result = await streamAzureOpenAIResponses(
 			azureModel,
 			{ messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }] },
-			{ apiKey: "test-key", azureBaseUrl: azureModel.baseUrl, azureApiVersion: "v1" },
+			{ apiKey: "test-key", azureBaseUrl: azureModel.baseUrl, azureApiVersion: "v1", fetch: fetchMock },
 		).result();
 
 		expect(result.stopReason).toBe("error");
@@ -194,7 +235,7 @@ describe("azure openai responses streaming", () => {
 	});
 
 	it("surfaces response.failed incomplete reasons", async () => {
-		global.fetch = vi.fn(async () =>
+		const fetchMock: FetchImpl = vi.fn(async () =>
 			createSseResponse([
 				{
 					type: "response.failed",
@@ -203,12 +244,12 @@ describe("azure openai responses streaming", () => {
 					},
 				},
 			]),
-		) as unknown as typeof fetch;
+		);
 
 		const result = await streamAzureOpenAIResponses(
 			azureModel,
 			{ messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }] },
-			{ apiKey: "test-key", azureBaseUrl: azureModel.baseUrl, azureApiVersion: "v1" },
+			{ apiKey: "test-key", azureBaseUrl: azureModel.baseUrl, azureApiVersion: "v1", fetch: fetchMock },
 		).result();
 
 		expect(result.stopReason).toBe("error");
@@ -216,7 +257,7 @@ describe("azure openai responses streaming", () => {
 	});
 
 	it("surfaces response.completed failed status_details errors", async () => {
-		global.fetch = vi.fn(async () =>
+		const fetchMock: FetchImpl = vi.fn(async () =>
 			createSseResponse([
 				{
 					type: "response.completed",
@@ -228,12 +269,12 @@ describe("azure openai responses streaming", () => {
 					},
 				},
 			]),
-		) as unknown as typeof fetch;
+		);
 
 		const result = await streamAzureOpenAIResponses(
 			azureModel,
 			{ messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }] },
-			{ apiKey: "test-key", azureBaseUrl: azureModel.baseUrl, azureApiVersion: "v1" },
+			{ apiKey: "test-key", azureBaseUrl: azureModel.baseUrl, azureApiVersion: "v1", fetch: fetchMock },
 		).result();
 
 		expect(result.stopReason).toBe("error");

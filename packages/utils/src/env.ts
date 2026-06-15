@@ -1,7 +1,9 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getAgentDir, getConfigRootDir } from "./dirs";
+import { getAgentDir, getConfigRootDir, refreshDirsFromEnv } from "./dirs";
+
+export * from "./worker-host";
 
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -30,11 +32,22 @@ export function isSafeEnvValue(value: string): boolean {
 	return !value.includes("\0");
 }
 
+export function isMacosMallocStackLoggingEnvName(name: string): boolean {
+	return name === "MallocStackLogging" || name === "MallocStackLoggingNoCompact";
+}
+
 export function filterProcessEnv(env: Record<string, string | undefined>): Record<string, string> {
 	const result: Record<string, string> = {};
 	for (const key in env) {
 		const value = env[key];
-		if (!isSafeEnvName(key) || value === undefined || !isSafeEnvValue(value)) continue;
+		if (
+			!isSafeEnvName(key) ||
+			isMacosMallocStackLoggingEnvName(key) ||
+			value === undefined ||
+			!isSafeEnvValue(value)
+		) {
+			continue;
+		}
 		result[key] = value;
 	}
 	return result;
@@ -93,18 +106,25 @@ const projectEnv = parseEnvFile(path.join(process.cwd(), ".env"));
 
 for (const key of Object.keys(Bun.env)) {
 	const value = Bun.env[key];
-	if (!isSafeEnvName(key) || value === undefined || !isSafeEnvValue(value)) {
+	if (!isSafeEnvName(key) || isMacosMallocStackLoggingEnvName(key) || value === undefined || !isSafeEnvValue(value)) {
 		delete Bun.env[key];
 	}
 }
 
 for (const file of [projectEnv, agentEnv, piEnv, homeEnv]) {
 	for (const key in file) {
-		if (!Bun.env[key]) {
+		if (!isMacosMallocStackLoggingEnvName(key) && !Bun.env[key]) {
 			Bun.env[key] = file[key];
 		}
 	}
 }
+
+// Directory-affecting keys (XDG_*_HOME, and in default mode PI_CODING_AGENT_DIR)
+// may have just arrived from the profile/agent `.env` applied above. The dirs
+// resolver cached its paths at module load — before this file ran — so rebuild
+// it now from the updated env. `getAgentDir()` already located the `.env` from
+// the profile name + home, so this re-reads only the directory vars.
+refreshDirsFromEnv();
 
 /**
  * Intentional re-export of Bun.env.
@@ -156,7 +176,7 @@ export function isBunTestRuntime(): boolean {
  * first for cheap fast-path detection.
  */
 export function isCompiledBinary(): boolean {
-	if (Bun.env.PI_COMPILED) return true;
+	if (process.env.PI_COMPILED || Bun.env.PI_COMPILED) return true;
 	const url = import.meta.url;
 	return url.includes("$bunfs") || url.includes("~BUN") || url.includes("%7EBUN");
 }

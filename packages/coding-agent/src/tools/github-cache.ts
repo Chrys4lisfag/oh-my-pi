@@ -8,10 +8,11 @@
  *   helpers swallow open/IO failures and degrade to "no cache" so a corrupt or
  *   unreadable DB never blocks a `gh` call.
  *
- * TTL:
  *   Soft TTL → return cached row directly.
- *   Past soft TTL but within hard TTL → return cached row AND schedule a
- *     background refresh (errors logged, never thrown).
+ *   Stateful issue/PR rows past soft TTL but within hard TTL → refresh
+ *     synchronously, falling back to the cached row if the live fetch fails.
+ *   Expensive PR diff rows past soft TTL but within hard TTL → return cached
+ *     row AND schedule a background refresh (errors logged, never thrown).
  *   Past hard TTL → treat as miss and fetch fresh.
  */
 
@@ -21,6 +22,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getGithubCacheDbPath, logger } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
+import { ToolAbortError } from "./tool-errors";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Storage layer
@@ -93,10 +95,11 @@ export function openDb(): Database | null {
 		const dbPath = getGithubCacheDbPath();
 		ensureParentDir(dbPath);
 		const db = new Database(dbPath);
+		// Install the busy handler BEFORE any lock-taking statement. See #2421.
+		db.run("PRAGMA busy_timeout = 5000");
 		db.run(`
 			PRAGMA journal_mode=WAL;
 			PRAGMA synchronous=NORMAL;
-			PRAGMA busy_timeout=5000;
 		`);
 		// Migrate any pre-existing table whose key/check constraint predates
 		// the current schema. The cache is regenerable, so we drop rows rather
@@ -175,6 +178,21 @@ function hashCacheIdentity(parts: string[]): string {
 }
 
 /**
+ * Memo for {@link resolveGithubCacheAuthKey}. Recomputed only when the token
+ * env vars or the hosts.yml path/mtime change, so the per-lookup cost on the
+ * cache hot path is four env reads plus one `stat` instead of a full file
+ * read + hash.
+ */
+interface AuthKeyMemoEntry {
+	envSig: string;
+	hostsPath: string;
+	hostsMtimeMs: number;
+	value: string | undefined;
+}
+const AUTH_KEY_TOKEN_ENV_VARS = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"];
+const authKeyMemo = new Map<string, AuthKeyMemoEntry>();
+
+/**
  * Best-effort local fingerprint for the active GitHub CLI credentials.
  *
  * Cache hits must not cross account/token boundaries, but doing a `gh api user`
@@ -185,16 +203,32 @@ function hashCacheIdentity(parts: string[]): string {
  * credential source is visible, callers should pass `null` to bypass caching.
  */
 export function resolveGithubCacheAuthKey(host: string = process.env.GH_HOST || "github.com"): string | undefined {
+	const hostsPath = path.join(getGhConfigDir(), "hosts.yml");
+	let envSig = "";
+	for (const name of AUTH_KEY_TOKEN_ENV_VARS) {
+		const value = process.env[name];
+		if (value) envSig += `${name}=${value.length}:${value}\0`;
+	}
+	let hostsMtimeMs = -1;
+	try {
+		hostsMtimeMs = fs.statSync(hostsPath, { throwIfNoEntry: false })?.mtimeMs ?? -1;
+	} catch (err) {
+		logger.debug("github cache: failed to stat gh hosts config for cache identity", { err: String(err) });
+	}
+	const memo = authKeyMemo.get(host);
+	if (memo && memo.envSig === envSig && memo.hostsPath === hostsPath && memo.hostsMtimeMs === hostsMtimeMs) {
+		return memo.value;
+	}
+
 	const parts: string[] = [`host:${host}`];
 	let hasCredentialMaterial = false;
-	for (const name of ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]) {
+	for (const name of AUTH_KEY_TOKEN_ENV_VARS) {
 		const value = process.env[name];
 		if (!value) continue;
 		hasCredentialMaterial = true;
 		parts.push(`${name}:${value}`);
 	}
 	try {
-		const hostsPath = path.join(getGhConfigDir(), "hosts.yml");
 		const hosts = fs.readFileSync(hostsPath, "utf8");
 		hasCredentialMaterial = true;
 		parts.push(`hosts:${hosts}`);
@@ -203,8 +237,9 @@ export function resolveGithubCacheAuthKey(host: string = process.env.GH_HOST || 
 			logger.debug("github cache: failed to read gh hosts config for cache identity", { err: String(err) });
 		}
 	}
-	if (!hasCredentialMaterial) return undefined;
-	return `${host}:${hashCacheIdentity(parts)}`;
+	const value = hasCredentialMaterial ? `${host}:${hashCacheIdentity(parts)}` : undefined;
+	authKeyMemo.set(host, { envSig, hostsPath, hostsMtimeMs, value });
+	return value;
 }
 
 function normalizeRepo(repo: string): string {
@@ -316,6 +351,31 @@ export function invalidate(
 	}
 }
 
+/**
+ * Drop every cached row for a given issue/PR number, regardless of repo,
+ * auth key, include_comments flag, or row kind ({@link CacheKind}). Best-effort:
+ * swallows DB failures the same way {@link invalidate} does.
+ *
+ * Used by the bash-side detector that reacts to `gh issue close` / `gh pr merge`
+ * style mutations. Repo + auth-key narrowing is intentionally skipped because
+ * the bash command often does not name the repo (defaults to cwd's `gh`
+ * config) and resolving the *current* repo from `cwd` for every bash call would
+ * be far more expensive than a write-amplified DELETE.
+ */
+export function invalidateAllForNumber(number: number, repo?: string): void {
+	const db = openDb();
+	if (!db) return;
+	try {
+		if (repo === undefined) {
+			db.prepare("DELETE FROM github_view_cache WHERE number = ?").run(number);
+		} else {
+			db.prepare("DELETE FROM github_view_cache WHERE number = ? AND repo = ?").run(number, normalizeRepo(repo));
+		}
+	} catch (err) {
+		logger.debug("github cache: invalidateAllForNumber failed", { err: String(err) });
+	}
+}
+
 /** Drop every cached row. Test helper. */
 export function clearAll(): void {
 	const db = openDb();
@@ -324,6 +384,26 @@ export function clearAll(): void {
 		db.prepare("DELETE FROM github_view_cache").run();
 	} catch (err) {
 		logger.debug("github cache: clear failed", { err: String(err) });
+	}
+}
+
+/**
+ * Drop every cached row for a repo, or all rows when the repo is unknown.
+ * Fallback for current-branch `gh pr merge`/`gh pr close`-style mutations
+ * where the bash command names no PR number or URL, so the target row cannot
+ * be identified. Over-invalidation is deliberate (see module header).
+ */
+export function invalidateAllForRepo(repo?: string): void {
+	const db = openDb();
+	if (!db) return;
+	try {
+		if (repo === undefined) {
+			db.prepare("DELETE FROM github_view_cache").run();
+		} else {
+			db.prepare("DELETE FROM github_view_cache WHERE repo = ?").run(normalizeRepo(repo));
+		}
+	} catch (err) {
+		logger.debug("github cache: invalidateAllForRepo failed", { err: String(err) });
 	}
 }
 
@@ -342,6 +422,7 @@ export function resetForTests(): void {
 	cachedDb = null;
 	openAttempted = false;
 	lastSweepAt = 0;
+	authKeyMemo.clear();
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -370,7 +451,7 @@ export interface CacheLookupOptions<T> {
 	now?: number;
 }
 
-export type CacheStatus = "miss" | "fresh" | "stale" | "disabled";
+export type CacheStatus = "miss" | "fresh" | "refreshed" | "stale" | "disabled";
 
 export interface CacheLookupResult<T> {
 	rendered: string;
@@ -442,6 +523,12 @@ function storeResult<T>(
 	});
 }
 
+/**
+ * In-flight background refreshes keyed by row identity. N concurrent stale
+ * reads of the same row must spawn one `gh` subprocess, not N identical ones.
+ */
+const inflightRefreshes = new Set<string>();
+
 function scheduleBackgroundRefresh<T>(
 	authKey: string,
 	repo: string,
@@ -450,9 +537,11 @@ function scheduleBackgroundRefresh<T>(
 	includeComments: boolean,
 	fetchFresh: () => Promise<FreshResult<T>>,
 ): void {
+	const key = `${authKey}|${normalizeRepo(repo)}|${kind}|${number}|${includeComments ? 1 : 0}`;
+	if (inflightRefreshes.has(key)) return;
+	inflightRefreshes.add(key);
 	queueMicrotask(() => {
-		const promise = fetchFresh();
-		promise
+		fetchFresh()
 			.then(fresh => {
 				storeResult(authKey, repo, kind, number, includeComments, fresh, Date.now());
 			})
@@ -463,6 +552,9 @@ function scheduleBackgroundRefresh<T>(
 					kind,
 					number,
 				});
+			})
+			.finally(() => {
+				inflightRefreshes.delete(key);
 			});
 	});
 }
@@ -505,7 +597,7 @@ export async function getOrFetchView<T>(options: CacheLookupOptions<T>): Promise
 				status: "fresh",
 				fetchedAt: cached.fetchedAt,
 			};
-		} else {
+		} else if (options.kind === "pr-diff") {
 			scheduleBackgroundRefresh(
 				authKey,
 				options.repo,
@@ -521,6 +613,28 @@ export async function getOrFetchView<T>(options: CacheLookupOptions<T>): Promise
 				status: "stale",
 				fetchedAt: cached.fetchedAt,
 			};
+		} else {
+			try {
+				const fresh = await options.fetchFresh();
+				const fetchedAt = Date.now();
+				storeResult(authKey, options.repo, options.kind, options.number, options.includeComments, fresh, fetchedAt);
+				return { ...fresh, status: "refreshed", fetchedAt };
+			} catch (err) {
+				if (err instanceof ToolAbortError) throw err;
+				logger.debug("github cache: synchronous refresh failed; returning stale view", {
+					err: String(err),
+					repo: options.repo,
+					kind: options.kind,
+					number: options.number,
+				});
+				return {
+					rendered: cached.rendered,
+					sourceUrl: cached.sourceUrl,
+					payload: cached.payload,
+					status: "stale",
+					fetchedAt: cached.fetchedAt,
+				};
+			}
 		}
 	}
 
@@ -534,7 +648,7 @@ export async function getOrFetchView<T>(options: CacheLookupOptions<T>): Promise
  * Human-friendly freshness note for protocol-handler `notes[]` rendering.
  */
 export function formatFreshnessNote(status: CacheStatus, fetchedAtMs: number, now: number = Date.now()): string {
-	if (status === "miss") return "Fetched live";
+	if (status === "miss" || status === "refreshed") return "Fetched live";
 	if (status === "disabled") return "Cache disabled; fetched live";
 	const ageSec = Math.max(0, Math.round((now - fetchedAtMs) / 1000));
 	const human =
@@ -543,6 +657,7 @@ export function formatFreshnessNote(status: CacheStatus, fetchedAtMs: number, no
 			: ageSec < 3600
 				? `${Math.round(ageSec / 60)}m ago`
 				: `${Math.round(ageSec / 3600)}h ago`;
-	if (status === "stale") return `Cached: ${human} (refreshing in background)`;
+	if (status === "stale")
+		return `WARNING: showing cached content from ${human}; live refresh failed or is still running`;
 	return `Cached: ${human}`;
 }

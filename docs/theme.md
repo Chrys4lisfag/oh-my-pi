@@ -17,7 +17,7 @@ Primary implementation: `src/modes/theme/theme.ts`.
 
 ## Theme JSON shape
 
-Theme files are JSON objects validated against the runtime schema in `theme.ts` (`ThemeJsonSchema`) and mirrored by `src/modes/theme/theme-schema.json`.
+Theme files are JSON objects validated against the runtime schema in `theme.ts` (`themeJsonSchema`) and mirrored by `src/modes/theme/theme-schema.json`.
 
 Top-level fields:
 
@@ -65,7 +65,7 @@ All tokens below are required in `colors`.
 
 `thinkingOff`, `thinkingMinimal`, `thinkingLow`, `thinkingMedium`, `thinkingHigh`, `thinkingXhigh`, `bashMode`, `pythonMode`
 
-### Status line segment colors (14)
+### Status line segment colors (13)
 
 `statusLineSep`, `statusLineModel`, `statusLinePath`, `statusLineGitClean`, `statusLineGitDirty`, `statusLineContext`, `statusLineSpend`, `statusLineStaged`, `statusLineDirty`, `statusLineUntracked`, `statusLineOutput`, `statusLineCost`, `statusLineSubagents`
 
@@ -85,7 +85,7 @@ If omitted, export code derives defaults from resolved theme colors.
 
 - `symbols.preset` sets a theme-level default symbol set.
 - `symbols.overrides` can override individual `SymbolKey` values.
-- `symbols.spinnerFrames` overrides the loading spinner frames. Accepts either a flat `string[]` (applied to both spinner types) or an object `{ "status"?: string[], "activity"?: string[] }` to override each type independently. Any type not specified falls back to the symbol preset's default frames. `status` drives the ~12.5fps spinner used by loaders and tool-execution indicators; `activity` drives the ~60fps spinner used by markdown progress bars and similar high-frequency UI.
+- `symbols.spinnerFrames` overrides the loading spinner frames. Accepts either a flat `string[]` (applied to both spinner types) or an object `{ "status"?: string[], "activity"?: string[] }` to override each type independently. Any type not specified falls back to the symbol preset's default frames. `status` drives the ~12.5fps spinner used by loaders and tool-execution indicators; `activity` drives the ~30fps spinner used by markdown progress bars and similar high-frequency UI.
 
 Runtime precedence:
 
@@ -233,7 +233,7 @@ Legacy migration exists: old flat `theme: "name"` is migrated to nested `theme.d
 1. Create file in custom themes dir, e.g. `~/.omp/agent/themes/my-theme.json`.
 2. Include `name`, optional `vars`, and **all required** `colors` tokens.
 3. Optionally include `symbols` and `export`.
-4. Select the theme in Settings (`Display -> Dark theme` or `Display -> Light theme`) depending on which auto slot you want.
+4. Select the theme in Settings (`Appearance -> Dark Theme` or `Appearance -> Light Theme`) depending on which auto slot you want.
 
 Minimal skeleton:
 

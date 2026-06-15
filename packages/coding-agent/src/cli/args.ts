@@ -1,19 +1,30 @@
 /**
  * CLI argument parsing and help display
  */
-import { type Effort, THINKING_EFFORTS } from "@oh-my-pi/pi-ai";
+import { type Effort, THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
 import { APP_NAME, CONFIG_DIR_NAME, logger } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
 import { parseEffort } from "../thinking";
-import { BUILTIN_TOOLS } from "../tools";
+import { BUILTIN_TOOL_NAMES } from "../tools/builtin-names";
+import {
+	OPTIONAL_FLAGS,
+	OPTIONAL_VALUE_FLAGS,
+	type ParseDeps,
+	PROFILE_BOOTSTRAP_BOUNDARY_ARG,
+	STRING_SETTERS,
+	STRING_VALUE_FLAGS,
+} from "./flag-tables";
 
 export type Mode = "text" | "json" | "rpc" | "acp" | "rpc-ui";
 
 export interface Args {
 	cwd?: string;
+	profile?: string;
+	alias?: string;
 	allowHome?: boolean;
 	provider?: string;
 	model?: string;
+	config?: string[];
 	smol?: string;
 	slow?: string;
 	plan?: string;
@@ -31,6 +42,8 @@ export interface Args {
 	sessionDir?: string;
 	providerSessionId?: string;
 	fork?: string;
+	/** Collab link to join at startup (set by the `join` subcommand; no CLI flag). */
+	join?: string;
 	models?: string[];
 	tools?: string[];
 	noTools?: boolean;
@@ -45,15 +58,38 @@ export interface Args {
 	noSkills?: boolean;
 	skills?: string[];
 	noRules?: boolean;
-	listModels?: string | true;
 	noTitle?: boolean;
 	autoApprove?: boolean;
 	approvalMode?: "always-ask" | "write" | "yolo";
 	messages: string[];
 	fileArgs: string[];
-	/** Unknown flags (potentially extension flags) - map of flag name to value */
+	/** Extension-registered flags this parse recognized — name to value. */
 	unknownFlags: Map<string, boolean | string>;
+	/**
+	 * `--`/`-` prefixed tokens this parse could not match against any built-in
+	 * or {@link extensionFlags} entry. The startup parse runs *before*
+	 * extensions load, so it always lists every extension-registered flag here;
+	 * the post-extension reparse in {@link applyExtensionFlags} clears those
+	 * once the real flag set is known. Anything still present after that
+	 * reparse is a genuine typo or stale flag and {@link reportUnrecognizedFlags}
+	 * surfaces it as a hard error so the agent does not silently start a
+	 * session with the misparsed positionals as a prompt (issue #2459).
+	 */
+	unrecognizedFlags: string[];
 }
+
+/**
+ * Runtime dependencies the data-driven setters need. Constructed once at
+ * module load and passed to every {@link STRING_SETTERS} call so the
+ * setter table itself can stay free of `@oh-my-pi/pi-utils` runtime imports
+ * (which would otherwise trip the profile bootstrap's env-init ordering).
+ */
+const PARSE_DEPS: ParseDeps = {
+	logger,
+	parseEffort,
+	builtinToolNames: BUILTIN_TOOL_NAMES,
+	thinkingEfforts: THINKING_EFFORTS,
+};
 
 export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { type: "boolean" | "string" }>): Args {
 	// Work on a copy: the `--option=value` handling below splices the value
@@ -65,10 +101,21 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 		messages: [],
 		fileArgs: [],
 		unknownFlags: new Map(),
+		unrecognizedFlags: [],
 	};
 
+	// `--` ends option parsing (POSIX end-of-options). Everything after it is
+	// literal positional text, so flag-shaped messages are not parsed or rejected.
+	let sawSeparator = false;
 	for (let i = 0; i < args.length; i++) {
 		let arg = args[i];
+		if (sawSeparator) {
+			result.messages.push(arg);
+			continue;
+		}
+		if (arg === PROFILE_BOOTSTRAP_BOUNDARY_ARG) {
+			continue;
+		}
 		const flagIndex = i;
 
 		// Support --flag=value syntax (e.g. --tools=ask,read). The value is
@@ -96,108 +143,59 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			if (extFlag.type === "boolean") {
 				result.unknownFlags.set(flagName, true);
 			} else if (extFlag.type === "string" && i + 1 < args.length) {
-				// Consume the value in `--flag=value` form, or when the next token is
-				// not flag-looking. A `-`-prefixed token in space form is left to be
-				// its own flag; pass a flag-looking value as `--flag=value`.
+				// Consume the value in `--flag=value` form or when the next token is not
+				// flag-looking. A standalone `--` remains the end-of-options marker; use
+				// `--flag=--` when an extension needs a literal "--" string value.
 				if (equalsValueIndex !== -1 || !args[i + 1].startsWith("-")) {
 					result.unknownFlags.set(flagName, args[++i]);
 				}
 			}
+		} else if (STRING_VALUE_FLAGS.has(arg)) {
+			// Built-in string flags consume the next token even when it is flag-looking
+			// (`--system-prompt --profile foo` ⇒ the prompt is the literal "--profile").
+			// The one token they must never absorb is the profile bootstrap's internal
+			// boundary sentinel: an extension-shadowable built-in like `--plan` (parsed
+			// here only when its boolean extension is NOT loaded) would otherwise swallow
+			// the marker as its value and drop the user's trailing message.
+			if (i + 1 < args.length && args[i + 1] !== PROFILE_BOOTSTRAP_BOUNDARY_ARG) {
+				STRING_SETTERS[arg](result, args[++i], PARSE_DEPS);
+			}
+		} else if (OPTIONAL_VALUE_FLAGS.has(arg)) {
+			const config = OPTIONAL_FLAGS[arg];
+			const next = args[i + 1];
+			const consume =
+				next !== undefined && !next.startsWith("-") && !(config.rejectEmpty === true && next.length === 0);
+			config.set(result, consume ? args[++i] : undefined);
 		} else if (arg === "--help" || arg === "-h") {
 			result.help = true;
 		} else if (arg === "--version" || arg === "-v") {
 			result.version = true;
 		} else if (arg === "--allow-home") {
 			result.allowHome = true;
-		} else if (arg === "--mode" && i + 1 < args.length) {
-			const mode = args[++i];
-			if (mode === "text" || mode === "json" || mode === "rpc" || mode === "acp" || mode === "rpc-ui") {
-				result.mode = mode;
-			}
+		} else if (arg === "--profile" && i + 1 < args.length) {
+			// Normally stripped by `extractProfileFlags` before parseArgs sees it;
+			// kept here as a fallback for direct parseArgs callers.
+			result.profile = args[++i];
+		} else if (arg.startsWith("--profile=")) {
+			result.profile = arg.slice("--profile=".length);
+		} else if (arg === "--alias" && i + 1 < args.length) {
+			result.alias = args[++i];
+		} else if (arg.startsWith("--alias=")) {
+			result.alias = arg.slice("--alias=".length);
 		} else if (arg === "--continue" || arg === "-c") {
 			result.continue = true;
-		} else if (arg === "--resume" || arg === "-r" || arg === "--session") {
-			const next = args[i + 1];
-			if (next && !next.startsWith("-")) {
-				result.resume = args[++i];
-			} else {
-				result.resume = true;
-			}
-		} else if (arg === "--fork" && i + 1 < args.length) {
-			result.fork = args[++i];
-		} else if (arg === "--provider" && i + 1 < args.length) {
-			result.provider = args[++i];
-		} else if (arg === "--model" && i + 1 < args.length) {
-			result.model = args[++i];
-		} else if (arg === "--smol" && i + 1 < args.length) {
-			result.smol = args[++i];
-		} else if (arg === "--slow" && i + 1 < args.length) {
-			result.slow = args[++i];
-		} else if (arg === "--plan" && i + 1 < args.length) {
-			result.plan = args[++i];
-		} else if (arg === "--api-key" && i + 1 < args.length) {
-			result.apiKey = args[++i];
-		} else if (arg === "--system-prompt" && i + 1 < args.length) {
-			result.systemPrompt = args[++i];
-		} else if (arg === "--append-system-prompt" && i + 1 < args.length) {
-			result.appendSystemPrompt = args[++i];
-		} else if (arg === "--provider-session-id" && i + 1 < args.length) {
-			result.providerSessionId = args[++i];
 		} else if (arg === "--no-session") {
 			result.noSession = true;
-		} else if (arg === "--session-dir" && i + 1 < args.length) {
-			result.sessionDir = args[++i];
-		} else if (arg === "--models" && i + 1 < args.length) {
-			result.models = args[++i].split(",").map(s => s.trim());
 		} else if (arg === "--no-tools") {
 			result.noTools = true;
 		} else if (arg === "--no-lsp") {
 			result.noLsp = true;
 		} else if (arg === "--no-pty") {
 			result.noPty = true;
-		} else if (arg === "--tools" && i + 1 < args.length) {
-			const toolNames = args[++i]
-				.split(",")
-				.map(s => s.trim().toLowerCase())
-				.filter(Boolean);
-			const validTools: string[] = [];
-			for (const name of toolNames) {
-				if (name in BUILTIN_TOOLS) {
-					validTools.push(name);
-				} else {
-					logger.warn("Unknown tool passed to --tools", {
-						tool: name,
-						validTools: Object.keys(BUILTIN_TOOLS),
-					});
-				}
-			}
-			result.tools = validTools;
-		} else if (arg === "--thinking" && i + 1 < args.length) {
-			const rawThinking = args[++i];
-			const thinking = parseEffort(rawThinking);
-			if (thinking !== undefined) {
-				result.thinking = thinking;
-			} else {
-				logger.warn("Invalid thinking level passed to --thinking", {
-					level: rawThinking,
-					validThinkingLevels: THINKING_EFFORTS,
-				});
-			}
 		} else if (arg === "--hide-thinking") {
 			result.hideThinking = true;
 		} else if (arg === "--print" || arg === "-p") {
 			result.print = true;
-		} else if (arg === "--export" && i + 1 < args.length) {
-			result.export = args[++i];
-		} else if (arg === "--hook" && i + 1 < args.length) {
-			result.hooks = result.hooks ?? [];
-			result.hooks.push(args[++i]);
-		} else if ((arg === "--extension" || arg === "-e") && i + 1 < args.length) {
-			result.extensions = result.extensions ?? [];
-			result.extensions.push(args[++i]);
-		} else if (arg === "--plugin-dir" && i + 1 < args.length) {
-			result.pluginDirs = result.pluginDirs ?? [];
-			result.pluginDirs.push(args[++i]);
 		} else if (arg === "--no-extensions") {
 			result.noExtensions = true;
 		} else if (arg === "--no-skills") {
@@ -208,30 +206,24 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			result.noTitle = true;
 		} else if (arg === "--auto-approve" || arg === "--yolo") {
 			result.autoApprove = true;
-		} else if (arg === "--approval-mode" && i + 1 < args.length) {
-			const mode = args[++i];
-			if (mode === "always-ask" || mode === "write" || mode === "yolo") {
-				result.approvalMode = mode;
-			} else {
-				logger.warn("Invalid value passed to --approval-mode", {
-					value: mode,
-					validValues: ["always-ask", "write", "yolo"],
-				});
-			}
-		} else if (arg === "--skills" && i + 1 < args.length) {
-			// Comma-separated glob patterns for skill filtering
-			result.skills = args[++i].split(",").map(s => s.trim());
-		} else if (arg === "--list-models") {
-			// Check if next arg is a search pattern (not a flag or file arg)
-			if (i + 1 < args.length && !args[i + 1].startsWith("-") && !args[i + 1].startsWith("@")) {
-				result.listModels = args[++i];
-			} else {
-				result.listModels = true;
-			}
 		} else if (arg.startsWith("@")) {
 			result.fileArgs.push(arg.slice(1)); // Remove @ prefix
-		} else if (!arg.startsWith("-")) {
+		} else if (!arg.startsWith("-") || arg === "-") {
+			// Plain positional or lone `-` (stdin marker) — pass through as a
+			// message rather than flagging it.
 			result.messages.push(arg);
+		} else if (arg === "--") {
+			// POSIX positional separator: drop the token and switch the loop
+			// into "everything from here is a positional" mode. The guard at
+			// the top of the loop body handles the remaining tokens.
+			sawSeparator = true;
+		} else {
+			// Flag-shaped (`-x`, `--name`) but unrecognized at this parse. Record
+			// it so the post-extension reparse can decide whether to surface it
+			// as a hard error. `--flag=value` already split `value` into the next
+			// slot; the standard "drop unconsumed equals value" guard below
+			// removes it so it does not leak into messages (issue #2459).
+			result.unrecognizedFlags.push(arg);
 		}
 		// Drop an unconsumed `--flag=value` value (e.g. a boolean flag): when no
 		// branch advanced past the spliced token, remove it so it does not fall
@@ -242,6 +234,24 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 	}
 
 	return result;
+}
+
+/**
+ * Emit a stderr error listing the unrecognized flags and return `true` when
+ * there were any. Caller is expected to exit with a non-zero status. Splitting
+ * the print from the exit keeps the helper unit-testable without forking a
+ * process (issue #2459).
+ */
+export function reportUnrecognizedFlags(
+	args: Pick<Args, "unrecognizedFlags">,
+	write: (text: string) => void = text => process.stderr.write(text),
+): boolean {
+	if (args.unrecognizedFlags.length === 0) return false;
+	const flags = args.unrecognizedFlags;
+	const plural = flags.length === 1 ? "" : "s";
+	write(`${chalk.red(`Error: unknown flag${plural}: ${flags.join(", ")}`)}\n`);
+	write(`Run \`${APP_NAME} --help\` for available flags.\n`);
+	return true;
 }
 
 export function getExtraHelpText(): string {
@@ -258,7 +268,7 @@ export function getExtraHelpText(): string {
   NODE_EXTRA_CA_CERTS        - CA bundle path (or inline PEM) for server certificate validation
   OPENAI_API_KEY             - OpenAI GPT models
   GEMINI_API_KEY             - Google Gemini models
-  GITHUB_TOKEN               - GitHub Copilot (or GH_TOKEN, COPILOT_GITHUB_TOKEN)
+  COPILOT_GITHUB_TOKEN      - GitHub Copilot
 
   ${chalk.dim("# Additional LLM Providers")}
   AZURE_OPENAI_API_KEY       - Azure OpenAI models
@@ -269,6 +279,7 @@ export function getExtraHelpText(): string {
   KILO_API_KEY               - Kilo Gateway models
   MISTRAL_API_KEY            - Mistral models
   ZAI_API_KEY                - z.ai models (ZhipuAI/GLM)
+  UMANS_AI_CODING_PLAN_API_KEY - Umans AI Coding Plan models
   MINIMAX_API_KEY            - MiniMax models
   OPENCODE_API_KEY           - OpenCode Zen/OpenCode Go models
   CURSOR_ACCESS_TOKEN        - Cursor AI models
@@ -284,20 +295,21 @@ export function getExtraHelpText(): string {
   ${chalk.dim("# Search & Tools")}
   EXA_API_KEY                - Exa web search
   BRAVE_API_KEY              - Brave web search
-  PERPLEXITY_API_KEY         - Perplexity web search (API)
+  PERPLEXITY_API_KEY         - Perplexity web search API key (optional; anonymous fallback)
   PERPLEXITY_COOKIES         - Perplexity web search (session cookie)
   TAVILY_API_KEY             - Tavily web search
   ANTHROPIC_SEARCH_API_KEY   - Anthropic web search (override; isolates search from main ANTHROPIC_API_KEY)
   ANTHROPIC_SEARCH_BASE_URL  - Anthropic web search base URL (override; pairs with ANTHROPIC_SEARCH_API_KEY)
 
   ${chalk.dim("# Configuration")}
+  OMP_PROFILE                 - Named profile for isolated agent state (same as --profile)
+  Use \`omp --profile <name> --alias <command>\` to create a shell shortcut for a profile
   PI_CODING_AGENT_DIR        - Session storage directory (default: ~/${CONFIG_DIR_NAME}/agent)
   PI_PACKAGE_DIR             - Override package directory (for Nix/Guix store paths)
   PI_SMOL_MODEL              - Override smol/fast model (see --smol)
   PI_SLOW_MODEL              - Override slow/reasoning model (see --slow)
   PI_PLAN_MODEL              - Override planning model (see --plan)
   PI_NO_PTY                  - Disable PTY-based interactive bash execution
-
   For complete environment variable reference, see:
   ${chalk.dim("docs/environment-variables.md")}
 ${chalk.bold("Available Tools (default-enabled unless noted):")}

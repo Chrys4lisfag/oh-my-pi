@@ -135,6 +135,47 @@ describe("AsyncJobManager", () => {
 		manager.cancel(firstJobId);
 	});
 
+	test("queued jobs do not count toward the cap until markRunning", async () => {
+		const manager = new AsyncJobManager({
+			maxRunningJobs: 1,
+			onJobComplete: async () => {},
+		});
+
+		const gate = Promise.withResolvers<void>();
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const queuedJobId = manager.register(
+			"task",
+			"queued",
+			async ({ markRunning }) => {
+				await gate.promise;
+				markRunning();
+				started.resolve();
+				await release.promise;
+				return "queued done";
+			},
+			{ queued: true },
+		);
+
+		// Queued job holds no slot: another job registers fine at cap 1.
+		const runningJobId = manager.register("bash", "running", async ({ signal }) => {
+			await new Promise<void>(resolve => {
+				signal.addEventListener("abort", () => resolve(), { once: true });
+			});
+			return "done";
+		});
+
+		// Free the slot, then let the queued job start: it now occupies the slot.
+		manager.cancel(runningJobId);
+		gate.resolve();
+		await started.promise;
+		expect(() => manager.register("bash", "third", async () => "third")).toThrow(/Background job limit reached/);
+
+		release.resolve();
+		await manager.waitForAll();
+		expect(manager.getJob(queuedJobId)?.status).toBe("completed");
+	});
+
 	test("evicts completed jobs after retention period", async () => {
 		const manager = new AsyncJobManager({
 			retentionMs: 25,
@@ -373,5 +414,60 @@ describe("AsyncJobManager", () => {
 		manager.cancelAll();
 		await manager.waitForAll();
 		expect(manager.getJob(parentJobId)?.status).toBe("cancelled");
+	});
+});
+
+describe("AsyncJobManager smart poll-wait escalation", () => {
+	const newManager = () => new AsyncJobManager({ onJobComplete: async () => {} });
+
+	test("first poll waits the ladder floor", () => {
+		const m = newManager();
+		expect(m.nextPollWaitMs("Main", 1_000)).toBe(5_000);
+		// A fresh owner also starts at the floor.
+		expect(m.nextPollWaitMs("Other", 1_000)).toBe(5_000);
+	});
+
+	test("back-to-back polls climb the ladder to the top rung", () => {
+		const m = newManager();
+		const owner = "Main";
+		const t = 1_000;
+		const waits: number[] = [];
+		for (let i = 0; i < 6; i++) {
+			// Same timestamp every time → zero gap → always escalates.
+			waits.push(m.nextPollWaitMs(owner, t));
+			m.recordPollWaitEnd(owner, t);
+		}
+		// Climbs the rungs, then saturates at the top.
+		expect(waits).toEqual([5_000, 10_000, 30_000, 60_000, 300_000, 300_000]);
+	});
+
+	test("a quiet gap of a minute resets back to the floor", () => {
+		const m = newManager();
+		const owner = "Main";
+
+		expect(m.nextPollWaitMs(owner, 0)).toBe(5_000);
+		m.recordPollWaitEnd(owner, 0);
+
+		// Still within the reset window (just under a minute) → keeps climbing.
+		expect(m.nextPollWaitMs(owner, 59_999)).toBe(10_000);
+		m.recordPollWaitEnd(owner, 60_000);
+
+		// A full minute without polling resets the climb to the floor.
+		expect(m.nextPollWaitMs(owner, 120_000)).toBe(5_000);
+	});
+
+	test("escalation is tracked independently per owner", () => {
+		const m = newManager();
+		const t = 1_000;
+
+		m.nextPollWaitMs("A", t);
+		m.recordPollWaitEnd("A", t);
+		m.nextPollWaitMs("A", t);
+		m.recordPollWaitEnd("A", t);
+
+		// A fresh owner starts at the floor regardless of A's escalation.
+		expect(m.nextPollWaitMs("B", t)).toBe(5_000);
+		// A keeps climbing from where it left off.
+		expect(m.nextPollWaitMs("A", t)).toBe(30_000);
 	});
 });

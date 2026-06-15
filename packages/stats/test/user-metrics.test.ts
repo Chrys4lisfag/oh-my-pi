@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { computeUserMessageMetrics, EMPTY_USER_METRICS } from "../src/user-metrics";
+import { computeUserMessageMetrics, EMPTY_USER_METRICS } from "@oh-my-pi/omp-stats/user-metrics";
 
 describe("computeUserMessageMetrics", () => {
 	it("returns zeros for empty / whitespace-only text", () => {
@@ -44,6 +44,14 @@ describe("computeUserMessageMetrics", () => {
 	it("counts quality-dismissal vocabulary as profanity", () => {
 		const m = computeUserMessageMetrics("this is garbage, useless and horrible work");
 		expect(m.profanity).toBe(3);
+	});
+
+	it("does not count the version-control tool `git` as profanity", () => {
+		// Regression for #2457: `git` was dropped from the profanity list so
+		// ordinary repository prose no longer scores as profanity. The slang
+		// plural `gits` is intentionally retained.
+		expect(computeUserMessageMetrics("git status shows the rebase failed").profanity).toBe(0);
+		expect(computeUserMessageMetrics("run git commit then git push").profanity).toBe(0);
 	});
 
 	it("folds drama runs / elongated interjections / dot trails into `anguish`", () => {

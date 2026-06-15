@@ -61,6 +61,7 @@ packages/coding-agent/src/internal-urls/docs-index.generated.ts
 *.bat
 packages/natives/native/pi_natives.win32-x64-baseline.node.old
 packages/typescript-edit-benchmark/runs/
+packages/coding-agent/src/export/html/tool-views.generated.js
 packages/natives/npm/
 /runs/
 python/omp-rpc/src/omp_rpc.egg-info/
@@ -82,3 +83,6 @@ python/robomp/src/robomp/static/
 python/robomp/web/dist/
 python/robomp/.env
 tools/tls-capture
+
+# Local, machine-specific boot perf baseline (see packages/coding-agent/scripts/bench-guard.ts)
+packages/coding-agent/bench/boot-baseline.json

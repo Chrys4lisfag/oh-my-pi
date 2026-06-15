@@ -11,6 +11,7 @@ import { dereferenceJsonSchema } from "./dereference";
 import { upgradeJsonSchemaTo202012 } from "./draft";
 import { areJsonValuesEqual, mergePropertySchemas } from "./equality";
 import {
+	ALL_CCA_TYPE_SPECIFIC_KEYS,
 	CLOUD_CODE_ASSIST_SHARED_SCHEMA_KEYS,
 	CLOUD_CODE_ASSIST_TYPE_SPECIFIC_KEYS,
 	COMBINATOR_KEYS,
@@ -51,7 +52,6 @@ export interface NormalizeSchemaOptions {
 
 interface NormalizeSchemaWalkOptions extends NormalizeSchemaOptions {
 	insideProperties: boolean;
-	epoch: number;
 }
 
 interface ResidualIncompatibilityChecks {
@@ -218,13 +218,27 @@ function applyDescriptionSpill(
 
 function normalizeSchemaNode(value: unknown, options: NormalizeSchemaWalkOptions): unknown {
 	if (Array.isArray(value)) {
-		if (!once(value, options.epoch)) return [];
-		return value.map(entry => normalizeSchemaNode(entry, options));
+		if (!enter(value)) return [];
+		try {
+			return value.map(entry => normalizeSchemaNode(entry, options));
+		} finally {
+			exit(value);
+		}
 	}
 	if (!isJsonObject(value)) {
 		return value;
 	}
-	if (!once(value, options.epoch)) return {};
+	// `enter`/`exit` path-tracking (not a visited-set): DAG-shared subtrees are
+	// normalized at every occurrence; only true cycles short-circuit to `{}`.
+	if (!enter(value)) return {};
+	try {
+		return normalizeSchemaObjectNode(value, options);
+	} finally {
+		exit(value);
+	}
+}
+
+function normalizeSchemaObjectNode(value: JsonObject, options: NormalizeSchemaWalkOptions): unknown {
 	let obj = options.normalizeFieldNames && !options.insideProperties ? applySnakeCaseRenames(value) : value;
 	if (options.collapseNullFields && !options.insideProperties) {
 		obj = preHandleNullFields(obj);
@@ -501,12 +515,32 @@ function collapseMixedTypeCombinerVariants(schema: JsonObject, combiner: "anyOf"
 	if (variantTypes.length < 2 || variantTypes.every(type => type === "object")) {
 		return schema;
 	}
-
 	const nextSchema = copySchemaWithout(schema, combiner);
 	const nonNullTypes = variantTypes.filter(t => t !== "null");
-	nextSchema.type = nonNullTypes[0] ?? variantTypes[0];
+	const chosenType: string = nonNullTypes[0] ?? variantTypes[0];
+	nextSchema.type = chosenType;
+	const chosenTypeAllowedKeys = CLOUD_CODE_ASSIST_TYPE_SPECIFIC_KEYS[chosenType] ?? {};
+
+	// Strip sibling keys that were copied from the parent and belong to a
+	// different type (e.g. `items` sibling on a now-string-typed schema).
+	for (const key in nextSchema) {
+		if (!Object.hasOwn(nextSchema, key)) continue;
+		if (key === "type") continue;
+		if (
+			Object.hasOwn(ALL_CCA_TYPE_SPECIFIC_KEYS, key) &&
+			!Object.hasOwn(chosenTypeAllowedKeys, key) &&
+			!Object.hasOwn(CLOUD_CODE_ASSIST_SHARED_SCHEMA_KEYS, key)
+		) {
+			delete nextSchema[key];
+		}
+	}
+
 	for (const key in mergedVariantFields) {
 		if (!Object.hasOwn(mergedVariantFields, key)) continue;
+		// Drop type-specific keys that don't belong to the chosen type
+		if (!Object.hasOwn(chosenTypeAllowedKeys, key) && !Object.hasOwn(CLOUD_CODE_ASSIST_SHARED_SCHEMA_KEYS, key)) {
+			continue;
+		}
 		const value = mergedVariantFields[key];
 		const existingValue = nextSchema[key];
 		if (existingValue !== undefined && !areJsonValuesEqual(existingValue, value)) {
@@ -774,7 +808,6 @@ export function normalizeSchema(value: unknown, options: NormalizeSchemaOptions)
 	let normalized = normalizeSchemaNode(dereferenced, {
 		...options,
 		insideProperties: false,
-		epoch: epochNext(),
 	});
 	if (options.stripResidualCombinersFixpoint) {
 		normalized = stripResidualCombiners(normalized);
@@ -1036,6 +1069,36 @@ function primitiveJsonTypeOf(value: unknown): StrictPrimitiveType | undefined {
 			return undefined;
 	}
 }
+function jsonSchemaTypeAcceptsValue(type: string, value: unknown): boolean {
+	switch (type) {
+		case "null":
+			return value === null;
+		case "string":
+			return typeof value === "string";
+		case "number":
+			return typeof value === "number";
+		case "integer":
+			return typeof value === "number" && Number.isInteger(value);
+		case "boolean":
+			return typeof value === "boolean";
+		case "array":
+			return Array.isArray(value);
+		case "object":
+			return isJsonObject(value);
+		default:
+			return true;
+	}
+}
+
+function narrowEnumToType(schema: Record<string, unknown>, type: string): boolean {
+	const enumValues = schema.enum;
+	if (!Array.isArray(enumValues)) return true;
+
+	const narrowed = enumValues.filter(value => jsonSchemaTypeAcceptsValue(type, value));
+	if (narrowed.length === 0) return false;
+	if (narrowed.length !== enumValues.length) schema.enum = narrowed;
+	return true;
+}
 
 /**
  * Returns the primitive `type` keyword that fully describes the constraint
@@ -1250,7 +1313,8 @@ export function sanitizeSchemaForStrictMode(
 		// `enforceStrictSchema` and the typical OpenAI strict-mode "description
 		// on the union" shape.
 		const { description, ...variantBase } = sanitizedWithoutType;
-		const variants = typeVariants.map(variantType => {
+		const variants: Record<string, unknown>[] = [];
+		for (const variantType of typeVariants) {
 			const variantSchema: Record<string, unknown> = { ...variantBase, type: variantType };
 			if (variantType !== "object") {
 				delete variantSchema.properties;
@@ -1260,8 +1324,14 @@ export function sanitizeSchemaForStrictMode(
 			if (variantType !== "array") {
 				delete variantSchema.items;
 			}
-			return sanitizeSchemaForStrictMode(variantSchema, epoch, cache, root);
-		});
+			if (!narrowEnumToType(variantSchema, variantType)) continue;
+			variants.push(sanitizeSchemaForStrictMode(variantSchema, epoch, cache, root));
+		}
+
+		if (variants.length === 0) {
+			cache.set(schema, sanitizedWithoutType);
+			return sanitizedWithoutType;
+		}
 
 		if (variants.length === 1) {
 			const sole = variants[0] as Record<string, unknown>;
@@ -1405,6 +1475,21 @@ export function sanitizeSchemaForStrictMode(
 }
 
 /**
+ * A node whose only constraining keyword is `anyOf` (annotations like
+ * `description` aside). Only such nodes can be merged into an enclosing
+ * union without changing semantics: sibling keywords (`type`, `enum`,
+ * `properties`, …) apply conjunctively with `anyOf`, so spreading the
+ * branches of a non-pure node would drop those constraints.
+ */
+function isPureAnyOfNode(value: unknown): value is Record<string, unknown> & { anyOf: unknown[] } {
+	if (!isJsonObject(value) || !Array.isArray(value.anyOf)) return false;
+	for (const key in value) {
+		if (key !== "anyOf" && key !== "description") return false;
+	}
+	return true;
+}
+
+/**
  * Recursively enforces JSON Schema constraints required by OpenAI/Codex strict mode:
  *   - `additionalProperties: false` on every object node
  *   - every key in `properties` present in `required`
@@ -1472,6 +1557,10 @@ function enforceStrictSchemaBody(
 					strictProperties[key] = processed;
 					continue;
 				}
+				if (isPureAnyOfNode(processed)) {
+					strictProperties[key] = { ...processed, anyOf: [...processed.anyOf, { type: "null" }] };
+					continue;
+				}
 				if (isJsonObject(processed) && typeof processed.description === "string") {
 					const { description, ...withoutDescription } = processed;
 					strictProperties[key] = { anyOf: [withoutDescription, { type: "null" }], description };
@@ -1511,6 +1600,26 @@ function enforceStrictSchemaBody(
 					: entry,
 			);
 		}
+	}
+	// Splice nested pure unions into the parent `anyOf`: `(A ∨ B) ∨ C` ≡ `A ∨ B ∨ C`.
+	// Some strict-mode validators (e.g. DeepSeek behind OpenRouter) reject anyOf
+	// branches that carry no `type`, which is exactly what a nested combinator
+	// node looks like (#2270). Branch recursion above already flattened deeper
+	// levels bottom-up, so a single pass suffices.
+	if (Array.isArray(result.anyOf) && result.anyOf.some(isPureAnyOfNode)) {
+		const flattened: unknown[] = [];
+		for (const branch of result.anyOf) {
+			if (!isPureAnyOfNode(branch)) {
+				flattened.push(branch);
+				continue;
+			}
+			flattened.push(...branch.anyOf);
+			// Keep the inner annotation when the parent has none.
+			if (typeof branch.description === "string" && result.description === undefined) {
+				result.description = branch.description;
+			}
+		}
+		result.anyOf = flattened;
 	}
 	for (const defsKey of ["$defs", "definitions"] as const) {
 		if (result[defsKey] != null && typeof result[defsKey] === "object" && !Array.isArray(result[defsKey])) {

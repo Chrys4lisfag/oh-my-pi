@@ -14,11 +14,17 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import type { ChildProcess } from "node:child_process";
 import { execSync, spawn } from "node:child_process";
-import { getBundledModel } from "@oh-my-pi/pi-ai/models";
 import { complete } from "@oh-my-pi/pi-ai/stream";
 import type { AssistantMessage, Context, Model, Usage } from "@oh-my-pi/pi-ai/types";
-import { isContextOverflow } from "@oh-my-pi/pi-ai/utils/overflow";
+import { isContextOverflow as originalIsContextOverflow } from "@oh-my-pi/pi-ai/utils/overflow";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { $which } from "@oh-my-pi/pi-utils";
+
+function isContextOverflow(message: AssistantMessage, contextWindow: number | null): boolean {
+	return originalIsContextOverflow(message, contextWindow ?? 0);
+}
+
 import { e2eApiKey, resolveApiKey } from "./oauth";
 
 // Resolve OAuth tokens at module level (async, runs before tests)
@@ -54,7 +60,7 @@ interface OverflowResult {
 }
 
 async function testContextOverflow(model: Model, apiKey: string): Promise<OverflowResult> {
-	const overflowContent = generateOverflowContent(model.contextWindow);
+	const overflowContent = generateOverflowContent(model.contextWindow ?? 0);
 
 	const context: Context = {
 		systemPrompt: ["You are a helpful assistant."],
@@ -74,7 +80,7 @@ async function testContextOverflow(model: Model, apiKey: string): Promise<Overfl
 	return {
 		provider: model.provider,
 		model: model.id,
-		contextWindow: model.contextWindow,
+		contextWindow: model.contextWindow ?? 0,
 		stopReason: response.stopReason,
 		errorMessage: response.errorMessage,
 		usage: response.usage,
@@ -458,7 +464,7 @@ describe("Context overflow error handling", () => {
 			// Either way, isContextOverflow should detect it (via usage check or we skip if rate limited)
 			if (result.stopReason === "stop") {
 				expect(result.hasUsageData).toBe(true);
-				expect(result.usage.input).toBeGreaterThan(model.contextWindow);
+				expect(result.usage.input).toBeGreaterThan(model.contextWindow ?? 0);
 				expect(isContextOverflow(result.response, model.contextWindow)).toBe(true);
 			} else {
 				// Rate limited or other error - just log and pass
@@ -593,7 +599,7 @@ describe("Context overflow error handling", () => {
 				setTimeout(checkServer, 1000);
 			});
 
-			model = {
+			model = buildModel({
 				id: "gpt-oss:20b",
 				api: "openai-completions",
 				provider: "ollama",
@@ -604,7 +610,7 @@ describe("Context overflow error handling", () => {
 				maxTokens: 16000,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				name: "Ollama GPT-OSS 20B",
-			};
+			});
 		}, 60000);
 
 		afterAll(() => {
@@ -640,7 +646,7 @@ describe("Context overflow error handling", () => {
 	describe.skipIf(lmStudioModel === undefined)("LM Studio (local)", () => {
 		it("should detect overflow via isContextOverflow", async () => {
 			if (!lmStudioModel) return;
-			const model: Model<"openai-completions"> = {
+			const model: Model<"openai-completions"> = buildModel({
 				id: lmStudioModel.id,
 				api: "openai-completions",
 				provider: "lm-studio",
@@ -651,7 +657,7 @@ describe("Context overflow error handling", () => {
 				maxTokens: 2048,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				name: lmStudioModel.name,
-			};
+			});
 
 			const result = await testContextOverflow(model, Bun.env.LM_STUDIO_API_KEY || "lm-studio");
 			logResult(result);
@@ -676,7 +682,7 @@ describe("Context overflow error handling", () => {
 	describe.skipIf(!llamaCppRunning)("llama.cpp (local)", () => {
 		it("should detect overflow via isContextOverflow", async () => {
 			// Using small context (4096) to match server --ctx-size setting
-			const model: Model<"openai-completions"> = {
+			const model: Model<"openai-completions"> = buildModel({
 				id: "local-model",
 				api: "openai-completions",
 				provider: "llama.cpp",
@@ -687,7 +693,7 @@ describe("Context overflow error handling", () => {
 				maxTokens: 2048,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				name: "llama.cpp Local Model",
-			};
+			});
 
 			const result = await testContextOverflow(model, "llama.cpp");
 			logResult(result);

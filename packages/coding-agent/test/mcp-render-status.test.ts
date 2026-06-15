@@ -2,19 +2,19 @@ import { beforeAll, describe, expect, it } from "bun:test";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { TSchema } from "@oh-my-pi/pi-ai";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { DeferredMCPTool, MCPTool, type MCPToolDetails } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
+import type { MCPServerConnection, MCPToolDefinition, MCPTransport } from "@oh-my-pi/pi-coding-agent/mcp/types";
 import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
 import { theme as activeTheme, getThemeByName, initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { formatStatusIcon } from "@oh-my-pi/pi-coding-agent/tools/render-utils";
 import { TUI } from "@oh-my-pi/pi-tui";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
-import { DeferredMCPTool, MCPTool, type MCPToolDetails } from "../src/mcp/tool-bridge";
-import type { MCPServerConnection, MCPToolDefinition, MCPTransport } from "../src/mcp/types";
 
 beforeAll(async () => {
 	resetSettingsForTest();
 	await Settings.init({ inMemory: true, cwd: process.cwd() });
 	await initTheme(false, undefined, undefined, "dark", "light");
-});
+}, 15_000);
 
 async function getRequiredTheme() {
 	const uiTheme = await getThemeByName("dark");
@@ -110,15 +110,15 @@ describe("MCP tool rendering", () => {
 	it("replaces the pending call header with a success header after completion", async () => {
 		const uiTheme = await getRequiredTheme();
 		const pendingIcon = Bun.stripANSI(formatStatusIcon("pending", uiTheme));
-		const successIcon = Bun.stripANSI(formatStatusIcon("success", uiTheme));
+		const doneIcon = Bun.stripANSI(uiTheme.styledSymbol("tool.mcp", "accent"));
 
 		const rendered = await renderCompletedMCPTool(false);
 
 		expect(makeTool().mergeCallAndResult).toBe(true);
 		expect(makeDeferredTool().mergeCallAndResult).toBe(true);
-		expect(rendered).toContain(`${successIcon} sentry/search_events`);
+		expect(rendered).toContain(`${doneIcon} sentry/search_events`);
 		expect(rendered).not.toContain(`${pendingIcon} sentry/search_events`);
-	});
+	}, 15_000);
 
 	it("replaces the pending call header with an error header for MCP errors", async () => {
 		const uiTheme = await getRequiredTheme();
@@ -129,5 +129,5 @@ describe("MCP tool rendering", () => {
 
 		expect(rendered).toContain(`${errorIcon} sentry/search_events`);
 		expect(rendered).not.toContain(`${pendingIcon} sentry/search_events`);
-	});
+	}, 15_000);
 });

@@ -25,7 +25,7 @@
  * Reference: https://docs.searxng.org/dev/search_api.html
  */
 
-import type { AuthStorage } from "@oh-my-pi/pi-ai";
+import type { AuthStorage, FetchImpl } from "@oh-my-pi/pi-ai";
 
 import { settings } from "../../../config/settings";
 import type { SearchResponse, SearchSource } from "../../../web/search/types";
@@ -207,12 +207,13 @@ async function callSearXNGSearch(
 		categories?: string;
 		language?: string;
 		signal?: AbortSignal;
+		fetch?: FetchImpl;
 	},
 	auth: SearXNGAuth | null,
 ): Promise<SearXNGResponse> {
 	const { url, headers } = buildRequest(endpoint, params, auth);
 
-	const response = await fetch(url, {
+	const response = await (params.fetch ?? fetch)(url, {
 		headers,
 		signal: withHardTimeout(params.signal),
 	});
@@ -233,6 +234,7 @@ export async function searchSearXNG(params: {
 	num_results?: number;
 	recency?: "day" | "week" | "month" | "year";
 	signal?: AbortSignal;
+	fetch?: FetchImpl;
 }): Promise<SearchResponse> {
 	const numResults = clampNumResults(params.num_results, DEFAULT_NUM_RESULTS, MAX_NUM_RESULTS);
 
@@ -260,6 +262,7 @@ export async function searchSearXNG(params: {
 			...params,
 			categories,
 			language,
+			fetch: params.fetch,
 		},
 		auth,
 	);
@@ -278,9 +281,21 @@ export async function searchSearXNG(params: {
 		});
 	}
 
+	const limitedSources = sources.slice(0, numResults);
+	if (limitedSources.length === 0 && response.unresponsive_engines?.length) {
+		const upstreamFailures = response.unresponsive_engines
+			.map(([engine, reason]) => `${engine}: ${reason}`)
+			.join("; ");
+		throw new SearchProviderError(
+			"searxng",
+			`SearXNG returned no usable results; upstream engines failed: ${upstreamFailures}`,
+			503,
+		);
+	}
+
 	return {
 		provider: "searxng",
-		sources: sources.slice(0, numResults),
+		sources: limitedSources,
 		relatedQuestions: response.suggestions?.length ? response.suggestions : undefined,
 	};
 }
@@ -304,6 +319,7 @@ export class SearXNGProvider extends SearchProvider {
 			num_results: params.numSearchResults ?? params.limit,
 			recency: params.recency,
 			signal: params.signal,
+			fetch: params.fetch,
 		});
 	}
 }

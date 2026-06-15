@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -12,7 +12,8 @@ import { TreeSelectorComponent } from "@oh-my-pi/pi-coding-agent/modes/component
 import { UserMessageSelectorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/user-message-selector";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { HistoryStorage } from "@oh-my-pi/pi-coding-agent/session/history-storage";
-import type { SessionInfo, SessionTreeNode } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { SessionTreeNode } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import type { SessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { setKeybindings } from "@oh-my-pi/pi-tui";
 
 const CTRL_N = "\x0e";
@@ -86,8 +87,15 @@ async function createHistoryStorage(prompts: string[]): Promise<HistoryStorage> 
 	tempDirs.push(dir);
 	HistoryStorage.resetInstance();
 	const storage = HistoryStorage.open(path.join(dir, "history.db"));
-	for (const prompt of prompts) {
-		await storage.add(prompt);
+	// add() batches writes behind a 100ms AsyncDrain timer. Drive that timer with
+	// fake timers so the flush is instant instead of waiting real wall-clock time.
+	vi.useFakeTimers();
+	try {
+		const writes = prompts.map(prompt => storage.add(prompt));
+		vi.advanceTimersByTime(100);
+		await Promise.all(writes);
+	} finally {
+		vi.useRealTimers();
 	}
 	return storage;
 }

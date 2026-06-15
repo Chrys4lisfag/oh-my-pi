@@ -10,7 +10,7 @@ Primary implementation files:
 - `src/config/model-resolver.ts` — parses model patterns and selects initial/smol/slow models
 - `src/config/settings-schema.ts` — model-related settings (`modelRoles`, provider transport preferences)
 - `src/session/auth-storage.ts` — API key + OAuth resolution order
-- `packages/ai/src/models.ts` and `packages/ai/src/types.ts` — built-in providers/models and `Model`/`compat` types
+- `packages/catalog/src/models.ts` and `packages/catalog/src/types.ts` — built-in providers/models (`getBundledModels` / `getBundledProviders`) and `Model`/`compat` types
 
 ## Config file location and legacy behavior
 
@@ -130,12 +130,26 @@ Must define at least one of:
 
 ### Discovery
 
-- `discovery` requires provider-level `api`.
+- `discovery` requires provider-level `api`, except `discovery.type: proxy` (per-model wire auto-detected).
 
 ### Model value checks
 
 - `id` required
 - `contextWindow` and `maxTokens` must be positive if provided
+
+### Command-resolved secrets
+
+Provider `apiKey` values and provider/model `headers` values may start with `!` to read a secret from command stdout. The command is run with a 10 s timeout, stdout is trimmed, and empty/failing commands are omitted:
+
+```yaml
+providers:
+  openai:
+    apiKey: "!op read op://dev/openai/api-key"
+    headers:
+      X-Team-Key: "!bw get password omp-team-key"
+```
+
+Successful command outputs are cached for the process lifetime so the command is not re-run for every model.
 
 ## Merge and override order
 
@@ -153,13 +167,13 @@ ModelRegistry pipeline (on refresh):
 ### Provider-model cache and static fingerprint
 
 Cached per-provider model lists are persisted in the model-cache SQLite
-database (schema v3) with a `static_fingerprint` column that hashes the
-static catalog slice merged into the row. When `resolveProviderModels`
+database (current schema version 5) with a `static_fingerprint` column that
+hashes the static catalog slice merged into the row. When `resolveProviderModels`
 skips the network fetch and the fingerprint of the in-memory static
 catalog matches the cached one, the cached rows are returned verbatim —
 the static + dynamic merge is bypassed entirely. The fingerprint is
-memoized per process via a WeakMap keyed by the static-models array
-reference, so repeated cold-start calls do not re-hash.
+memoized per process by tagging the static-models array with a symbol
+property, so repeated cold-start calls do not re-hash.
 
 ## Canonical model equivalence and coalescing
 
@@ -242,10 +256,13 @@ If `ollama` is not explicitly configured, registry adds an implicit discoverable
 
 - provider: `ollama`
 - api: `openai-responses`
-- base URL: `OLLAMA_BASE_URL` or `http://127.0.0.1:11434`
+- base URL: `OLLAMA_BASE_URL`, or `OLLAMA_HOST`, or `http://127.0.0.1:11434`
+- context window: `OLLAMA_CONTEXT_LENGTH` if set, otherwise Ollama `/api/show` metadata, otherwise `128000`
 - auth mode: keyless (`auth: none` behavior)
 
 Runtime discovery calls Ollama endpoints and normalizes discovered OpenAI-compatible models to `openai-responses`.
+
+`OLLAMA_CONTEXT_LENGTH` does not configure Ollama's runtime `num_ctx`; set that in Ollama/model configuration separately.
 
 ### Implicit llama.cpp discovery
 
@@ -268,6 +285,8 @@ If `lm-studio` is not explicitly configured, registry adds an implicit discovera
 - auth mode: keyless (`auth: none` behavior)
 
 Runtime discovery fetches models (`GET /models`) and synthesizes model entries with local defaults.
+
+This path also works for local OpenAI-compatible servers that are not LM Studio. For example, if oMLX is bound to Ollama's usual port, set `LM_STUDIO_BASE_URL=http://127.0.0.1:11434/v1` to discover it through the existing `/v1/models` flow. Running oMLX and Ollama side by side requires assigning a different port to one of them. Do not configure oMLX as `ollama`: Ollama discovery uses native `/api/tags` and `/api/show` endpoints, not OpenAI `/v1/models`.
 
 ### Explicit provider discovery
 
@@ -398,7 +417,7 @@ Resolution precedence for exact selectors:
 
 Supported model roles:
 
-- `default`, `smol`, `slow`, `vision`, `plan`, `designer`, `commit`, `task`
+- `default`, `smol`, `slow`, `vision`, `plan`, `designer`, `commit`, `title`, `task`, `advisor`
 
 Role aliases like `pi/smol` expand through `settings.modelRoles`. Each role value can also append a thinking selector such as `:minimal`, `:low`, `:medium`, or `:high`.
 
@@ -440,14 +459,14 @@ disabledProviders:
 
 String entries apply everywhere. Scoped entries apply when the current working directory is the configured path or one of its subdirectories. Use `path`, `paths`, `pathPrefix`, or `pathPrefixes`; use `models` for `enabledModels`, `providers` for `disabledProviders`, or `values` for either.
 
-## `/model` and `--list-models`
+## `/model` and `omp models`
 
 Both surfaces keep provider-prefixed models visible and selectable.
 
 They now also expose canonical/coalesced models:
 
 - `/model` includes a canonical view alongside provider tabs
-- `--list-models` prints a canonical section plus the concrete provider rows
+- `omp models` prints provider-grouped tables of every concrete model, and `omp models canonical` prints the coalesced canonical view
 
 Selecting a canonical entry stores the canonical selector. Selecting a provider row stores the explicit `provider/modelId`.
 
@@ -506,7 +525,7 @@ The built-in model policy currently links OpenAI `codex-spark` variants to `gpt-
 
 ## Compatibility and routing fields
 
-The `compat` block on a provider or model overrides the URL-based auto-detection in `packages/ai/src/providers/openai-completions-compat.ts`. It is validated by `OpenAICompatSchema` in `packages/coding-agent/src/config/models-config-schema.ts` and consumed by every `openai-completions` transport (`packages/ai/src/providers/openai-completions.ts`). The canonical type is `OpenAICompat` in `packages/ai/src/types.ts`.
+The `compat` block on a provider or model overrides the URL-based auto-detection in `packages/catalog/src/compat/openai.ts` (`buildOpenAICompat`). It is validated by `OpenAICompatSchema` in `packages/coding-agent/src/config/models-config-schema.ts` and consumed by every `openai-completions` transport (`packages/ai/src/providers/openai-completions.ts`). The canonical type is `OpenAICompat` in `packages/catalog/src/types.ts`.
 
 `models.yml` accepts the following keys (all optional; unset falls back to URL detection):
 
@@ -520,17 +539,24 @@ Request shaping:
 - `supportsToolChoice` — emit the `tool_choice` parameter when the caller forces a specific tool. Default: `true`. Set `false` for endpoints that 400 on `tool_choice` (e.g. DeepSeek when reasoning is on).
 - `disableReasoningOnForcedToolChoice` — drop `reasoning_effort` / OpenRouter `reasoning` whenever `tool_choice` forces a call. Default: auto (Kimi/Anthropic-fronted endpoints).
 - `disableReasoningOnToolChoice` — drop reasoning fields whenever any `tool_choice` is sent. Default: auto (DeepSeek reasoning models).
+- `alwaysSendMaxTokens` — always send a max-token field when the caller did not provide one. Default: auto (Kimi-family models derive TPM limits from `max_tokens`).
+- `strictResponsesPairing` — Responses-API tool-call/result history must be strictly paired. Default: auto (Azure OpenAI, GitHub Copilot).
+- `streamIdleTimeoutMs` — stream-watchdog idle-timeout floor in ms for slow reasoning hosts. Default: auto (GLM coding-plan hosts, direct DeepSeek reasoning).
+- `cacheControlFormat` — `"anthropic"` to include Anthropic-style prompt-cache markers in chat-completions payloads. Default: auto (OpenRouter `anthropic/*` models).
+- `supportsLongPromptCacheRetention` — host honors `prompt_cache_retention: "24h"` on the Responses API. Default: auto (api.openai.com).
 - `extraBody` — extra top-level fields merged into every request body (gateway hints, controller selectors, etc.).
 
 Reasoning / thinking:
 
-- `supportsReasoningEffort` — accept `reasoning_effort`. Default: auto (off for Grok and zAI).
+- `supportsReasoningEffort` — accept `reasoning_effort`. Default: auto (off for Grok, Z.ai/Zhipu, and Xiaomi MiMo).
+- `supportsReasoningParams` — whether request shaping may send reasoning params at all. Default: auto (off for GitHub Copilot chat-completions).
 - `reasoningEffortMap` — partial map from internal effort levels (`minimal|low|medium|high|xhigh`) to provider-specific strings (e.g. DeepSeek maps `xhigh -> "max"`).
 - `thinkingFormat` — request shape for thinking: `"openai"` (`reasoning_effort`), `"openrouter"` (`reasoning: { effort }`), `"zai"` (`thinking: { type: "enabled" }`), `"qwen"` (top-level `enable_thinking`), or `"qwen-chat-template"` (`chat_template_kwargs.enable_thinking`). Default: `"openai"`.
 - `reasoningContentField` — assistant field carrying chain-of-thought: `"reasoning_content"`, `"reasoning"`, or `"reasoning_text"`. Default: auto.
 - `requiresReasoningContentForToolCalls` — assistant tool-call turns must round-trip the reasoning field (DeepSeek-R1, Kimi, OpenRouter when reasoning is on). Default: `false`.
 - `allowsSyntheticReasoningContentForToolCalls` — allow a placeholder reasoning field when a prior assistant tool-call turn lacks provider reasoning content. Default: `true`; set `false` for providers that validate the exact reasoning value.
 - `requiresAssistantContentForToolCalls` — assistant tool-call turns must include non-empty text content (Kimi). Default: `false`.
+- `whenThinking` — partial compat overrides applied only when a request actually engages thinking mode (deep-merged over the baseline compat).
 
 Tool / message normalization:
 
@@ -550,13 +576,13 @@ Provider-level `compat` is the baseline; per-model `compat` is deep-merged on to
 
 ### Anthropic compatibility (`anthropic-messages`)
 
-For `anthropic-messages` models the runtime uses a separate `AnthropicCompat` shape (`packages/ai/src/types.ts`). The `models.yml` schema currently exposes only the strict-tools opt-out as a top-level provider field (see below); the remaining Anthropic-side knobs (`disableAdaptiveThinking`, `supportsEagerToolInputStreaming`, `supportsLongCacheRetention`, `supportsMidConversationSystem`) are set by built-in catalog metadata and are not user-configurable from `models.yml`.
+For `anthropic-messages` models the runtime uses a separate `AnthropicCompat` shape (`packages/catalog/src/types.ts`). The `models.yml` schema exposes the strict-tools opt-out as a top-level provider field (see below) plus two Anthropic-side flags in the same `compat` slot — `requiresToolResultId` (non-standard `id` alias on `tool_result` blocks for Z.AI-style proxies) and `replayUnsignedThinking` (replay unsigned thinking blocks as native thinking instead of demoting them to text); the remaining Anthropic-side knobs (`disableAdaptiveThinking`, `supportsEagerToolInputStreaming`, `supportsLongCacheRetention`, `supportsMidConversationSystem`, `supportsForcedToolChoice`, `supportsSamplingParams`) are set by built-in catalog metadata and are not user-configurable from `models.yml`.
 
 ### Strict tool schemas (`disableStrictTools`)
 
-Anthropic's API supports a `strict` field on tool definitions that forces the model to always follow the provided schema exactly. This is enabled by default for all `anthropic-messages` providers because it guarantees schema conformance in agentic systems.
+Anthropic's API supports a `strict` field on tool definitions that forces the model to always follow the provided schema exactly. OMP enables it by default for a small allowlist of high-frequency built-in `anthropic-messages` tools (`bash`, `python`, `edit`, and `find`) whose schemas fit Anthropic's strict grammar limits; other tools still send normalized schemas but omit `strict`.
 
-Third-party providers that front the Anthropic API (AWS Bedrock, Azure, self-hosted proxies) do not always implement this field and will reject requests that include it. Set `disableStrictTools: true` at the provider level to opt out:
+Third-party providers that front the Anthropic API (AWS Bedrock, Azure, self-hosted proxies) do not always implement this field and will reject requests that include it. Set `disableStrictTools: true` at the provider level to opt out of strict mode for the allowlisted tools:
 
 ```yaml
 providers:
@@ -578,7 +604,7 @@ providers:
           cacheWrite: 3.75
 ```
 
-`disableStrictTools` is a provider-level flag that applies to all models in the provider.
+`disableStrictTools` is a provider-level flag that applies to all models in the provider. It disables the Anthropic `strict` marker only for tools that OMP would otherwise mark strict; it does not change runtime tool argument validation. OMP can automatically retry without strict tools after Anthropic reports a strict-grammar-too-large error before the first streamed token, but proxies that reject the `strict` field for other reasons should set this flag explicitly.
 
 Tool schemas going on the wire are normalized by the unified flow in
 `packages/ai/src/utils/schema/normalize.ts` (Google/CCA/MCP dispatchers
@@ -601,6 +627,45 @@ providers:
     models:
       - id: Qwen/Qwen2.5-Coder-32B-Instruct
         name: Qwen 2.5 Coder 32B (local)
+```
+
+For oMLX or another local OpenAI-compatible server with a discoverable `/v1/models` endpoint, prefer discovery instead of listing models by hand. Set `api` to the endpoint family your server actually exposes: `openai-completions` uses `/v1/chat/completions`; servers that expose `/v1/responses` need `openai-responses` instead.
+
+```yaml
+providers:
+  omlx:
+    baseUrl: http://127.0.0.1:11434/v1
+    auth: none
+    api: openai-completions
+    discovery:
+      type: openai-models-list
+```
+
+The built-in vLLM provider can be pointed at a non-default endpoint without declaring a custom discovery type. OMP uses vLLM's `/v1/models` metadata and preserves vLLM's `max_model_len` field as the discovered context window.
+
+```yaml
+providers:
+  vllm:
+    baseUrl: http://192.168.5.3:8085/v1
+    auth: none
+```
+
+For multiple vLLM endpoints, use arbitrary provider IDs with the generic OpenAI-compatible discovery path. Set `auth: none` for local no-auth servers or `apiKey` for authenticated ones. Generic discovery reads `max_model_len` first and then `context_length` as a generic OpenAI-compatible fallback.
+
+```yaml
+providers:
+  vllm-fast:
+    baseUrl: http://host-a:8000/v1
+    auth: none
+    api: openai-completions
+    discovery:
+      type: openai-models-list
+  vllm-long:
+    baseUrl: http://host-b:8000/v1
+    auth: none
+    api: openai-completions
+    discovery:
+      type: openai-models-list
 ```
 
 ### Hosted proxy with env-based key

@@ -5,7 +5,7 @@ Patches files given diff hunks. Primary tool for existing-file edits.
 - `@@` — bare header when context lines unique
 - `@@ $ANCHOR` — anchor copied verbatim from file (full line or unique substring)
 **Anchor Selection:**
-1. Otherwise choose highly specific anchor copied from file:
+1. Prefer bare `@@` when context lines alone are unique; otherwise choose highly specific anchor copied from file:
    - full function signature
    - class declaration
    - unique string literal/error message
@@ -42,29 +42,16 @@ Returns success/failure; on failure, error message indicates:
 </output>
 
 <critical>
-- MUST read target file before editing
-- MUST copy anchors and context lines verbatim (including whitespace)
-- NEVER use anchors as comments (no line numbers, location labels, placeholders like `@@ @@`)
-- NEVER place new lines outside the intended block
-- If edit fails or breaks structure, MUST re-read file and produce new patch from current content—NEVER retry same diff
-- NEVER use edit to fix indentation, whitespace, or reformat code. Formatting is a single command run once at the end (`bun fmt`, `cargo fmt`, `prettier —write`, etc.)—not N individual edits. If you see inconsistent indentation after an edit, leave it; the formatter will fix all of it in one pass.
+- You MUST read the target file before editing
+- You MUST copy anchors and context lines verbatim (including whitespace)
+- You NEVER use anchors as comments (no line numbers, location labels, placeholders like `@@ @@`)
+- You NEVER place new lines outside the intended block
+- If edit fails or breaks structure, you MUST re-read the file and produce a new patch from current content — you NEVER retry the same diff
+- NEVER use edit to fix indentation, whitespace, or reformat code. Formatting is a single command run once at the end (`bun fmt`, `cargo fmt`, `prettier --write`, etc.) — not N individual edits. If you see inconsistent indentation after an edit, leave it; the formatter will fix all of it in one pass.
 </critical>
-
-<examples>
-# Create
-`edit {"path":"hello.txt","edits":[{"op":"create","diff":"Hello\n"}]}`
-# Update
-`edit {"path":"src/app.py","edits":[{"op":"update","diff":"@@ def greet():\n def greet():\n-print('Hi')\n+print('Hello')\n"}]}`
-# Rename
-`edit {"path":"src/app.py","edits":[{"op":"update","rename":"src/main.py","diff":"@@\n …\n"}]}`
-# Delete
-`edit {"path":"obsolete.txt","edits":[{"op":"delete"}]}`
-# Multiple entries
-All entries in one call apply to top-level `path`; use separate calls for different files.
-</examples>
 
 <avoid>
 - Generic anchors: `import`, `export`, `describe`, `function`, `const`
-- Repeating same addition in multiple hunks; duplicate blocks
-- Full-file overwrites for minor changes; acceptable for major restructures or short files
+- Repeating same addition in multiple hunks (duplicate blocks)
+- Full-file overwrites for minor changes (acceptable for major restructures or short files)
 </avoid>

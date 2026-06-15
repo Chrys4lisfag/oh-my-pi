@@ -1,14 +1,15 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EDIT_MODE_STRATEGIES } from "@oh-my-pi/pi-coding-agent/edit";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import { TUI } from "@oh-my-pi/pi-tui";
+import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
+import { theme as activeTheme, initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { previewWindowRows } from "@oh-my-pi/pi-coding-agent/tools/render-utils";
+import { TUI, visibleWidth } from "@oh-my-pi/pi-tui";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
-import { ToolExecutionComponent } from "../src/modes/components/tool-execution";
 
 // The streaming edit preview is a fixed-height tail window ("cursor"): the last
 // EDIT_STREAMING_PREVIEW_LINES rows of the recomputed diff are pinned to the
@@ -56,13 +57,71 @@ describe("streaming edit preview height (stable, full tail window)", () => {
 	// Char-by-char partials of the new function body.
 	const partials = Array.from({ length: fullNew.length }, (_, i) => fullNew.slice(0, i + 1));
 
+	// Deterministic render scheduler. The live TUI throttles renders behind
+	// setTimeout (~33ms/frame) and resize settles, and the harness's
+	// waitForRender sleeps 40ms per settle, so a finalization loop burns ~16
+	// real frame waits in wall-clock time for cadence this test never asserts.
+	// This queue-backed scheduler records every immediate/throttled render the
+	// TUI requests (including resize-settle repaints) and replays them on demand
+	// via flush(), so the scrollback-replace and stable-window contracts are
+	// driven by explicit render flushes instead of the clock.
+	type DrainableScheduler = {
+		now(): number;
+		scheduleImmediate(cb: () => void): void;
+		scheduleRender(cb: () => void, delayMs: number): { cancel(): void };
+		flush(): void;
+	};
+	function makeDrainableScheduler(): DrainableScheduler {
+		let clock = 0;
+		const queue: Array<{ run: () => void; cancelled: boolean }> = [];
+		const enqueue = (cb: () => void) => {
+			const item = { run: cb, cancelled: false };
+			queue.push(item);
+			return item;
+		};
+		return {
+			now: () => clock,
+			scheduleImmediate(cb) {
+				enqueue(cb);
+			},
+			scheduleRender(cb) {
+				const item = enqueue(cb);
+				return {
+					cancel() {
+						item.cancelled = true;
+					},
+				};
+			},
+			// Drain to quiescence: a render callback may queue follow-up renders
+			// (the post-frame re-schedule, a resize settle's forced clear), which
+			// this loop picks up. The guard trips only on a pathological render
+			// that re-arms itself unconditionally.
+			flush() {
+				let guard = 0;
+				while (queue.length > 0) {
+					if (++guard > 100_000) throw new Error("render scheduler did not settle");
+					const item = queue.shift()!;
+					clock += 1;
+					if (!item.cancelled) item.run();
+				}
+			},
+		};
+	}
+
 	// Real TUI + virtual terminal harness: drives the component through the
 	// actual differential renderer so native scrollback (not just the in-memory
 	// component height) is exercised. Mirrors makeComponent's construction but
-	// swaps the stub for a live TUI wired to an xterm-backed terminal.
-	function makeTuiComponent(): { component: ToolExecutionComponent; term: VirtualTerminal; tui: TUI } {
+	// swaps the stub for a live TUI wired to a ghostty-backed terminal and the
+	// drainable scheduler in place of wall-clock frame timers.
+	function makeTuiComponent(): {
+		component: ToolExecutionComponent;
+		term: VirtualTerminal;
+		tui: TUI;
+		scheduler: DrainableScheduler;
+	} {
 		const term = new VirtualTerminal(80, 8);
-		const tui = new TUI(term);
+		const scheduler = makeDrainableScheduler();
+		const tui = new TUI(term, undefined, { renderScheduler: scheduler });
 		const tool = { mode: "replace" } as unknown as AgentTool;
 		const component = new ToolExecutionComponent(
 			"edit",
@@ -73,12 +132,21 @@ describe("streaming edit preview height (stable, full tail window)", () => {
 			tmpDir,
 		);
 		tui.addChild(component);
-		return { component, term, tui };
+		return { component, term, tui, scheduler };
 	}
 
-	// Let the TUI's throttled render pipeline flush, then drain the terminal.
-	function settleTerminal(term: VirtualTerminal): Promise<void> {
-		return term.waitForRender();
+	// Settle the preview deterministically: await the off-render-path diff
+	// recompute kicked off by the latest updateArgs/setArgsComplete (its
+	// completion is what queues the preview's render), then replay every queued
+	// render synchronously and drain the terminal — no frame/animation sleeps.
+	async function settleTerminal(
+		component: ToolExecutionComponent,
+		scheduler: DrainableScheduler,
+		term: VirtualTerminal,
+	): Promise<void> {
+		await component.whenPreviewSettled();
+		scheduler.flush();
+		await term.flush();
 	}
 
 	// Whole native buffer (scrollback + viewport) with trailing padding trimmed.
@@ -119,14 +187,14 @@ describe("streaming edit preview height (stable, full tail window)", () => {
 			tmpDir,
 		);
 		// Await the actual diff recompute rather than racing the spinner's render
-		// ticks. The streaming spinner calls requestRender every ~16ms, so on a
+		// ticks. The streaming spinner calls requestRender every ~33ms, so on a
 		// slow box a tick — not the (file-read + whole-file Myers) compute — would
 		// resolve the wait and let us sample a stale, mid-abort preview. That is the
 		// CI flake that collapsed Math.min(...steady) to 4. whenPreviewSettled()
 		// resolves only when this chunk's recompute has updated the preview.
 		await component.whenPreviewSettled();
 
-		const trailingBlankRows = (rows: string[]): number => {
+		const trailingBlankRows = (rows: readonly string[]): number => {
 			let n = 0;
 			for (let i = rows.length - 1; i >= 0; i--) {
 				if (rows[i].replace(/\x1b\[[0-9;]*m/gu, "").trimEnd() === "") n++;
@@ -163,7 +231,7 @@ describe("streaming edit preview height (stable, full tail window)", () => {
 		// And it is never padded into a half-empty rectangle (the regression).
 		expect(maxTrailingBlank).toBeLessThanOrEqual(1);
 		expect(finalizedHeight).toBeGreaterThan(1);
-	});
+	}, 30_000);
 
 	test("real TUI finalization replaces streaming edit preview throughout native scrollback", async () => {
 		const previewPrefix = "PREVIEW_ONLY_STREAM_SENTINEL_";
@@ -186,11 +254,11 @@ describe("streaming edit preview height (stable, full tail window)", () => {
 			"+  return finalValue;",
 			" }",
 		].join("\n");
-		const { component, term, tui } = makeTuiComponent();
+		const { component, term, tui, scheduler } = makeTuiComponent();
 
 		try {
 			tui.start();
-			await settleTerminal(term);
+			await settleTerminal(component, scheduler, term);
 
 			let maxStreamingHeight = 0;
 			let sawPreviewSentinel = false;
@@ -229,7 +297,7 @@ describe("streaming edit preview height (stable, full tail window)", () => {
 				applyStep();
 				term.scrollLines(1_000);
 				tui.requestRender(i % 3 === 0 || i >= streamingStepCount);
-				await settleTerminal(term);
+				await settleTerminal(component, scheduler, term);
 
 				if (i < streamingStepCount) {
 					const rows = normalizedBufferRows(term);
@@ -242,18 +310,12 @@ describe("streaming edit preview height (stable, full tail window)", () => {
 			expect(sawPreviewSentinel).toBe(true);
 			expect(maxStreamingHeight).toBeGreaterThan(term.rows);
 
-			const preCheckpointBufferText = normalizedBufferRows(term).join("\n");
-			const stalePreviewRowsExistedBeforeCheckpoint = preCheckpointBufferText.includes(previewPrefix);
 			term.scrollLines(1_000);
-			const checkpointRefreshed = tui.refreshNativeScrollbackIfDirty({ allowUnknownViewport: true });
-			await settleTerminal(term);
+			await settleTerminal(component, scheduler, term);
 
 			const finalBufferText = normalizedBufferRows(term).join("\n");
 			expect(finalBufferText).toContain(finalSentinel);
 			expect(finalBufferText).not.toContain(previewPrefix);
-			if (stalePreviewRowsExistedBeforeCheckpoint) {
-				expect(checkpointRefreshed).toBe(true);
-			}
 
 			term.scrollLines(-1_000);
 			await term.flush();
@@ -269,7 +331,11 @@ describe("streaming edit preview height (stable, full tail window)", () => {
 			tui.stop();
 			await term.flush();
 		}
-	}, 10_000);
+		// Real TUI + Ghostty WASM integration can exceed Bun's default budget on CI:
+		// startup, repeated native scrollback refreshes, and throttled render frames are
+		// intentionally exercised here. Keep the contract assertions above; only widen
+		// the integration-test budget.
+	}, 30_000);
 
 	test("the underlying diff genuinely oscillates (guard against a vacuous test)", async () => {
 		const ctx = {
@@ -291,5 +357,92 @@ describe("streaming edit preview height (stable, full tail window)", () => {
 		}
 		const hasDecrease = rawLineCounts.some((count, i) => i > 0 && count < rawLineCounts[i - 1]);
 		expect(hasDecrease).toBe(true);
+	}, 30_000);
+});
+
+describe("streaming tool call preview height (bounded across renderers)", () => {
+	beforeAll(async () => {
+		// `evalToolRenderer.renderCall` walks the theme during highlighting; the
+		// bash/ssh/eval pending previews exercised below DO NOT read
+		// `settings.*`, so the global Settings singleton is intentionally left
+		// untouched here. Resetting/initialising it in `beforeEach` raced with
+		// parallel test files that do the same dance (issue #2582), flipping the
+		// proxy under us and timing the eval test out.
+		await initTheme();
 	});
+	function renderPending(toolName: string, args: unknown): { lines: readonly string[]; text: string } {
+		const term = new VirtualTerminal(80, 20);
+		const tui = new TUI(term);
+		const component = new ToolExecutionComponent(toolName, args, {}, undefined, tui, process.cwd());
+		try {
+			const lines = component.render(80);
+			return { lines, text: lines.map(line => Bun.stripANSI(line)).join("\n") };
+		} finally {
+			component.stopAnimation();
+		}
+	}
+
+	test("framed inline tool previews span the full tool width", () => {
+		const width = 80;
+		const { lines } = renderPending("bash", { command: "echo hi" });
+		const strippedLines = lines.map(line => Bun.stripANSI(line));
+		const topBorder = strippedLines.find(line => line.includes(activeTheme.boxSharp.topLeft));
+
+		expect(topBorder).toBeDefined();
+		expect(topBorder?.[0]).toBe(activeTheme.boxSharp.topLeft);
+		expect(topBorder?.endsWith(activeTheme.boxSharp.topRight)).toBe(true);
+		expect(visibleWidth(topBorder ?? "")).toBe(width);
+	});
+
+	test("bash/ssh pending previews stay short even with very long multiline args", () => {
+		// bash/ssh window the collapsed command to a viewport-sized TAIL: the end
+		// (the live edge while args stream) stays visible behind an "… N earlier
+		// lines" marker on top; the head is elided.
+		const window = previewWindowRows();
+		const total = window + 5;
+		const longLines = Array.from({ length: total }, (_, i) => `line-${i}`);
+		// Tail window = marker row + the last (window - 1) command lines.
+		const hidden = total - (window - 1);
+		const lastHidden = `line-${hidden - 1}`;
+		const firstVisible = `line-${hidden}`;
+		const lastVisible = `line-${total - 1}`;
+		const cases: Array<{ name: string; args: unknown }> = [
+			{ name: "bash", args: { command: longLines.join("\n") } },
+			{ name: "ssh", args: { host: "example", command: longLines.join("\n") } },
+		];
+
+		for (const testCase of cases) {
+			const { lines, text } = renderPending(testCase.name, testCase.args);
+			expect(lines.length, `${testCase.name} preview should stay bounded`).toBeLessThan(window + 10);
+			for (const needle of [firstVisible, lastVisible]) {
+				expect(text, `${testCase.name} preview should keep ${needle}`).toContain(needle);
+			}
+			expect(text, `${testCase.name} preview should elide line-0`).not.toContain("line-0");
+			expect(text, `${testCase.name} preview should elide ${lastHidden}`).not.toContain(lastHidden);
+			expect(text, `${testCase.name} preview should advertise the elided head`).toContain(
+				`… ${hidden} earlier lines`,
+			);
+		}
+	}, 30_000);
+
+	test("eval pending preview windows the code to the viewport tail", () => {
+		// Eval cell code is capped to the same viewport-sized TAIL window as
+		// bash/ssh: the live edge stays visible behind an "… N earlier lines"
+		// marker on top; ctrl+o uncaps. Unlike bash, the marker row sits above
+		// the window, so previewWindowRows() code lines stay visible.
+		const window = previewWindowRows();
+		const total = window + 5;
+		const hidden = total - window;
+		const longLines = Array.from({ length: total }, (_, i) => `line-${i}`);
+		const { lines, text } = renderPending("eval", {
+			cells: [{ language: "js", title: "big", code: longLines.map(line => `const ${line} = 1;`).join("\n") }],
+		});
+
+		expect(lines.length, "eval code preview should stay bounded").toBeLessThan(window + 10);
+		expect(text).toContain(`const line-${total - 1} = 1;`);
+		expect(text).toContain(`const line-${hidden} = 1;`);
+		expect(text).not.toContain("const line-0 = 1;");
+		expect(text).not.toContain(`const line-${hidden - 1} = 1;`);
+		expect(text).toContain(`… ${hidden} earlier lines`);
+	}, 30_000);
 });

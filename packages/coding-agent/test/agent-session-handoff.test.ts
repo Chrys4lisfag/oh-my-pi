@@ -1,38 +1,84 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import { Agent } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import * as compactionModule from "@oh-my-pi/pi-agent-core/compaction";
-import type { AssistantMessage, ToolCall } from "@oh-my-pi/pi-ai";
-import { getBundledModel } from "@oh-my-pi/pi-ai/models";
+import type { AssistantMessage, Model, ToolCall } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRunner, loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
+const HANDOFF_SECRET = "HANDOFF_SECRET_TOKEN_12345";
+
 describe("AgentSession handoff", () => {
+	// Immutable across the whole file: the model registry's synchronous bundled-model
+	// load dominates per-test setup (~100ms each), and the auth store + bundled model
+	// never change. Build them once. Per-test mutable state (session, session file,
+	// emitted events) is rebuilt in beforeEach.
+	let sharedDir: TempDir;
+	let authStorage: AuthStorage;
+	let modelRegistry: ModelRegistry;
+	let model: Model;
+
 	let tempDir: TempDir;
 	let session: AgentSession;
 	let sessionManager: SessionManager;
-	let authStorage: AuthStorage;
-	let modelRegistry: ModelRegistry;
 	let events: AgentSessionEvent[];
+	let obfuscator: SecretObfuscator;
+
+	/** Poll `predicate` until it holds (returns as soon as the state is reached) or the
+	 *  deadline elapses. Replaces blind settle sleeps for tests with a positive signal. */
+	async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
+		const deadline = Date.now() + timeoutMs;
+		while (!predicate()) {
+			if (Date.now() >= deadline) {
+				throw new Error("Timed out waiting for condition");
+			}
+			await Bun.sleep(1);
+		}
+	}
+
+	/** Drain post-turn maintenance deterministically for negative tests (those proving
+	 *  maintenance did NOT run, where there is no positive signal to poll on). Post-turn
+	 *  work is scheduled fire-and-forget: a single event-loop turn lets the handler run to
+	 *  its decision and register any compaction pass as a tracked post-prompt task, then
+	 *  `waitForIdle()` drains that task to completion. */
+	async function drainMaintenance(): Promise<void> {
+		await Bun.sleep(0);
+		await session.waitForIdle();
+	}
+
+	beforeAll(async () => {
+		sharedDir = TempDir.createSync("@pi-handoff-shared-");
+		authStorage = await AuthStorage.create(path.join(sharedDir.path(), "testauth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		modelRegistry = new ModelRegistry(authStorage);
+
+		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!bundled) {
+			throw new Error("Expected built-in anthropic model to exist");
+		}
+		model = bundled;
+	});
+
+	afterAll(async () => {
+		authStorage.close();
+		try {
+			await sharedDir.remove();
+		} catch {}
+	});
 
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@pi-handoff-");
-		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		modelRegistry = new ModelRegistry(authStorage);
 		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
 		events = [];
-
-		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
-		if (!model) {
-			throw new Error("Expected built-in anthropic model to exist");
-		}
+		obfuscator = new SecretObfuscator([{ type: "plain", content: HANDOFF_SECRET }]);
 
 		const agent = new Agent({
 			initialState: {
@@ -51,6 +97,7 @@ describe("AgentSession handoff", () => {
 				"compaction.autoContinue": false,
 			}),
 			modelRegistry,
+			obfuscator,
 		});
 
 		session.subscribe(event => {
@@ -85,7 +132,6 @@ describe("AgentSession handoff", () => {
 		if (session) {
 			await session.dispose();
 		}
-		authStorage.close();
 		try {
 			await tempDir.remove();
 		} catch {}
@@ -97,13 +143,72 @@ describe("AgentSession handoff", () => {
 		const generateHandoffSpy = vi.spyOn(compactionModule, "generateHandoff").mockResolvedValue(handoffText);
 
 		const result = await session.handoff();
-		await Bun.sleep(20);
+		await drainMaintenance();
 
 		expect(generateHandoffSpy).toHaveBeenCalledTimes(1);
 		expect(result?.document).toBe(handoffText);
+
 		expect(events.filter(event => event.type === "auto_compaction_start")).toHaveLength(0);
 		expect(events.filter(event => event.type === "auto_compaction_end")).toHaveLength(0);
 		expect(sessionManager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(0);
+	});
+
+	it("obfuscates custom instructions before generating a handoff", async () => {
+		const placeholder = obfuscator.obfuscate(HANDOFF_SECRET);
+		const generateHandoffSpy = vi
+			.spyOn(compactionModule, "generateHandoff")
+			.mockResolvedValue(`## Goal\nKeep ${placeholder}`);
+
+		const result = await session.handoff(`preserve ${HANDOFF_SECRET}`);
+
+		const handoffCall = generateHandoffSpy.mock.calls[0];
+		if (!handoffCall) throw new Error("Expected generateHandoff call");
+		expect(handoffCall[3].customInstructions).toBe(`preserve ${placeholder}`);
+		expect(handoffCall[3].customInstructions).not.toContain(HANDOFF_SECRET);
+		expect(result?.document).toContain(HANDOFF_SECRET);
+		expect(result?.document).not.toContain(placeholder);
+	});
+
+	it("obfuscates previous compaction summary and preserve data before forwarding to compact()", async () => {
+		const placeholder = obfuscator.obfuscate(HANDOFF_SECRET);
+		const entries = sessionManager.getBranch();
+		const lastEntryId = entries[entries.length - 1]?.id;
+		if (!lastEntryId) throw new Error("Expected a seeded entry id");
+		const fixedPreparation: compactionModule.CompactionPreparation = {
+			firstKeptEntryId: lastEntryId,
+			messagesToSummarize: [{ role: "user", content: [{ type: "text", text: "old" }], timestamp: 1 }],
+			turnPrefixMessages: [],
+			recentMessages: [],
+			isSplitTurn: false,
+			tokensBefore: 100,
+			previousSummary: `summary ${HANDOFF_SECRET}`,
+			previousPreserveData: {
+				openaiRemoteCompaction: {
+					replacementHistory: [{ role: "user", content: `history ${HANDOFF_SECRET}` }],
+				},
+			},
+			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			settings: compactionModule.DEFAULT_COMPACTION_SETTINGS,
+		};
+		vi.spyOn(compactionModule, "prepareCompaction").mockReturnValue(fixedPreparation);
+
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockResolvedValue({
+			summary: "new summary",
+			shortSummary: undefined,
+			firstKeptEntryId: lastEntryId,
+			tokensBefore: 100,
+			details: {},
+		});
+
+		await session.compact();
+
+		const call = compactSpy.mock.calls[0];
+		if (!call) throw new Error("Expected compact call");
+		expect(call[0].previousSummary).toBe(`summary ${placeholder}`);
+		expect(call[0].previousSummary).not.toContain(HANDOFF_SECRET);
+		const preserveData = JSON.stringify(call[0].previousPreserveData);
+		expect(preserveData).toContain(placeholder);
+		expect(preserveData).not.toContain(HANDOFF_SECRET);
 	});
 
 	it("runs context maintenance before sending an oversized pending prompt", async () => {
@@ -123,12 +228,293 @@ describe("AgentSession handoff", () => {
 		});
 
 		await session.prompt("pending prompt ".repeat(120));
-		await Bun.sleep(20);
+		await waitFor(
+			() =>
+				compactSpy.mock.calls.length === 1 &&
+				events.some(event => event.type === "auto_compaction_end" && event.aborted === false),
+		);
 
 		expect(compactSpy).toHaveBeenCalledTimes(1);
 		expect(promptSpy).toHaveBeenCalledTimes(1);
 		expect(events).toContainEqual({ type: "auto_compaction_start", reason: "threshold", action: "context-full" });
 		expect(events.some(event => event.type === "auto_compaction_end" && event.aborted === false)).toBe(true);
+	});
+	it("keeps pre-prompt context-full checks aligned with provider-anchored usage", async () => {
+		await session.dispose();
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		events = [];
+
+		const mock = createMockModel({
+			id: "gpt-5.5",
+			provider: "openai",
+			contextWindow: 10_000,
+			responses: [
+				{
+					content: ["ok"],
+					stopReason: "stop",
+					usage: {
+						input: 1_005,
+						output: 20,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 1_025,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+				},
+			],
+		});
+		const seedUser: AgentMessage = {
+			role: "user",
+			content: [{ type: "text", text: "seed" }],
+			timestamp: Date.now() - 2,
+		};
+		const seedAssistant: AssistantMessage = {
+			role: "assistant",
+			content: [
+				{
+					type: "thinking",
+					thinking: "short reasoning",
+					thinkingSignature: JSON.stringify({
+						id: "rs_repro",
+						type: "reasoning",
+						content: [],
+						encrypted_content: "blob ".repeat(30_000),
+						summary: [],
+					}),
+				},
+				{ type: "text", text: "done" },
+			],
+			api: mock.api,
+			provider: "openai",
+			model: mock.id,
+			stopReason: "stop",
+			usage: {
+				input: 1_000,
+				output: 10,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 1_010,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now() - 1,
+		};
+		sessionManager.appendMessage(seedUser);
+		sessionManager.appendMessage(seedAssistant);
+
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: {
+				model: mock,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [seedUser, seedAssistant],
+			},
+			streamFn: mock.stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({
+				"compaction.enabled": true,
+				"compaction.autoContinue": false,
+				"compaction.strategy": "context-full",
+				"compaction.thresholdTokens": 8_000,
+				"contextPromotion.enabled": false,
+			}),
+			modelRegistry,
+		});
+		session.subscribe(event => {
+			events.push(event);
+		});
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
+			summary: "pre-prompt compacted",
+			shortSummary: undefined,
+			firstKeptEntryId: preparation.firstKeptEntryId,
+			tokensBefore: preparation.tokensBefore,
+			details: {},
+		}));
+
+		expect(session.getContextUsage({ contextWindow: 10_000 })).toMatchObject({
+			tokens: 1_000,
+			contextWindow: 10_000,
+			percent: 10,
+		});
+
+		await session.prompt("small pending prompt");
+
+		expect(compactSpy).not.toHaveBeenCalled();
+		expect(events.filter(event => event.type === "auto_compaction_start")).toHaveLength(0);
+		expect(mock.calls).toHaveLength(1);
+	});
+	it("counts current non-message token growth in provider-anchored pre-prompt checks", async () => {
+		await session.dispose();
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		events = [];
+
+		const extensionsResult = await loadExtensions([], tempDir.path());
+		const extensionRunner = new ExtensionRunner(
+			extensionsResult.extensions,
+			extensionsResult.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
+		const emitBeforeAgentStart = vi
+			.spyOn(extensionRunner, "emitBeforeAgentStart")
+			.mockResolvedValueOnce(undefined)
+			.mockResolvedValueOnce({ systemPrompt: ["expanded system prompt ".repeat(30_000)] });
+		vi.spyOn(extensionRunner, "emit").mockResolvedValue(undefined);
+
+		const mock = createMockModel({
+			id: "gpt-5.5",
+			provider: "openai",
+			contextWindow: 10_000,
+			responses: [
+				{
+					content: ["seed response"],
+					stopReason: "stop",
+					usage: {
+						input: 1_000,
+						output: 10,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 1_010,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+				},
+			],
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: {
+				model: mock,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: mock.stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({
+				"compaction.enabled": true,
+				"compaction.autoContinue": false,
+				"compaction.strategy": "context-full",
+				"compaction.thresholdTokens": 8_000,
+				"compaction.keepRecentTokens": 1,
+				"contextPromotion.enabled": false,
+			}),
+			modelRegistry,
+			extensionRunner,
+		});
+		session.subscribe(event => {
+			events.push(event);
+		});
+
+		await session.prompt("seed prompt");
+		expect(mock.calls).toHaveLength(1);
+		expect(session.getContextUsage({ contextWindow: 10_000 })).toMatchObject({
+			tokens: 1_000,
+			contextWindow: 10_000,
+			percent: 10,
+		});
+
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
+			summary: "pre-prompt compacted",
+			shortSummary: undefined,
+			firstKeptEntryId: preparation.firstKeptEntryId,
+			tokensBefore: preparation.tokensBefore,
+			details: {},
+		}));
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockImplementation(async () => {
+			expect(sessionManager.getEntries().some(entry => entry.type === "compaction")).toBe(true);
+		});
+
+		await session.prompt("small pending prompt");
+		await waitFor(
+			() =>
+				compactSpy.mock.calls.length === 1 &&
+				events.some(event => event.type === "auto_compaction_end" && event.aborted === false),
+		);
+
+		expect(emitBeforeAgentStart).toHaveBeenCalledTimes(2);
+		expect(compactSpy).toHaveBeenCalledTimes(1);
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(events).toContainEqual({ type: "auto_compaction_start", reason: "threshold", action: "context-full" });
+	});
+
+	it("does not double-count unchanged non-message tokens in provider-anchored pre-prompt checks", async () => {
+		await session.dispose();
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		events = [];
+
+		const mock = createMockModel({
+			id: "gpt-5.5",
+			provider: "openai",
+			contextWindow: 10_000,
+			responses: [
+				{
+					content: ["seed response"],
+					stopReason: "stop",
+					usage: {
+						input: 8_500,
+						output: 10,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 8_510,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+				},
+				{ content: ["ok"], stopReason: "stop" },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: {
+				model: mock,
+				systemPrompt: ["expanded system prompt ".repeat(30_000)],
+				tools: [],
+				messages: [],
+			},
+			streamFn: mock.stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({
+				"compaction.enabled": false,
+				"compaction.autoContinue": false,
+				"compaction.strategy": "context-full",
+				"compaction.thresholdTokens": 9_500,
+				"contextPromotion.enabled": false,
+			}),
+			modelRegistry,
+		});
+		session.subscribe(event => {
+			events.push(event);
+		});
+
+		await session.prompt("seed prompt");
+		expect(mock.calls).toHaveLength(1);
+		session.settings.set("compaction.enabled", true);
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
+			summary: "pre-prompt compacted",
+			shortSummary: undefined,
+			firstKeptEntryId: preparation.firstKeptEntryId,
+			tokensBefore: preparation.tokensBefore,
+			details: {},
+		}));
+
+		await session.prompt("small pending prompt");
+		await drainMaintenance();
+
+		expect(compactSpy).not.toHaveBeenCalled();
+		expect(events.filter(event => event.type === "auto_compaction_start")).toHaveLength(0);
+		expect(mock.calls).toHaveLength(2);
 	});
 	it("does not run auto maintenance after final yield", async () => {
 		session.settings.set("compaction.strategy", "handoff");
@@ -177,7 +563,7 @@ describe("AgentSession handoff", () => {
 			isError: false,
 		});
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
-		await Bun.sleep(20);
+		await drainMaintenance();
 
 		expect(handoffSpy).not.toHaveBeenCalled();
 		expect(events.filter(event => event.type === "auto_compaction_start")).toHaveLength(0);
@@ -259,7 +645,7 @@ describe("AgentSession handoff", () => {
 		const handoffSpy = vi.spyOn(session, "handoff");
 		session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
-		await Bun.sleep(20);
+		await drainMaintenance();
 
 		expect(handoffSpy).not.toHaveBeenCalled();
 		expect(events.filter(event => event.type === "auto_compaction_start")).toHaveLength(0);
@@ -307,7 +693,7 @@ describe("AgentSession handoff", () => {
 
 		session.agent.emitExternalEvent({ type: "message_end", message: overflowAssistant });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [overflowAssistant] });
-		await Bun.sleep(20);
+		await waitFor(() => events.filter(event => event.type === "auto_compaction_end").length === 1);
 
 		expect(handoffSpy).not.toHaveBeenCalled();
 		const startEvents = events.filter(event => event.type === "auto_compaction_start");
@@ -352,7 +738,11 @@ describe("AgentSession handoff", () => {
 
 		session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
-		await Bun.sleep(20);
+		await waitFor(
+			() =>
+				handoffSpy.mock.calls.length === 1 &&
+				events.filter(event => event.type === "auto_compaction_end").length === 1,
+		);
 
 		expect(handoffSpy).toHaveBeenCalledTimes(1);
 		expect(handoffSpy).toHaveBeenCalledWith(expect.stringContaining("Threshold-triggered maintenance"), {
@@ -500,7 +890,8 @@ describe("AgentSession handoff", () => {
 
 		session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
-		await Bun.sleep(20);
+		await waitFor(() => handoffSpy.mock.calls.length === 1);
+		await session.waitForIdle();
 
 		expect(handoffSpy).toHaveBeenCalledTimes(1);
 		// The bug surfaced as agent.continue() racing the deferred handoff. With the fix,
@@ -554,7 +945,7 @@ describe("AgentSession handoff", () => {
 		session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
 		// Let the deferred handoff post-prompt task enter the generateHandoff await.
-		await Bun.sleep(20);
+		await waitFor(() => session.isGeneratingHandoff);
 		expect(generateHandoffSpy).toHaveBeenCalledTimes(1);
 		expect(session.isGeneratingHandoff).toBe(true);
 
@@ -601,7 +992,7 @@ describe("AgentSession handoff", () => {
 
 		session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
-		await Bun.sleep(20);
+		await waitFor(() => events.filter(event => event.type === "auto_compaction_end").length === 1);
 
 		expect(handoffSpy).toHaveBeenCalledTimes(1);
 		const endEvents = events.filter(event => event.type === "auto_compaction_end");

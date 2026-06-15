@@ -2,7 +2,7 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
 import { prompt, untilAborted } from "@oh-my-pi/pi-utils";
-import * as z from "zod/v4";
+import { z } from "zod/v4";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import resolveDescription from "../prompts/tools/resolve.md" with { type: "text" };
@@ -187,6 +187,20 @@ export class ResolveTool implements AgentTool<typeof resolveSchema, ResolveToolD
 		return untilAborted(signal, async () => {
 			const invoker = this.session.peekQueueInvoker?.() ?? this.session.peekStandingResolveHandler?.();
 			if (!invoker) {
+				// `discard` is a request to cancel/abort a staged action. When nothing is
+				// pending, the desired end-state (no staged change) already holds, so honor
+				// it as a successful cancellation instead of surfacing a hard error to the
+				// model. `apply` still errors — there is nothing to apply.
+				if (params.action === "discard") {
+					return {
+						content: [{ type: "text" as const, text: "Nothing to discard; no pending action remains." }],
+						details: {
+							action: "discard",
+							reason: params.reason,
+							...(params.extra != null ? { extra: params.extra } : {}),
+						},
+					};
+				}
 				throw new ToolError("No pending action to resolve. Nothing to apply or discard.");
 			}
 			const result = (await invoker(params)) as AgentToolResult<ResolveToolDetails>;
@@ -227,7 +241,10 @@ export const resolveToolRenderer = {
 		const isApply = action === "apply" && !result.isError;
 		const isFailedApply = action === "apply" && result.isError;
 		const bgColor = result.isError ? "error" : isApply ? "success" : "warning";
-		const icon = isApply ? uiTheme.status.success : uiTheme.status.error;
+		// Bare symbol: the line is wrapped in inverse(fg(...)), so any embedded fg
+		// reset (styledSymbol/status glyphs carry their own \x1b[39m) would drop the
+		// inverse block back to the default background mid-line.
+		const icon = uiTheme.symbol(isApply ? "tool.resolve" : "status.error");
 		const verb = isApply ? "Accept" : isFailedApply ? "Failed" : "Discard";
 		const separator = ": ";
 		const separatorIndex = label.indexOf(separator);
@@ -240,7 +257,7 @@ export const resolveToolRenderer = {
 		const lines = ["", headerLine, "", uiTheme.italic(reason), ""];
 
 		return {
-			render(width: number) {
+			render(width: number): readonly string[] {
 				const lineWidth = Math.max(3, width);
 				const innerWidth = Math.max(1, lineWidth - 2);
 				return lines.map(line => {

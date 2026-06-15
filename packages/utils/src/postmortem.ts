@@ -39,7 +39,6 @@ function runCleanup(reason: Reason): Promise<void> {
 			cleanupStage = "running";
 			break;
 		case "running":
-			logger.error("Cleanup invoked recursively", { stack: new Error().stack });
 			return Promise.resolve();
 		case "complete":
 			return Promise.resolve();
@@ -159,8 +158,9 @@ export function register(id: string, callback: (reason: Reason) => void | Promis
 	};
 
 	if (cleanupStage !== "idle") {
-		// If cleanup is already running/completed, warn and run on microtask.
-		logger.warn("Cleanup invoked recursively", { id });
+		// Cleanup is already in progress or complete; run late registrations once
+		// without re-entering the global cleanup pass.
+		logger.debug("Cleanup already started; running late callback once", { id });
 		try {
 			callback(Reason.MANUAL);
 		} catch (e) {

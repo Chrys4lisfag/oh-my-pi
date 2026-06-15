@@ -1,21 +1,26 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { canonicalSnapshotKey } from "@oh-my-pi/pi-coding-agent/edit/file-snapshot-store";
 import type { RenderResultOptions } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/types";
+import { AgentHubOverlayComponent } from "@oh-my-pi/pi-coding-agent/modes/components/agent-hub";
+import { TreeSelectorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tree-selector";
+import type {
+	ObservableSession,
+	SessionObserverRegistry,
+} from "@oh-my-pi/pi-coding-agent/modes/session-observer-registry";
 import type { Theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import type { SessionEntry, SessionTreeNode } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { ToolChoiceQueue } from "@oh-my-pi/pi-coding-agent/session/tool-choice-queue";
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { searchToolRenderer } from "@oh-my-pi/pi-coding-agent/tools/search";
 import { Text } from "@oh-my-pi/pi-tui";
-import { SessionObserverOverlayComponent } from "../../src/modes/components/session-observer-overlay";
-import { TreeSelectorComponent } from "../../src/modes/components/tree-selector";
-import type { ObservableSession, SessionObserverRegistry } from "../../src/modes/session-observer-registry";
-import { initTheme } from "../../src/modes/theme/theme";
-import type { SessionEntry, SessionTreeNode } from "../../src/session/session-manager";
 
 function createTestSession(cwd: string, overrides: Partial<ToolSession> = {}): ToolSession {
 	return {
@@ -121,15 +126,19 @@ describe("tool path arrays", () => {
 
 	beforeAll(async () => {
 		await initTheme(false, undefined, undefined, "dark", "light");
-	});
-	beforeEach(async () => {
-		treeEntryCounter = 0;
+		resetSettingsForTest();
+		await Settings.init({ inMemory: true });
 		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "search-path-lists-"));
 		await createSearchFixture(tempDir);
 	});
 
-	afterEach(async () => {
+	beforeEach(() => {
+		treeEntryCounter = 0;
+	});
+
+	afterAll(async () => {
 		await fs.rm(tempDir, { recursive: true, force: true });
+		resetSettingsForTest();
 	});
 
 	it("search accepts explicit path arrays", async () => {
@@ -194,7 +203,7 @@ describe("tool path arrays", () => {
 		const text = getText(result);
 		const details = result.details as { fileCount?: number; missingPaths?: string[] } | undefined;
 
-		expect(text).toMatch(/^¶packages\/grep\.txt#[0-9A-F]{4}/m);
+		expect(text).toMatch(/^\[packages\/grep\.txt#[0-9A-F]{4}\]/m);
 		expect(text).toContain("Skipped missing paths: missing.txt");
 		expect(text).not.toContain("apps");
 		expect(details?.fileCount).toBe(1);
@@ -217,7 +226,10 @@ describe("tool path arrays", () => {
 		expect(tag).toBeDefined();
 		if (!tag) throw new Error("Missing search snapshot tag");
 
-		const snapshot = session.fileSnapshotStore?.byHash(path.join(tempDir, "apps", "grep.txt"), tag);
+		const snapshot = session.fileSnapshotStore?.byHash(
+			canonicalSnapshotKey(path.join(tempDir, "apps", "grep.txt")),
+			tag,
+		);
 		expect(snapshot?.text).toBe("shared-needle apps\n");
 	});
 
@@ -244,6 +256,31 @@ describe("tool path arrays", () => {
 		expect(details?.fileCount).toBe(1);
 		expect(details?.scopePath).toBe("folder with spaces");
 	});
+	it("search resolves bracketed literal paths (Next.js routes) when they exist", async () => {
+		// Create `apps/[id]/page.tsx` — `[id]` is glob char-class syntax but here it
+		// is a literal directory name. The literal path must take precedence over
+		// the glob interpretation, otherwise the lookup returns no matches.
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "search-path-lists-"));
+		await fs.mkdir(path.join(tmp, "apps", "[id]"), { recursive: true });
+		await Bun.write(path.join(tmp, "apps", "[id]", "page.tsx"), "bracket-needle\n");
+
+		const tools = await createTools(createTestSession(tmp));
+		const tool = tools.find(entry => entry.name === "search");
+		if (!tool) throw new Error("Missing search tool");
+
+		const single = await tool.execute("search-bracket-literal-single", {
+			pattern: "bracket-needle",
+			paths: ["apps/[id]/page.tsx"],
+		});
+		expect(getText(single)).toContain("bracket-needle");
+
+		const dir = await tool.execute("search-bracket-literal-dir", {
+			pattern: "bracket-needle",
+			paths: ["apps/[id]"],
+		});
+		expect(getText(dir)).toContain("bracket-needle");
+		await fs.rm(tmp, { recursive: true, force: true });
+	});
 
 	it("search pending renderer accepts a single string path", () => {
 		const component = searchToolRenderer.renderCall(
@@ -255,8 +292,9 @@ describe("tool path arrays", () => {
 		expect(component).toBeInstanceOf(Text);
 		expect((component as Text).getText()).toContain("in folder with spaces/");
 	});
-	it("session observer overlay renders a single-string search path summary", async () => {
-		const sessionFile = await makeJsonlSessionFile(tempDir, [
+	it("agent hub chat renders a single-string search path summary", async () => {
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "search-path-lists-"));
+		const sessionFile = await makeJsonlSessionFile(tmp, [
 			{ type: "session", version: 3, id: "search-overlay-session", timestamp: new Date().toISOString() },
 			{
 				type: "message",
@@ -294,22 +332,8 @@ describe("tool path arrays", () => {
 					timestamp: 2,
 				},
 			},
-			{
-				type: "message",
-				id: "msg-tool-1",
-				parentId: "msg-assistant-1",
-				timestamp: new Date().toISOString(),
-				message: {
-					role: "toolResult",
-					toolName: "search",
-					toolCallId: "search-call-1",
-					content: [{ type: "text", text: "note.txt" }],
-					isError: false,
-					timestamp: 3,
-				},
-			},
 		]);
-		const registry = makeSubagentRegistry([
+		const observers = makeSubagentRegistry([
 			{
 				id: "search-overlay-session",
 				kind: "subagent",
@@ -319,11 +343,33 @@ describe("tool path arrays", () => {
 				lastUpdate: Date.now(),
 			},
 		]);
+		const agents = new AgentRegistry();
+		agents.register({
+			id: "search-overlay-session",
+			displayName: "search-overlay-session",
+			kind: "sub",
+			parentId: "Main",
+			session: null,
+			sessionFile,
+			status: "parked",
+		});
 
-		const overlay = new SessionObserverOverlayComponent(registry, () => {}, ["ctrl+s"]);
-		const rendered = Bun.stripANSI(overlay.render(120).join("\n"));
+		const hub = new AgentHubOverlayComponent({
+			observers,
+			hubKeys: ["ctrl+s"],
+			onDone: () => {},
+			requestRender: () => {},
+			registry: agents,
+		});
+		hub.openChat("search-overlay-session");
+		const rendered = Bun.stripANSI(hub.render(120).join("\n"));
+		hub.dispose();
 
-		expect(rendered).toContain("paths: folder with spaces/");
+		// The hub chat now renders through searchToolRenderer.renderCall; the
+		// single-string `paths` arg shows up as the "in <paths>" scope meta on the
+		// pending call line (a completed result merges the call line away).
+		expect(rendered).toContain("in folder with spaces/");
+		await fs.rm(tmp, { recursive: true, force: true });
 	});
 
 	it("tree selector renders a single-string search path summary", () => {
@@ -434,12 +480,13 @@ describe("tool path arrays", () => {
 	});
 
 	it("write reports absolute in-cwd targets relative to cwd", async () => {
-		const tools = await createTools(createTestSession(tempDir));
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "search-path-lists-"));
+		const tools = await createTools(createTestSession(tmp));
 		const tool = tools.find(entry => entry.name === "write");
 		expect(tool).toBeDefined();
 		if (!tool) throw new Error("Missing write tool");
 
-		const absoluteTarget = path.join(tempDir, "written.txt");
+		const absoluteTarget = path.join(tmp, "written.txt");
 		const result = await tool.execute("write-absolute-in-cwd", {
 			path: absoluteTarget,
 			content: "written\n",
@@ -447,8 +494,9 @@ describe("tool path arrays", () => {
 		const text = getText(result);
 
 		expect(text).toContain("Successfully wrote 8 bytes to written.txt");
-		expect(text).not.toContain(tempDir);
+		expect(text).not.toContain(tmp);
 		expect(await Bun.file(absoluteTarget).text()).toBe("written\n");
+		await fs.rm(tmp, { recursive: true, force: true });
 	});
 
 	it("read expands comma-delimited paths", async () => {
@@ -558,9 +606,11 @@ describe("tool path arrays", () => {
 	});
 
 	it("ast_edit applies across an explicit path array", async () => {
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "search-path-lists-"));
+		await createSearchFixture(tmp);
 		const queue = new ToolChoiceQueue();
 		const tools = await createTools(
-			createTestSession(tempDir, {
+			createTestSession(tmp, {
 				getToolChoiceQueue: () => queue,
 				buildToolChoice: () => ({ type: "tool" as const, name: "resolve" }),
 				steer: () => {},
@@ -589,16 +639,13 @@ describe("tool path arrays", () => {
 		if (!invoker) throw new Error("Expected pending resolve invoker");
 		await invoker({ action: "apply", reason: "apply multi-path ast edit" });
 
-		expect(await Bun.file(path.join(tempDir, "apps", "ast.ts")).text()).toContain("modernWrap(appsValue, appsArg)");
-		expect(await Bun.file(path.join(tempDir, "packages", "ast.ts")).text()).toContain(
+		expect(await Bun.file(path.join(tmp, "apps", "ast.ts")).text()).toContain("modernWrap(appsValue, appsArg)");
+		expect(await Bun.file(path.join(tmp, "packages", "ast.ts")).text()).toContain(
 			"modernWrap(packagesValue, packagesArg)",
 		);
-		expect(await Bun.file(path.join(tempDir, "phases", "ast.ts")).text()).toContain(
-			"modernWrap(phasesValue, phasesArg)",
-		);
-		expect(await Bun.file(path.join(tempDir, "other", "ast.ts")).text()).toContain(
-			"legacyWrap(otherValue, otherArg)",
-		);
+		expect(await Bun.file(path.join(tmp, "phases", "ast.ts")).text()).toContain("modernWrap(phasesValue, phasesArg)");
+		expect(await Bun.file(path.join(tmp, "other", "ast.ts")).text()).toContain("legacyWrap(otherValue, otherArg)");
+		await fs.rm(tmp, { recursive: true, force: true });
 	});
 
 	it("find accepts explicit path arrays", async () => {
@@ -763,13 +810,14 @@ describe("tool path arrays", () => {
 	});
 
 	it("grep keeps explicit files exact", async () => {
-		await fs.mkdir(path.join(tempDir, "nested"), { recursive: true });
-		await Bun.write(path.join(tempDir, "alpha.txt"), "exact-needle alpha\n");
-		await Bun.write(path.join(tempDir, "beta.txt"), "exact-needle beta\n");
-		await Bun.write(path.join(tempDir, "nested", "alpha.txt"), "exact-needle nested alpha\n");
-		await Bun.write(path.join(tempDir, "nested", "beta.txt"), "exact-needle nested beta\n");
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "search-path-lists-"));
+		await fs.mkdir(path.join(tmp, "nested"), { recursive: true });
+		await Bun.write(path.join(tmp, "alpha.txt"), "exact-needle alpha\n");
+		await Bun.write(path.join(tmp, "beta.txt"), "exact-needle beta\n");
+		await Bun.write(path.join(tmp, "nested", "alpha.txt"), "exact-needle nested alpha\n");
+		await Bun.write(path.join(tmp, "nested", "beta.txt"), "exact-needle nested beta\n");
 
-		const tools = await createTools(createTestSession(tempDir));
+		const tools = await createTools(createTestSession(tmp));
 		const tool = tools.find(entry => entry.name === "search");
 		expect(tool).toBeDefined();
 		if (!tool) throw new Error("Missing search tool");
@@ -788,6 +836,7 @@ describe("tool path arrays", () => {
 		expect(text).not.toContain("nested");
 		expect(details?.fileCount).toBe(2);
 		expect(details?.scopePath).toBe("alpha.txt, beta.txt");
+		await fs.rm(tmp, { recursive: true, force: true });
 	});
 
 	it("grep renders only file headings that have child lines", async () => {
@@ -815,10 +864,11 @@ describe("tool path arrays", () => {
 	});
 
 	it("grep explains match and context gutters with new format", async () => {
-		await Bun.write(path.join(tempDir, "context.txt"), "#if FLAG\nneedle\n#endif\n");
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "search-path-lists-"));
+		await Bun.write(path.join(tmp, "context.txt"), "#if FLAG\nneedle\n#endif\n");
 
 		const tools = await createTools(
-			createTestSession(tempDir, {
+			createTestSession(tmp, {
 				settings: Settings.isolated({ "search.contextBefore": 1, "search.contextAfter": 1 }),
 			}),
 		);
@@ -835,5 +885,6 @@ describe("tool path arrays", () => {
 		expect(text).toMatch(/ 1:#if FLAG/);
 		expect(text).toMatch(/\*2:needle/);
 		expect(text).toMatch(/ 3:#endif/);
+		await fs.rm(tmp, { recursive: true, force: true });
 	});
 });

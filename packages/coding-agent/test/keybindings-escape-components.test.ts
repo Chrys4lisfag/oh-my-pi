@@ -1,12 +1,12 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
-import { getBundledModel } from "@oh-my-pi/pi-ai";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { KeybindingsManager } from "@oh-my-pi/pi-coding-agent/config/keybindings";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ModelSelectorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/model-selector";
 import { SessionSelectorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/session-selector";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import type { SessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { SessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { setKeybindings, type TUI } from "@oh-my-pi/pi-tui";
 
 beforeAll(() => {
@@ -78,8 +78,7 @@ describe("component escape bindings", () => {
 		const modelRegistry = {
 			getAll: () => [model],
 			getDiscoverableProviders: () => [],
-			getCanonicalModels: () => [],
-			resolveCanonicalModel: () => undefined,
+			getCanonicalModelSelections: () => [],
 		} as unknown as ModelRegistry;
 		const ui = {
 			requestRender: vi.fn(),

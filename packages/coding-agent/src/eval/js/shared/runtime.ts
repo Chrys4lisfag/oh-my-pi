@@ -42,6 +42,11 @@ export interface RuntimeOptions {
 	 * via `setRunScope()` instead.
 	 */
 	extraGlobals?: Record<string, unknown>;
+	/**
+	 * On-disk roots the helpers substitute for internal-URL schemes (e.g.
+	 * `{ local: "/…/artifacts/local" }`). Stable for the worker's lifetime.
+	 */
+	localRoots?: Record<string, string>;
 }
 
 // Strict base64: characters from the standard alphabet plus optional `=` padding, and a
@@ -126,15 +131,18 @@ export class JsRuntime {
 	#env: Map<string, string>;
 	#als = new AsyncLocalStorage<RunContext>();
 	#moduleLoader: LocalModuleLoader;
+	#localRoots: Record<string, string>;
 
 	constructor(opts: RuntimeOptions) {
 		this.#cwd = opts.initialCwd;
 		this.sessionId = opts.sessionId;
 		this.#env = new Map();
 		this.#moduleLoader = new LocalModuleLoader(this.sessionId);
+		this.#localRoots = opts.localRoots ?? {};
 		this.helpers = createHelpers({
 			cwd: () => this.#activeCwd(),
 			env: this.#env,
+			localRoots: () => this.#localRoots,
 			emitStatus: event => this.#activeHooks("emitStatus")?.onDisplay({ type: "status", event }),
 		});
 		this.#install(opts.extraGlobals);
@@ -173,7 +181,7 @@ export class JsRuntime {
 			finalExpressionValue: undefined,
 		};
 		return await this.#als.run(context, async () => {
-			const wrapped = wrapCode(code);
+			const wrapped = await wrapCode(code);
 			const value = indirectEval(wrapped.source, filename);
 			if (wrapped.finalExpressionReturned) {
 				const awaited = await awaitMaybePromise(value);
@@ -334,7 +342,61 @@ export class JsRuntime {
 		// Prelude assigns console bridge + short aliases (`read`, `write`, `tool`, `display`, ...)
 		// onto globalThis. Must run after helpers are in place.
 		indirectEval(JAVASCRIPT_PRELUDE_SOURCE);
+		RUN_HOOK_RESOLVERS.add(() => this.#als.getStore()?.hooks);
+		patchStdioOnce();
 	}
+}
+
+/** Resolvers for each live runtime's active-run hooks (one per JsRuntime instance). */
+const RUN_HOOK_RESOLVERS = new Set<() => RuntimeHooks | undefined>();
+
+/** Streams whose `write` the runtime has already wrapped (patch-once guard). */
+const PATCHED_STDIO_STREAMS = new WeakSet<NodeJS.WriteStream>();
+
+/** Hooks for whichever registered runtime currently has an active run, if any. */
+function activeRunHooks(): RuntimeHooks | undefined {
+	for (const resolve of RUN_HOOK_RESOLVERS) {
+		const hooks = resolve();
+		if (hooks) return hooks;
+	}
+	return undefined;
+}
+
+/**
+ * Wrap `process.stdout` / `process.stderr` `write` exactly once per process so
+ * user `process.stdout.write(...)` lands in the active run's text sink. Models
+ * reach for it out of Node habit, but `process` is intentionally the host
+ * worker's real object (see {@link JsRuntime} `#install`), so unrouted writes
+ * escape to the worker's own stdio and never reach the cell — and `write()`
+ * returns a boolean, so a cell ending in `process.stdout.write("x")` captured
+ * `true` while losing the text. Patch only the `write` method (never replace
+ * `process`), preserve exact bytes (no trailing newline), and fall through to
+ * the real stream when no run is active so the worker's own logging is intact.
+ */
+function patchStdioOnce(): void {
+	const streams: NodeJS.WriteStream[] = [process.stdout, process.stderr];
+	for (const stream of streams) {
+		if (!stream || PATCHED_STDIO_STREAMS.has(stream)) continue;
+		PATCHED_STDIO_STREAMS.add(stream);
+		const original = stream.write.bind(stream) as (...args: unknown[]) => boolean;
+		const routed = (chunk: unknown, encoding?: unknown, callback?: unknown): boolean => {
+			const hooks = activeRunHooks();
+			if (!hooks) return original(chunk, encoding, callback);
+			const cb = typeof encoding === "function" ? encoding : callback;
+			const enc = typeof encoding === "string" ? (encoding as BufferEncoding) : undefined;
+			hooks.onText(chunkToString(chunk, enc));
+			if (typeof cb === "function") (cb as (error?: Error | null) => void)();
+			return true;
+		};
+		stream.write = routed as unknown as typeof stream.write;
+	}
+}
+
+/** Coerce a `write()` chunk to text, honoring an explicit encoding for byte chunks. */
+function chunkToString(chunk: unknown, encoding?: BufferEncoding): string {
+	if (typeof chunk === "string") return chunk;
+	if (chunk instanceof Uint8Array) return Buffer.from(chunk).toString(encoding ?? "utf8");
+	return String(chunk);
 }
 
 function formatConsoleArgs(args: unknown[]): string {

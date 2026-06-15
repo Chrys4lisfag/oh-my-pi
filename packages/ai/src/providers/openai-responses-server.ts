@@ -11,7 +11,7 @@
 
 import { logger } from "@oh-my-pi/pi-utils";
 import { resolvePromptCacheKey } from "../auth-gateway/http";
-import type { AuthGatewayParsedRequest as ParsedRequest } from "../auth-gateway/types";
+import type { AuthGatewayStreamControl, AuthGatewayParsedRequest as ParsedRequest } from "../auth-gateway/types";
 import type {
 	AssistantMessage,
 	AssistantMessageEventStream,
@@ -574,6 +574,17 @@ function reasoningItemId(part: ThinkingContent): string {
 }
 
 /**
+ * pi-ai responses providers mint composite `"{call_id}|{item_id}"` tool-call
+ * ids ({@link encodeResponsesToolCallId}). Only the call_id half belongs on
+ * the wire: third-party clients validate the `call_id` charset
+ * (`^[a-zA-Z0-9_-]+$`) or echo it to other backends, and `|` fails both.
+ */
+function wireCallId(id: string): string {
+	const sep = id.indexOf("|");
+	return sep >= 0 ? id.slice(0, sep) : id;
+}
+
+/**
  * Walk the assistant content array and group consecutive TextContent into a
  * single message item; each ThinkingContent / ToolCall is its own item.
  */
@@ -609,7 +620,7 @@ function buildOutputItems(message: AssistantMessage): OutputItem[] {
 				out.push({
 					type: "custom_tool_call",
 					id: part.thoughtSignature ?? makeCustomCallId(),
-					call_id: part.id,
+					call_id: wireCallId(part.id),
 					name: part.customWireName,
 					input: rawInput,
 					status: "completed",
@@ -618,7 +629,7 @@ function buildOutputItems(message: AssistantMessage): OutputItem[] {
 				out.push({
 					type: "function_call",
 					id: part.thoughtSignature ?? makeFuncCallId(),
-					call_id: part.id,
+					call_id: wireCallId(part.id),
 					name: part.name,
 					arguments: JSON.stringify(part.arguments ?? {}),
 					status: "completed",
@@ -698,6 +709,7 @@ interface OpenFunctionCall {
 	kind: "function_call";
 	itemId: string;
 	outputIndex: number;
+	contentIndex: number;
 	callId: string;
 	name: string;
 	argsText: string;
@@ -713,23 +725,35 @@ function sseEvent(name: string, data: unknown): string {
 export function encodeStream(
 	events: AssistantMessageEventStream,
 	requestedModelId: string,
+	_options?: ParsedRequest["options"],
+	control?: AuthGatewayStreamControl,
 ): ReadableStream<Uint8Array> {
 	const encoder = new TextEncoder();
 	const responseId = makeRespId();
 	let sequenceNumber = 0;
+	let cancelled = control?.signal?.aborted === true;
+	const markCancelled = () => {
+		cancelled = true;
+	};
+	control?.signal?.addEventListener("abort", markCancelled, { once: true });
 	const seq = () => sequenceNumber++;
 
 	return new ReadableStream<Uint8Array>({
 		async start(controller) {
 			const emit = (name: string, data: Record<string, unknown>) => {
-				controller.enqueue(encoder.encode(sseEvent(name, { type: name, sequence_number: seq(), ...data })));
+				if (!cancelled)
+					controller.enqueue(encoder.encode(sseEvent(name, { type: name, sequence_number: seq(), ...data })));
 			};
-			const emitDone = () => controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+			const emitDone = () => {
+				if (!cancelled) controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+			};
 
 			let createdAt = Math.floor(Date.now() / 1000);
 			let outputIndex = 0;
 			const state: { open: OpenItem | null } = { open: null };
+			const openFunctionCalls = new Map<number, OpenFunctionCall>();
 			const finishedItems: OutputItem[] = [];
+			const allocateOutputIndex = (): number => outputIndex++;
 
 			const responseSnapshot = (status: ResponseStatus, output: OutputItem[] | []) => ({
 				id: responseId,
@@ -742,6 +766,7 @@ export function encodeStream(
 			});
 
 			const openMessage = (): OpenMessage => {
+				const itemOutputIndex = allocateOutputIndex();
 				const itemId = makeMsgId();
 				const item = {
 					type: "message" as const,
@@ -750,11 +775,11 @@ export function encodeStream(
 					role: "assistant" as const,
 					content: [] as Array<{ type: "output_text"; text: string; annotations: never[] }>,
 				};
-				emit("response.output_item.added", { output_index: outputIndex, item });
+				emit("response.output_item.added", { output_index: itemOutputIndex, item });
 				const next: OpenMessage = {
 					kind: "message",
 					itemId,
-					outputIndex,
+					outputIndex: itemOutputIndex,
 					contentIndex: 0,
 					currentPartText: "",
 					content: [],
@@ -764,6 +789,7 @@ export function encodeStream(
 			};
 
 			const openReasoning = (partial: AssistantMessage, contentIndex: number): OpenReasoning => {
+				const itemOutputIndex = allocateOutputIndex();
 				const part = partial.content[contentIndex];
 				const itemId = part && part.type === "thinking" ? reasoningItemId(part) : makeReasoningId();
 				const item = {
@@ -771,22 +797,23 @@ export function encodeStream(
 					id: itemId,
 					summary: [] as Array<{ type: "summary_text"; text: string }>,
 				};
-				emit("response.output_item.added", { output_index: outputIndex, item });
+				emit("response.output_item.added", { output_index: itemOutputIndex, item });
 				// Open the summary part. Real OpenAI streams summary text in the
 				// canonical `reasoning_summary_*` lifecycle; pi-ai's own decoder
 				// reads `summary[].text` from the eventual `output_item.done`.
 				emit("response.reasoning_summary_part.added", {
 					item_id: itemId,
-					output_index: outputIndex,
+					output_index: itemOutputIndex,
 					summary_index: 0,
 					part: { type: "summary_text", text: "" },
 				});
-				const next: OpenReasoning = { kind: "reasoning", itemId, outputIndex, reasoningText: "" };
+				const next: OpenReasoning = { kind: "reasoning", itemId, outputIndex: itemOutputIndex, reasoningText: "" };
 				state.open = next;
 				return next;
 			};
 
 			const openToolCall = (partial: AssistantMessage, contentIndex: number): OpenFunctionCall => {
+				const itemOutputIndex = allocateOutputIndex();
 				const part = partial.content[contentIndex];
 				const tc = part && part.type === "toolCall" ? part : undefined;
 				const customWireName: string | undefined =
@@ -795,7 +822,7 @@ export function encodeStream(
 						: undefined;
 				const isCustom = customWireName !== undefined;
 				const itemId = tc?.thoughtSignature ?? (isCustom ? makeCustomCallId() : makeFuncCallId());
-				const callId = tc?.id ?? "";
+				const callId = wireCallId(tc?.id ?? "");
 				const name = customWireName ?? tc?.name ?? "";
 				const item = isCustom
 					? {
@@ -814,18 +841,63 @@ export function encodeStream(
 							arguments: "",
 							status: "in_progress",
 						};
-				emit("response.output_item.added", { output_index: outputIndex, item });
+				emit("response.output_item.added", { output_index: itemOutputIndex, item });
 				const next: OpenFunctionCall = {
 					kind: "function_call",
 					itemId,
-					outputIndex,
+					outputIndex: itemOutputIndex,
+					contentIndex,
 					callId,
 					name,
 					argsText: "",
 					...(isCustom ? { customWireName } : {}),
 				};
+				openFunctionCalls.set(contentIndex, next);
 				state.open = next;
 				return next;
+			};
+
+			const closeFunctionCall = (call: OpenFunctionCall): void => {
+				const text = call.argsText ?? "";
+				if (call.customWireName) {
+					const item = {
+						type: "custom_tool_call",
+						id: call.itemId,
+						call_id: call.callId ?? "",
+						name: call.customWireName,
+						input: text,
+						status: "completed",
+					};
+					emit("response.output_item.done", { output_index: call.outputIndex, item });
+					finishedItems.push({
+						type: "custom_tool_call",
+						id: call.itemId,
+						call_id: call.callId ?? "",
+						name: call.customWireName,
+						input: text,
+						status: "completed",
+					});
+				} else {
+					const item = {
+						type: "function_call",
+						id: call.itemId,
+						call_id: call.callId ?? "",
+						name: call.name ?? "",
+						arguments: text,
+						status: "completed",
+					};
+					emit("response.output_item.done", { output_index: call.outputIndex, item });
+					finishedItems.push({
+						type: "function_call",
+						id: call.itemId,
+						call_id: call.callId ?? "",
+						name: call.name ?? "",
+						arguments: text,
+						status: "completed",
+					});
+				}
+				openFunctionCalls.delete(call.contentIndex);
+				if (state.open === call) state.open = null;
 			};
 
 			const closeOpen = () => {
@@ -846,6 +918,7 @@ export function encodeStream(
 						status: "completed",
 						content: state.open.content,
 					});
+					state.open = null;
 				} else if (state.open.kind === "reasoning") {
 					const summary = [{ type: "summary_text" as const, text: state.open.reasoningText ?? "" }];
 					const item = {
@@ -859,79 +932,40 @@ export function encodeStream(
 						id: state.open.itemId,
 						summary,
 					});
+					state.open = null;
 				} else {
-					const text = state.open.argsText ?? "";
-					if (state.open.customWireName) {
-						const item = {
-							type: "custom_tool_call",
-							id: state.open.itemId,
-							call_id: state.open.callId ?? "",
-							name: state.open.customWireName,
-							input: text,
-							status: "completed",
-						};
-						emit("response.output_item.done", { output_index: state.open.outputIndex, item });
-						finishedItems.push({
-							type: "custom_tool_call",
-							id: state.open.itemId,
-							call_id: state.open.callId ?? "",
-							name: state.open.customWireName,
-							input: text,
-							status: "completed",
-						});
-					} else {
-						const item = {
-							type: "function_call",
-							id: state.open.itemId,
-							call_id: state.open.callId ?? "",
-							name: state.open.name ?? "",
-							arguments: text,
-							status: "completed",
-						};
-						emit("response.output_item.done", { output_index: state.open.outputIndex, item });
-						finishedItems.push({
-							type: "function_call",
-							id: state.open.itemId,
-							call_id: state.open.callId ?? "",
-							name: state.open.name ?? "",
-							arguments: text,
-							status: "completed",
-						});
-					}
+					closeFunctionCall(state.open);
 				}
-				outputIndex++;
-				state.open = null;
 			};
 
-			try {
-				let finalMessage: AssistantMessage | null = null;
-				let failureMessage: AssistantMessage | null = null;
+			const closeOpenFunctionCalls = (): void => {
+				for (const call of [...openFunctionCalls.values()]) {
+					closeFunctionCall(call);
+				}
+			};
 
+			const functionCallForEvent = (contentIndex: number): OpenFunctionCall | undefined => {
+				const byIndex = openFunctionCalls.get(contentIndex);
+				if (byIndex) return byIndex;
+				return state.open?.kind === "function_call" ? state.open : undefined;
+			};
+			let finalMessage: AssistantMessage | undefined;
+			let failureMessage: AssistantMessage | undefined;
+			try {
+				if (cancelled) {
+					controller.close();
+					return;
+				}
 				for await (const ev of events) {
+					if (cancelled) return;
 					switch (ev.type) {
 						case "start": {
 							createdAt = Math.floor((ev.partial.timestamp || Date.now()) / 1000);
 							// response.created — initial envelope.
-							controller.enqueue(
-								encoder.encode(
-									sseEvent("response.created", {
-										type: "response.created",
-										sequence_number: seq(),
-										response: responseSnapshot("in_progress", []),
-									}),
-								),
-							);
+							emit("response.created", { response: responseSnapshot("in_progress", []) });
 							// response.in_progress — mirrors real OpenAI; some clients gate
 							// on it before reading items.
-							controller.enqueue(
-								encoder.encode(
-									sseEvent("response.in_progress", {
-										type: "response.in_progress",
-										sequence_number: seq(),
-										response: responseSnapshot("in_progress", []),
-									}),
-								),
-							);
+							emit("response.in_progress", { response: responseSnapshot("in_progress", []) });
 							break;
 						}
 						case "text_start": {
@@ -941,7 +975,7 @@ export function encodeStream(
 								cur = state.open;
 								cur.currentPartText = "";
 							} else {
-								if (state.open) closeOpen();
+								if (state.open && state.open.kind !== "function_call") closeOpen();
 								cur = openMessage();
 							}
 							const part = { type: "output_text", text: "", annotations: [] as never[] };
@@ -992,7 +1026,7 @@ export function encodeStream(
 							break;
 						}
 						case "thinking_start": {
-							if (state.open) closeOpen();
+							if (state.open && state.open.kind !== "function_call") closeOpen();
 							openReasoning(ev.partial, ev.contentIndex);
 							break;
 						}
@@ -1029,13 +1063,13 @@ export function encodeStream(
 							break;
 						}
 						case "toolcall_start": {
-							if (state.open) closeOpen();
+							if (state.open && state.open.kind !== "function_call") closeOpen();
 							openToolCall(ev.partial, ev.contentIndex);
 							break;
 						}
 						case "toolcall_delta": {
-							if (state.open?.kind !== "function_call") break;
-							const cur: OpenFunctionCall = state.open;
+							const cur = functionCallForEvent(ev.contentIndex);
+							if (!cur) break;
 							cur.argsText += ev.delta;
 							if (cur.customWireName) {
 								emit("response.custom_tool_call_input.delta", {
@@ -1053,8 +1087,8 @@ export function encodeStream(
 							break;
 						}
 						case "toolcall_end": {
-							if (state.open?.kind !== "function_call") break;
-							const cur: OpenFunctionCall = state.open;
+							const cur = functionCallForEvent(ev.contentIndex);
+							if (!cur) break;
 							// Promote possibly-late info from the canonical ToolCall.
 							const tc = ev.toolCall;
 							if (tc.customWireName && !cur.customWireName) cur.customWireName = tc.customWireName;
@@ -1087,7 +1121,7 @@ export function encodeStream(
 									name: cur.name,
 								});
 							}
-							closeOpen();
+							closeFunctionCall(cur);
 							break;
 						}
 						case "done": {
@@ -1102,6 +1136,7 @@ export function encodeStream(
 				}
 
 				if (failureMessage) {
+					closeOpenFunctionCalls();
 					if (state.open) closeOpen();
 					controller.enqueue(
 						encoder.encode(
@@ -1120,6 +1155,7 @@ export function encodeStream(
 					return;
 				}
 
+				closeOpenFunctionCalls();
 				if (state.open) closeOpen();
 				const message = finalMessage ?? ((await events.result().catch(() => null)) as AssistantMessage | null);
 
@@ -1158,26 +1194,35 @@ export function encodeStream(
 				emitDone();
 				controller.close();
 			} catch (err) {
-				controller.enqueue(
-					encoder.encode(
-						sseEvent("response.failed", {
-							type: "response.failed",
-							sequence_number: seq(),
-							response: {
-								id: responseId,
-								object: "response",
-								created_at: Math.floor(Date.now() / 1000),
-								status: "failed",
-								model: requestedModelId,
-								output: [],
-								error: { message: err instanceof Error ? err.message : String(err) },
-							},
-						}),
-					),
-				);
-				emitDone();
-				controller.close();
+				if (!cancelled) {
+					controller.enqueue(
+						encoder.encode(
+							sseEvent("response.failed", {
+								type: "response.failed",
+								sequence_number: seq(),
+								response: {
+									id: responseId,
+									object: "response",
+									created_at: Math.floor(Date.now() / 1000),
+									status: "failed",
+									model: requestedModelId,
+									output: [],
+									error: { message: err instanceof Error ? err.message : String(err) },
+								},
+							}),
+						),
+					);
+					emitDone();
+					controller.close();
+				}
+			} finally {
+				control?.signal?.removeEventListener("abort", markCancelled);
 			}
+		},
+		cancel(reason) {
+			cancelled = true;
+			control?.signal?.removeEventListener("abort", markCancelled);
+			control?.onCancel?.(reason);
 		},
 	});
 }

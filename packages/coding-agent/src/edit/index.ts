@@ -2,7 +2,9 @@ import { MismatchError as HashlineMismatchError } from "@oh-my-pi/hashline";
 import hashlineGrammar from "@oh-my-pi/hashline/grammar.lark" with { type: "text" };
 import hashlineDescription from "@oh-my-pi/hashline/prompt.md" with { type: "text" };
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
+import type { ToolExample } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
+import type { z } from "zod/v4";
 import {
 	createLspWritethrough,
 	type FileDiagnosticsResult,
@@ -14,7 +16,7 @@ import { getDiagnosticsLedger } from "../lsp/diagnostics-ledger";
 import applyPatchDescription from "../prompts/tools/apply-patch.md" with { type: "text" };
 import patchDescription from "../prompts/tools/patch.md" with { type: "text" };
 import replaceDescription from "../prompts/tools/replace.md" with { type: "text" };
-import type { ToolSession } from "../tools";
+import type { DeferredDiagnosticsEntry, ToolSession } from "../tools";
 import { truncateForPrompt } from "../tools/approval";
 import { isInternalUrlPath } from "../tools/path-utils";
 import { type EditMode, normalizeEditMode, resolveEditMode } from "../utils/edit-mode";
@@ -50,6 +52,7 @@ type EditParams = ReplaceParams | PatchParams | HashlineParams | ApplyPatchParam
 type EditModeDefinition = {
 	description: (session: ToolSession) => string;
 	parameters: TInput;
+	examples?: readonly ToolExample[];
 	execute: (
 		tool: EditTool,
 		params: EditParams,
@@ -238,8 +241,23 @@ async function executeSinglePathEntries(
 			if (text) contentTexts.push(text);
 		} catch (err) {
 			const errorText = err instanceof Error ? err.message : String(err);
-			contentTexts.push(`Error editing ${path}: ${errorText}`);
+			contentTexts.push(`Error editing ${path} (entry ${i + 1} of ${runs.length}): ${errorText}`);
+			if (i > 0) {
+				contentTexts.push(i === 1 ? `Entry 1 was already applied.` : `Entries 1-${i} were already applied.`);
+			}
+			if (i + 1 < runs.length) {
+				contentTexts.push(
+					(i + 2 === runs.length
+						? `Entry ${runs.length} was NOT applied`
+						: `Entries ${i + 2}-${runs.length} were NOT applied`) +
+						`; re-read the file and re-issue only the failed and unapplied entries.`,
+				);
+			}
 			errorCount++;
+			// Stop at the first failure: later entries were authored against
+			// line numbers/content that assumed this entry succeeded, and
+			// applying them after a failure compounds the damage.
+			break;
 		}
 
 		if (!isLast && onUpdate) {
@@ -275,7 +293,7 @@ function extractApprovalPath(args: unknown): string {
 	const record = args && typeof args === "object" ? (args as Record<string, unknown>) : {};
 	const input = typeof record.input === "string" ? record.input : undefined;
 	if (input) {
-		const hashlineMatch = /^(?:¶|§|@)([^\s#]+)/m.exec(input);
+		const hashlineMatch = /^\[([^#\r\n]+)(?:#[0-9a-fA-F]{4})?\]/m.exec(input);
 		if (hashlineMatch?.[1]) return hashlineMatch[1];
 
 		const applyPatchMatch = /^\*\*\* (?:Add|Update|Delete) File:\s*(.+)$/m.exec(input);
@@ -297,7 +315,6 @@ export class EditTool implements AgentTool<TInput> {
 	readonly name = "edit";
 	readonly label = "Edit";
 	readonly loadMode = "essential";
-	readonly nonAbortable = true;
 	readonly concurrency = "exclusive";
 	readonly strict = true;
 
@@ -307,6 +324,10 @@ export class EditTool implements AgentTool<TInput> {
 	readonly #editMode?: EditMode;
 	readonly #dedupDiagnostics: boolean;
 	readonly #pendingDeferredFetches = new Map<string, AbortController>();
+	/** Fallback per-path mutation counter used only when the session does not expose
+	 *  a shared one. Prefer `session.bumpFileMutationVersion` so write (and any other
+	 *  tool) mutating the same file also invalidates pending late-diagnostics. */
+	readonly #editVersionByPath = new Map<string, number>();
 
 	constructor(private readonly session: ToolSession) {
 		const {
@@ -336,6 +357,10 @@ export class EditTool implements AgentTool<TInput> {
 
 	get parameters(): TInput {
 		return this.#getModeDefinition().parameters;
+	}
+
+	get examples(): readonly ToolExample[] | undefined {
+		return this.#getModeDefinition().examples;
 	}
 
 	/**
@@ -386,6 +411,39 @@ export class EditTool implements AgentTool<TInput> {
 			patch: {
 				description: () => prompt.render(patchDescription),
 				parameters: patchEditSchema,
+				examples: [
+					{
+						caption: "Create",
+						call: { path: "hello.txt", edits: [{ op: "create", diff: "Hello\n" }] },
+					},
+					{
+						caption: "Update",
+						call: {
+							path: "src/app.py",
+							edits: [
+								{
+									op: "update",
+									diff: "@@ def greet():\n def greet():\n-print('Hi')\n+print('Hello')\n",
+								},
+							],
+						},
+					},
+					{
+						caption: "Rename",
+						call: {
+							path: "src/app.py",
+							edits: [{ op: "update", rename: "src/main.py", diff: "@@\n …\n" }],
+						},
+					},
+					{
+						caption: "Delete",
+						call: { path: "obsolete.txt", edits: [{ op: "delete" }] },
+					},
+					{
+						caption: "Multiple entries",
+						note: "All entries in one call apply to the top-level `path`; use separate calls for different files.",
+					},
+				] satisfies readonly ToolExample<z.input<typeof patchEditSchema>>[],
 				execute: (
 					tool: EditTool,
 					params: EditParams,
@@ -414,6 +472,14 @@ export class EditTool implements AgentTool<TInput> {
 			apply_patch: {
 				description: () => prompt.render(applyPatchDescription),
 				parameters: applyPatchSchema,
+				examples: [
+					{
+						caption: "Apply a combined patch file",
+						call: {
+							input: '*** Begin Patch\n*** Add File: hello.txt\n+Hello world\n*** Update File: src/app.py\n*** Move to: src/main.py\n@@ def greet():\n-print("Hi")\n+print("Hello, world!")\n*** Delete File: obsolete.txt\n*** End Patch\n',
+						},
+					},
+				] satisfies readonly ToolExample<z.input<typeof applyPatchSchema>>[],
 				execute: (
 					tool: EditTool,
 					params: EditParams,
@@ -503,10 +569,11 @@ export class EditTool implements AgentTool<TInput> {
 		}
 
 		const deferredController = new AbortController();
+		const editVersion = this.#bumpFileVersion(path);
 		return {
 			onDeferredDiagnostics: (lateDiagnostics: FileDiagnosticsResult) => {
 				this.#pendingDeferredFetches.delete(path);
-				this.#injectLateDiagnostics(path, lateDiagnostics);
+				this.#injectLateDiagnostics(path, lateDiagnostics, editVersion);
 			},
 			signal: deferredController.signal,
 			finalize: (diagnostics: FileDiagnosticsResult | undefined) => {
@@ -519,24 +586,34 @@ export class EditTool implements AgentTool<TInput> {
 		};
 	}
 
-	#injectLateDiagnostics(path: string, diagnostics: FileDiagnosticsResult): void {
+	#injectLateDiagnostics(path: string, diagnostics: FileDiagnosticsResult, editVersion: number): void {
 		const effective = this.#dedupDiagnostics
 			? getDiagnosticsLedger(this.session).reduce(path, diagnostics)
 			: diagnostics;
 		if (this.#dedupDiagnostics && effective.messages.length === 0) return;
 
-		const summary = effective.summary ?? "";
-		const lines = effective.messages ?? [];
-		const body = [`Late LSP diagnostics for ${path} (arrived after the edit tool returned):`, summary, ...lines]
-			.filter(Boolean)
-			.join("\n");
+		const entry: DeferredDiagnosticsEntry = {
+			path,
+			summary: effective.summary ?? "",
+			messages: effective.messages ?? [],
+			errored: effective.errored,
+			// Drop at flush time if a later edit to the same file superseded this fetch.
+			isStale: () => this.#fileVersion(path) !== editVersion,
+		};
+		this.session.queueDeferredDiagnostics?.(entry);
+	}
 
-		this.session.queueDeferredMessage?.({
-			role: "custom",
-			customType: "lsp-late-diagnostic",
-			content: body,
-			display: false,
-			timestamp: Date.now(),
-		});
+	/** Bump the file's mutation counter (session-global when available). */
+	#bumpFileVersion(path: string): number {
+		if (this.session.bumpFileMutationVersion) return this.session.bumpFileMutationVersion(path);
+		const next = (this.#editVersionByPath.get(path) ?? 0) + 1;
+		this.#editVersionByPath.set(path, next);
+		return next;
+	}
+
+	/** Read the file's current mutation counter (session-global when available). */
+	#fileVersion(path: string): number {
+		if (this.session.getFileMutationVersion) return this.session.getFileMutationVersion(path);
+		return this.#editVersionByPath.get(path) ?? 0;
 	}
 }

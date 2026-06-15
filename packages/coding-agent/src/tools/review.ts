@@ -12,7 +12,7 @@ import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Container, Text } from "@oh-my-pi/pi-tui";
 import { isRecord } from "@oh-my-pi/pi-utils";
-import * as z from "zod/v4";
+import { z } from "zod/v4";
 import type { Theme, ThemeColor } from "../modes/theme/theme";
 import { subprocessToolRegistry } from "../task/subprocess-tool-registry";
 import type { ReviewFinding } from "../task/types";
@@ -169,7 +169,7 @@ export const reportFindingTool: AgentTool<typeof ReportFindingParams, ReportFind
 		}`;
 
 		return new Text(
-			`${theme.fg("success", theme.status.success)} ${icon} ${theme.fg(color, `[${label}]`)} ${theme.fg(
+			`${theme.styledSymbol("tool.review", "accent")} ${icon} ${theme.fg(color, `[${label}]`)} ${theme.fg(
 				"dim",
 				location,
 			)}`,

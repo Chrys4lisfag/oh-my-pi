@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { Model } from "@oh-my-pi/pi-ai";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { mergeDiscoveredModel } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 
 /**
@@ -14,7 +15,7 @@ const STANDARD = "https://api.xiaomimimo.com/v1";
 const TOKEN_PLAN = "https://token-plan-sgp.xiaomimimo.com/v1";
 
 function bundled(baseUrl: string): Model<"openai-completions"> {
-	return {
+	return buildModel({
 		id: "mimo-v2.5",
 		name: "MiMo v2.5",
 		api: "openai-completions",
@@ -25,7 +26,7 @@ function bundled(baseUrl: string): Model<"openai-completions"> {
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128000,
 		maxTokens: 8192,
-	};
+	});
 }
 
 describe("mergeDiscoveredModel", () => {
@@ -71,6 +72,37 @@ describe("mergeDiscoveredModel", () => {
 		const existing = bundled(STANDARD);
 		const merged = mergeDiscoveredModel(discovered, existing, { baseUrl: "https://my-proxy.example.com/v1" });
 		expect(merged.baseUrl).toBe("https://my-proxy.example.com/v1");
+	});
+
+	test("preserves provider override transport on rediscovery (#2555 openrouter gateway regression)", () => {
+		// Bundled openrouter entry carries transport=pi-native after
+		// applying providerOverride at boot (#loadBuiltInModels). Discovery
+		// refetched the same model from /v1/models — provider catalogs
+		// never set transport in defaults, so the discovered model has no
+		// transport hint of its own.
+		const existing: Model<"openai-completions"> = {
+			...bundled("http://localhost:4000"),
+			transport: "pi-native",
+			headers: { Authorization: "Bearer gateway-token" },
+		};
+		const discovered = bundled("http://localhost:4000");
+		const merged = mergeDiscoveredModel(discovered, existing, {
+			baseUrl: "http://localhost:4000",
+			transport: "pi-native",
+			headers: { Authorization: "Bearer gateway-token" },
+		});
+		expect(merged.transport).toBe("pi-native");
+		expect(merged.baseUrl).toBe("http://localhost:4000");
+		expect(merged.headers).toEqual({ Authorization: "Bearer gateway-token" });
+	});
+
+	test("provider override path (no bundled entry): transport flows through", () => {
+		const discovered = bundled("http://localhost:4000");
+		const merged = mergeDiscoveredModel(discovered, undefined, {
+			baseUrl: "http://localhost:4000",
+			transport: "pi-native",
+		});
+		expect(merged.transport).toBe("pi-native");
 	});
 
 	test("returns model untouched when no existing entry and no override", () => {

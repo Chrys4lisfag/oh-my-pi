@@ -1,9 +1,12 @@
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
+import type { ToolExample } from "@oh-my-pi/pi-ai";
 import { prompt, untilAborted } from "@oh-my-pi/pi-utils";
-import * as z from "zod/v4";
+import { z } from "zod/v4";
 import browserDescription from "../prompts/tools/browser.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
+import { enforceInlineByteCap } from "../session/streaming-output";
 import { truncateForPrompt } from "./approval";
+import { resolveCmuxKind } from "./browser/cmux/rpc";
 import { acquireBrowser, type BrowserHandle, type BrowserKind, type BrowserKindTag } from "./browser/registry";
 import type { Observation, ScreenshotResult } from "./browser/tab-protocol";
 import { acquireTab, dropHeadlessTabs, getTab, releaseAllTabs, releaseTab, runInTab } from "./browser/tab-supervisor";
@@ -13,6 +16,8 @@ import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
 
+export { cmuxSnapshotToObservation, mapWaitUntil, resolveCmuxKind, serializeEval } from "./browser/cmux/rpc";
+export { CmuxSocketClient } from "./browser/cmux/socket-client";
 export { extractReadableFromHtml, type ReadableFormat, type ReadableResult } from "./browser/readable";
 export type { Observation, ObservationEntry } from "./browser/tab-protocol";
 
@@ -76,6 +81,12 @@ function resolveBrowserKind(params: BrowserParams, session: ToolSession): Browse
 		const exe = resolveToCwd(app.path, session.cwd);
 		return { kind: "spawned", path: exe };
 	}
+	const cmuxKind = resolveCmuxKind({
+		settingEnabled: session.settings.get("browser.cmux") as boolean | undefined,
+	});
+	if (cmuxKind) {
+		return cmuxKind;
+	}
 	const headless = session.settings.get("browser.headless") as boolean;
 	return { kind: "headless", headless };
 }
@@ -107,6 +118,57 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 	readonly summary = "Control a headless browser to navigate and interact with web pages";
 	readonly parameters = browserSchema;
 	readonly strict = true;
+
+	readonly examples: readonly ToolExample<z.input<typeof browserSchema>>[] = [
+		{
+			caption: "Open a tab",
+			call: { action: "open", name: "docs", url: "https://example.com" },
+		},
+		{
+			caption: "Read structured page data in the opened tab",
+			call: {
+				action: "run",
+				name: "docs",
+				code: "const obs = await tab.observe(); display(obs); return obs.elements.length;",
+			},
+		},
+		{
+			caption: "Click an observed element by id",
+			call: {
+				action: "run",
+				name: "docs",
+				code: "const obs = await tab.observe(); const link = obs.elements.find(e => e.role === 'link' && e.name === 'Sign in'); assert(link, 'Sign in link missing'); await (await tab.id(link.id)).click();",
+			},
+		},
+		{
+			caption: "Fill and submit a form via selectors",
+			call: {
+				action: "run",
+				name: "docs",
+				code: "await tab.fill('input[name=email]', 'me@example.com'); await tab.click('text/Continue');",
+			},
+		},
+		{
+			caption: "Screenshot to look at the page — no save path",
+			call: {
+				action: "run",
+				name: "docs",
+				code: "await tab.screenshot();",
+			},
+		},
+		{
+			caption: "Attach to an existing Electron app",
+			call: {
+				action: "open",
+				name: "cursor",
+				app: { path: "/Applications/Cursor.app/Contents/MacOS/Cursor" },
+			},
+		},
+		{
+			caption: "Close every tab and kill spawned-app processes",
+			call: { action: "close", all: true, kill: true },
+		},
+	];
 
 	constructor(private readonly session: ToolSession) {}
 	#description?: string;
@@ -271,12 +333,41 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 			.filter((c): c is { type: "text"; text: string } => c.type === "text")
 			.map(c => c.text)
 			.join("\n");
-		details.result = textOnly;
+		// Final defense at the tool-result boundary: a single run can display
+		// tens of KB (large JSON returns, dumped observations). Cap the combined
+		// text inline; the full text stays recoverable via the artifact footer
+		// when allocation succeeds.
+		const cappedText = await enforceInlineByteCap(textOnly, {
+			label: "browser output",
+			saveArtifact: full => saveBrowserOutputArtifact(this.session, full),
+		});
+		details.result = cappedText;
+		if (cappedText !== textOnly) {
+			const nonText = content.filter(c => c.type !== "text");
+			return toolResult(details)
+				.content([...nonText, { type: "text", text: cappedText }])
+				.done();
+		}
 		return toolResult(details).content(content).done();
 	}
 }
 
+/** Persist over-cap browser run output as a session artifact; mirrors the bash minimizer's save path. */
+async function saveBrowserOutputArtifact(session: ToolSession, fullText: string): Promise<string | undefined> {
+	try {
+		const alloc = await session.allocateOutputArtifact?.("browser-original");
+		if (!alloc?.path || !alloc.id) return undefined;
+		await Bun.write(alloc.path, fullText);
+		return alloc.id;
+	} catch {
+		return undefined;
+	}
+}
+
 function describeBrowser(handle: BrowserHandle): string {
+	if (!("browser" in handle)) {
+		return `cmux browser (${handle.kind.surface ?? "split"})`;
+	}
 	switch (handle.kind.kind) {
 		case "headless":
 			return `headless browser (${handle.kind.headless ? "hidden" : "visible"})`;
@@ -295,6 +386,8 @@ function describeKind(kind: BrowserKind): string {
 			return `spawned:${kind.path}`;
 		case "connected":
 			return `connected:${kind.cdpUrl}`;
+		case "cmux":
+			return `cmux:${kind.surface ?? "split"}`;
 	}
 }
 
@@ -303,6 +396,7 @@ function sameBrowserKind(a: BrowserKind, b: BrowserKind): boolean {
 	if (a.kind === "headless" && b.kind === "headless") return a.headless === b.headless;
 	if (a.kind === "spawned" && b.kind === "spawned") return a.path === b.path;
 	if (a.kind === "connected" && b.kind === "connected") return a.cdpUrl === b.cdpUrl;
+	if (a.kind === "cmux" && b.kind === "cmux") return a.socketPath === b.socketPath;
 	return false;
 }
 

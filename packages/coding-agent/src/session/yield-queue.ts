@@ -6,11 +6,13 @@ export interface YieldDispatcher<P> {
 	isStale?(entry: P): boolean;
 	/** Produce one batched AgentMessage from non-stale entries. Return null to skip. */
 	build(survivors: P[]): AgentMessage | null;
+	/** If true, entries for this kind are drained only by {@link drainLazy} and never trigger the idle flush. */
+	skipIdleFlush?: boolean;
 }
 
 export interface YieldQueueOptions {
 	isStreaming: () => boolean;
-	injectStreaming(msg: AgentMessage): void;
+	injectStreaming?(msg: AgentMessage): void;
 	injectIdle(messages: AgentMessage[]): Promise<void>;
 	scheduleIdleFlush(run: () => Promise<void>): void;
 }
@@ -20,6 +22,7 @@ type YieldFlushMode = "streaming" | "idle";
 interface StoredDispatcher {
 	isStale?: (entry: unknown) => boolean;
 	build: (survivors: unknown[]) => AgentMessage | null;
+	skipIdleFlush?: boolean;
 }
 
 function formatError(error: unknown): string {
@@ -40,6 +43,7 @@ export class YieldQueue {
 		const stored: StoredDispatcher = {
 			...(dispatcher.isStale ? { isStale: entry => dispatcher.isStale?.(entry as P) ?? false } : {}),
 			build: survivors => dispatcher.build(survivors as P[]),
+			...(dispatcher.skipIdleFlush ? { skipIdleFlush: true } : {}),
 		};
 		this.#dispatchers.set(kind, stored);
 		return () => {
@@ -60,7 +64,7 @@ export class YieldQueue {
 			this.#entries.set(kind, entries);
 		}
 		entries.push(entry);
-		if (!this.#options.isStreaming()) {
+		if (!this.#options.isStreaming() && !this.#dispatchers.get(kind)!.skipIdleFlush) {
 			this.#scheduleIdleFlush();
 		}
 	}
@@ -85,7 +89,7 @@ export class YieldQueue {
 			if (!message) continue;
 			if (mode === "streaming") {
 				try {
-					this.#options.injectStreaming(message);
+					this.#options.injectStreaming?.(message);
 				} catch (error) {
 					logger.warn("Yield queue streaming dispatch failed", { kind, error: formatError(error) });
 				}
@@ -100,6 +104,24 @@ export class YieldQueue {
 				logger.warn("Yield queue idle dispatch failed", { error: formatError(error) });
 			}
 		}
+	}
+
+	/**
+	 * Snapshot and remove all queued entries, returning one lazy thunk per kind.
+	 * Each thunk applies the dispatcher's staleness filter and builds the batched
+	 * message only when called — so the consumer (the agent loop) decides, at the
+	 * moment it injects, whether the message is still worth delivering (a thunk may
+	 * return null to skip). Background-job completions and late diagnostics reach
+	 * the model between requests without the agent having to stop.
+	 */
+	drainLazy(): Array<() => AgentMessage | null> {
+		const thunks: Array<() => AgentMessage | null> = [];
+		for (const [kind, dispatcher] of this.#dispatchers) {
+			const entries = this.#drain(kind);
+			if (entries.length === 0) continue;
+			thunks.push(() => this.#build(kind, dispatcher, entries));
+		}
+		return thunks;
 	}
 
 	clear(): void {

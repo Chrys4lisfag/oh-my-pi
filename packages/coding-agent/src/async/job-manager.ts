@@ -6,6 +6,27 @@ const DELIVERY_RETRY_JITTER_MS = 200;
 const DEFAULT_RETENTION_MS = 5 * 60 * 1000;
 const DEFAULT_MAX_RUNNING_JOBS = 15;
 
+/**
+ * Adaptive ("smart") `job` poll-wait ladder (ms). A tight poll loop climbs
+ * these rungs so each immediate re-poll backs off and stops spending turns on
+ * "still running" frames; the floor (first rung) is the shortest wait and the
+ * top rung is the longest a smart poll will ever block. Only used when
+ * `async.pollWaitDuration` is set to `smart`; fixed durations wait verbatim.
+ */
+const POLL_WAIT_LADDER_MS = [5_000, 10_000, 30_000, 60_000, 300_000] as const;
+/**
+ * Going at least this long between poll calls means the agent stepped out of
+ * the poll loop to do real work — the next poll drops back to the ladder floor.
+ */
+const POLL_ESCALATION_RESET_MS = 60_000;
+
+interface PollEscalationState {
+	/** Index into POLL_WAIT_LADDER_MS used for the most recent poll wait. */
+	level: number;
+	/** Timestamp (ms) when the most recent poll wait returned. */
+	lastPollEndAt: number;
+}
+
 export interface AsyncJob {
 	id: string;
 	type: "bash" | "task";
@@ -23,6 +44,12 @@ export interface AsyncJob {
 	 * supply an id (e.g. legacy tests, SDK consumers without an agent context).
 	 */
 	ownerId?: string;
+	/**
+	 * Job is registered but parked behind a caller-managed gate (e.g. a task
+	 * batch semaphore). Queued jobs do not count toward the running-job limit
+	 * until the caller invokes `markRunning()` from the run context.
+	 */
+	queued?: boolean;
 }
 
 export interface AsyncJobManagerOptions {
@@ -53,6 +80,8 @@ export interface AsyncJobRegisterOptions {
 	/** Registry id of the agent that owns this job; used to scope cancelAll. */
 	ownerId?: string;
 	onProgress?: (text: string, details?: Record<string, unknown>) => void | Promise<void>;
+	/** Register the job in queued state; see {@link AsyncJob.queued}. */
+	queued?: boolean;
 }
 
 /**
@@ -88,6 +117,7 @@ export class AsyncJobManager {
 	readonly #suppressedDeliveries = new Set<string>();
 	readonly #watchedJobs = new Set<string>();
 	readonly #evictionTimers = new Map<string, NodeJS.Timeout>();
+	readonly #pollEscalation = new Map<string | undefined, PollEscalationState>();
 	readonly #onJobComplete: AsyncJobManagerOptions["onJobComplete"];
 	readonly #maxRunningJobs: number;
 	readonly #retentionMs: number;
@@ -110,6 +140,17 @@ export class AsyncJobManager {
 		this.#retentionMs = Math.max(0, Math.floor(options.retentionMs ?? DEFAULT_RETENTION_MS));
 	}
 
+	/** True when the running-job count has reached the configured cap. */
+	get atCapacity(): boolean {
+		if (this.#disposed) return true;
+		// Mirror register(): queued jobs hold no execution slot.
+		let activeCount = 0;
+		for (const job of this.#jobs.values()) {
+			if (job.status === "running" && !job.queued) activeCount++;
+		}
+		return activeCount >= this.#maxRunningJobs;
+	}
+
 	register(
 		type: "bash" | "task",
 		label: string,
@@ -117,14 +158,21 @@ export class AsyncJobManager {
 			jobId: string;
 			signal: AbortSignal;
 			reportProgress: (text: string, details?: Record<string, unknown>) => Promise<void>;
+			/** Clear the queued flag once the job actually starts executing. */
+			markRunning: () => void;
 		}) => Promise<string>,
 		options?: AsyncJobRegisterOptions,
 	): string {
 		if (this.#disposed) {
 			throw new Error("Async job manager is disposed");
 		}
-		const runningCount = this.getRunningJobs().length;
-		if (runningCount >= this.#maxRunningJobs) {
+		// Queued jobs hold no execution slot yet — only count jobs that are
+		// actually running so a large parked batch cannot starve registration.
+		let activeCount = 0;
+		for (const existing of this.#jobs.values()) {
+			if (existing.status === "running" && !existing.queued) activeCount++;
+		}
+		if (activeCount >= this.#maxRunningJobs) {
 			throw new Error(
 				`Background job limit reached (${this.#maxRunningJobs}). Wait for running jobs to finish or cancel one.`,
 			);
@@ -144,6 +192,7 @@ export class AsyncJobManager {
 			abortController,
 			promise: Promise.resolve(),
 			ownerId: options?.ownerId,
+			queued: options?.queued === true,
 		};
 
 		const reportProgress = async (text: string, details?: Record<string, unknown>): Promise<void> => {
@@ -159,7 +208,14 @@ export class AsyncJobManager {
 		};
 		job.promise = (async () => {
 			try {
-				const text = await run({ jobId: id, signal: abortController.signal, reportProgress });
+				const text = await run({
+					jobId: id,
+					signal: abortController.signal,
+					reportProgress,
+					markRunning: () => {
+						job.queued = false;
+					},
+				});
 				if (job.status === "cancelled") {
 					job.resultText = text;
 					this.#scheduleEviction(id);
@@ -261,6 +317,32 @@ export class AsyncJobManager {
 		return removed;
 	}
 
+	/**
+	 * Compute the next adaptive ("smart") wait (ms) for a blocking `job` poll by
+	 * the given owner. Consecutive polls — those starting within
+	 * POLL_ESCALATION_RESET_MS of the previous poll returning — climb
+	 * POLL_WAIT_LADDER_MS so a tight wait loop backs off; a longer gap means the
+	 * agent left to do real work, so the wait resets to the floor. Pair each call
+	 * with `recordPollWaitEnd()` once the wait returns.
+	 */
+	nextPollWaitMs(ownerId: string | undefined, now: number = Date.now()): number {
+		const prev = this.#pollEscalation.get(ownerId);
+		const reset = !prev || now - prev.lastPollEndAt >= POLL_ESCALATION_RESET_MS;
+		const level = reset ? 0 : Math.min(prev.level + 1, POLL_WAIT_LADDER_MS.length - 1);
+		this.#pollEscalation.set(ownerId, { level, lastPollEndAt: prev?.lastPollEndAt ?? now });
+		return POLL_WAIT_LADDER_MS[level];
+	}
+
+	/**
+	 * Mark a blocking poll wait as finished so the idle-reset window is measured
+	 * from now. Polling again before POLL_ESCALATION_RESET_MS elapses keeps
+	 * climbing the ladder; waiting longer resets it to the floor.
+	 */
+	recordPollWaitEnd(ownerId: string | undefined, now: number = Date.now()): void {
+		const prev = this.#pollEscalation.get(ownerId);
+		this.#pollEscalation.set(ownerId, { level: prev?.level ?? 0, lastPollEndAt: now });
+	}
+
 	acknowledgeDeliveries(jobIds: string[]): number {
 		const uniqueJobIds = Array.from(new Set(jobIds.map(id => id.trim()).filter(id => id.length > 0)));
 		if (uniqueJobIds.length === 0) return 0;
@@ -276,6 +358,26 @@ export class AsyncJobManager {
 			...this.#deliveries.filter(delivery => !this.isDeliverySuppressed(delivery.jobId)),
 		);
 		return before - this.#deliveries.length;
+	}
+
+	/**
+	 * Lift a foreground-wait suppression set via `acknowledgeDeliveries`. If the
+	 * job already finished while suppressed (its delivery enqueue was skipped),
+	 * re-enqueue the completion so the result is still delivered exactly once.
+	 */
+	resumeDeliveries(jobIds: string[]): void {
+		for (const rawId of jobIds) {
+			const jobId = rawId.trim();
+			if (!jobId) continue;
+			if (!this.#suppressedDeliveries.delete(jobId)) continue;
+			const job = this.#jobs.get(jobId);
+			if (!job || (job.status !== "completed" && job.status !== "failed")) continue;
+			const queued =
+				this.#deliveries.some(delivery => delivery.jobId === jobId) ||
+				this.#inFlightDeliveries.some(delivery => delivery.jobId === jobId);
+			if (queued) continue;
+			this.#enqueueDelivery(jobId, job.status === "completed" ? (job.resultText ?? "") : (job.errorText ?? ""));
+		}
 	}
 
 	/**
@@ -351,6 +453,7 @@ export class AsyncJobManager {
 		this.#inFlightDeliveries.length = 0;
 		this.#suppressedDeliveries.clear();
 		this.#watchedJobs.clear();
+		this.#pollEscalation.clear();
 		return drained;
 	}
 

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { Tool, ToolCall } from "@oh-my-pi/pi-ai/types";
 import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
-import * as z from "zod/v4";
+import { z } from "zod/v4";
 
 describe("Tool argument coercion", () => {
 	it("coerces numeric strings when schema expects number", () => {
@@ -42,6 +42,163 @@ describe("Tool argument coercion", () => {
 		expect(typeof result.label).toBe("string");
 	});
 
+	it("stringifies object values when schema expects string", () => {
+		const tool: Tool = {
+			name: "object-string",
+			description: "",
+			parameters: z.object({ payload: z.string() }),
+		};
+
+		const result = validateToolArguments(tool, {
+			type: "toolCall",
+			id: "call-object-string",
+			name: "object-string",
+			arguments: { payload: { a: 1, nested: ["x"] } },
+		}) as { payload: string };
+
+		expect(result.payload).toBe('{"a":1,"nested":["x"]}');
+	});
+
+	it("stringifies array values when schema expects string", () => {
+		const tool: Tool = {
+			name: "array-string",
+			description: "",
+			parameters: z.object({ payload: z.string() }),
+		};
+
+		const result = validateToolArguments(tool, {
+			type: "toolCall",
+			id: "call-array-string",
+			name: "array-string",
+			arguments: { payload: ["a", 2, true] },
+		}) as { payload: string };
+
+		expect(result.payload).toBe('["a",2,true]');
+	});
+
+	it("coerces numeric 0 and 1 to booleans", () => {
+		const tool: Tool = {
+			name: "numeric-booleans",
+			description: "",
+			parameters: z.object({ enabled: z.boolean(), disabled: z.boolean() }),
+		};
+
+		const result = validateToolArguments(tool, {
+			type: "toolCall",
+			id: "call-numeric-booleans",
+			name: "numeric-booleans",
+			arguments: { enabled: 1, disabled: 0 },
+		}) as { enabled: boolean; disabled: boolean };
+
+		expect(result).toEqual({ enabled: true, disabled: false });
+	});
+
+	it("coerces booleans to numeric 0 and 1", () => {
+		const tool: Tool = {
+			name: "boolean-numbers",
+			description: "",
+			parameters: z.object({ enabled: z.number(), disabled: z.number().int() }),
+		};
+
+		const result = validateToolArguments(tool, {
+			type: "toolCall",
+			id: "call-boolean-numbers",
+			name: "boolean-numbers",
+			arguments: { enabled: true, disabled: false },
+		}) as { enabled: number; disabled: number };
+
+		expect(result).toEqual({ enabled: 1, disabled: 0 });
+	});
+
+	it("rejects numeric boolean values other than 0 or 1", () => {
+		const tool: Tool = {
+			name: "invalid-numeric-boolean",
+			description: "",
+			parameters: z.object({ enabled: z.boolean() }),
+		};
+
+		expect(() =>
+			validateToolArguments(tool, {
+				type: "toolCall",
+				id: "call-invalid-numeric-boolean",
+				name: "invalid-numeric-boolean",
+				arguments: { enabled: 2 },
+			}),
+		).toThrow('Validation failed for tool "invalid-numeric-boolean"');
+	});
+
+	it("keeps raw in-band blocks out of validation errors", () => {
+		const tool: Tool = {
+			name: "raw-debug",
+			description: "",
+			parameters: z.object({ input: z.string() }),
+		};
+		const rawBlock = '<|start|>assistant<|channel|>commentary to=functions.edit <|message|>{"input":"x"}}<|call|>';
+
+		expect(() =>
+			validateToolArguments(tool, {
+				type: "toolCall",
+				id: "call-raw-debug",
+				name: "raw-debug",
+				arguments: {},
+				rawBlock,
+			}),
+		).toThrow('Validation failed for tool "raw-debug"');
+		expect(() =>
+			validateToolArguments(tool, {
+				type: "toolCall",
+				id: "call-raw-debug",
+				name: "raw-debug",
+				arguments: {},
+				rawBlock,
+			}),
+		).not.toThrow(rawBlock);
+	});
+
+	it("coerces common string boolean forms", () => {
+		const tool: Tool = {
+			name: "string-booleans",
+			description: "",
+			parameters: z.object({
+				t: z.boolean(),
+				f: z.boolean(),
+				one: z.boolean(),
+				zero: z.boolean(),
+				yes: z.boolean(),
+				no: z.boolean(),
+				on: z.boolean(),
+				off: z.boolean(),
+			}),
+		};
+
+		const result = validateToolArguments(tool, {
+			type: "toolCall",
+			id: "call-string-booleans",
+			name: "string-booleans",
+			arguments: {
+				t: "TRUE",
+				f: "false",
+				one: "1",
+				zero: "0",
+				yes: "yes",
+				no: "NO",
+				on: "on",
+				off: "OFF",
+			},
+		}) as Record<string, boolean>;
+
+		expect(result).toEqual({
+			t: true,
+			f: false,
+			one: true,
+			zero: false,
+			yes: true,
+			no: false,
+			on: true,
+			off: false,
+		});
+	});
+
 	it("parses JSON arrays in string values when schema expects array", () => {
 		const tool: Tool = {
 			name: "t3",
@@ -76,6 +233,178 @@ describe("Tool argument coercion", () => {
 
 		const result = validateToolArguments(tool, toolCall) as { paths: string[] };
 		expect(result.paths).toEqual(["src/**/*.ts"]);
+	});
+
+	it("wraps a singleton object in an array when schema expects object array", () => {
+		const tool: Tool = {
+			name: "todo_like",
+			description: "",
+			parameters: z.object({
+				ops: z.array(
+					z.object({
+						op: z.literal("init"),
+						list: z.array(
+							z.object({
+								phase: z.string(),
+								items: z.array(z.string()),
+							}),
+						),
+					}),
+				),
+			}),
+		};
+
+		const result = validateToolArguments(tool, {
+			type: "toolCall",
+			id: "call-singleton-object-array",
+			name: "todo_like",
+			arguments: {
+				ops: {
+					op: "init",
+					list: [{ phase: "Repro", items: ["capture"] }],
+				},
+			},
+		});
+
+		expect(result).toEqual({
+			ops: [{ op: "init", list: [{ phase: "Repro", items: ["capture"] }] }],
+		});
+	});
+
+	it("wraps a singleton number in an array when schema expects number array", () => {
+		const tool: Tool = {
+			name: "numeric_list",
+			description: "",
+			parameters: z.object({ values: z.array(z.number()) }),
+		};
+
+		const result = validateToolArguments(tool, {
+			type: "toolCall",
+			id: "call-singleton-number-array",
+			name: "numeric_list",
+			arguments: { values: 7 },
+		});
+
+		expect(result).toEqual({ values: [7] });
+	});
+
+	it("does not wrap singleton values for array expectations from failed union branches", () => {
+		const entry = z.object({ id: z.number() });
+		const tool: Tool = {
+			name: "union_shape",
+			description: "",
+			parameters: z.union([z.array(entry), entry]),
+		};
+
+		const result = validateToolArguments(tool, {
+			type: "toolCall",
+			id: "call-union-shape",
+			name: "union_shape",
+			arguments: { id: "1" },
+		});
+
+		expect(result).toEqual({ id: 1 });
+	});
+
+	it("does not wrap singleton values for JSON Schema anyOf array branches", () => {
+		const tool: Tool = {
+			name: "json_schema_union",
+			description: "",
+			parameters: {
+				type: "object",
+				properties: {
+					target: {
+						anyOf: [
+							{
+								type: "array",
+								items: {
+									type: "object",
+									properties: { a: { type: "boolean" } },
+									required: ["a"],
+									additionalProperties: false,
+								},
+							},
+							{
+								type: "object",
+								properties: { a: { type: "boolean" } },
+								required: ["a"],
+								additionalProperties: false,
+							},
+						],
+					},
+				},
+				required: ["target"],
+				additionalProperties: false,
+			},
+		};
+
+		// The bug would silently coerce `{ a: "true" }` into `[{ a: true }]` by
+		// wrapping the object to satisfy the failed `anyOf` array branch and
+		// then coercing the inner string into a boolean. Branch tracking keeps
+		// the wrap from firing so the wrong shape never makes it through.
+		expect(() =>
+			validateToolArguments(tool, {
+				type: "toolCall",
+				id: "call-jsonschema-union",
+				name: "json_schema_union",
+				arguments: { target: { a: "true" } },
+			}),
+		).toThrow("Validation failed");
+	});
+
+	it("still wraps nested array fields inside a tag-selected Zod union branch", () => {
+		const tool: Tool = {
+			name: "tagged_union",
+			description: "",
+			parameters: z.union([
+				z.object({ type: z.literal("indices"), indices: z.array(z.number()) }),
+				z.object({ type: z.literal("all") }),
+			]),
+		};
+
+		const result = validateToolArguments(tool, {
+			type: "toolCall",
+			id: "call-tagged-union",
+			name: "tagged_union",
+			arguments: { type: "indices", indices: 1 },
+		});
+
+		expect(result).toEqual({ type: "indices", indices: [1] });
+	});
+
+	it("still wraps nested array fields inside a tag-selected JSON Schema anyOf branch", () => {
+		const tool: Tool = {
+			name: "tagged_json_union",
+			description: "",
+			parameters: {
+				anyOf: [
+					{
+						type: "object",
+						properties: {
+							type: { const: "indices" },
+							indices: { type: "array", items: { type: "number" } },
+						},
+						required: ["type", "indices"],
+						additionalProperties: false,
+					},
+					{
+						type: "object",
+						properties: { type: { const: "all" } },
+						required: ["type"],
+						additionalProperties: false,
+					},
+				],
+			},
+		};
+
+		const result = validateToolArguments(tool, {
+			type: "toolCall",
+			id: "call-tagged-json-union",
+			name: "tagged_json_union",
+			arguments: { type: "indices", indices: 1 },
+		});
+
+		expect(result).toEqual({ type: "indices", indices: [1] });
 	});
 
 	it("parses JSON objects in string values when schema expects object", () => {
@@ -987,5 +1316,149 @@ describe("Tool argument coercion", () => {
 
 		const result = validateToolArguments(tool, toolCall) as Record<string, unknown>;
 		expect(result.op).toBe("fix");
+	});
+
+	describe("string|array union (regression: #1788)", () => {
+		// `search` and `gh` tools declare `paths`/`pr` as `union(string, array<string>)`
+		// so the LLM can pass a single path or many. Some providers (Z.AI / GLM)
+		// double-serialize array tool-call arguments into JSON strings, which the
+		// union accepts as a string — silently feeding the downstream tool a literal
+		// `["a","b"]` path string.
+		const unionTool: Tool = {
+			name: "search",
+			description: "",
+			parameters: z.object({
+				pattern: z.string(),
+				paths: z.union([z.string(), z.array(z.string()).min(1)]),
+			}),
+		};
+
+		it("parses a JSON-encoded single-element array into a real array", () => {
+			const result = validateToolArguments(unionTool, {
+				type: "toolCall",
+				id: "u1",
+				name: "search",
+				arguments: { pattern: "name", paths: '["package.json"]' },
+			}) as { paths: unknown };
+			expect(result.paths).toEqual(["package.json"]);
+		});
+
+		it("parses a JSON-encoded multi-element array into a real array", () => {
+			const result = validateToolArguments(unionTool, {
+				type: "toolCall",
+				id: "u2",
+				name: "search",
+				arguments: { pattern: "name", paths: '["package.json","App.tsx"]' },
+			}) as { paths: unknown };
+			expect(result.paths).toEqual(["package.json", "App.tsx"]);
+		});
+
+		it("parses a JSON-encoded array containing an absolute path", () => {
+			const result = validateToolArguments(unionTool, {
+				type: "toolCall",
+				id: "u3",
+				name: "search",
+				arguments: { pattern: "name", paths: '["/home/user/project/package.json"]' },
+			}) as { paths: unknown };
+			expect(result.paths).toEqual(["/home/user/project/package.json"]);
+		});
+
+		it("preserves a plain string path (no brackets) untouched", () => {
+			const result = validateToolArguments(unionTool, {
+				type: "toolCall",
+				id: "u4",
+				name: "search",
+				arguments: { pattern: "name", paths: "package.json" },
+			}) as { paths: unknown };
+			expect(result.paths).toBe("package.json");
+		});
+
+		it("preserves a real array path untouched", () => {
+			const result = validateToolArguments(unionTool, {
+				type: "toolCall",
+				id: "u5",
+				name: "search",
+				arguments: { pattern: "name", paths: ["package.json", "App.tsx"] },
+			}) as { paths: unknown };
+			expect(result.paths).toEqual(["package.json", "App.tsx"]);
+		});
+
+		it("leaves a glob-style string with brackets untouched when it does not parse as JSON", () => {
+			// `[abc]` is a glob char class; not valid JSON without quoted members.
+			const result = validateToolArguments(unionTool, {
+				type: "toolCall",
+				id: "u6",
+				name: "search",
+				arguments: { pattern: "name", paths: "[abc]" },
+			}) as { paths: unknown };
+			expect(result.paths).toBe("[abc]");
+		});
+
+		it("preserves JSON-array-shaped strings that do not satisfy the array branch", () => {
+			const result = validateToolArguments(unionTool, {
+				type: "toolCall",
+				id: "u7",
+				name: "search",
+				arguments: { pattern: "name", paths: "[1]" },
+			}) as { paths: unknown };
+			expect(result.paths).toBe("[1]");
+		});
+
+		it("does not coerce JSON-shape strings when the schema only accepts string", () => {
+			const stringOnly: Tool = {
+				name: "string_only",
+				description: "",
+				parameters: z.object({ value: z.string() }),
+			};
+			const result = validateToolArguments(stringOnly, {
+				type: "toolCall",
+				id: "u8",
+				name: "string_only",
+				arguments: { value: '["not-a-list"]' },
+			}) as { value: unknown };
+			expect(result.value).toBe('["not-a-list"]');
+		});
+
+		it("re-runs union coercion after the root arguments object is JSON-parsed", () => {
+			// Some providers double-encode the entire arguments object — the call
+			// arrives with `arguments` as the JSON string of an object whose own
+			// `paths` field is itself a JSON-encoded array. Both layers must
+			// unwind for the search bug fix (#1788) to actually take effect.
+			const rootStringArgs = JSON.stringify({
+				pattern: "name",
+				paths: '["package.json"]',
+			}) as unknown as Record<string, unknown>;
+			const result = validateToolArguments(unionTool, {
+				type: "toolCall",
+				id: "u9",
+				name: "search",
+				arguments: rootStringArgs,
+			}) as { pattern: string; paths: unknown };
+			expect(result.pattern).toBe("name");
+			expect(result.paths).toEqual(["package.json"]);
+		});
+
+		it("re-runs union coercion after a nested object field is JSON-parsed", () => {
+			const nestedTool: Tool = {
+				name: "nested_search",
+				description: "",
+				parameters: z.object({
+					payload: z.object({
+						paths: z.union([z.string(), z.array(z.string()).min(1)]),
+					}),
+				}),
+			};
+			const result = validateToolArguments(nestedTool, {
+				type: "toolCall",
+				id: "u10",
+				name: "nested_search",
+				arguments: {
+					payload: JSON.stringify({
+						paths: '["package.json"]',
+					}),
+				},
+			}) as { payload: { paths: unknown } };
+			expect(result.payload.paths).toEqual(["package.json"]);
+		});
 	});
 });

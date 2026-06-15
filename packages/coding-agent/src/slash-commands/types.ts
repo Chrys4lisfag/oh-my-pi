@@ -14,6 +14,7 @@ export interface SubcommandDef {
 /** Declarative builtin slash command metadata used by autocomplete and help UI. */
 export interface BuiltinSlashCommand {
 	name: string;
+	aliases?: string[];
 	description: string;
 	/** Subcommands for dropdown completion (e.g. /mcp add, /mcp list). */
 	subcommands?: SubcommandDef[];
@@ -71,20 +72,17 @@ export interface SlashCommandRuntime {
 
 /**
  * Runtime visible to TUI-only handlers (`handleTui`). Carries the interactive
- * mode context plus the background-detach hook. Intentionally narrower than
- * `SlashCommandRuntime` so existing callers can keep building it from just
- * `{ ctx, handleBackgroundCommand }`; when the TUI dispatcher needs to invoke
- * a `handle` (no `handleTui` override), it synthesizes a `SlashCommandRuntime`
- * from `ctx`.
+ * mode context. Intentionally narrower than `SlashCommandRuntime` so existing
+ * callers can keep building it from just `{ ctx }`; when the TUI dispatcher
+ * needs to invoke a `handle` (no `handleTui` override), it synthesizes a
+ * `SlashCommandRuntime` from `ctx`.
  */
 export interface TuiSlashCommandRuntime {
 	ctx: InteractiveModeContext;
-	handleBackgroundCommand: () => void;
 }
 
 /** Unified slash-command spec consumed by both TUI and ACP dispatchers. */
 export interface SlashCommandSpec extends BuiltinSlashCommand {
-	aliases?: string[];
 	/** When false, the dispatcher refuses to handle invocations that include arguments. */
 	allowArgs?: boolean;
 	/**

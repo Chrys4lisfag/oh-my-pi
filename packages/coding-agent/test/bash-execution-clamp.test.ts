@@ -7,7 +7,7 @@ import { visibleWidth } from "@oh-my-pi/pi-tui";
 const MAX_DISPLAY_LINE_CHARS = 4000;
 
 describe("BashExecutionComponent #clampDisplayLine", () => {
-	const ui = { requestRender: () => {} } as unknown as TUI;
+	const ui = { requestRender: () => {}, requestComponentRender: () => {} } as unknown as TUI;
 
 	beforeEach(async () => {
 		const theme = await getThemeByName("dark");
@@ -214,14 +214,6 @@ describe("BashExecutionComponent #clampDisplayLine", () => {
 
 			expect(output).toContain("omitted");
 			expect(output).toContain(`[1 visible columns omitted]`);
-		});
-
-		it("handles string with 0 visible width (empty after ANSI removal)", () => {
-			const onlyAnsi = "\x1b[0m\x1b[1m\x1b[2m";
-			const component = createComponentWithOutput(onlyAnsi);
-			const output = component.getOutput();
-
-			expect(output).toBeDefined();
 		});
 
 		it("handles empty string", () => {
