@@ -217,7 +217,7 @@ export const KEYBINDINGS = {
 		description: "Toggle speech-to-text (default gesture: hold Space)",
 	},
 	"app.profile.cycle": {
-		defaultKeys: "alt+m",
+		defaultKeys: "alt+c",
 		description: "Cycle model profile",
 	},
 } as const satisfies KeybindingDefinitions;
