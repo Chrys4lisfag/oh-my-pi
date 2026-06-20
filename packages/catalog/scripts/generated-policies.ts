@@ -208,9 +208,13 @@ function applyGeneratedModelPolicy(model: ModelSpec<Api>): void {
 		model.maxTokens = copilotLimits.maxTokens;
 	}
 
-	// GLM Coding Plan (zai): GLM-5.2 is the selectable 1M served id; pin it
-	// so endpoint discovery or older bundled fallbacks cannot regress to 200k.
-	if (model.provider === "zai" && model.id === "glm-5.2") {
+	if (model.provider === "ollama-cloud") {
+		model.omitMaxOutputTokens = true;
+	}
+
+	// GLM Coding Plan: GLM-5.2 is the selectable 1M served id; pin it so
+	// endpoint discovery or older bundled fallbacks cannot regress to 200k.
+	if ((model.provider === "zai" || model.provider === "zhipu-coding-plan") && model.id === "glm-5.2") {
 		model.contextWindow = 1_000_000;
 		model.maxTokens = 131_072;
 	}

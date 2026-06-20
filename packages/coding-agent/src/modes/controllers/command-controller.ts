@@ -47,6 +47,7 @@ import { buildHotkeysMarkdown } from "../../modes/utils/hotkeys-markdown";
 import { buildToolsMarkdown } from "../../modes/utils/tools-markdown";
 import type { AsyncJobSnapshotItem } from "../../session/agent-session";
 import type { AuthStorage, OAuthAccountIdentity } from "../../session/auth-storage";
+import type { CompactMode } from "../../session/compact-modes";
 import type { NewSessionOptions } from "../../session/session-entries";
 import { formatShakeSummary, type ShakeMode, type ShakeResult } from "../../session/shake-types";
 import { limitMatchesActiveAccount } from "../../slash-commands/helpers/active-oauth-account";
@@ -93,9 +94,9 @@ export class CommandController {
 		}
 	}
 
-	handleDumpCommand(isRaw = false) {
+	handleDumpCommand() {
 		try {
-			const formatted = this.ctx.session.formatSessionAsText({ compact: !isRaw });
+			const formatted = this.ctx.session.formatSessionAsText();
 			if (!formatted) {
 				this.ctx.showError("No messages to dump yet.");
 				return;
@@ -1156,6 +1157,7 @@ export class CommandController {
 
 	async handleCompactCommand(
 		customInstructions?: string,
+		mode?: CompactMode,
 		beforeFlush?: (outcome: CompactionOutcome) => void | Promise<void>,
 	): Promise<CompactionOutcome> {
 		const entries = this.ctx.sessionManager.getEntries();
@@ -1166,7 +1168,7 @@ export class CommandController {
 			return "ok";
 		}
 
-		return this.executeCompaction(customInstructions, false, beforeFlush);
+		return this.executeCompaction(customInstructions, false, beforeFlush, mode);
 	}
 
 	/**
@@ -1212,6 +1214,7 @@ export class CommandController {
 		customInstructionsOrOptions?: string | CompactOptions,
 		isAuto = false,
 		beforeFlush?: (outcome: CompactionOutcome) => void | Promise<void>,
+		mode?: CompactMode,
 	): Promise<CompactionOutcome> {
 		if (this.ctx.loadingAnimation) {
 			this.ctx.loadingAnimation.stop();
@@ -1233,9 +1236,16 @@ export class CommandController {
 		let outcome: CompactionOutcome = "ok";
 		try {
 			const instructions = typeof customInstructionsOrOptions === "string" ? customInstructionsOrOptions : undefined;
-			const options =
+			const baseOptions =
 				customInstructionsOrOptions && typeof customInstructionsOrOptions === "object"
 					? customInstructionsOrOptions
+					: undefined;
+			// The slash path passes `mode` positionally; the extension path carries
+			// it inside the options object. Either source wins over no mode.
+			const effectiveMode = mode ?? baseOptions?.mode;
+			const options =
+				baseOptions || effectiveMode
+					? { ...baseOptions, ...(effectiveMode ? { mode: effectiveMode } : {}) }
 					: undefined;
 			await this.ctx.session.compact(instructions, options);
 
