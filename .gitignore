@@ -81,6 +81,8 @@ python/robomp/data/
 python/robomp/.cache/
 python/robomp/src/robomp/static/
 python/robomp/web/dist/
+python/robomp/web/verify-out/
+/verify-out/
 python/robomp/.env
 tools/tls-capture
 

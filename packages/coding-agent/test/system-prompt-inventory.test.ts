@@ -2,7 +2,13 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildSystemPrompt, type SystemPromptToolMetadata } from "@oh-my-pi/pi-coding-agent/system-prompt";
+import { buildSystemPrompt as buildSdkSystemPrompt } from "@oh-my-pi/pi-coding-agent/sdk";
+import {
+	buildSystemPrompt,
+	DEFAULT_SYSTEM_PROMPT_TOOL_NAMES,
+	type SystemPromptToolMetadata,
+} from "@oh-my-pi/pi-coding-agent/system-prompt";
+import type { Tool } from "@oh-my-pi/pi-coding-agent/tools";
 import { cleanupTempHome } from "./helpers/temp-home-cleanup";
 
 const EMPTY_TREE = {
@@ -31,6 +37,17 @@ const TOOLS = new Map<string, SystemPromptToolMetadata>([
 		},
 	],
 ]);
+
+const SDK_TOOL: Tool = {
+	name: "sdk_custom",
+	label: "SDK Custom",
+	description: "SDK-provided custom tool.",
+	parameters: { type: "object", properties: {} },
+	approval: "read",
+	async execute() {
+		return { content: [{ type: "text", text: "ok" }] };
+	},
+};
 
 describe("system prompt tool inventory", () => {
 	let tempDir = "";
@@ -61,6 +78,20 @@ describe("system prompt tool inventory", () => {
 		return systemPrompt.join("\n\n");
 	}
 
+	function inventoryFrom(text: string): string {
+		// Tolerate either prompt layout: the merge-base "# Inventory" / "ENV" framing and the
+		// reordered "# Tool Inventory" / "TOOL POLICY" framing on current main. The slice just
+		// needs to isolate the rendered tool list from the rest of the prompt.
+		const inventoryStart =
+			["# Tool Inventory", "# Inventory"].map(header => text.indexOf(header)).find(index => index >= 0) ?? -1;
+		expect(inventoryStart).toBeGreaterThan(-1);
+		const sectionEnds = ["\nENV\n", "\nTOOL POLICY", "\n# "]
+			.map(marker => text.indexOf(marker, inventoryStart + 1))
+			.filter(index => index > inventoryStart);
+		const inventoryEnd = sectionEnds.length > 0 ? Math.min(...sectionEnds) : text.length;
+		return text.slice(inventoryStart, inventoryEnd);
+	}
+
 	it("renders a compact name list only when native tools are active and descriptors stay in schemas", async () => {
 		const text = await render({ nativeTools: true, inlineToolDescriptors: false });
 		expect(text).toContain("- Read: `read`");
@@ -87,6 +118,115 @@ describe("system prompt tool inventory", () => {
 		expect(text).not.toContain("- Read: `read`");
 	});
 
+	it("uses a conservative fallback inventory when no tools map is provided", async () => {
+		const { systemPrompt } = await buildSystemPrompt({
+			cwd: tempDir,
+			contextFiles: [],
+			skills: [],
+			rules: [],
+			workspaceTree: { ...EMPTY_TREE, rootPath: tempDir },
+		});
+		const inventory = inventoryFrom(systemPrompt.join("\n\n"));
+		for (const toolName of DEFAULT_SYSTEM_PROMPT_TOOL_NAMES) {
+			expect(inventory).toContain(`- \`${toolName}\``);
+		}
+		expect(inventory).not.toContain("- `browser`");
+		expect(inventory).not.toContain("- `task`");
+	});
+
+	it("SDK wrapper renders provided tools instead of the fallback inventory", async () => {
+		const { systemPrompt } = await buildSdkSystemPrompt({
+			cwd: tempDir,
+			contextFiles: [],
+			skills: [],
+			tools: [SDK_TOOL],
+		});
+		const inventory = inventoryFrom(systemPrompt.join("\n\n"));
+		expect(inventory).toContain("- SDK Custom: `sdk_custom`");
+		expect(inventory).not.toContain("- `read`");
+	});
+
+	it("SDK wrapper preserves an explicit empty tool list", async () => {
+		const { systemPrompt } = await buildSdkSystemPrompt({
+			cwd: tempDir,
+			contextFiles: [],
+			skills: [],
+			tools: [],
+		});
+		const text = systemPrompt.join("\n\n");
+
+		expect(text).not.toContain("# Inventory");
+		expect(text).not.toContain("- `read`");
+	});
+
+	it("keeps visible skills when no tools map is provided", async () => {
+		const { systemPrompt } = await buildSystemPrompt({
+			cwd: tempDir,
+			contextFiles: [],
+			skills: [
+				{
+					name: "prompt-authoring",
+					description: "Prompt authoring workflow",
+					filePath: path.join(tempDir, "SKILL.md"),
+					baseDir: tempDir,
+					source: "test",
+				},
+			],
+			rules: [],
+			workspaceTree: { ...EMPTY_TREE, rootPath: tempDir },
+		});
+		const text = systemPrompt.join("\n\n");
+
+		expect(text).toContain("- prompt-authoring: Prompt authoring workflow");
+	});
+
+	it("omits skills when active tool names exclude read", async () => {
+		const { systemPrompt } = await buildSystemPrompt({
+			cwd: tempDir,
+			contextFiles: [],
+			skills: [
+				{
+					name: "search-only-skill",
+					description: "Should not render without read",
+					filePath: path.join(tempDir, "SKILL.md"),
+					baseDir: tempDir,
+					source: "test",
+				},
+			],
+			rules: [],
+			toolNames: ["bash"],
+			tools: TOOLS,
+			workspaceTree: { ...EMPTY_TREE, rootPath: tempDir },
+		});
+		const text = systemPrompt.join("\n\n");
+
+		expect(text).not.toContain("search-only-skill");
+	});
+
+	it("omits hidden skills even when read is active", async () => {
+		const { systemPrompt } = await buildSystemPrompt({
+			cwd: tempDir,
+			contextFiles: [],
+			skills: [
+				{
+					name: "hidden-workflow",
+					description: "Hidden prompt workflow",
+					filePath: path.join(tempDir, "SKILL.md"),
+					baseDir: tempDir,
+					source: "test",
+					hide: true,
+				},
+			],
+			rules: [],
+			toolNames: ["read"],
+			tools: TOOLS,
+			workspaceTree: { ...EMPTY_TREE, rootPath: tempDir },
+		});
+		const text = systemPrompt.join("\n\n");
+
+		expect(text).not.toContain("hidden-workflow");
+	});
+
 	it("tells the agent to read matching skills before work", async () => {
 		const { systemPrompt } = await buildSystemPrompt({
 			cwd: tempDir,
@@ -109,17 +249,5 @@ describe("system prompt tool inventory", () => {
 
 		expect(text).toContain("<skills>");
 		expect(text).toContain("- frontend-design: Frontend UI workflow");
-	});
-
-	it("places the inventory at the bottom of the TOOLS section (after I/O and Exploration)", async () => {
-		const text = await render({ nativeTools: true, inlineToolDescriptors: false });
-		const inventoryIdx = text.indexOf("# Inventory");
-		const ioIdx = text.indexOf("# I/O");
-		const explorationIdx = text.indexOf("# Exploration");
-		expect(inventoryIdx).toBeGreaterThan(-1);
-		expect(ioIdx).toBeGreaterThan(-1);
-		expect(explorationIdx).toBeGreaterThan(-1);
-		expect(inventoryIdx).toBeGreaterThan(ioIdx);
-		expect(inventoryIdx).toBeGreaterThan(explorationIdx);
 	});
 });

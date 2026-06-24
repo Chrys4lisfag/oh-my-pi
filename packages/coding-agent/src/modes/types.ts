@@ -137,6 +137,17 @@ export interface InteractiveModeContext {
 
 	// State
 	isInitialized: boolean;
+	/**
+	 * `true` once `renderInitialMessages` has rendered the session transcript
+	 * into `chatContainer` at least once.
+	 *
+	 * Extension chat-rebuilds (`ExtensionUiController.#applyCustomMessageDisplay`)
+	 * are gated on this: rebuilding before the initial render would plant a
+	 * session-derived component into the chat that `renderInitialMessages` then
+	 * both re-renders from session entries AND re-appends via
+	 * `preserveExistingChat`, duplicating the message (issue #1955).
+	 */
+	initialChatRendered: boolean;
 	isBashMode: boolean;
 	toolOutputExpanded: boolean;
 	todoExpanded: boolean;
@@ -148,8 +159,7 @@ export interface InteractiveModeContext {
 	loopLimit?: LoopLimitRuntime;
 	planModePlanFilePath?: string;
 	hideThinkingBlock: boolean;
-	pendingImages: ImageContent[];
-	pendingImageLinks: (string | undefined)[];
+	proseOnlyThinking: boolean;
 	compactionQueuedMessages: CompactionQueuedMessage[];
 	pendingTools: Map<string, ToolExecutionHandle>;
 	pendingBashComponents: BashExecutionComponent[];
@@ -257,6 +267,13 @@ export interface InteractiveModeContext {
 	 * delivery error should leave the signature set untouched.
 	 */
 	withLocalSubmission<T>(text: string, fn: () => Promise<T>, options?: { imageCount?: number }): Promise<T>;
+	/** Clears bookkeeping for an optimistic local user message once the matching session event arrives. */
+	clearOptimisticUserMessage(): void;
+	/** Replaces the raw optimistic user render with the canonical message emitted by the session. */
+	replaceOptimisticUserMessage(
+		message: AgentMessage,
+		options?: { imageLinks?: readonly (string | undefined)[] },
+	): void;
 	isKnownSlashCommand(text: string): boolean;
 	addMessageToChat(
 		message: AgentMessage,
@@ -289,7 +306,7 @@ export interface InteractiveModeContext {
 	handleHotkeysCommand(): void;
 	handleToolsCommand(): void;
 	handleContextCommand(): void;
-	handleDumpCommand(): void;
+	handleDumpCommand(): Promise<void>;
 	handleAdvisorDumpCommand(isRaw?: boolean): void;
 	handleDebugTranscriptCommand(): Promise<void>;
 	handleClearCommand(): Promise<void>;
@@ -349,6 +366,8 @@ export interface InteractiveModeContext {
 	handleBtwEscape(): boolean;
 	handleBtwBranchKey(): Promise<boolean>;
 	canBranchBtw(): boolean;
+	canCopyBtw(): boolean;
+	handleBtwCopyKey(): Promise<boolean>;
 	handleBtwBranch(question: string, assistantMessage: AssistantMessage): Promise<void>;
 	handleOmfgCommand(complaint: string): Promise<void>;
 	hasActiveOmfg(): boolean;
@@ -363,7 +382,7 @@ export interface InteractiveModeContext {
 	handlePlanModeCommand(initialPrompt?: string): Promise<void>;
 	handleGoalModeCommand(rest?: string): Promise<void>;
 	handleGuidedGoalCommand(rest?: string): Promise<void>;
-	handleLoopCommand(args?: string): Promise<void>;
+	handleLoopCommand(args?: string): Promise<string | undefined>;
 	disableLoopMode(): void;
 	pauseLoop(): void;
 	handlePlanApproval(details: PlanApprovalDetails): Promise<void>;
