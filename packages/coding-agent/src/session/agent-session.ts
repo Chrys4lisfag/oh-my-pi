@@ -13021,6 +13021,10 @@ export class AgentSession {
 	 */
 	setAdvisorEnabled(enabled: boolean): boolean {
 		this.#advisorEnabled = enabled;
+		// Propagate to the settings instance so spawned subagents (which snapshot
+		// settings via createSubagentSettings) inherit the parent's runtime toggle
+		// rather than reading the stale persisted value.
+		this.settings.override("advisor.enabled", enabled);
 		if (enabled) {
 			return this.#buildAdvisorRuntime(true);
 		}
