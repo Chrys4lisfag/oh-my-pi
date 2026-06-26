@@ -192,14 +192,18 @@ function toPlainContent(
 	};
 }
 
-function convertMessage(message: Message, supportsImages: boolean): OllamaMessage {
+function convertMessage(
+	message: Message,
+	supportsImages: boolean,
+	developerRole: "system" | "user" = "user",
+): OllamaMessage {
 	if (message.role === "user") {
 		const converted = toPlainContent(message.content, supportsImages);
 		return { role: "user", ...converted };
 	}
 	if (message.role === "developer") {
 		const converted = toPlainContent(message.content, supportsImages);
-		return { role: "system", ...converted };
+		return { role: developerRole, ...converted };
 	}
 	if (message.role === "toolResult") {
 		const converted = toPlainContent(message.content, supportsImages);
@@ -240,23 +244,27 @@ function convertMessage(message: Message, supportsImages: boolean): OllamaMessag
 }
 
 function convertMessages(model: Model<"ollama-chat">, context: Context): OllamaMessage[] {
-	const messages: Message[] = [];
-	// Emit one developer message per ordered system prompt. The wire role is mapped to "system"
-	// by `convertMessage`, but keeping the prompts separate preserves prefix-cache stability:
-	// if only the trailing prompt changes between calls, the leading system messages keep
-	// their identical token prefix so KV-cache reuse covers them.
-	for (const systemPrompt of normalizeSystemPrompts(context.systemPrompt)) {
-		messages.push({
-			role: "developer",
-			content: systemPrompt,
-			timestamp: Date.now(),
-		});
-	}
-	messages.push(...context.messages);
+	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
+	const systemMessages: Message[] = systemPrompts.map(systemPrompt => ({
+		role: "developer",
+		content: systemPrompt,
+		timestamp: Date.now(),
+	}));
+	const messages: Message[] = [...systemMessages, ...context.messages];
 	const isCloud = model.provider === "ollama-cloud";
 	const supportsImages = model.input.includes("image");
-	return transformMessages(messages, model).map(msg => {
-		const converted = convertMessage(msg, supportsImages);
+	return transformMessages(messages, model).map((msg, index) => {
+		// Real `systemPrompt` entries (always emitted first) stay on Ollama's
+		// `system` role. After the static prefix, a developer turn keeps `system`
+		// when it's an agent-owned control instruction (empty/unexpected-stop
+		// retries, checkpoint rewind warning, todo reminders — all carry
+		// `attribution: "agent"`), but a user-attributed developer turn (auto-learn
+		// capture nudge, advisor cards, file-mention companions) drops to `user`.
+		// That keeps the in-conversation byte prefix stable for prefix caches
+		// (llama.cpp, #3456) without demoting mandatory agent reminders.
+		const developerRole =
+			msg.role === "developer" && (index < systemPrompts.length || msg.attribution !== "user") ? "system" : "user";
+		const converted = convertMessage(msg, supportsImages, developerRole);
 		// Ollama cloud rejects requests when assistant history messages contain the `thinking`
 		// field — it's valid in model responses but not accepted as a history input. Strip it
 		// to prevent HTTP 400 errors. Local Ollama instances are unaffected.
@@ -427,6 +435,17 @@ function mapDoneReason(doneReason: string | undefined, output: AssistantMessage)
 		return "toolUse";
 	}
 	return "stop";
+}
+
+const EMPTY_OLLAMA_LENGTH_COMPLETION_MESSAGE =
+	"Model returned no content: prompt filled the context window; raise Ollama num_ctx or shorten the prompt.";
+
+function hasVisibleAssistantContent(output: AssistantMessage): boolean {
+	return output.content.some(block => {
+		if (block.type === "text") return block.text.trim().length > 0;
+		if (block.type === "thinking") return block.thinking.trim().length > 0;
+		return block.type === "toolCall";
+	});
 }
 
 const OLLAMA_RETRY_DELAYS_MS = [2_000, 5_000, 10_000];
@@ -694,6 +713,10 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 			}
 			endActiveThinkingBlock();
 			endActiveTextBlock();
+			if (output.stopReason === "length" && !hasVisibleAssistantContent(output)) {
+				output.stopReason = "error";
+				output.errorMessage = EMPTY_OLLAMA_LENGTH_COMPLETION_MESSAGE;
+			}
 			// Tool calls always mean "execute and continue" in the OpenAI/Ollama contract.
 			// If the turn produced tool-call blocks but reported a natural `stop`, promote
 			// to `toolUse` so the agent loop runs them (it gates execution on the stop
@@ -704,6 +727,11 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) {
 				output.ttft = firstTokenTime - startTime;
+			}
+			if (output.stopReason === "error") {
+				stream.push({ type: "error", reason: "error", error: output });
+				stream.end();
+				return;
 			}
 			const doneReason =
 				output.stopReason === "length" ? "length" : output.stopReason === "toolUse" ? "toolUse" : "stop";
