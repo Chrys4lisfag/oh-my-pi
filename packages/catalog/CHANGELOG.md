@@ -2,6 +2,65 @@
 
 ## [Unreleased]
 
+## [16.2.9] - 2026-06-30
+
+### Added
+
+- Added full capability support for Claude Sonnet 5, aligning it with Claude Opus 4.8 and Fable 5. This includes adaptive thinking display, mid-conversation system messages, sampling parameter and thinking omission API restrictions, and 5-tier adaptive reasoning effort mapping (including xhigh and max levels) across direct APIs, OpenRouter, and Bedrock Converse.
+
+### Changed
+
+- Updated input and output costs for models in the catalog.
+
+## [16.2.7] - 2026-06-30
+
+### Fixed
+
+- Fixed compatibility with Kimi K2.7 Code on native endpoints to ensure thinking mode is preserved and tool choice is not forced.
+- Fixed Cerebras gemma-4-31b dynamic discovery to correctly identify the model as image-capable, enabling proper serialization of attached images.
+
+## [16.2.6] - 2026-06-29
+
+### Fixed
+
+- Fixed namespaced GLM-5.x model IDs on Z.AI/Zhipu OpenAI-compatible endpoints to inherit the widened stream watchdog, avoiding spurious stalled-stream errors during long thinking phases. ([#3819](https://github.com/can1357/oh-my-pi/issues/3819))
+
+## [16.2.3] - 2026-06-28
+
+### Added
+
+- Added support and configuration parameters for V2 streaming compaction in RemoteCompactionConfig, catalog types, and model/provider metadata.
+
+### Changed
+
+- Enabled automatic content markup healing for all OpenAI-compatible streaming models
+- Updated pricing and context window limits for several catalog models.
+- Disabled reasoning capability for multiple providers in the catalog.
+
+## [16.2.2] - 2026-06-27
+
+### Removed
+
+- Removed 'pi' from the list of supported dialects.
+
+## [16.2.0] - 2026-06-27
+
+### Added
+
+- Added GitLab Duo Agent catalog discovery, including namespace selection, live model mapping, and a bundled fallback model for fresh installs.
+- Added OpenAICompat.supportsNamedToolChoice to support forced tool use on string-only OpenAI-compatible chat servers without emitting the named function-object tool_choice shape.
+- Added model metadata support for provider-native remote compaction and compaction-only model selection.
+
+### Changed
+
+- Disabled the thinking-effort selector for GitLab Duo Agent models since the underlying platform parameters are server-fixed.
+
+### Fixed
+
+- Improved GitLab Duo Agent and Duo Workflow namespace and project discovery to robustly handle paginated groups, SSH remotes with custom ports, Git worktrees, self-managed GitLab instances with relative paths, and configuration via GITLAB_DUO_PROJECT_PATH or GITLAB_DUO_PROJECT_ID.
+- Fixed built-in LiteLLM discovery to prefer rich proxy metadata from management endpoints and avoid caching stale capability data.
+- Fixed GitLab Duo Workflow model specifications to resolve correct static context windows, enabling accurate context usage tracking and auto-compaction.
+
 ## [16.1.23] - 2026-06-26
 
 ### Added

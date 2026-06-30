@@ -2,6 +2,52 @@
 
 ## [Unreleased]
 
+## [16.2.9] - 2026-06-30
+
+### Added
+
+- Improved resilience in `fetchWithRetry()` by adding a response-body retry gate to handle deterministic provider failures that return retryable HTTP statuses.
+
+### Fixed
+
+- Fixed YAML frontmatter parsing for skill descriptions containing unquoted colons (`: `), ensuring typed fields are correctly preserved without triggering unnecessary warnings.
+
+## [16.2.7] - 2026-06-30
+
+### Added
+
+- Added a utility to detect binary files based on content sniffing.
+
+## [16.2.6] - 2026-06-29
+
+### Added
+
+- Added `stripWindowsExtendedLengthPathPrefix()` utility to normalize `\\?\` and native Win32 path prefixes before Bun import or spawn calls.
+
+## [16.2.3] - 2026-06-28
+
+### Added
+
+- Added `escapeXmlAttribute` utility function for safe XML attribute value encoding.
+
+### Fixed
+
+- Fixed a crash in `ptree.ChildProcess.bytes()` and the `ssh://` read path when handling large subprocess outputs (over 128 KB) under Bun by ensuring it consistently returns a `Uint8Array`.
+
+## [16.2.0] - 2026-06-27
+
+### Added
+
+- Added a relaxed JSON parser supporting single-quoted strings, unquoted keys, and comments.
+- Added `parseStreamingJson` and `parseStreamingJsonThrottled` for robust, efficient parsing of truncated or incremental streaming JSON.
+- Added an XDG-aware document conversion cache directory helper.
+- Exported `removeWithRetries()` as a standalone asynchronous function to handle retry-on-EBUSY cleanup logic.
+
+### Changed
+
+- Improved `readSseJson` to gracefully recover truncated or malformed final events using the streaming JSON parser, ending the stream cleanly instead of throwing.
+- Increased the retry delay for EBUSY file-lock errors from 25ms to 50ms (extending the total retry window to 2 seconds) to improve reliability on Windows.
+
 ## [16.1.8] - 2026-06-20
 
 ### Added

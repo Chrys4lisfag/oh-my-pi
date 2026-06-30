@@ -15,6 +15,7 @@ export type KnownApi =
 	| "google-vertex"
 	| "ollama-chat"
 	| "cursor-agent"
+	| "gitlab-duo-agent"
 	| "devin-agent";
 export type Api = KnownApi | (string & {});
 
@@ -269,6 +270,14 @@ export interface OpenAICompat {
 	 */
 	supportsForcedToolChoice?: boolean;
 	/**
+	 * Whether the chat-completions endpoint accepts the object form that pins one
+	 * named function (`{ type: "function", function: { name } }`). Some
+	 * OpenAI-compatible hosts such as llama.cpp only accept string
+	 * `tool_choice` values; request builders downgrade a named force to
+	 * `"required"` when this is false. Default: true.
+	 */
+	supportsNamedToolChoice?: boolean;
+	/**
 	 * Drop reasoning fields (`reasoning_effort`, OpenRouter `reasoning`) for
 	 * the request when `tool_choice` forces a tool call. Mirrors the Anthropic
 	 * `disableThinkingIfToolChoiceForced` rule for backends like Kimi that
@@ -412,6 +421,11 @@ export interface AnthropicCompat {
 	 */
 	replayUnsignedThinking?: boolean;
 	/**
+	 * Whether the endpoint requires `thinking.type: "enabled"` whenever the
+	 * model reasons. Use for models that reject omitted or disabled thinking.
+	 */
+	requiresThinkingEnabled?: boolean;
+	/**
 	 * Prefix Anthropic built-in tool names (`web_search`, `code_execution`, ...)
 	 * when they are ordinary client tools. Some Anthropic-compatible gateways
 	 * intercept those exact names as server tools and return raw search/result
@@ -465,6 +479,7 @@ export interface ResolvedOpenAISharedCompat {
 	disableReasoningOnToolChoice: boolean;
 	supportsToolChoice: boolean;
 	supportsForcedToolChoice: boolean;
+	supportsNamedToolChoice: boolean;
 	reasoningContentField?: OpenAICompat["reasoningContentField"];
 	requiresReasoningContentForToolCalls: boolean;
 	requiresReasoningContentForAllAssistantTurns: boolean;
@@ -516,6 +531,7 @@ export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
 			| "disableReasoningOnToolChoice"
 			| "supportsToolChoice"
 			| "supportsForcedToolChoice"
+			| "supportsNamedToolChoice"
 			| "reasoningContentField"
 			| "requiresReasoningContentForToolCalls"
 			| "requiresReasoningContentForAllAssistantTurns"
@@ -642,6 +658,24 @@ export type CompatOf<TApi extends Api> = TApi extends "openrouter"
 					? ResolvedDevinCompat
 					: undefined;
 
+/** Provider-native compaction endpoint configuration for one model. */
+export interface RemoteCompactionConfig<TApi extends Api = Api> {
+	/** Enables provider-native compaction for providers not enabled by built-in policy. */
+	enabled?: boolean;
+	/** Adapter family used by the configured compaction endpoint. */
+	api?: TApi;
+	/** Absolute V1 compact endpoint URL; when omitted, the adapter derives it from the model base URL. */
+	endpoint?: string;
+	/** Enables Responses-stream V2 compaction for models verified to support `compaction_trigger`. */
+	v2StreamingEnabled?: boolean;
+	/** Absolute Responses-stream endpoint URL for V2 compaction; overrides `streamingEndpoint`. */
+	v2Endpoint?: string;
+	/** Absolute provider streaming endpoint URL used by V2 compaction when no dedicated endpoint is set. */
+	streamingEndpoint?: string;
+	/** Model id sent to the compaction endpoint when it differs from the active model id. */
+	model?: string;
+}
+
 // Model interface for the unified model system
 export interface Model<TApi extends Api = Api> {
 	id: string;
@@ -672,6 +706,8 @@ export interface Model<TApi extends Api = Api> {
 	 * reports that native tool calling is unsupported.
 	 */
 	supportsTools?: boolean;
+	/** GitLab Duo Workflow root namespace selected during catalog discovery. */
+	gitlabDuoWorkflowRootNamespaceId?: string;
 	cost: {
 		input: number; // $/million tokens
 		output: number; // $/million tokens
@@ -714,6 +750,10 @@ export interface Model<TApi extends Api = Api> {
 	preferWebsockets?: boolean;
 	/** Preferred model to switch to when context promotion is triggered (model id or provider/id). */
 	contextPromotionTarget?: string;
+	/** Preferred model to use only for compaction (model id or provider/id); the active session model is unchanged. */
+	compactionModel?: string;
+	/** Provider-native compaction endpoint configuration. */
+	remoteCompaction?: RemoteCompactionConfig<TApi>;
 	/** Provider-assigned priority value (lower = higher priority). */
 	priority?: number;
 	/** Canonical thinking capability metadata for this model. */

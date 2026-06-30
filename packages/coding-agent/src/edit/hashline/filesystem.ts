@@ -16,8 +16,9 @@
  * (batch request, diagnostics) lives on the instance and isn't safe to
  * share across concurrent edit tools.
  */
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { Filesystem, NotFoundError, type WriteResult } from "@oh-my-pi/hashline";
+import { Filesystem, NotFoundError, type PreflightWriteOptions, type WriteResult } from "@oh-my-pi/hashline";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import type { FileDiagnosticsResult, WritethroughCallback, WritethroughDeferredHandle } from "../../lsp";
 import type { ToolSession } from "../../tools";
@@ -27,6 +28,7 @@ import { invalidateFsScanAfterWrite } from "../../tools/fs-cache-invalidation";
 import { isInternalUrlPath } from "../../tools/path-utils";
 import { enforcePlanModeWrite, resolvePlanPath, targetsLocalSandbox } from "../../tools/plan-mode-guard";
 import { canonicalSnapshotKey } from "../file-snapshot-store";
+import { isNotebookPath } from "../notebook";
 import { readEditFileText, serializeEditFileText } from "../read-file";
 import type { LspBatchRequest } from "../renderer";
 
@@ -122,8 +124,54 @@ export class HashlineFilesystem extends Filesystem {
 		return content;
 	}
 
-	async preflightWrite(relativePath: string): Promise<void> {
+	async readBinary(relativePath: string): Promise<Uint8Array | undefined> {
+		const absolutePath = this.resolveAbsolute(relativePath);
+		if (isNotebookPath(absolutePath)) return undefined;
+		try {
+			return await fs.readFile(absolutePath);
+		} catch (error) {
+			if (isEnoent(error)) throw new NotFoundError(relativePath, error);
+			throw error;
+		}
+	}
+
+	async preflightWrite(relativePath: string, options?: PreflightWriteOptions): Promise<void> {
+		const fileOp = options?.fileOp;
+		if (fileOp?.kind === "rem") {
+			enforcePlanModeWrite(this.session, relativePath, { op: "delete" });
+			return;
+		}
+		if (fileOp?.kind === "move") {
+			enforcePlanModeWrite(this.session, relativePath, { op: "update", move: fileOp.dest });
+			return;
+		}
 		enforcePlanModeWrite(this.session, relativePath, { op: "update" });
+	}
+
+	async delete(relativePath: string): Promise<void> {
+		enforcePlanModeWrite(this.session, relativePath, { op: "delete" });
+		const absolutePath = this.resolveAbsolute(relativePath);
+		try {
+			await fs.rm(absolutePath);
+		} catch (error) {
+			if (isEnoent(error)) throw new NotFoundError(relativePath, error);
+			throw error;
+		}
+		invalidateFsScanAfterWrite(absolutePath);
+	}
+
+	async move(fromRelative: string, toRelative: string, content?: string): Promise<void> {
+		enforcePlanModeWrite(this.session, fromRelative, { op: "update", move: toRelative });
+		const fromAbsolute = this.resolveAbsolute(fromRelative);
+		const toAbsolute = this.resolveAbsolute(toRelative);
+		if (content !== undefined) {
+			await Bun.write(toAbsolute, content);
+			await fs.rm(fromAbsolute);
+		} else {
+			await fs.rename(fromAbsolute, toAbsolute);
+		}
+		invalidateFsScanAfterWrite(fromAbsolute);
+		invalidateFsScanAfterWrite(toAbsolute);
 	}
 
 	async writeText(relativePath: string, content: string): Promise<WriteResult> {

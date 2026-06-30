@@ -4,7 +4,7 @@
 import { APP_NAME, CONFIG_DIR_NAME, logger } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
 import { CLI_THINKING_LEVELS, type ConfiguredThinkingLevel, parseCliThinkingLevel } from "../thinking";
-import { BUILTIN_TOOL_NAMES } from "../tools/builtin-names";
+import { BUILTIN_TOOL_NAMES, normalizeToolNames } from "../tools/builtin-names";
 import {
 	OPTIONAL_FLAGS,
 	OPTIONAL_VALUE_FLAGS,
@@ -90,8 +90,38 @@ const PARSE_DEPS: ParseDeps = {
 	logger,
 	parseThinking: parseCliThinkingLevel,
 	builtinToolNames: BUILTIN_TOOL_NAMES,
+	normalizeToolNames,
 	thinkingEfforts: CLI_THINKING_LEVELS,
 };
+
+const WINDOWS_PATH_VALUE_FLAGS: ReadonlySet<string> = new Set(["--extension", "-e", "--hook"]);
+const WINDOWS_PATH_START_RE =
+	/^(?:[A-Za-z]:[\\/]|\\\\[?]\\(?:[A-Za-z]:[\\/]|UNC[\\/])|\\\\[^\\/]+[\\/][^\\/]+[\\/]|\/\/[?]\/(?:[A-Za-z]:\/|UNC\/)|\/\/[^/]+\/[^/]+\/)/;
+const WINDOWS_MODULE_PATH_SUFFIX_RE = /\.(?:[cm]?[jt]sx?)$/i;
+
+function consumeBuiltInStringValue(flag: string, args: string[], valueIndex: number): { value: string; index: number } {
+	const value = args[valueIndex];
+	if (
+		value === undefined ||
+		!WINDOWS_PATH_VALUE_FLAGS.has(flag) ||
+		!WINDOWS_PATH_START_RE.test(value) ||
+		WINDOWS_MODULE_PATH_SUFFIX_RE.test(value)
+	) {
+		return { value: value ?? "", index: valueIndex };
+	}
+
+	let candidate = value;
+	for (let index = valueIndex + 1; index < args.length; index++) {
+		const next = args[index];
+		if (next === PROFILE_BOOTSTRAP_BOUNDARY_ARG || next.startsWith("-")) break;
+		candidate += ` ${next}`;
+		if (WINDOWS_MODULE_PATH_SUFFIX_RE.test(candidate)) {
+			return { value: candidate, index };
+		}
+	}
+
+	return { value, index: valueIndex };
+}
 
 export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { type: "boolean" | "string" }>): Args {
 	// Work on a copy: the `--option=value` handling below splices the value
@@ -160,7 +190,9 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			// here only when its boolean extension is NOT loaded) would otherwise swallow
 			// the marker as its value and drop the user's trailing message.
 			if (i + 1 < args.length && args[i + 1] !== PROFILE_BOOTSTRAP_BOUNDARY_ARG) {
-				STRING_SETTERS[arg](result, args[++i], PARSE_DEPS);
+				const consumed = consumeBuiltInStringValue(arg, args, i + 1);
+				i = consumed.index;
+				STRING_SETTERS[arg](result, consumed.value, PARSE_DEPS);
 			}
 		} else if (OPTIONAL_VALUE_FLAGS.has(arg)) {
 			const config = OPTIONAL_FLAGS[arg];
@@ -310,6 +342,8 @@ export function getExtraHelpText(): string {
   PERPLEXITY_API_KEY         - Perplexity web search API key (optional; anonymous fallback)
   PERPLEXITY_COOKIES         - Perplexity web search (session cookie)
   TAVILY_API_KEY             - Tavily web search
+  TINYFISH_API_KEY           - TinyFish web search
+  FIRECRAWL_API_KEY          - Firecrawl web search
   ANTHROPIC_SEARCH_API_KEY   - Anthropic web search (override; isolates search from main ANTHROPIC_API_KEY)
   ANTHROPIC_SEARCH_BASE_URL  - Anthropic web search base URL (override; pairs with ANTHROPIC_SEARCH_API_KEY)
 
@@ -330,7 +364,7 @@ ${chalk.bold("Available Tools (default-enabled unless noted):")}
   edit          - Edit files with find/replace
   write         - Write files (creates/overwrites)
   grep          - Search file contents
-  find          - Find files by glob pattern
+  glob          - Find files by glob pattern
   lsp           - Language server protocol (code intelligence)
   python        - Execute Python code (requires: ${APP_NAME} setup python)
   notebook      - Edit Jupyter notebooks

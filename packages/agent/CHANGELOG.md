@@ -2,6 +2,52 @@
 
 ## [Unreleased]
 
+## [16.2.4] - 2026-06-28
+
+### Changed
+
+- Improved the reliability of remote compaction by introducing transient error retries, configurable timeouts, and immediate termination upon user-initiated aborts.
+
+### Fixed
+
+- Fixed an issue where assistant responses and encrypted reasoning could be lost during local history trimming prior to remote compaction.
+- Fixed type compatibility for hosts with title audit entries by adding support for `title_change` session metadata.
+- Fixed an issue where transient stream read failures after a completed tool call were treated as terminal errors, allowing the agent to successfully execute the tool and continue the turn.
+
+## [16.2.3] - 2026-06-28
+
+### Changed
+
+- Enabled V2 streaming remote compaction by default for compatible AI and OpenAI-compatible models, which forwards full conversation history to the provider and supports session routing, prompt caching, provider-native tool history replay, transient error retries, and configurable timeouts.
+
+### Fixed
+
+- Fixed an issue where assistant responses and encrypted reasoning could be lost during local history trimming.
+- Added `title_change` session metadata to the compaction entry type union to maintain type compatibility for hosts with title audit entries.
+
+## [16.2.2] - 2026-06-27
+
+### Added
+
+- Added optional AgentTool.matcherPaths(args) and AgentTool.matcherEntries(args) hooks to allow tools to surface target file paths and isolate file evaluations for path-scoped stream matchers (e.g., when handling multi-file payloads or embedded paths in streamed arguments).
+
+### Removed
+
+- Removed support for Pi dialect integration.
+
+## [16.2.0] - 2026-06-27
+
+### Added
+
+- Added an optional `cwdResolver` to `Agent` and `getCwd` to `AgentLoopConfig` to dynamically resolve the working directory per LLM call, allowing workspace-scoped provider discovery (such as GitLab Duo Agent) to follow live directory changes without reconstructing the agent.
+
+### Fixed
+
+- Fixed an issue where API-level provider refusals were replayed as assistant dialogue on subsequent requests, preventing repeated refusals after a single blocked turn.
+- Fixed a bug where internal streaming state (`partialJson`) could leak onto the final `AssistantMessage` if a stream ended without a `toolcall_end` event.
+- Fixed `Agent` to correctly forward the working directory (`cwd`) into provider stream options, enabling providers like GitLab Duo Agent to scope local tool execution to the workspace.
+- Enabled custom OpenAI-compatible providers to use native remote compaction instead of falling back to local summarization.
+
 ## [16.1.23] - 2026-06-26
 
 ### Changed

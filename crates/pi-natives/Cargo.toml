@@ -20,6 +20,7 @@ base64.workspace = true
 clap.workspace = true
 dashmap.workspace = true
 globset.workspace = true
+fontdue.workspace = true
 grep-matcher.workspace = true
 grep-regex.workspace = true
 grep-searcher.workspace = true
@@ -36,6 +37,7 @@ phf.workspace = true
 pi-ast.workspace = true
 pi-iso.workspace = true
 pi-shell.workspace = true
+pi-uutils-ctx = { path = "../pi-uutils-ctx" }
 portable-pty.workspace = true
 png.workspace = true
 rayon.workspace = true

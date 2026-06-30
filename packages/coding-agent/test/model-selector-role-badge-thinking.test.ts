@@ -7,6 +7,7 @@ import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-regis
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ModelSelectorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/model-selector";
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { AUTO_THINKING, type ConfiguredThinkingLevel } from "@oh-my-pi/pi-coding-agent/thinking";
 import type { TUI } from "@oh-my-pi/pi-tui";
 
 function normalizeRenderedText(text: string): string {
@@ -66,7 +67,7 @@ function createContextTestModel(id: string, contextWindow: number): Model {
 function createScopedSelector(
 	models: Model[],
 	settings: Settings,
-	onSelect: (model: Model) => void,
+	onSelect: (model: Model, role: string | null, thinkingLevel?: ConfiguredThinkingLevel, selector?: string) => void,
 	options?: { temporaryOnly?: boolean; currentContextTokens?: number },
 ): ModelSelectorComponent {
 	const modelRegistry = {
@@ -83,7 +84,7 @@ function createScopedSelector(
 		settings,
 		modelRegistry,
 		models.map(model => ({ model })),
-		model => onSelect(model),
+		(model, role, thinkingLevel, selector) => onSelect(model, role, thinkingLevel, selector),
 		() => {},
 		options,
 	);
@@ -155,6 +156,26 @@ describe("ModelSelector role badge thinking display", () => {
 		expect(rendered).not.toContain("low medium high max");
 	});
 
+	test("reloads DEFAULT(auto) from defaultThinkingLevel", async () => {
+		installTestTheme();
+		const model = getBundledModel("openai", "gpt-5.5");
+		if (!model) throw new Error("Expected bundled model openai/gpt-5.5");
+
+		const settings = Settings.isolated({
+			defaultThinkingLevel: AUTO_THINKING,
+			modelRoles: {
+				default: `${model.provider}/${model.id}`,
+			},
+		});
+
+		const selector = createSelector(model, settings);
+		await Bun.sleep(0);
+		installTestTheme();
+
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("DEFAULT (auto)");
+	});
+
 	test("shows compact auto badges for unconfigured role defaults", async () => {
 		installTestTheme();
 		const settings = Settings.isolated({});
@@ -207,7 +228,7 @@ describe("ModelSelector role badge thinking display", () => {
 		expect(rendered).toContain("default/smol/plan/task/slow/custom roles");
 	});
 
-	test("opens the role assignment menu but guards over-context default switches", async () => {
+	test("opens over-context default role actions for global configuration", async () => {
 		installTestTheme();
 		const settings = Settings.isolated({});
 		const small = createContextTestModel("only-small", 4096);
@@ -225,12 +246,18 @@ describe("ModelSelector role badge thinking display", () => {
 		selector.handleInput("\n");
 		const afterOpen = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(afterOpen).toContain("Action for: only-small");
-		expect(afterOpen).toContain("Set as DEFAULT (Default) ⦸ context>4.1k");
+		expect(afterOpen).toContain("Set as DEFAULT (Default)");
+		expect(afterOpen).not.toContain("context>4.1k");
 
 		selector.handleInput("\n");
 		const afterRoleEnter = normalizeRenderedText(selector.render(220).join("\n"));
-		expect(afterRoleEnter).toContain("Thinking for: Fast (only-small)");
+		expect(afterRoleEnter).toContain("Thinking for: Default (only-small)");
 		expect(onSelect).not.toHaveBeenCalled();
+
+		selector.handleInput("\n");
+		expect(onSelect.mock.calls[0]?.[0]).toBe(small);
+		expect(onSelect.mock.calls[0]?.[1]).toBe("default");
+		expect(onSelect.mock.calls[0]?.[3]).toBe("test/only-small");
 	});
 
 	test("uses cached models for Enter while offline refresh is still pending", () => {

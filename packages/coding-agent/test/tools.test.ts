@@ -11,15 +11,15 @@ import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
-import { FindTool } from "@oh-my-pi/pi-coding-agent/tools/find";
 import { JobTool } from "@oh-my-pi/pi-coding-agent/tools/job";
 import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
-import { DEFAULT_FILE_LIMIT, MULTI_FILE_PER_FILE_MATCHES, SearchTool } from "@oh-my-pi/pi-coding-agent/tools/search";
 import * as toolTimeouts from "@oh-my-pi/pi-coding-agent/tools/tool-timeouts";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import { unzip } from "@oh-my-pi/pi-coding-agent/utils/zip";
 import { $which, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
+import { GlobTool } from "../src/tools/glob";
+import { DEFAULT_FILE_LIMIT, GrepTool, MULTI_FILE_PER_FILE_MATCHES } from "../src/tools/grep";
 
 // Helper to extract text from content blocks
 function getTextOutput(result: any): string {
@@ -268,8 +268,8 @@ describe("Coding Agent Tools", () => {
 	let writeTool: WriteTool;
 	let editTool: EditTool;
 	let bashTool: BashTool;
-	let searchTool: SearchTool;
-	let findTool: FindTool;
+	let searchTool: GrepTool;
+	let findTool: GlobTool;
 	let originalEditVariant: string | undefined;
 
 	beforeAll(async () => {
@@ -294,8 +294,8 @@ describe("Coding Agent Tools", () => {
 		writeTool = wrapToolWithMetaNotice(new WriteTool(session));
 		editTool = wrapToolWithMetaNotice(new EditTool(session));
 		bashTool = wrapToolWithMetaNotice(new BashTool(session));
-		searchTool = wrapToolWithMetaNotice(new SearchTool(session));
-		findTool = wrapToolWithMetaNotice(new FindTool(session));
+		searchTool = wrapToolWithMetaNotice(new GrepTool(session));
+		findTool = wrapToolWithMetaNotice(new GlobTool(session));
 	});
 
 	afterEach(() => {
@@ -578,15 +578,27 @@ describe("Coding Agent Tools", () => {
 			expect(output).toContain("Use :1 to read from the start, or :3 to read the last line.");
 		});
 
-		it("should emit a binary notice instead of mojibake for files with NUL bytes", async () => {
-			const testFile = path.join(testDir, "blob.bin");
-			fs.writeFileSync(testFile, Buffer.from([0x61, 0x62, 0x63, 0x00, 0xff, 0xfe, 0x64, 0x65]));
+		it("should refuse binary files (NUL or invalid UTF-8) instead of emitting mojibake", async () => {
+			const nulFile = path.join(testDir, "blob.bin");
+			fs.writeFileSync(nulFile, Buffer.from([0x61, 0x62, 0x63, 0x00, 0xff, 0xfe, 0x64, 0x65]));
+			// A header with no NUL but invalid UTF-8 (lone 0xFF/0xC0) must also refuse.
+			const invalidUtf8File = path.join(testDir, "font.ttfish");
+			fs.writeFileSync(invalidUtf8File, Buffer.from([0x4d, 0x5a, 0xff, 0xfe, 0xc0, 0xc0, 0x90, 0x91]));
 
-			const result = await readTool.execute("test-call-binary-nul", { path: testFile });
-			const output = getTextOutput(result);
+			for (const file of [nulFile, invalidUtf8File]) {
+				const output = getTextOutput(await readTool.execute("test-call-binary", { path: file }));
+				expect(output).toContain("Cannot read binary file");
+				expect(output).not.toContain("\u0000");
+				expect(output).not.toContain("\uFFFD");
+			}
+		});
 
-			expect(output).toContain("Cannot read binary file");
-			expect(output).toContain("NUL bytes");
+		it("reads a binary file verbatim when :raw is requested", async () => {
+			const testFile = path.join(testDir, "raw-blob.bin");
+			fs.writeFileSync(testFile, Buffer.from([0x61, 0x62, 0x63, 0x00, 0x64, 0x65]));
+
+			const output = getTextOutput(await readTool.execute("test-call-binary-raw", { path: `${testFile}:raw` }));
+			expect(output).not.toContain("Cannot read binary file");
 		});
 
 		it("should reject malformed internal-URL selectors instead of dumping the whole resource", async () => {
@@ -1691,9 +1703,9 @@ function b() {
 			const content = ["before", "match one", "after", "middle", "match two", "after two"].join("\n");
 			fs.writeFileSync(testFile, content);
 
-			const contextSettings = Settings.isolated({ "search.contextBefore": 1, "search.contextAfter": 1 });
+			const contextSettings = Settings.isolated({ "grep.contextBefore": 1, "grep.contextAfter": 1 });
 			const contextSearchTool = wrapToolWithMetaNotice(
-				new SearchTool(createTestToolSession(testDir, contextSettings)),
+				new GrepTool(createTestToolSession(testDir, contextSettings)),
 			);
 			const result = await contextSearchTool.execute("test-call-12", {
 				pattern: "match",
@@ -1713,9 +1725,9 @@ function b() {
 			const lines = Array.from({ length: 10 }, (_, idx) => (idx === 0 || idx === 5 ? "match" : `filler ${idx}`));
 			fs.writeFileSync(testFile, lines.join("\n"));
 
-			const noContextSettings = Settings.isolated({ "search.contextBefore": 0, "search.contextAfter": 0 });
+			const noContextSettings = Settings.isolated({ "grep.contextBefore": 0, "grep.contextAfter": 0 });
 			const noContextSearchTool = wrapToolWithMetaNotice(
-				new SearchTool(createTestToolSession(testDir, noContextSettings)),
+				new GrepTool(createTestToolSession(testDir, noContextSettings)),
 			);
 			const result = await noContextSearchTool.execute("test-call-12-gap", {
 				pattern: "match",

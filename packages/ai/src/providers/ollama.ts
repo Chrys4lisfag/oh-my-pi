@@ -1,5 +1,5 @@
-import { extractHttpStatusFromError, fetchWithRetry } from "@oh-my-pi/pi-utils";
-import { ProviderHttpError } from "../errors";
+import { fetchWithRetry, parseStreamingJson } from "@oh-my-pi/pi-utils";
+import * as AIError from "../error";
 import { getEnvApiKey } from "../stream";
 import type {
 	Api,
@@ -15,14 +15,14 @@ import type {
 	ToolChoice,
 } from "../types";
 import { normalizeSystemPrompts } from "../utils";
+import { clearStreamingPartialJson, kStreamingPartialJson } from "../utils/block-symbols";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import { type CapturedHttpErrorResponse, finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
+import type { CapturedHttpErrorResponse, RawHttpRequestDump } from "../utils/http-inspector";
 import {
 	armPreResponseTimeout,
 	getOpenAIStreamFirstEventTimeoutMs,
 	getOpenAIStreamIdleTimeoutMs,
 } from "../utils/idle-iterator";
-import { parseStreamingJson } from "../utils/json-parse";
 import { toolWireSchema } from "../utils/schema/wire";
 import {
 	getStreamMarkupHealingPattern,
@@ -32,11 +32,6 @@ import {
 } from "../utils/stream-markup-healing";
 import { transformMessages } from "./transform-messages";
 import { joinTextWithImagePlaceholder, partitionVisionContent } from "./vision-guard";
-
-/** Non-2xx response from the Ollama `/api/chat` endpoint. */
-export class OllamaApiError extends ProviderHttpError {
-	override readonly name = "OllamaApiError";
-}
 
 export interface OllamaChatOptions extends StreamOptions {
 	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -91,7 +86,7 @@ type OllamaChatChunk = {
 
 type InternalToolCallBlock = AssistantMessage["content"][number] & {
 	type: "toolCall";
-	partialJson?: string;
+	[kStreamingPartialJson]?: string;
 };
 
 function normalizeBaseUrl(baseUrl?: string): string {
@@ -328,6 +323,10 @@ function createChatBody(model: Model<"ollama-chat">, context: Context, options: 
 	};
 }
 
+function shouldRetryOllamaResponse(response: Response, bodyText: string): boolean {
+	return response.status < 500 || !AIError.LLAMA_CPP_TOOL_CALL_PARSE_PATTERN.test(bodyText);
+}
+
 async function captureHttpErrorResponse(response: Response): Promise<CapturedHttpErrorResponse> {
 	let bodyText: string | undefined;
 	let bodyJson: unknown;
@@ -417,9 +416,9 @@ function endToolCallBlock(stream: AssistantMessageEventStream, output: Assistant
 		return;
 	}
 	const toolCall = block as InternalToolCallBlock;
-	if (toolCall.partialJson) {
-		toolCall.arguments = parseStreamingJson<Record<string, unknown>>(toolCall.partialJson);
-		delete toolCall.partialJson;
+	if (toolCall[kStreamingPartialJson]) {
+		toolCall.arguments = parseStreamingJson<Record<string, unknown>>(toolCall[kStreamingPartialJson]);
+		clearStreamingPartialJson(toolCall);
 	}
 	stream.push({ type: "toolcall_end", contentIndex: index, toolCall, partial: output });
 }
@@ -457,7 +456,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 ): AssistantMessageEventStream => {
 	const stream = new AssistantMessageEventStream();
 	void (async () => {
-		const startTime = Date.now();
+		const startTime = performance.now();
 		let firstTokenTime: number | undefined;
 		const output = createEmptyOutput(model);
 		let rawRequestDump: RawHttpRequestDump | undefined;
@@ -470,6 +469,10 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 			? new StreamMarkupHealing({ pattern: streamMarkupHealingPattern })
 			: undefined;
 		let healedToolCallEmitted = false;
+		// Once the provider streams native reasoning (`message.thinking`), drop any
+		// thinking the text-channel healer also recovers so a model that emits both
+		// does not double-count its reasoning.
+		let suppressHealedThinking = false;
 		const endActiveTextBlock = (): void => {
 			if (activeTextIndex === undefined) return;
 			endTextBlock(stream, output, activeTextIndex);
@@ -498,7 +501,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 					partial: output,
 				});
 			}
-			if (!firstTokenTime) firstTokenTime = Date.now();
+			if (!firstTokenTime) firstTokenTime = performance.now();
 		};
 		const appendVisibleThinking = (thinking: string): void => {
 			if (thinking.length === 0) return;
@@ -518,7 +521,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 					partial: output,
 				});
 			}
-			if (!firstTokenTime) firstTokenTime = Date.now();
+			if (!firstTokenTime) firstTokenTime = performance.now();
 		};
 		const emitHealedToolCall = (call: HealedToolCall): void => {
 			endActiveThinkingBlock();
@@ -528,7 +531,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 				id: call.id,
 				name: call.name,
 				arguments: parseStreamingJson<Record<string, unknown>>(call.arguments),
-				partialJson: call.arguments,
+				[kStreamingPartialJson]: call.arguments,
 			};
 			output.content.push(toolCall);
 			const index = output.content.length - 1;
@@ -541,13 +544,13 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 			});
 			endToolCallBlock(stream, output, index);
 			healedToolCallEmitted = true;
-			if (!firstTokenTime) firstTokenTime = Date.now();
+			if (!firstTokenTime) firstTokenTime = performance.now();
 		};
 		const emitHealingEvent = (event: StreamMarkupHealingEvent): void => {
 			if (event.type === "text") {
 				appendVisibleText(event.text);
 			} else if (event.type === "thinking") {
-				appendVisibleThinking(event.thinking);
+				if (!suppressHealedThinking) appendVisibleThinking(event.thinking);
 			} else {
 				emitHealedToolCall(event.call);
 			}
@@ -559,7 +562,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 		try {
 			const apiKey = options.apiKey || getEnvApiKey(model.provider);
 			if (!apiKey) {
-				throw new Error(`No API key for provider: ${model.provider}`);
+				throw new AIError.MissingApiKeyError(model.provider);
 			}
 			const baseUrl = normalizeBaseUrl(model.baseUrl);
 			let body = createChatBody(model, context, options);
@@ -599,6 +602,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 					body: JSON.stringify(body),
 					signal: watchdog.signal,
 					defaultDelayMs: OLLAMA_RETRY_DELAYS_MS,
+					shouldRetryResponse: shouldRetryOllamaResponse,
 					fetch: options.fetch,
 					timeout: false,
 				});
@@ -607,16 +611,19 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 			}
 			if (!response.ok) {
 				capturedErrorResponse = await captureHttpErrorResponse(response);
-				throw new OllamaApiError(`HTTP ${response.status} from ${baseUrl}/api/chat`, response.status, {
+				throw new AIError.OllamaApiError(`HTTP ${response.status} from ${baseUrl}/api/chat`, response.status, {
 					headers: response.headers,
 				});
 			}
 			if (!response.body) {
-				throw new Error("Ollama returned an empty response body");
+				throw new AIError.OllamaApiError("Ollama returned an empty response body", response.status, {
+					headers: response.headers,
+				});
 			}
 			stream.push({ type: "start", partial: output });
 			for await (const chunk of iterateNdjson(response.body)) {
 				if (chunk.message?.thinking) {
+					suppressHealedThinking = true;
 					endActiveTextBlock();
 					if (activeThinkingIndex === undefined) {
 						output.content.push({ type: "thinking", thinking: "" });
@@ -634,7 +641,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 						});
 					}
 					if (!firstTokenTime) {
-						firstTokenTime = Date.now();
+						firstTokenTime = performance.now();
 					}
 				}
 				const chunkContent = chunk.message?.content;
@@ -663,7 +670,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 							id: `ollama:${output.content.length}:${name}`,
 							name,
 							arguments: parseStreamingJson<Record<string, unknown>>(partialJson),
-							partialJson,
+							[kStreamingPartialJson]: partialJson,
 						};
 						output.content.push(toolCall);
 						const index = output.content.length - 1;
@@ -676,7 +683,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 							partial: output,
 						});
 						if (!firstTokenTime) {
-							firstTokenTime = Date.now();
+							firstTokenTime = performance.now();
 						}
 					}
 				}
@@ -724,7 +731,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 			if (output.stopReason === "stop" && output.content.some(block => block.type === "toolCall")) {
 				output.stopReason = "toolUse";
 			}
-			output.duration = Date.now() - startTime;
+			output.duration = performance.now() - startTime;
 			if (firstTokenTime) {
 				output.ttft = firstTokenTime - startTime;
 			}
@@ -740,13 +747,21 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 		} catch (error) {
 			for (const block of output.content) {
 				if (block.type === "toolCall") {
-					delete (block as InternalToolCallBlock).partialJson;
+					clearStreamingPartialJson(block);
 				}
 			}
-			output.stopReason = options.signal?.aborted ? "aborted" : "error";
-			output.errorStatus = extractHttpStatusFromError(error);
-			output.errorMessage = await finalizeErrorMessage(error, rawRequestDump, capturedErrorResponse);
-			output.duration = Date.now() - startTime;
+			const result = await AIError.finalize(error, {
+				api: model.api,
+				provider: model.provider,
+				signal: options.signal,
+				rawRequestDump,
+				capturedErrorResponse,
+			});
+			output.stopReason = result.stopReason;
+			output.errorStatus = result.status;
+			output.errorId = result.id;
+			output.errorMessage = result.message;
+			output.duration = performance.now() - startTime;
 			if (firstTokenTime) {
 				output.ttft = firstTokenTime - startTime;
 			}

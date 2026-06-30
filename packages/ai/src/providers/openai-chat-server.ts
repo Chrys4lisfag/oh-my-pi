@@ -6,13 +6,14 @@ import { resolvePromptCacheKey } from "../auth-gateway/http";
  * `stream(model, context, options)`.
  */
 import type { AuthGatewayStreamControl, AuthGatewayParsedRequest as ParsedRequest } from "../auth-gateway/types";
+import * as AIError from "../error";
 import type {
 	AssistantMessage,
 	AssistantMessageEventStream,
 	Context,
 	ImageContent,
 	Message,
-	ResolvedServiceTier,
+	ServiceTier,
 	StopReason,
 	TextContent,
 	Tool,
@@ -37,7 +38,7 @@ function isReasoningEffort(value: unknown): value is ReasoningEffort {
 	return value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh";
 }
 
-function isServiceTier(value: unknown): value is ResolvedServiceTier {
+function isServiceTier(value: unknown): value is ServiceTier {
 	return value === "auto" || value === "default" || value === "flex" || value === "scale" || value === "priority";
 }
 
@@ -53,7 +54,7 @@ export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
 	// vendor-neutral headers when the body doesn't carry one.
 	const parsed = openaiChatRequestSchema(body);
 	if (parsed instanceof type.errors) {
-		throw new Error(`openai-chat: ${parsed.summary}`);
+		throw new AIError.ValidationError(`openai-chat: ${parsed.summary}`);
 	}
 	const data = parsed;
 

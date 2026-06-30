@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+## [16.2.7] - 2026-06-30
+
+### Fixed
+
+- Improved premium request calculation accuracy by correctly accounting for specific model families.
+
+## [16.2.6] - 2026-06-29
+
+### Fixed
+
+- Fixed application crashes and Bun aborts on macOS and when parsing large stats session files, including during `omp --smoke-test` runs, by utilizing a more resilient serial parser and lenient line scanner.
+
+## [16.2.3] - 2026-06-28
+
+### Added
+
+- Support for parsing named advisor transcripts using the `__advisor.<slug>.jsonl` naming convention.
+
+## [16.2.0] - 2026-06-27
+
+### Added
+
+- Added a Gain tab to the `omp stats` dashboard (`/#/gain`) to display snapcompact token-savings with project scoping from synced session folders.
+
 ## [16.1.17] - 2026-06-24
 
 ### Fixed

@@ -5,10 +5,11 @@ import * as path from "node:path";
 import { Effort, type FetchImpl, type Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
+import type { OpenAICompat } from "@oh-my-pi/pi-catalog/types";
 import { kNoAuth, ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { Snowflake } from "@oh-my-pi/pi-utils";
+import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 
 describe("ModelRegistry runtime discovery", () => {
 	let tempDir: string;
@@ -56,7 +57,7 @@ describe("ModelRegistry runtime discovery", () => {
 		}
 		authStorage.close();
 		if (tempDir && fs.existsSync(tempDir)) {
-			fs.rmSync(tempDir, { recursive: true });
+			removeSyncWithRetries(tempDir);
 		}
 	});
 
@@ -171,6 +172,22 @@ describe("ModelRegistry runtime discovery", () => {
 		const model = registry.find("ollama", "phi4-mini");
 		expect(model?.contextWindow).toBe(32768);
 		expect(model?.maxTokens).toBe(32768);
+	});
+
+	test("prefers Ollama runtime num_ctx over training context metadata", async () => {
+		const fetchMock = mockOllamaDiscovery(["qwen3:27b"], "http://127.0.0.1:11434", {
+			parameters: "temperature 0.6\nnum_ctx 123904\n",
+			model_info: {
+				"qwen3.context_length": 262144,
+			},
+			capabilities: ["completion", "thinking"],
+		});
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+
+		const model = registry.find("ollama", "qwen3:27b");
+		expect(model?.contextWindow).toBe(123904);
+		expect(model?.maxTokens).toBe(32_768);
 	});
 
 	test("discovers ollama-cloud through built-in descriptor flow without regressing local implicit ollama", async () => {
@@ -631,7 +648,7 @@ describe("ModelRegistry runtime discovery", () => {
 		const apiKey = await registry.getApiKey(llamaModels[0]);
 		expect(apiKey).toBe(kNoAuth);
 	});
-	test("llama.cpp discovery reads context window from props n_ctx", async () => {
+	test("llama.cpp discovery maps unlimited output limits to the context window", async () => {
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
 			if (url === "http://127.0.0.1:8080/models") {
@@ -645,6 +662,7 @@ describe("ModelRegistry runtime discovery", () => {
 					JSON.stringify({
 						default_generation_settings: {
 							n_ctx: 262144,
+							params: { max_tokens: -1, n_predict: -1 },
 						},
 						modalities: {
 							vision: true,
@@ -663,10 +681,42 @@ describe("ModelRegistry runtime discovery", () => {
 		await registry.refresh();
 		const llama = registry.find("llama.cpp", "qwen35-35b-a3b");
 		expect(llama?.contextWindow).toBe(262144);
-		expect(llama?.maxTokens).toBe(32_768);
+		expect(llama?.maxTokens).toBe(262144);
 		expect(llama?.input).toEqual(["text", "image"]);
 	});
-	test("llama.cpp discovery prefers per-model meta n_ctx over props", async () => {
+
+	test("llama.cpp discovery ignores positive props defaults as per-request limits, not hard caps", async () => {
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:8080/models") {
+				return new Response(JSON.stringify({ data: [{ id: "bounded-output" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url === "http://127.0.0.1:8080/props") {
+				return new Response(
+					JSON.stringify({
+						default_generation_settings: {
+							n_ctx: 262144,
+							params: { max_tokens: 65536, n_predict: 65536 },
+						},
+					}),
+					{
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					},
+				);
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		const llama = registry.find("llama.cpp", "bounded-output");
+		expect(llama?.contextWindow).toBe(262144);
+		expect(llama?.maxTokens).toBe(32_768);
+	});
+	test("llama.cpp discovery prefers runtime n_ctx over training context metadata", async () => {
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
 			if (url === "http://127.0.0.1:8080/models") {
@@ -695,11 +745,36 @@ describe("ModelRegistry runtime discovery", () => {
 		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 		await registry.refresh();
 		expect(registry.find("llama.cpp", "ctx-88k")?.contextWindow).toBe(88832);
+		expect(registry.find("llama.cpp", "ctx-train")?.contextWindow).toBe(128000);
+		expect(registry.find("llama.cpp", "unloaded")?.contextWindow).toBe(128000);
+	});
+
+	test("llama.cpp discovery falls back to n_ctx_train before the global default", async () => {
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:8080/models") {
+				return new Response(
+					JSON.stringify({
+						data: [{ id: "ctx-train", meta: { n_ctx_train: 65536 } }, { id: "unloaded" }],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			if (url === "http://127.0.0.1:8080/props") {
+				return new Response(JSON.stringify({ default_generation_settings: {} }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
 		expect(registry.find("llama.cpp", "ctx-train")?.contextWindow).toBe(65536);
 		expect(registry.find("llama.cpp", "unloaded")?.contextWindow).toBe(128000);
 	});
 
-	test("llama.cpp selected model refresh patches newly loaded meta n_ctx", async () => {
+	test("llama.cpp selected model refresh patches newly loaded meta n_ctx and unlimited output limit", async () => {
 		writeModelCache(
 			"llama.cpp",
 			Date.now(),
@@ -729,6 +804,20 @@ describe("ModelRegistry runtime discovery", () => {
 					headers: { "Content-Type": "application/json" },
 				});
 			}
+			if (url === "http://127.0.0.1:8080/props") {
+				return new Response(
+					JSON.stringify({
+						default_generation_settings: {
+							n_ctx: 239104,
+							params: { max_tokens: -1, n_predict: -1 },
+						},
+					}),
+					{
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					},
+				);
+			}
 			throw new Error(`Unexpected URL: ${url}`);
 		};
 		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
@@ -737,8 +826,128 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(stale.contextWindow).toBe(128000);
 		const refreshed = await registry.refreshSelectedModelMetadata(stale);
 		expect(refreshed.contextWindow).toBe(239104);
-		expect(refreshed.maxTokens).toBe(32768);
+		expect(refreshed.maxTokens).toBe(239104);
 		expect(registry.find("llama.cpp", "sleeping-model")?.contextWindow).toBe(239104);
+	});
+
+	test("llama.cpp selected model refresh leaves the cached model untouched when /models no longer lists it", async () => {
+		writeModelCache(
+			"llama.cpp",
+			Date.now(),
+			[
+				buildModel({
+					id: "swapped-out-model",
+					name: "swapped-out-model",
+					provider: "llama.cpp",
+					api: "openai-responses",
+					baseUrl: "http://127.0.0.1:8080",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128000,
+					maxTokens: 32768,
+				}),
+			],
+			true,
+			"",
+			cacheDbPath,
+		);
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:8080/models") {
+				return new Response(JSON.stringify({ data: [{ id: "another-model", meta: { n_ctx: 524288 } }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url === "http://127.0.0.1:8080/props") {
+				return new Response(
+					JSON.stringify({
+						default_generation_settings: {
+							n_ctx: 524288,
+							params: { max_tokens: -1, n_predict: -1 },
+						},
+					}),
+					{
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					},
+				);
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		const stale = registry.find("llama.cpp", "swapped-out-model");
+		if (!stale) throw new Error("cached llama.cpp model missing");
+		const refreshed = await registry.refreshSelectedModelMetadata(stale);
+		expect(refreshed.contextWindow).toBe(128000);
+		expect(refreshed.maxTokens).toBe(32768);
+	});
+
+	test("llama.cpp selected model refresh clamps unlimited output to overridden context", async () => {
+		writeRawModelsJson({
+			"llama.cpp": {
+				baseUrl: "http://127.0.0.1:8080",
+				api: "openai-responses",
+				auth: "none",
+				discovery: { type: "llama.cpp" },
+				modelOverrides: {
+					"bounded-context-model": { contextWindow: 128000 },
+				},
+			},
+		});
+		writeModelCache(
+			"llama.cpp",
+			Date.now(),
+			[
+				buildModel({
+					id: "bounded-context-model",
+					name: "bounded-context-model",
+					provider: "llama.cpp",
+					api: "openai-responses",
+					baseUrl: "http://127.0.0.1:8080",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 262144,
+					maxTokens: 32768,
+				}),
+			],
+			true,
+			"",
+			cacheDbPath,
+		);
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:8080/models") {
+				return new Response(JSON.stringify({ data: [{ id: "bounded-context-model", meta: { n_ctx: 262144 } }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url === "http://127.0.0.1:8080/props") {
+				return new Response(
+					JSON.stringify({
+						default_generation_settings: {
+							n_ctx: 262144,
+							params: { max_tokens: -1, n_predict: -1 },
+						},
+					}),
+					{
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					},
+				);
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		const bounded = registry.find("llama.cpp", "bounded-context-model");
+		if (!bounded) throw new Error("cached llama.cpp model missing");
+		expect(bounded.contextWindow).toBe(128000);
+		const refreshed = await registry.refreshSelectedModelMetadata(bounded);
+		expect(refreshed.contextWindow).toBe(128000);
+		expect(refreshed.maxTokens).toBe(128000);
 	});
 
 	test("llama.cpp selected model refresh does not resolve command api keys", async () => {
@@ -932,5 +1141,200 @@ describe("ModelRegistry runtime discovery", () => {
 		// never pinning the model at a broken `0` window.
 		const zeroCtx = registry.getAll().find(m => m.provider === "proxy-test" && m.id === "zero-context-model");
 		expect(zeroCtx?.contextWindow).toBe(128000);
+	});
+
+	test("litellm discovery maps rich model metadata and keeps runtime /v1 baseUrl", async () => {
+		writeRawModelsJson({
+			"litellm-test": {
+				baseUrl: "http://127.0.0.1:4000",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "litellm" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:4000/model_group/info") {
+				return Response.json({
+					data: [
+						{
+							model_group: "gpt-big",
+							max_input_tokens: 262_144,
+							max_output_tokens: 16_384,
+							supports_vision: true,
+							supports_reasoning: true,
+							supported_openai_params: ["reasoning_effort"],
+						},
+					],
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		const model = registry.find("litellm-test", "gpt-big");
+
+		expect(model?.baseUrl).toBe("http://127.0.0.1:4000/v1");
+		expect(model?.contextWindow).toBe(262_144);
+		expect(model?.maxTokens).toBe(16_384);
+		expect(model?.input).toEqual(["text", "image"]);
+		expect(model?.reasoning).toBe(true);
+	});
+
+	test("litellm discovery enriches configured proxy models with bundled references", async () => {
+		writeRawModelsJson({
+			"litellm-test": {
+				baseUrl: "http://127.0.0.1:4000/v1",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "litellm" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:4000/model_group/info") {
+				return Response.json({ data: [{ model_group: "gpt-5", supports_reasoning: true }] });
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		const model = registry.find("litellm-test", "gpt-5");
+
+		expect(model?.name).toBe("GPT-5");
+		expect(model?.contextWindow).toBe(400_000);
+		expect(model?.maxTokens).toBe(128_000);
+		expect(model?.thinking?.mode).toBe("effort");
+		expect((model?.compat as OpenAICompat | undefined)?.supportsReasoningEffort).toBe(true);
+	});
+
+	test("litellm discovery defaults to LiteLLM local proxy when baseUrl is omitted", async () => {
+		writeRawModelsJson({
+			"litellm-test": {
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "litellm" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://localhost:4000/model_group/info") {
+				return new Response("{}", { status: 404 });
+			}
+			if (url === "http://localhost:4000/v2/model/info" || url === "http://localhost:4000/model/info") {
+				return new Response("{}", { status: 404 });
+			}
+			if (url === "http://localhost:4000/v1/model/info") {
+				return new Response("{}", { status: 404 });
+			}
+			if (url === "http://localhost:4000/v1/models") {
+				return Response.json({ data: [{ id: "default-litellm" }] });
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+
+		expect(registry.find("litellm-test", "default-litellm")?.baseUrl).toBe("http://localhost:4000/v1");
+	});
+
+	test("litellm discovery reuses configured bearer on rich and fallback requests", async () => {
+		writeRawModelsJson({
+			"litellm-test": {
+				baseUrl: "http://127.0.0.1:4001",
+				apiKey: "sk-1234",
+				api: "openai-completions",
+				auth: "apiKey",
+				discovery: { type: "litellm" },
+			},
+		});
+		const authByUrl = new Map<string, string | undefined>();
+		const fetchMock: FetchImpl = async (input, init) => {
+			const url = String(input);
+			const headers = init?.headers as Record<string, string> | undefined;
+			authByUrl.set(url, headers?.Authorization);
+			if (url === "http://127.0.0.1:4001/model_group/info") {
+				return new Response("{}", { status: 401 });
+			}
+			if (url === "http://127.0.0.1:4001/v2/model/info") {
+				return new Response("{}", { status: 500 });
+			}
+			if (url === "http://127.0.0.1:4001/model/info" || url === "http://127.0.0.1:4001/v1/model/info") {
+				return new Response("{}", { status: 404 });
+			}
+			if (url === "http://127.0.0.1:4001/v1/models") {
+				return Response.json({ data: [{ id: "fallback-model" }] });
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+
+		expect(authByUrl.get("http://127.0.0.1:4001/model_group/info")).toBe("Bearer sk-1234");
+		expect(authByUrl.get("http://127.0.0.1:4001/v2/model/info")).toBe("Bearer sk-1234");
+		expect(authByUrl.get("http://127.0.0.1:4001/model/info")).toBe("Bearer sk-1234");
+		expect(authByUrl.get("http://127.0.0.1:4001/v1/model/info")).toBe("Bearer sk-1234");
+		expect(authByUrl.get("http://127.0.0.1:4001/v1/models")).toBe("Bearer sk-1234");
+		expect(registry.getProviderDiscoveryState("litellm-test")?.status).toBe("ok");
+		expect(registry.find("litellm-test", "fallback-model")?.baseUrl).toBe("http://127.0.0.1:4001/v1");
+	});
+
+	test("litellm discovery rejects invalid rich limits and falls back safely", async () => {
+		writeRawModelsJson({
+			"litellm-test": {
+				baseUrl: "http://127.0.0.1:4002/v1",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "litellm" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:4002/model_group/info") {
+				return Response.json({
+					data: [{ model_group: "bad-limits", max_input_tokens: 0, max_output_tokens: "nope" }],
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		const model = registry.find("litellm-test", "bad-limits");
+
+		expect(model?.contextWindow).toBe(128000);
+		expect(model?.maxTokens).toBe(32768);
+	});
+
+	test("litellm discovery accepts v2 model info when model_group info is absent", async () => {
+		writeRawModelsJson({
+			"litellm-test": {
+				baseUrl: "http://127.0.0.1:4003/v1",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "litellm" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:4003/model_group/info") {
+				return new Response("{}", { status: 404 });
+			}
+			if (url === "http://127.0.0.1:4003/v2/model/info") {
+				return Response.json({
+					data: [
+						{
+							model_name: "team-gpt",
+							model_info: { id: "deployment-id", max_input_tokens: 200_000, max_output_tokens: 12_000 },
+						},
+					],
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+
+		expect(registry.find("litellm-test", "team-gpt")?.contextWindow).toBe(200_000);
+		expect(registry.find("litellm-test", "deployment-id")).toBeUndefined();
 	});
 });

@@ -18,6 +18,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/edit";
 import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import { type Type, type } from "arktype";
 
 beforeAll(async () => {
@@ -55,7 +56,7 @@ async function withTempDir(fn: (tempDir: string) => Promise<void>): Promise<void
 	try {
 		await fn(tempDir);
 	} finally {
-		await fs.rm(tempDir, { recursive: true, force: true });
+		await removeWithRetries(tempDir);
 	}
 }
 
@@ -107,6 +108,56 @@ describe("hashline executor", () => {
 			expect(await Bun.file(filePath).text()).toBe("aaa\nbbb\nccc\nbbb\nccc\nNEW");
 			expect(text).not.toContain("Auto-dropped");
 			expect(text).not.toContain("Auto-absorbed");
+		});
+	});
+
+	it("preserves UTF-8 BOM bytes when hashline edits decoded text", async () => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "Program.cs");
+			const source = "using A;\n";
+			await Bun.write(filePath, new Uint8Array([0xef, 0xbb, 0xbf, ...new TextEncoder().encode(source)]));
+			const session = makeHashlineSession(tempDir);
+			const sourceTag = recordFullSnapshot(getFileReadCache(session), filePath, source);
+			const input = `${header("Program.cs", sourceTag)}\n${sameLineRange(tag(1, source))}\n${repl("using B;")}\n`;
+
+			await executeHashlineSingle(hashlineExecuteOptions(tempDir, input, undefined, session));
+
+			const bytes = await fs.readFile(filePath);
+			expect(Array.from(bytes.subarray(0, 3))).toEqual([0xef, 0xbb, 0xbf]);
+			expect(new TextDecoder().decode(bytes.subarray(3))).toBe("using B;\n");
+		});
+	});
+
+	it("edits BOM-prefixed notebooks through the virtual cell text", async () => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "notebook.ipynb");
+			const notebook = {
+				cells: [
+					{
+						cell_type: "markdown",
+						metadata: { keep: true },
+						source: ["# Title\n"],
+					},
+				],
+				metadata: {},
+				nbformat: 4,
+				nbformat_minor: 5,
+			};
+			await Bun.write(
+				filePath,
+				new Uint8Array([0xef, 0xbb, 0xbf, ...new TextEncoder().encode(JSON.stringify(notebook))]),
+			);
+			const session = makeHashlineSession(tempDir);
+			const editableText = "# %% [markdown] cell:0\n# Title\n";
+			const sourceTag = recordFullSnapshot(getFileReadCache(session), filePath, editableText);
+			const input = `${header("notebook.ipynb", sourceTag)}\n${sameLineRange(tag(2, "# Title"))}\n${repl("# Updated")}\n`;
+
+			await executeHashlineSingle(hashlineExecuteOptions(tempDir, input, undefined, session));
+
+			const updated = await Bun.file(filePath).json();
+			expect(updated.cells).toHaveLength(1);
+			expect(updated.cells[0].source).toEqual(["# Updated\n"]);
+			expect(updated.cells[0].metadata).toEqual({ keep: true });
 		});
 	});
 

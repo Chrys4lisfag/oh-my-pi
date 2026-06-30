@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [16.2.8] - 2026-06-30
+
+### Fixed
+
+- Fixed hashline writes preserving UTF-8 BOM bytes when the host text decoder hides the leading `U+FEFF`. ([#3867](https://github.com/can1357/oh-my-pi/issues/3867))
+
+## [16.2.6] - 2026-06-29
+
+### Fixed
+
+- Fixed a parser error ("payload line has no preceding hunk header") caused by stray dots before the trailing colon in hunk headers, improving compatibility with GLM 5.2 outputs.
+
+## [16.2.0] - 2026-06-27
+
+### Added
+
+- Added `REM` (remove) and `MV` (move/rename) section operations to hashline patches, allowing files to be deleted or relocated (with snapshot history migration) directly within the edit tool.
+
 ## [16.1.23] - 2026-06-26
 
 ### Added

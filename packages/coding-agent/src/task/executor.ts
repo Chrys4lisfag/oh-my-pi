@@ -7,7 +7,7 @@
 import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentTelemetryConfig, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
-import type { Api, Model, ServiceTier, Usage } from "@oh-my-pi/pi-ai";
+import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
 import { logger, popLoopPhase, prompt, pushLoopPhase, untilAborted } from "@oh-my-pi/pi-utils";
 import type { Rule } from "../capability/rule";
 import { ModelRegistry } from "../config/model-registry";
@@ -18,7 +18,7 @@ import {
 	resolveModelOverrideWithAuthFallback,
 } from "../config/model-resolver";
 import type { PromptTemplate } from "../config/prompt-templates";
-import { resolveSubagentServiceTier } from "../config/service-tier";
+import { buildServiceTierByFamily, resolveSubagentServiceTier } from "../config/service-tier";
 import { Settings } from "../config/settings";
 import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
 import type { ToolPathWithSource } from "../extensibility/custom-tools";
@@ -56,7 +56,6 @@ import { ToolAbortError } from "../tools/tool-errors";
 import type { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
-import { Semaphore } from "./parallel";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import {
 	type AgentDefinition,
@@ -71,7 +70,11 @@ import {
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
 	type TaskToolDetails,
+	type YieldItem,
 } from "./types";
+import { arrayValuedLabels, assembleYieldResult } from "./yield-assembly";
+
+export type { YieldItem } from "./types";
 
 const MCP_CALL_TIMEOUT_MS = 60_000;
 
@@ -84,7 +87,7 @@ const MCP_CALL_TIMEOUT_MS = 60_000;
  */
 export const SOFT_REQUEST_BUDGET: Record<string, number> = {
 	explore: 40,
-	quick_task: 40,
+	sonic: 40,
 	default: 90,
 };
 
@@ -193,51 +196,6 @@ function installSubagentRetryFallbackChain(args: {
 	}
 	settings.override("retry.fallbackChains", fallbackChains);
 	return role;
-}
-
-const PROVIDER_MAX_CONCURRENCY_SETTINGS: Record<string, SettingPath> = {
-	"ollama-cloud": "providers.ollama-cloud.maxConcurrency",
-};
-
-interface ProviderSemaphoreEntry {
-	limit: number;
-	semaphore: Semaphore;
-}
-
-const providerSemaphores = new Map<string, ProviderSemaphoreEntry>();
-
-/**
- * Resolve the configured concurrency ceiling for a provider, or `undefined`
- * when the provider has no cap concept at all. A configured value `<= 0` means
- * "unlimited" and maps to `Infinity` — still a tracked ceiling, so every run
- * holds a slot and a later finite resize counts work started while unlimited.
- */
-function getProviderConcurrencyLimit(settings: Settings, provider: string): number | undefined {
-	const settingPath = PROVIDER_MAX_CONCURRENCY_SETTINGS[provider];
-	if (!settingPath) return undefined;
-	const raw = settings.get(settingPath);
-	const limit = Number.isFinite(raw) ? Math.trunc(raw) : 0;
-	return limit > 0 ? limit : Number.POSITIVE_INFINITY;
-}
-
-function getProviderSemaphore(settings: Settings, provider: string): Semaphore | undefined {
-	const limit = getProviderConcurrencyLimit(settings, provider);
-	if (limit === undefined) return undefined;
-	// Always hand out (and acquire on) the single shared limiter, even when
-	// unlimited (Infinity). Resizing it in place — rather than replacing it —
-	// keeps every in-flight slot counted, so a runtime or mixed limit change can
-	// never push concurrency past the cap (issue #3464 review feedback).
-	const existing = providerSemaphores.get(provider);
-	if (existing) {
-		if (existing.limit !== limit) {
-			existing.limit = limit;
-			existing.semaphore.resize(limit);
-		}
-		return existing.semaphore;
-	}
-	const semaphore = new Semaphore(limit);
-	providerSemaphores.set(provider, { limit, semaphore });
-	return semaphore;
 }
 
 function renderIrcPeerRoster(selfId: string): string {
@@ -386,12 +344,12 @@ export interface ExecutorOptions {
 	modelRegistry?: ModelRegistry;
 	settings?: Settings;
 	/**
-	 * Parent session's live effective service tier, the source of truth for a
-	 * subagent whose `serviceTierSubagent` is `"inherit"`. `null` = the parent
+	 * Parent session's live per-family service tiers, the source of truth for a
+	 * subagent whose `tier.subagent` is `"inherit"`. `null` = the parent
 	 * explicitly has no tier (e.g. `/fast off`); omitted = no live session, so
-	 * inherit falls back to the configured `serviceTier` setting.
+	 * inherit falls back to the subagent's configured `tier.*` settings.
 	 */
-	parentServiceTier?: ServiceTier | null;
+	parentServiceTier?: ServiceTierByFamily | null;
 	/** Override local:// protocol options so subagent shares parent's local:// root */
 	localProtocolOptions?: LocalProtocolOptions;
 	/**
@@ -421,6 +379,12 @@ export interface ExecutorOptions {
 	 * passes its own `getAgentId()`).
 	 */
 	parentAgentId?: string;
+	/**
+	 * Keep the finished subagent addressable in the registry for IRC/revival.
+	 * Defaults to true. Eval bridge agents are programmatic one-shot helpers and
+	 * set this false so disposal unregisters them instead of leaving idle peers.
+	 */
+	keepAlive?: boolean;
 }
 
 function parseStringifiedJson(value: unknown): unknown {
@@ -511,21 +475,6 @@ function resolveFallbackCompletion(rawOutput: string, outputSchema: unknown): { 
 	return { data: candidate };
 }
 
-export interface YieldItem {
-	data?: unknown;
-	status?: "success" | "aborted";
-	error?: string;
-	/**
-	 * Set by the in-tool yield validator when it exhausted its retry budget
-	 * (MAX_SCHEMA_RETRIES) and accepted a schema-invalid payload anyway.
-	 * `finalizeSubprocessOutput` honors this by serializing the payload and
-	 * surfacing a stderr warning, instead of re-emitting `schema_violation`
-	 * — which would silently swap the subagent's "accepted" view for a
-	 * different, opaque error blob in the parent's view of the result.
-	 */
-	schemaOverridden?: boolean;
-}
-
 interface FinalizeSubprocessOutputArgs {
 	rawOutput: string;
 	exitCode: number;
@@ -535,6 +484,7 @@ interface FinalizeSubprocessOutputArgs {
 	yieldItems?: YieldItem[];
 	reportFindings?: ReviewFinding[];
 	outputSchema: unknown;
+	lastAssistantText?: string;
 }
 
 interface FinalizeSubprocessOutputResult {
@@ -577,7 +527,7 @@ function buildSchemaViolationOutcome(
 
 export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): FinalizeSubprocessOutputResult {
 	let { rawOutput, exitCode, stderr } = args;
-	const { yieldItems, reportFindings, doneAborted, signalAborted, outputSchema } = args;
+	const { yieldItems, reportFindings, doneAborted, signalAborted, outputSchema, lastAssistantText } = args;
 	let abortedViaYield = false;
 	const hasYield = Array.isArray(yieldItems) && yieldItems.length > 0;
 	const hadFailureBeforeYield = exitCode !== 0 && stderr.trim().length > 0;
@@ -594,15 +544,16 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 				rawOutput = `{"aborted":true,"error":"${lastYield.error || "Unknown error"}"}`;
 			}
 		} else {
-			const submitData = lastYield?.data;
-			if (submitData === null || submitData === undefined) {
+			const assembled = assembleYieldResult(yieldItems, lastAssistantText, arrayValuedLabels(outputSchema));
+			if (!assembled || assembled.missingData) {
 				rawOutput = rawOutput ? `${SUBAGENT_WARNING_NULL_YIELD}\n\n${rawOutput}` : SUBAGENT_WARNING_NULL_YIELD;
 			} else {
 				const { validator, error: schemaError } = buildOutputValidator(outputSchema);
-				const overridden = lastYield?.schemaOverridden === true;
-				const completeData = normalizeCompleteData(submitData, reportFindings, validator);
+				const completeData = assembled.rawText
+					? assembled.data
+					: normalizeCompleteData(assembled.data, reportFindings, validator);
 				const result =
-					schemaError || overridden
+					schemaError || assembled.schemaOverridden
 						? { success: true as const }
 						: (validator?.validate(completeData) ?? { success: true as const });
 				if (!result.success) {
@@ -613,14 +564,17 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 					exitCode = outcome.exitCode;
 				} else {
 					try {
-						rawOutput = JSON.stringify(completeData, null, 2) ?? "null";
+						rawOutput =
+							assembled.rawText && typeof completeData === "string"
+								? completeData
+								: (JSON.stringify(completeData, null, 2) ?? "null");
 					} catch (err) {
 						const errorMessage = err instanceof Error ? err.message : String(err);
 						rawOutput = `{"error":"Failed to serialize yield data: ${errorMessage}"}`;
 					}
 					if (!hadFailureBeforeYield) {
 						exitCode = 0;
-						stderr = overridden
+						stderr = assembled.schemaOverridden
 							? SUBAGENT_WARNING_SCHEMA_OVERRIDDEN
 							: schemaError
 								? `invalid output schema: ${schemaError}`
@@ -785,21 +739,28 @@ export function createMCPProxyTools(mcpManager: MCPManager): CustomTool[] {
 export function createSubagentSettings(
 	baseSettings: Settings,
 	overrides?: Partial<Record<SettingPath, unknown>>,
-	inheritedServiceTier?: ServiceTier | null,
+	inheritedServiceTier?: ServiceTierByFamily | null,
 ): Settings {
 	const snapshot: Partial<Record<SettingPath, unknown>> = {};
 	for (const key of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
 		snapshot[key] = baseSettings.get(key);
 	}
-	// Resolve the subagent's service tier from `serviceTierSubagent` ("inherit" =
-	// match the parent's live tier when a live session supplied one, else the
-	// configured `serviceTier`). The result is stamped back onto the snapshot so
-	// createAgentSession's `settings.get("serviceTier")` read picks it up.
-	snapshot.serviceTier = resolveSubagentServiceTier(
-		baseSettings.get("serviceTierSubagent"),
-		baseSettings.get("serviceTier"),
-		inheritedServiceTier,
-	);
+	// Resolve the subagent's per-family tiers from `tier.subagent` ("inherit" =
+	// match the parent's live tiers when a live session supplied them, else the
+	// subagent's own configured tier.* settings). The result is stamped back onto
+	// the snapshot so createAgentSession's tier.* reads pick it up.
+	const inheritedTiers =
+		inheritedServiceTier === undefined
+			? buildServiceTierByFamily(
+					baseSettings.get("tier.openai"),
+					baseSettings.get("tier.anthropic"),
+					baseSettings.get("tier.google"),
+				)
+			: (inheritedServiceTier ?? {});
+	const subagentTiers = resolveSubagentServiceTier(baseSettings.get("tier.subagent"), inheritedTiers);
+	snapshot["tier.openai"] = subagentTiers.openai ?? "none";
+	snapshot["tier.anthropic"] = subagentTiers.anthropic ?? "none";
+	snapshot["tier.google"] = subagentTiers.google ?? "none";
 	return Settings.isolated({
 		...snapshot,
 		"async.enabled": false,
@@ -854,6 +815,8 @@ interface SubagentRunMonitor {
 	/** Whether the (attempted) abort counts as a cancelled run rather than an internal failure. */
 	isAbortedRun(): boolean;
 	requestAbort(reason: AbortReason): void;
+	abortActiveSession(): Promise<void>;
+	waitForActiveSessionAbort(): Promise<void>;
 	resolveSignalAbortReason(): string;
 	resolveAbortReasonText(): string;
 	setActiveSession(session: AgentSession | null): void;
@@ -917,12 +880,29 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		cacheRead: 0,
 		cacheWrite: 0,
 		totalTokens: 0,
+		reasoningTokens: 0,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
 	let hasUsage = false;
 	let budgetSteerSent = false;
 	let budgetLimitExceeded = false;
 	let lastAssistantSalvageText: string | undefined;
+	let activeSessionAbortPromise: Promise<void> | undefined;
+
+	const abortActiveSession = (): Promise<void> => {
+		const session = activeSession;
+		if (!session) return Promise.resolve();
+		activeSessionAbortPromise ??= session.abort().catch(error => {
+			logger.debug("Subagent session abort cleanup failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+		return activeSessionAbortPromise;
+	};
+
+	const waitForActiveSessionAbort = async (): Promise<void> => {
+		if (activeSessionAbortPromise) await activeSessionAbortPromise;
+	};
 
 	const requestAbort = (reason: AbortReason) => {
 		if (reason === "timeout") {
@@ -941,9 +921,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		abortSent = true;
 		abortReason = reason;
 		abortController.abort();
-		if (activeSession) {
-			void activeSession.abort();
-		}
+		void abortActiveSession();
 	};
 
 	// Handle abort signal
@@ -1293,6 +1271,8 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 						accumulatedUsage.cacheRead += getNumberField(usageRecord, "cacheRead") ?? 0;
 						accumulatedUsage.cacheWrite += getNumberField(usageRecord, "cacheWrite") ?? 0;
 						accumulatedUsage.totalTokens += getNumberField(usageRecord, "totalTokens") ?? 0;
+						accumulatedUsage.reasoningTokens =
+							(accumulatedUsage.reasoningTokens ?? 0) + (getNumberField(usageRecord, "reasoningTokens") ?? 0);
 						if (costRecord) {
 							accumulatedUsage.cost.input += getNumberField(costRecord, "input") ?? 0;
 							accumulatedUsage.cost.output += getNumberField(costRecord, "output") ?? 0;
@@ -1423,6 +1403,8 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		isAbortedRun: () =>
 			abortReason === "signal" || runtimeLimitExceeded || budgetLimitExceeded || abortReason === undefined,
 		requestAbort,
+		abortActiveSession,
+		waitForActiveSessionAbort,
 		resolveSignalAbortReason,
 		resolveAbortReasonText,
 		setActiveSession: session => {
@@ -1641,6 +1623,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 			yieldItems,
 			reportFindings,
 			outputSchema: args.outputSchema,
+			lastAssistantText: monitor.lastAssistantSalvageText(),
 		});
 	} finally {
 		popLoopPhase();
@@ -1750,6 +1733,59 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		retryFailure: progress.retryFailure,
 		outputMeta,
 	};
+}
+
+export async function finalizeSubagentLifecycle(args: {
+	id: string;
+	session: AgentSession;
+	aborted: boolean;
+	keepAlive: boolean;
+	isolated: boolean;
+	agentIdleTtlMs: number;
+	reviveSession: (() => Promise<AgentSession>) | null;
+}): Promise<void> {
+	const registry = AgentRegistry.global();
+	const disposeSession = async (): Promise<void> => {
+		try {
+			await untilAborted(AbortSignal.timeout(5000), () => args.session.dispose());
+		} catch {
+			// Ignore cleanup errors
+		}
+	};
+
+	if (args.aborted) {
+		// Hard abort (caller signal / wall-clock / budget): terminal teardown.
+		registry.setStatus(args.id, "aborted");
+		await disposeSession();
+		return;
+	}
+
+	if (!args.keepAlive) {
+		// One-shot helper: dispose and unregister. No IRC, no revival.
+		await disposeSession();
+		registry.unregister(args.id);
+		return;
+	}
+
+	if (args.isolated) {
+		// Isolated run: the worktree is merged + cleaned after the run, so
+		// the session is not resumable. Park the ref WITHOUT adopting — the
+		// transcript stays reachable (history://), but ensureLive will throw.
+		// Status must flip to "parked" before dispose so the sdk dispose
+		// wrapper skips unregister.
+		registry.setStatus(args.id, "parked");
+		await disposeSession();
+		registry.detachSession(args.id);
+		return;
+	}
+
+	// Keep-alive: finished and failed subagents both stay interrogable.
+	// The lifecycle manager owns idle-TTL parking + revival from here on.
+	registry.setStatus(args.id, "idle");
+	AgentLifecycleManager.global().adopt(args.id, {
+		idleTtlMs: args.agentIdleTtlMs,
+		revive: args.reviveSession ?? undefined,
+	});
 }
 
 /**
@@ -1953,8 +1989,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		let sessionOpenedAt: number | undefined;
 		let sessionCreatedAt: number | undefined;
 		let readyAt: number | undefined;
-		let providerSemaphore: Semaphore | undefined;
-		let providerSemaphoreAcquired = false;
 
 		try {
 			checkAbort();
@@ -2023,13 +2057,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				? resolvedThinkingLevel
 				: (thinkingLevel ?? resolvedThinkingLevel);
 			resolvedAt = performance.now();
-			if (model) {
-				providerSemaphore = getProviderSemaphore(settings, model.provider);
-				if (providerSemaphore) {
-					await providerSemaphore.acquire(abortSignal);
-					providerSemaphoreAcquired = true;
-				}
-			}
 
 			const effectiveCwd = worktree ?? cwd;
 			const sessionManager = sessionFile
@@ -2211,7 +2238,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			abortSignal.addEventListener(
 				"abort",
 				() => {
-					void session.abort();
+					void monitor.abortActiveSession();
 				},
 				{ once: true, signal: sessionAbortController.signal },
 			);
@@ -2219,7 +2246,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// the awaited setup above, the listener registration races the dispatch
 			// and may not observe the already-fired abort event. Mirror it manually.
 			if (abortSignal.aborted) {
-				void session.abort();
+				void monitor.abortActiveSession();
 			}
 
 			const pendingExtensionMessages: Array<Promise<unknown>> = [];
@@ -2320,11 +2347,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				}
 				if (exitCode === 0) exitCode = 1;
 			}
-			if (providerSemaphoreAcquired) {
-				providerSemaphore?.release();
-				providerSemaphoreAcquired = false;
-			}
 			sessionAbortController.abort();
+			try {
+				await untilAborted(AbortSignal.timeout(5000), () => monitor.waitForActiveSessionAbort());
+			} catch {
+				// Ignore abort cleanup timeouts/errors; terminal disposal below is still best-effort.
+			}
 			if (unsubscribe) {
 				try {
 					unsubscribe();
@@ -2336,44 +2364,23 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const session = monitor.takeActiveSession();
 			if (session) {
 				monitor.captureSalvage(session);
-				const registry = AgentRegistry.global();
-				if (aborted) {
-					// Hard abort (caller signal / wall-clock / budget): terminal teardown.
-					registry.setStatus(id, "aborted");
-					try {
-						await untilAborted(AbortSignal.timeout(5000), () => session.dispose());
-					} catch {
-						// Ignore cleanup errors
-					}
-				} else if (worktree !== undefined) {
-					// Isolated run: the worktree is merged + cleaned after the run, so
-					// the session is not resumable. Park the ref WITHOUT adopting — the
-					// transcript stays reachable (history://), but ensureLive will throw.
-					// Status must flip to "parked" before dispose so the sdk dispose
-					// wrapper skips unregister.
-					registry.setStatus(id, "parked");
-					try {
-						await untilAborted(AbortSignal.timeout(5000), () => session.dispose());
-					} catch {
-						// Ignore cleanup errors
-					}
-					registry.detachSession(id);
-				} else {
-					// Keep-alive: finished and failed subagents both stay interrogable.
-					// The lifecycle manager owns idle-TTL parking + revival from here on.
-					registry.setStatus(id, "idle");
-					AgentLifecycleManager.global().adopt(id, {
-						idleTtlMs: agentIdleTtlMs,
-						revive: reviveSession ?? undefined,
-					});
-				}
+				await finalizeSubagentLifecycle({
+					id,
+					session,
+					aborted,
+					keepAlive: options.keepAlive !== false,
+					isolated: worktree !== undefined,
+					agentIdleTtlMs,
+					reviveSession,
+				});
 			}
 		}
 
 		// Launch-latency breakdown (subagent invocation → first chat dispatch).
-		// Phase deltas are performance.now() spans; the semaphore brackets use the
-		// Date.now epochs captured by the spawn site (invokedAt before acquire,
-		// acquiredAt after) so queue wait and pre-run setup are reported apart.
+		// Phase deltas are performance.now() spans; the task-tool concurrency
+		// brackets use the Date.now epochs captured by the spawn site
+		// (invokedAt before acquire, acquiredAt after) so queue wait and
+		// pre-run setup are reported apart.
 		const span = (from: number | undefined, to: number | undefined): number | undefined =>
 			from !== undefined && to !== undefined ? Math.round(to - from) : undefined;
 		const queueMs =

@@ -9,6 +9,7 @@ import {
 	Input,
 	matchesKey,
 	ScrollView,
+	type SgrMouseEvent,
 	Spacer,
 	type Tab,
 	TabBar,
@@ -23,7 +24,12 @@ import { getKnownRoleIds, getRoleInfo, MODEL_ROLE_IDS, MODEL_ROLES } from "../..
 import type { Settings } from "../../config/settings";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
 import { matchesSelectDown, matchesSelectUp } from "../../modes/utils/keybinding-matchers";
-import { AUTO_THINKING, type ConfiguredThinkingLevel, getConfiguredThinkingLevelMetadata } from "../../thinking";
+import {
+	AUTO_THINKING,
+	type ConfiguredThinkingLevel,
+	getConfiguredThinkingLevelMetadata,
+	parseConfiguredThinkingLevel,
+} from "../../thinking";
 import { getTabBarTheme } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
 
@@ -174,7 +180,12 @@ export class ModelSelectorComponent extends Container {
 	#tui: TUI;
 	#scopedModels: ReadonlyArray<ScopedModelItem>;
 	#temporaryOnly: boolean;
+	#directSelect: boolean;
+	#pickerHint: string | undefined;
 	#currentContextTokens: number;
+	#listLineOffset = 0;
+	#listStartIndex = 0;
+	#listVisibleCount = 0;
 
 	#menuRoleActions: MenuRoleAction[] = [];
 
@@ -200,7 +211,13 @@ export class ModelSelectorComponent extends Container {
 		scopedModels: ReadonlyArray<ScopedModelItem>,
 		onSelect: RoleSelectCallback,
 		onCancel: () => void,
-		options?: { temporaryOnly?: boolean; initialSearchInput?: string; currentContextTokens?: number },
+		options?: {
+			temporaryOnly?: boolean;
+			directSelect?: boolean;
+			pickerHint?: string;
+			initialSearchInput?: string;
+			currentContextTokens?: number;
+		},
 	) {
 		super();
 
@@ -211,6 +228,8 @@ export class ModelSelectorComponent extends Container {
 		this.#onSelectCallback = onSelect;
 		this.#onCancelCallback = onCancel;
 		this.#temporaryOnly = options?.temporaryOnly ?? false;
+		this.#directSelect = options?.directSelect ?? false;
+		this.#pickerHint = options?.pickerHint;
 		const currentContextTokens = options?.currentContextTokens ?? 0;
 		this.#currentContextTokens =
 			Number.isFinite(currentContextTokens) && currentContextTokens > 0 ? Math.floor(currentContextTokens) : 0;
@@ -235,6 +254,9 @@ export class ModelSelectorComponent extends Container {
 		this.addChild(new Spacer(1));
 		if (this.#temporaryOnly) {
 			this.addChild(new Text(theme.fg("muted", TEMPORARY_MODEL_PICKER_HINT), 0, 0));
+			this.addChild(new Spacer(1));
+		} else if (this.#directSelect && this.#pickerHint) {
+			this.addChild(new Text(theme.fg("muted", this.#pickerHint), 0, 0));
 			this.addChild(new Spacer(1));
 		}
 
@@ -325,10 +347,7 @@ export class ModelSelectorComponent extends Container {
 			if (resolved.model) {
 				nextRoles[role] = {
 					model: resolved.model,
-					thinkingLevel:
-						resolved.explicitThinkingLevel && resolved.thinkingLevel !== undefined
-							? resolved.thinkingLevel
-							: ThinkingLevel.Inherit,
+					thinkingLevel: this.#getResolvedRoleThinkingLevel(role, resolved),
 					autoSelected: false,
 				};
 			}
@@ -346,10 +365,7 @@ export class ModelSelectorComponent extends Container {
 				if (!resolved.model) continue;
 				nextRoles[role] = {
 					model: resolved.model,
-					thinkingLevel:
-						resolved.explicitThinkingLevel && resolved.thinkingLevel !== undefined
-							? resolved.thinkingLevel
-							: ThinkingLevel.Inherit,
+					thinkingLevel: this.#getResolvedRoleThinkingLevel(role, resolved),
 					autoSelected: true,
 				};
 			}
@@ -714,10 +730,6 @@ export class ModelSelectorComponent extends Container {
 		return this.#temporaryOnly && this.#isModelOverCurrentContext(model);
 	}
 
-	#isDefaultRoleActionOverContextLimit(action: MenuRoleAction, model: Model): boolean {
-		return action.role === "default" && this.#isModelOverCurrentContext(model);
-	}
-
 	#formatCurrentContextLimitSuffix(model: Model): string {
 		return ` ${theme.status.disabled} context>${formatNumber(model.contextWindow ?? 0).toLowerCase()}`;
 	}
@@ -937,6 +949,8 @@ export class ModelSelectorComponent extends Container {
 			Math.min(this.#selectedIndex - Math.floor(maxVisible / 2), visibleItems.length - maxVisible),
 		);
 		const endIndex = Math.min(startIndex + maxVisible, visibleItems.length);
+		this.#listStartIndex = startIndex;
+		this.#listVisibleCount = Math.max(0, endIndex - startIndex);
 
 		const showProvider = this.#getActiveTabId() === ALL_TAB;
 
@@ -1044,6 +1058,19 @@ export class ModelSelectorComponent extends Container {
 			);
 		}
 	}
+	#getResolvedRoleThinkingLevel(
+		role: string,
+		resolved: { explicitThinkingLevel: boolean; thinkingLevel?: ThinkingLevel },
+	): ConfiguredThinkingLevel {
+		if (resolved.explicitThinkingLevel && resolved.thinkingLevel !== undefined) {
+			return resolved.thinkingLevel;
+		}
+		if (role === "default") {
+			return parseConfiguredThinkingLevel(this.#settings.get("defaultThinkingLevel")) ?? ThinkingLevel.Inherit;
+		}
+		return ThinkingLevel.Inherit;
+	}
+
 	#getThinkingLevelsForModel(model: Model): ReadonlyArray<ConfiguredThinkingLevel> {
 		return [ThinkingLevel.Inherit, ThinkingLevel.Off, AUTO_THINKING, ...getSupportedEfforts(model)];
 	}
@@ -1065,47 +1092,16 @@ export class ModelSelectorComponent extends Container {
 			: this.#filteredModels[this.#selectedIndex];
 	}
 
-	#isMenuRoleIndexDisabled(index: number, selectedItem: ModelItem | CanonicalModelItem): boolean {
-		const action = this.#menuRoleActions[index];
-		return action ? this.#isDefaultRoleActionOverContextLimit(action, selectedItem.model) : false;
-	}
-
-	#coerceMenuSelectedIndex(index: number, selectedItem: ModelItem | CanonicalModelItem): number {
+	#coerceMenuSelectedIndex(index: number): number {
 		const maxIndex = this.#menuRoleActions.length - 1;
 		if (maxIndex < 0) {
 			return 0;
 		}
-		const clamped = Math.max(0, Math.min(index, maxIndex));
-		if (!this.#isMenuRoleIndexDisabled(clamped, selectedItem)) {
-			return clamped;
-		}
-		for (let i = clamped + 1; i <= maxIndex; i++) {
-			if (!this.#isMenuRoleIndexDisabled(i, selectedItem)) {
-				return i;
-			}
-		}
-		for (let i = clamped - 1; i >= 0; i--) {
-			if (!this.#isMenuRoleIndexDisabled(i, selectedItem)) {
-				return i;
-			}
-		}
-		return clamped;
+		return Math.max(0, Math.min(index, maxIndex));
 	}
 
-	#moveMenuSelection(delta: number, selectedItem: ModelItem | CanonicalModelItem, optionCount: number): void {
-		let index = this.#menuSelectedIndex;
-		for (let step = 0; step < optionCount; step++) {
-			index = (index + delta + optionCount) % optionCount;
-			if (this.#menuStep !== "role" || !this.#isMenuRoleIndexDisabled(index, selectedItem)) {
-				this.#menuSelectedIndex = index;
-				this.#updateMenu();
-				return;
-			}
-		}
-		this.#menuSelectedIndex =
-			this.#menuStep === "role"
-				? this.#coerceMenuSelectedIndex(this.#menuSelectedIndex, selectedItem)
-				: this.#menuSelectedIndex;
+	#moveMenuSelection(delta: number, _selectedItem: ModelItem | CanonicalModelItem, optionCount: number): void {
+		this.#menuSelectedIndex = (this.#menuSelectedIndex + delta + optionCount) % optionCount;
 		this.#updateMenu();
 	}
 
@@ -1116,7 +1112,7 @@ export class ModelSelectorComponent extends Container {
 		this.#isMenuOpen = true;
 		this.#menuStep = "role";
 		this.#menuSelectedRole = null;
-		this.#menuSelectedIndex = this.#coerceMenuSelectedIndex(0, selectedItem);
+		this.#menuSelectedIndex = this.#coerceMenuSelectedIndex(0);
 		// Collapse the model list while the action/thinking menu is open so the
 		// menu owns the full viewport instead of stacking below a now-irrelevant
 		// (and often off-screen) list.
@@ -1149,9 +1145,7 @@ export class ModelSelectorComponent extends Container {
 				})
 			: this.#menuRoleActions.map((action, index) => {
 					const prefix = index === this.#menuSelectedIndex ? `  ${theme.nav.cursor} ` : "    ";
-					const disabled = this.#isDefaultRoleActionOverContextLimit(action, selectedItem.model);
-					const suffix = disabled ? this.#formatCurrentContextLimitSuffix(selectedItem.model) : "";
-					return `${prefix}${action.label}${suffix}`;
+					return `${prefix}${action.label}`;
 				});
 
 		const selectedRoleName = this.#menuSelectedRole ? getRoleInfo(this.#menuSelectedRole, this.#settings).name : "";
@@ -1231,6 +1225,55 @@ export class ModelSelectorComponent extends Container {
 		return Math.max(MIN_VISIBLE_OPTIONS, Math.min(optionCount, terminalRows - MENU_CHROME_ROWS));
 	}
 
+	/**
+	 * Concatenate children like Container.render, recording where the model list
+	 * lands so routed mouse events can be hit-tested against it.
+	 */
+	override render(width: number): readonly string[] {
+		const lines: string[] = [];
+		for (const child of this.children) {
+			const childLines = child.render(Math.max(1, width));
+			if (child === this.#listContainer) {
+				this.#listLineOffset = lines.length;
+			}
+			lines.push(...childLines);
+		}
+		return lines;
+	}
+
+	routeMouse(event: SgrMouseEvent, line: number, _col: number): void {
+		if (this.#isMenuOpen) return;
+
+		if (event.wheel !== null) {
+			this.#moveSelection(event.wheel);
+			return;
+		}
+
+		const listLine = line - this.#listLineOffset;
+		if (listLine < 0 || listLine >= this.#listVisibleCount) return;
+
+		const index = this.#listStartIndex + listLine;
+		const item = this.#getVisibleItems()[index];
+		if (!item || this.#isItemDisabled(item)) return;
+
+		if (event.motion) {
+			if (index !== this.#selectedIndex) {
+				this.#selectedIndex = index;
+				this.#updateList();
+			}
+			return;
+		}
+
+		if (event.leftClick) {
+			this.#selectedIndex = index;
+			if (this.#temporaryOnly || this.#directSelect) {
+				this.#handleSelect(item, null);
+			} else {
+				this.#openMenu();
+			}
+		}
+	}
+
 	handleInput(keyData: string): void {
 		if (this.#isMenuOpen) {
 			this.#handleMenuInput(keyData);
@@ -1254,12 +1297,12 @@ export class ModelSelectorComponent extends Container {
 			return;
 		}
 
-		// Enter - open context menu or select directly in temporary mode
+		// Enter - open context menu or select directly in temporary/direct-select mode
 		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
 			const selectedItem = this.#getSelectedItem();
 			if (selectedItem && !this.#isItemDisabled(selectedItem)) {
-				if (this.#temporaryOnly) {
-					// In temporary mode, skip menu and select directly
+				if (this.#temporaryOnly || this.#directSelect) {
+					// In temporary/direct-select mode, skip menu and select directly
 					this.#handleSelect(selectedItem, null);
 				} else {
 					this.#openMenu();
@@ -1301,7 +1344,7 @@ export class ModelSelectorComponent extends Container {
 		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
 			if (this.#menuStep === "role") {
 				const action = this.#menuRoleActions[this.#menuSelectedIndex];
-				if (!action || this.#isDefaultRoleActionOverContextLimit(action, selectedItem.model)) return;
+				if (!action) return;
 				this.#menuSelectedRole = action.role;
 				this.#menuStep = "thinking";
 				this.#menuSelectedIndex = this.#getThinkingPreselectIndex(action.role, selectedItem.model);

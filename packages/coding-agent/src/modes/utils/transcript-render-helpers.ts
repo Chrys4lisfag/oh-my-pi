@@ -99,9 +99,9 @@ export function buildFileMentionBlock(files: FileMentionMessage["files"], indent
 	const block = new TranscriptBlock();
 	for (const file of files) {
 		let suffix: string;
-		if (file.skippedReason === "tooLarge") {
+		if (file.skippedReason === "tooLarge" || file.skippedReason === "binary") {
 			const size = typeof file.byteSize === "number" ? formatBytes(file.byteSize) : "unknown size";
-			suffix = `(skipped: ${size})`;
+			suffix = file.skippedReason === "binary" ? `(skipped: binary, ${size})` : `(skipped: ${size})`;
 		} else {
 			suffix = file.image
 				? "(image)"
@@ -146,11 +146,11 @@ export function resolveAssistantErrorMessage(
 	message: AssistantAgentMessage,
 	retryAttempt = 0,
 ): { hasErrorStop: boolean; errorMessage: string | null } {
-	const isAbortedSilently = message.stopReason === "aborted" && isSilentAbort(message.errorMessage);
+	const isAbortedSilently = message.stopReason === "aborted" && isSilentAbort(message);
 	const hasErrorStop = !isAbortedSilently && (message.stopReason === "aborted" || message.stopReason === "error");
 	const errorMessage = hasErrorStop
 		? message.stopReason === "aborted"
-			? resolveAbortLabel(message.errorMessage, retryAttempt)
+			? resolveAbortLabel(message, retryAttempt)
 			: message.errorMessage || "Error"
 		: null;
 	return { hasErrorStop, errorMessage };

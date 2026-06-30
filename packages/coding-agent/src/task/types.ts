@@ -111,7 +111,7 @@ export interface TaskItem {
 }
 
 export const taskSchema = type({
-	agent: "string",
+	agent: "string = 'task'",
 	"id?": "string",
 	"description?": "string",
 	"role?": ROLE_INPUT_SCHEMA,
@@ -120,7 +120,7 @@ export const taskSchema = type({
 	"+": "delete",
 });
 const taskSchemaNoIsolation = type({
-	agent: "string",
+	agent: "string = 'task'",
 	"id?": "string",
 	"description?": "string",
 	"role?": ROLE_INPUT_SCHEMA,
@@ -128,13 +128,13 @@ const taskSchemaNoIsolation = type({
 	"+": "delete",
 });
 const taskSchemaBatch = type({
-	agent: "string",
+	agent: "string = 'task'",
 	context: "string",
 	tasks: taskItemSchemaIsolated.array(),
 	"+": "delete",
 });
 const taskSchemaBatchNoIsolation = type({
-	agent: "string",
+	agent: "string = 'task'",
 	context: "string",
 	tasks: taskItemSchema.array(),
 	"+": "delete",
@@ -160,7 +160,7 @@ export function getTaskSchema(options: { isolationEnabled: boolean; batchEnabled
  * transcripts using the flat form keep working under either setting.
  */
 export interface TaskParams {
-	/** Agent type; required. */
+	/** Agent type to spawn; defaults to `"task"` (the general-purpose worker) when omitted. */
 	agent?: string;
 	/** Stable agent id (flat form); default = generated AdjectiveNoun. */
 	id?: string;
@@ -255,6 +255,23 @@ export interface AgentDefinition {
 	readSummarize?: boolean;
 	source: AgentSource;
 	filePath?: string;
+}
+
+/** Details extracted from a subagent `yield` tool call for final-result assembly and task rendering. */
+export interface YieldItem {
+	data?: unknown;
+	status?: "success" | "aborted";
+	error?: string;
+	/** A string label is terminal; a non-empty array of labels is incremental. */
+	type?: string | string[];
+	/** Resolve this yield's payload from the latest durable assistant text instead of `data`. */
+	useLastTurn?: boolean;
+	/**
+	 * Set by the in-tool yield validator when it exhausted its retry budget and
+	 * accepted schema-invalid data anyway. The executor preserves that override
+	 * during post-mortem validation.
+	 */
+	schemaOverridden?: boolean;
 }
 
 /** Progress tracking for a single agent */
@@ -366,6 +383,12 @@ export interface SingleResult {
 	patchPath?: string;
 	/** Branch name for isolated branch-mode output */
 	branchName?: string;
+	/**
+	 * Baseline commit SHA the task branch was created from. Passed to
+	 * `mergeTaskBranches` so cherry-pick uses the inclusive range
+	 * `branchBaseSha..branchName` and preserves every agent commit's message.
+	 */
+	branchBaseSha?: string;
 	/** Nested repo patches to apply after parent merge */
 	nestedPatches?: NestedRepoPatch[];
 	/** Data extracted by registered subprocess tool handlers (keyed by tool name) */

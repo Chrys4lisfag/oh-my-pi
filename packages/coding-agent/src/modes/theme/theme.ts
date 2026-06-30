@@ -96,6 +96,7 @@ export type SymbolKey =
 	| "icon.pause"
 	| "icon.loop"
 	| "icon.folder"
+	| "icon.worktree"
 	| "icon.search"
 	| "icon.scratchFolder"
 	| "icon.file"
@@ -228,7 +229,9 @@ export type SymbolKey =
 	| "tool.review"
 	| "tool.inspectImage"
 	| "tool.goal"
-	| "tool.irc";
+	| "tool.irc"
+	| "tool.delete"
+	| "tool.move";
 
 type SymbolMap = Record<SymbolKey, string>;
 
@@ -297,6 +300,7 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	"icon.pause": "⏸",
 	"icon.loop": "↻",
 	"icon.folder": "📁",
+	"icon.worktree": "🌳",
 	"icon.search": "🔍",
 	"icon.scratchFolder": "🗑",
 	"icon.file": "📄",
@@ -430,6 +434,8 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	"tool.inspectImage": "🖼",
 	"tool.goal": "◎",
 	"tool.irc": "✉",
+	"tool.delete": "🗑",
+	"tool.move": "➜",
 };
 
 const NERD_SYMBOLS: SymbolMap = {
@@ -557,6 +563,8 @@ const NERD_SYMBOLS: SymbolMap = {
 	"icon.search": "\uf002",
 	// pick:  | alt:
 	"icon.scratchFolder": "\uf014",
+	// pick: nf-fa-sitemap | alt: nf-cod-list_tree
+	"icon.worktree": "\uf0e8",
 	// pick:  | alt:  
 	"icon.file": "\uf15b",
 	// pick:  | alt:  ⎇
@@ -735,6 +743,8 @@ const NERD_SYMBOLS: SymbolMap = {
 	"tool.inspectImage": "\uEAEA",
 	"tool.goal": "\uEBF8",
 	"tool.irc": "\uF086",
+	"tool.delete": "\uf12d",
+	"tool.move": "\uf061",
 };
 
 const ASCII_SYMBOLS: SymbolMap = {
@@ -802,6 +812,7 @@ const ASCII_SYMBOLS: SymbolMap = {
 	"icon.pause": "||",
 	"icon.loop": "loop",
 	"icon.folder": "[D]",
+	"icon.worktree": "[wt]",
 	"icon.search": "[/]",
 	"icon.scratchFolder": "[T]",
 	"icon.file": "[F]",
@@ -933,6 +944,8 @@ const ASCII_SYMBOLS: SymbolMap = {
 	"tool.inspectImage": "[i]",
 	"tool.goal": "(o)",
 	"tool.irc": "irc",
+	"tool.delete": "rm",
+	"tool.move": "mv",
 };
 
 const SYMBOL_PRESETS: Record<SymbolPreset, SymbolMap> = {
@@ -1789,6 +1802,7 @@ export class Theme {
 			pause: this.#symbols["icon.pause"],
 			loop: this.#symbols["icon.loop"],
 			folder: this.#symbols["icon.folder"],
+			worktree: this.#symbols["icon.worktree"],
 			scratchFolder: this.#symbols["icon.scratchFolder"],
 			file: this.#symbols["icon.file"],
 			git: this.#symbols["icon.git"],

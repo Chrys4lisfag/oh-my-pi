@@ -6,6 +6,7 @@ import {
 	getEnvApiKey,
 	getProviderDetails,
 	type ProviderDetails,
+	resolveUsedFraction,
 	type UsageLimit,
 	type UsageReport,
 } from "@oh-my-pi/pi-ai";
@@ -39,6 +40,7 @@ import { BashExecutionComponent } from "../../modes/components/bash-execution";
 import { BorderedLoader } from "../../modes/components/bordered-loader";
 import { DynamicBorder } from "../../modes/components/dynamic-border";
 import { EvalExecutionComponent } from "../../modes/components/eval-execution";
+import { MoveOverlay, type MoveOverlayResult } from "../../modes/components/move-overlay";
 import { TranscriptBlock } from "../../modes/components/transcript-container";
 import { getMarkdownTheme, getSymbolTheme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
@@ -364,6 +366,27 @@ export class CommandController {
 					0,
 				),
 			]);
+			return;
+		}
+		if (stats.advisors.length > 1) {
+			let info = `${theme.bold("Advisor Status")} (${stats.advisors.length} advisors)\n`;
+			for (const a of stats.advisors) {
+				const ctx =
+					a.contextWindow > 0
+						? `${a.contextTokens.toLocaleString()} / ${a.contextWindow.toLocaleString()} (${Math.round((a.contextTokens / a.contextWindow) * 100)}%)`
+						: `${a.contextTokens.toLocaleString()}`;
+				info += `\n${theme.bold(a.name)}\n`;
+				info += `${theme.fg("dim", "Model:")} ${a.model.provider}/${a.model.id}\n`;
+				info += `${theme.fg("dim", "Context:")} ${ctx}\n`;
+				info += `${theme.fg("dim", "Messages:")} ${a.messages.total.toLocaleString()}\n`;
+				info += `${theme.fg("dim", "Spend:")} ${a.tokens.input.toLocaleString()} in / ${a.tokens.output.toLocaleString()} out`;
+				if (a.cost > 0) info += `, $${a.cost.toFixed(4)}`;
+				info += "\n";
+			}
+			info += `\n${theme.bold("Totals")}\n`;
+			info += `${theme.fg("dim", "Tokens:")} ${stats.tokens.total.toLocaleString()}\n`;
+			if (stats.cost > 0) info += `${theme.fg("dim", "Cost:")} $${stats.cost.toFixed(4)}\n`;
+			this.ctx.present([new Spacer(1), new Text(info, 1, 0)]);
 			return;
 		}
 		const model = stats.model!;
@@ -852,7 +875,7 @@ export class CommandController {
 		setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
 
 		this.ctx.statusLine.invalidate();
-		this.ctx.statusLine.setSessionStartTime(Date.now());
+		this.ctx.statusLine.resetActiveTime();
 		this.ctx.updateEditorTopBorder();
 		this.ctx.updateEditorBorderColor();
 		this.ctx.chatContainer.clear();
@@ -919,13 +942,34 @@ export class CommandController {
 		]);
 	}
 
-	async handleMoveCommand(targetPath: string): Promise<void> {
+	/**
+	 * `/move` — relocate the current session to a different directory.
+	 *
+	 * With no `targetPath` (TUI only), opens an autocomplete overlay so the user
+	 * can pick or type a directory. With a `targetPath`, resolves it directly.
+	 * If the target directory does not exist, the user is asked whether to create
+	 * it. The active session file and artifacts are moved into the target
+	 * directory's session bucket so `/resume` from that directory can find it.
+	 */
+	async handleMoveCommand(targetPath?: string): Promise<void> {
 		if (this.ctx.session.isStreaming) {
 			this.ctx.showWarning("Wait for the current response to finish or abort it before moving.");
 			return;
 		}
 
-		const unquoted = stripOuterDoubleQuotes(targetPath);
+		let input: string | undefined = targetPath?.trim() || undefined;
+
+		// No argument in TUI mode: open the path autocomplete overlay.
+		if (!input) {
+			const result = await this.ctx.showHookCustom<MoveOverlayResult | undefined>(
+				(_tui, _theme, _keybindings, done) => new MoveOverlay(this.ctx.sessionManager.getCwd(), done),
+				{ overlay: true },
+			);
+			if (!result) return; // cancelled
+			input = result.directory;
+		}
+
+		const unquoted = stripOuterDoubleQuotes(input);
 		if (!unquoted) {
 			this.ctx.showError("Usage: /move <path>");
 			return;
@@ -934,29 +978,56 @@ export class CommandController {
 		const cwd = this.ctx.sessionManager.getCwd();
 		const resolvedPath = resolveToCwd(unquoted, cwd);
 
+		// If the directory doesn't exist, offer to create it.
+		let isDirectory: boolean;
 		try {
-			const stat = await fs.stat(resolvedPath);
-			if (!stat.isDirectory()) {
-				this.ctx.showError(`Not a directory: ${resolvedPath}`);
+			isDirectory = (await fs.stat(resolvedPath)).isDirectory();
+		} catch {
+			isDirectory = false;
+		}
+
+		if (!isDirectory) {
+			const parentDir = path.dirname(resolvedPath);
+			let parentExists = false;
+			try {
+				parentExists = (await fs.stat(parentDir)).isDirectory();
+			} catch {
+				parentExists = false;
+			}
+			if (!parentExists) {
+				this.ctx.showError(`Cannot create "${path.basename(resolvedPath)}": parent directory does not exist`);
 				return;
 			}
-		} catch {
-			this.ctx.showError(`Directory does not exist: ${resolvedPath}`);
+			const confirmed = await this.ctx.showHookConfirm(
+				"Create directory?",
+				`"${path.basename(resolvedPath)}" does not exist. Create it?`,
+			);
+			if (!confirmed) return;
+			try {
+				await fs.mkdir(resolvedPath, { recursive: true });
+			} catch (err) {
+				this.ctx.showError(`Failed to create directory: ${err instanceof Error ? err.message : String(err)}`);
+				return;
+			}
+		}
+
+		try {
+			await this.ctx.sessionManager.moveTo(resolvedPath);
+		} catch (err) {
+			this.ctx.showError(`Move failed: ${err instanceof Error ? err.message : String(err)}`);
 			return;
 		}
 
-		try {
-			await this.ctx.sessionManager.flush();
-			await this.ctx.sessionManager.moveTo(resolvedPath);
-			await this.ctx.applyCwdChange(resolvedPath);
+		await this.ctx.applyCwdChange(resolvedPath);
 
-			this.ctx.present([
-				new Spacer(1),
-				new Text(`${theme.fg("accent", `${theme.status.success} Session moved to ${resolvedPath}`)}`, 1, 1),
-			]);
-		} catch (err) {
-			this.ctx.showError(`Move failed: ${err instanceof Error ? err.message : String(err)}`);
-		}
+		this.ctx.updateEditorBorderColor();
+		await this.ctx.reloadTodos();
+		this.ctx.ui.requestRender();
+
+		this.ctx.present([
+			new Spacer(1),
+			new Text(`${theme.fg("accent", `${theme.status.success} Moved to ${resolvedPath}`)}`, 1, 1),
+		]);
 	}
 
 	async handleRenameCommand(title: string): Promise<void> {
@@ -1428,22 +1499,10 @@ export function renderProviderSection(details: ProviderDetails, uiTheme: Pick<ty
 	return `${lines.join("\n")}\n`;
 }
 
-function resolveFraction(limit: UsageLimit): number | undefined {
-	const amount = limit.amount;
-	if (amount.usedFraction !== undefined) return amount.usedFraction;
-	if (amount.used !== undefined && amount.limit !== undefined && amount.limit > 0) {
-		return amount.used / amount.limit;
-	}
-	if (amount.unit === "percent" && amount.used !== undefined) {
-		return amount.used / 100;
-	}
-	return undefined;
-}
-
 function resolveProviderUsageTotal(reports: UsageReport[]): number {
 	return reports
 		.flatMap(report => report.limits)
-		.map(limit => resolveFraction(limit) ?? 0)
+		.map(limit => resolveUsedFraction(limit) ?? 0)
 		.reduce((sum, value) => sum + value, 0);
 }
 
@@ -1464,22 +1523,28 @@ function formatWindowSuffix(label: string, windowLabel: string, uiTheme: typeof 
 }
 
 function formatAccountLabel(limit: UsageLimit, report: UsageReport, index: number): string {
-	const email = (report.metadata?.email as string | undefined) ?? limit.scope.accountId;
-	if (email) return email;
-	const accountId = (report.metadata?.accountId as string | undefined) ?? limit.scope.accountId;
+	const email = report.metadata?.email;
+	if (typeof email === "string" && email) return email;
+	const accountId =
+		typeof report.metadata?.accountId === "string" && report.metadata.accountId
+			? report.metadata.accountId
+			: limit.scope.accountId || undefined;
 	if (accountId) return accountId;
-	const projectId = (report.metadata?.projectId as string | undefined) ?? limit.scope.projectId;
+	const projectId =
+		typeof report.metadata?.projectId === "string" && report.metadata.projectId
+			? report.metadata.projectId
+			: limit.scope.projectId || undefined;
 	if (projectId) return projectId;
 	return `account ${index + 1}`;
 }
 
 function formatUnlimitedReportLabel(report: UsageReport, index: number): string {
-	const email = report.metadata?.email as string | undefined;
-	if (email) return email;
-	const accountId = report.metadata?.accountId as string | undefined;
-	if (accountId) return accountId;
-	const projectId = report.metadata?.projectId as string | undefined;
-	if (projectId) return projectId;
+	const email = report.metadata?.email;
+	if (typeof email === "string" && email) return email;
+	const accountId = report.metadata?.accountId;
+	if (typeof accountId === "string" && accountId) return accountId;
+	const projectId = report.metadata?.projectId;
+	if (typeof projectId === "string" && projectId) return projectId;
 	return `account ${index + 1}`;
 }
 
@@ -1554,7 +1619,7 @@ function resolveAggregateStatus(limits: UsageLimit[]): UsageLimit["status"] {
 
 function formatAggregateAmount(limits: UsageLimit[]): string {
 	const fractions = limits
-		.map(limit => resolveFraction(limit))
+		.map(limit => resolveUsedFraction(limit))
 		.filter((value): value is number => value !== undefined);
 	if (fractions.length === limits.length && fractions.length > 0) {
 		const sum = fractions.reduce((total, value) => total + value, 0);
@@ -1611,7 +1676,7 @@ function resolveStatusColor(status: UsageLimit["status"]): "success" | "warning"
 }
 
 function renderUsageBar(limit: UsageLimit, uiTheme: typeof theme, barWidth: number): string {
-	const fraction = resolveFraction(limit);
+	const fraction = resolveUsedFraction(limit);
 	if (fraction === undefined) {
 		return uiTheme.fg("dim", "·".repeat(barWidth));
 	}
@@ -1719,9 +1784,11 @@ export function renderUsageReports(
 			const count = report.resetCredits?.availableCount ?? 0;
 			if (count <= 0) continue;
 			const label =
-				(report.metadata?.email as string | undefined) ??
-				(report.metadata?.accountId as string | undefined) ??
-				"account";
+				typeof report.metadata?.email === "string" && report.metadata.email
+					? report.metadata.email
+					: typeof report.metadata?.accountId === "string" && report.metadata.accountId
+						? report.metadata.accountId
+						: "account";
 			const isActive =
 				!!activeAccount &&
 				((!!activeAccount.accountId && activeAccount.accountId === report.metadata?.accountId) ||
@@ -1729,6 +1796,23 @@ export function renderUsageReports(
 			resetAccountLines.push(
 				`    • ${label}: ${count} saved reset${count === 1 ? "" : "s"}${isActive ? " (active)" : ""}`,
 			);
+			const credits = report.resetCredits?.credits;
+			if (credits) {
+				for (const credit of credits) {
+					if (credit.expiresAt) {
+						const expiryMs = Date.parse(credit.expiresAt);
+						if (!Number.isNaN(expiryMs)) {
+							const remaining = expiryMs - nowMs;
+							const expiryDate = credit.expiresAt.slice(0, 10);
+							if (remaining > 0) {
+								resetAccountLines.push(`        expires in ${formatDuration(remaining)} (${expiryDate})`);
+							} else {
+								resetAccountLines.push(`        expired (${expiryDate})`);
+							}
+						}
+					}
+				}
+			}
 		}
 		if (resetAccountLines.length > 0) {
 			lines.push(
@@ -1741,7 +1825,7 @@ export function renderUsageReports(
 			const entries = group.limits.map((limit, index) => ({
 				limit,
 				report: group.reports[index],
-				fraction: resolveFraction(limit),
+				fraction: resolveUsedFraction(limit),
 				index,
 			}));
 			entries.sort((a, b) => {
@@ -1794,8 +1878,8 @@ export function renderUsageReports(
 		const unlimitedReports = providerReports.filter(report => report.limits.length === 0);
 		for (const report of unlimitedReports) {
 			const label = formatUnlimitedReportLabel(report, 0);
-			const tier = report.metadata?.planType as string | undefined;
-			const tierSuffix = tier ? ` ${uiTheme.fg("dim", `(${tier})`)}` : "";
+			const tier = report.metadata?.planType;
+			const tierSuffix = typeof tier === "string" && tier ? ` ${uiTheme.fg("dim", `(${tier})`)}` : "";
 			lines.push(
 				`${uiTheme.fg("success", uiTheme.status.success)} ${label}${tierSuffix} ${uiTheme.fg("dim", "-- no limits")}`,
 			);

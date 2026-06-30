@@ -213,6 +213,70 @@ describe("formatUsageBreakdown", () => {
 		expect(disclaimerIdx).toBeLessThan(firstLimitIdx);
 	});
 
+	it("renders Antigravity weekly windows in the usage breakdown", () => {
+		const now = Date.parse("2026-01-01T00:00:00.000Z");
+		const reports: UsageReport[] = [
+			{
+				provider: "google-antigravity",
+				fetchedAt: now,
+				metadata: { email: "ag@example.test", projectId: "proj-1" },
+				limits: [
+					{
+						id: "google-antigravity:google:default:weekly",
+						label: "Usage (Google)",
+						scope: { provider: "google-antigravity", projectId: "proj-1", windowId: "weekly" },
+						window: {
+							id: "weekly",
+							label: "Weekly",
+							durationMs: SEVEN_DAYS,
+							resetsAt: now + SEVEN_DAYS,
+						},
+						amount: { unit: "percent", usedFraction: 0.6, remainingFraction: 0.4 },
+						status: "ok",
+					},
+				],
+			},
+		];
+
+		const text = stripVTControlCharacters(formatUsageBreakdown(reports, [], now));
+		expect(text).toContain("Google Antigravity");
+		expect(text).toContain("Usage (Google) (Weekly)");
+		expect(text).toContain("60.0% used");
+		expect(text).toContain("0.40× quota left");
+	});
+
+	it("renders saved reset expiry state for future and expired credits", () => {
+		const now = Date.parse("2026-01-01T00:00:00.000Z");
+		const reports: UsageReport[] = [
+			{
+				provider: "openai-codex",
+				fetchedAt: now,
+				limits: [],
+				metadata: { email: "future@example.test" },
+				resetCredits: {
+					availableCount: 1,
+					credits: [{ expiresAt: "2026-01-03T00:00:00.000Z" }],
+				},
+			},
+			{
+				provider: "openai-codex",
+				fetchedAt: now,
+				limits: [],
+				metadata: { email: "expired@example.test" },
+				resetCredits: {
+					availableCount: 1,
+					credits: [{ expiresAt: "2025-12-30T00:00:00.000Z" }],
+				},
+			},
+		];
+
+		const text = stripVTControlCharacters(formatUsageBreakdown(reports, [], now));
+		expect(text).toContain("future@example.test");
+		expect(text).toContain("soonest expires in 2d (2026-01-03)");
+		expect(text).toContain("expired@example.test");
+		expect(text).toContain("expired (2025-12-30)");
+	});
+
 	it("deduplicates identical per-limit notes across accounts sharing a window", () => {
 		const note = "Overage requests: 5";
 		const reports = [

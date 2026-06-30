@@ -30,6 +30,7 @@ pub use rg::run as run_rg;
 #[derive(Parser, Debug)]
 #[command(
 	name = "grep",
+	version = concat!("grep (pi-uu-grep) ", env!("CARGO_PKG_VERSION")),
 	about = "Search for PATTERN in each FILE or standard input.",
 	disable_help_flag = true,
 	disable_version_flag = true
@@ -39,8 +40,8 @@ struct Cli {
 	#[arg(short = 'e', long = "regexp", value_name = "PATTERN")]
 	patterns: Vec<String>,
 
-	/// PATTERN is an extended regular expression (the default behaviour).
-	#[allow(dead_code)]
+	/// Treat PATTERN as a strict extended regular expression: a pattern that
+	/// fails to parse is reported as an error rather than matched literally.
 	#[arg(short = 'E', long = "extended-regexp")]
 	extended: bool,
 
@@ -126,6 +127,31 @@ struct Cli {
 	#[arg(long = "help", action = clap::ArgAction::Help)]
 	help: Option<bool>,
 
+	/// Print version information.
+	///
+	/// GNU grep ships a `--version`, and shell startup scripts probe it.
+	/// Routed through clap so output lands on the in-process stdout via the
+	/// same path as `--help`.
+	#[allow(dead_code)]
+	#[arg(short = 'V', long = "version", action = clap::ArgAction::Version)]
+	version: Option<bool>,
+
+	/// Surface color in matches: accepted for GNU-grep compatibility and
+	/// silently ignored. The builtin writes to in-process file descriptors
+	/// (often a pipe consumed by another tool), so injecting ANSI escapes
+	/// would corrupt downstream output. The common `alias grep='grep
+	/// --color=auto'` from distro bashrc files passes through unchanged.
+	#[allow(dead_code)]
+	#[arg(
+		long = "color",
+		alias = "colour",
+		value_name = "WHEN",
+		num_args = 0..=1,
+		require_equals = true,
+		default_missing_value = "auto",
+	)]
+	color: Option<String>,
+
 	/// PATTERN followed by FILEs (PATTERN is omitted when -e is given).
 	#[arg(value_name = "ARGS")]
 	args: Vec<OsString>,
@@ -158,7 +184,15 @@ fn escape_literal(pat: &str) -> String {
 	out
 }
 
-/// Build the ripgrep regex matcher from the collected patterns and flags.
+/// Build the regex matcher from the collected patterns and flags.
+///
+/// In the default mode, any pattern that is not valid extended-regex syntax is
+/// matched literally instead of rejected — so `grep "fail)"` finds the text
+/// `fail)` the way GNU basic grep does, rather than erroring on the unbalanced
+/// `)`. The fallback is per-pattern: in a multi-`-e` search, valid alternatives
+/// keep their regex meaning and only the offending pattern is escaped. `-E`
+/// opts into strict extended-regex syntax (no fallback); `-F` escapes every
+/// pattern up front.
 fn build_matcher(patterns: &[String], cli: &Cli) -> Result<RegexMatcher, grep_regex::Error> {
 	let mut builder = RegexMatcherBuilder::new();
 	builder.case_insensitive(cli.ignore_case);
@@ -170,9 +204,26 @@ fn build_matcher(patterns: &[String], cli: &Cli) -> Result<RegexMatcher, grep_re
 	}
 	if cli.fixed {
 		let escaped: Vec<String> = patterns.iter().map(|p| escape_literal(p)).collect();
-		builder.build_many(&escaped)
-	} else {
-		builder.build_many(patterns)
+		return builder.build_many(&escaped);
+	}
+	match builder.build_many(patterns) {
+		Ok(matcher) => Ok(matcher),
+		Err(err) if !cli.extended => {
+			// Escape only the patterns that fail to compile so valid regex
+			// alternatives keep their meaning.
+			let sanitized: Vec<String> = patterns
+				.iter()
+				.map(|p| {
+					if builder.build(p).is_ok() {
+						p.clone()
+					} else {
+						escape_literal(p)
+					}
+				})
+				.collect();
+			builder.build_many(&sanitized).map_err(|_| err)
+		},
+		Err(err) => Err(err),
 	}
 }
 
@@ -624,5 +675,122 @@ pub fn run(argv: Vec<OsString>) -> i32 {
 		0
 	} else {
 		1
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{
+		collections::HashMap,
+		io::Cursor,
+		sync::{Arc, Mutex, atomic::AtomicBool},
+	};
+
+	use pi_uutils_ctx::{ScopeIo, scope};
+
+	use super::*;
+
+	/// Sink that collects writes into a shared buffer for assertions.
+	struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+	impl Write for SharedBuf {
+		fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+			self.0.lock().expect("buffer lock").extend_from_slice(buf);
+			Ok(buf.len())
+		}
+
+		fn flush(&mut self) -> io::Result<()> {
+			Ok(())
+		}
+	}
+
+	/// Run the `grep` builtin with `args` (no argv[0]) over `stdin`, returning
+	/// `(exit_code, stdout, stderr)`.
+	fn run_grep(args: &[&str], stdin: &str) -> (i32, String, String) {
+		let out = Arc::new(Mutex::new(Vec::new()));
+		let err = Arc::new(Mutex::new(Vec::new()));
+		let io = ScopeIo {
+			stdin:                 Box::new(Cursor::new(stdin.as_bytes().to_vec())),
+			stdin_fd:              None,
+			stdin_is_search_input: true,
+			stdout:                Box::new(SharedBuf(Arc::clone(&out))),
+			stderr:                Box::new(SharedBuf(Arc::clone(&err))),
+			cwd:                   std::env::temp_dir(),
+			env:                   HashMap::new(),
+			cancel:                Arc::new(AtomicBool::new(false)),
+		};
+		let argv: Vec<OsString> = std::iter::once("grep")
+			.chain(args.iter().copied())
+			.map(OsString::from)
+			.collect();
+		let code = scope(io, || run(argv));
+		let stdout =
+			String::from_utf8(out.lock().expect("stdout lock").clone()).expect("utf8 stdout");
+		let stderr =
+			String::from_utf8(err.lock().expect("stderr lock").clone()).expect("utf8 stderr");
+		(code, stdout, stderr)
+	}
+
+	#[test]
+	fn unbalanced_paren_pattern_matches_literally() {
+		// Regression: `grep "fail)"` used to abort with `regex parse error:
+		// unopened group`. It must now match the literal text and exit 0.
+		let (code, stdout, stderr) = run_grep(&["-A", "1", "fail)"], "ok\n(1 fail)\nnext\n");
+		assert_eq!(code, 0, "stderr: {stderr}");
+		assert!(stderr.is_empty(), "no error expected, got: {stderr}");
+		assert!(stdout.contains("(1 fail)"), "matched line missing: {stdout}");
+		assert!(stdout.contains("next"), "after-context line missing: {stdout}");
+	}
+
+	#[test]
+	fn extended_flag_reports_parse_error() {
+		// -E opts into strict extended-regex syntax: the bad pattern is an error.
+		let (code, _stdout, stderr) = run_grep(&["-E", "fail)"], "fail)\n");
+		assert_eq!(code, 2);
+		assert!(stderr.contains("grep:"), "expected a grep error, got: {stderr}");
+	}
+
+	#[test]
+	fn valid_regex_still_applies() {
+		// A parseable pattern is used as a regex, not matched literally.
+		let (code, stdout, _err) = run_grep(&["fo+"], "foooo\nbar\n");
+		assert_eq!(code, 0);
+		assert!(stdout.contains("foooo"));
+		assert!(!stdout.contains("bar"));
+	}
+
+	#[test]
+	fn multi_pattern_keeps_valid_alternative_as_regex() {
+		// Per-pattern fallback: valid `fo+` stays a regex while `bar)` is escaped.
+		let (code, stdout, err) = run_grep(&["-e", "fo+", "-e", "bar)", "-h"], "foooo\nbar)\nbaz\n");
+		assert_eq!(code, 0, "stderr: {err}");
+		assert!(stdout.contains("foooo"), "regex alternative should match: {stdout}");
+		assert!(stdout.contains("bar)"), "literal alternative should match: {stdout}");
+		assert!(!stdout.contains("baz"), "non-matching line leaked: {stdout}");
+	}
+
+	#[test]
+	fn color_flag_is_accepted_and_ignored() {
+		// Regression for #3755: the universal `alias grep='grep --color=auto'`
+		// must not break bare `grep` in shell pipelines.
+		for color in ["--color=auto", "--color=always", "--color=never", "--color", "--colour=auto"] {
+			let (code, stdout, stderr) = run_grep(&[color, "foo"], "foo\nbar\n");
+			assert_eq!(code, 0, "{color}: stderr: {stderr}");
+			assert!(stderr.is_empty(), "{color}: unexpected stderr: {stderr}");
+			assert_eq!(stdout, "foo\n", "{color}: matched lines: {stdout:?}");
+		}
+	}
+
+	#[test]
+	fn version_flag_prints_and_exits_zero() {
+		// `grep --version` is the universal probe shells run; the builtin must
+		// not reject it with exit 2.
+		let (code, stdout, stderr) = run_grep(&["--version"], "");
+		assert_eq!(code, 0, "stderr: {stderr}");
+		assert!(stderr.is_empty(), "unexpected stderr: {stderr}");
+		assert!(
+			stdout.contains("grep") && stdout.contains("pi-uu-grep"),
+			"version output should identify the builtin, got: {stdout:?}"
+		);
 	}
 }
