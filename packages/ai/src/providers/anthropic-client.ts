@@ -34,7 +34,15 @@ const DEFAULT_TIMEOUT_MS = 600_000;
 /** Default retry budget, matching the SDK's default. */
 const DEFAULT_MAX_RETRIES = 2;
 const INITIAL_RETRY_DELAY_S = 0.5;
-const MAX_RETRY_DELAY_S = 8;
+// Backoff cap for the streaming provider-retry loop (anthropic.ts). Raised from
+// 8s → 30s so a SUSTAINED `overloaded_error` / 529 capacity event is ridden out
+// patiently instead of surfacing after ~55s: early attempts stay fast
+// (0.5→1→2→4→8→16s) and only attempts past the cap — which only occur during a
+// prolonged outage — wait the full 30s, stretching the 10-attempt provider budget
+// to ~2min before the session-level retry takes over. A server `retry-after`
+// hint still overrides this. Pre-content retries only (guarded by
+// firstTokenTime/streamedReplayUnsafeContent), so no visible-content duplication.
+const MAX_RETRY_DELAY_S = 30;
 
 /** Per-request options accepted by {@link AnthropicMessages.create}. */
 export interface AnthropicRequestOptions {
