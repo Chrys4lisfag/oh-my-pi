@@ -297,14 +297,7 @@ describe("AgentSession eager todo enforcement", () => {
 		session.sessionManager.appendMessage(priorAssistant);
 		const completeSimpleMock = vi.spyOn(ai, "completeSimple").mockResolvedValue({
 			stopReason: "stop",
-			content: [
-				{
-					type: "toolCall",
-					id: "call-title",
-					name: "set_title",
-					arguments: { title: "Parser recovery replan" },
-				},
-			],
+			content: [{ type: "text", text: "<title>Parser recovery replan</title>" }],
 		} as never);
 		scriptedResponses = [
 			createToolCallAssistantMessage("todo", {
@@ -325,6 +318,43 @@ describe("AgentSession eager todo enforcement", () => {
 		expect(titleInput).toContain("I found the parser recovery path.");
 		expect(titleInput).toContain("The recovery heuristic should drive the replan title.");
 		expect(titleInput).toContain("replan parser diagnostics");
+	});
+
+	it("forwards the configured title system prompt to the replan refresh path", async () => {
+		// Issue #3734: TITLE_SYSTEM.md must apply on todo-init replan refresh,
+		// not just first-input titling. Without the threaded override, the
+		// bundled prompt silently overwrote auto titles in Plan Mode.
+		const customPrompt = "Generate kebab-case titles prefixed with `plan/`.";
+		await recreateSession({ "title.refreshOnReplan": true });
+		session.setTitleSystemPrompt(customPrompt);
+		await session.setSessionName("Old auto title", "auto");
+		const priorUser: AgentMessage = {
+			role: "user",
+			content: "rework parser diagnostics",
+			timestamp: Date.now() - 1,
+		};
+		session.agent.appendMessage(priorUser);
+		session.sessionManager.appendMessage(priorUser);
+		const completeSimpleMock = vi.spyOn(ai, "completeSimple").mockResolvedValue({
+			stopReason: "stop",
+			content: [{ type: "text", text: "<title>plan/parser-diagnostics</title>" }],
+		} as never);
+		scriptedResponses = [
+			createToolCallAssistantMessage("todo", {
+				op: "init",
+				list: [{ phase: "Parser", items: ["Replan parser diagnostics"] }],
+			}),
+			createAssistantMessage("todo initialized"),
+		];
+
+		const titleApplied = waitForSessionName("plan/parser-diagnostics");
+		await session.prompt("replan parser diagnostics");
+		await titleApplied;
+
+		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
+		const request = completeSimpleMock.mock.calls[0]?.[1] as { systemPrompt?: string[] } | undefined;
+		expect(request?.systemPrompt?.[0]).toBe(customPrompt);
+		expect(request?.systemPrompt?.[1]).toContain("<title>");
 	});
 
 	it("does not refresh todo-init titles when the current title is user-authored", async () => {

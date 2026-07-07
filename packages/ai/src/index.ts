@@ -46,4 +46,5 @@ export * from "./utils/retry";
 export * from "./utils/retry-after";
 export * from "./utils/schema";
 export * from "./utils/thinking-loop";
+export * from "./utils/tool-call-loop-guard";
 export * from "./utils/validation";

@@ -34,6 +34,7 @@ import { ToolExecutionComponent } from "../../modes/components/tool-execution";
 import { TranscriptBlock } from "../../modes/components/transcript-container";
 import { createUsageRowBlock } from "../../modes/components/usage-row";
 import { UserMessageComponent } from "../../modes/components/user-message";
+import { decodeStreamedToolArgs, streamingStringKeysForTool } from "../../modes/controllers/tool-args-reveal";
 import { materializeImageReferenceLinksSync } from "../../modes/image-references";
 import { theme } from "../../modes/theme/theme";
 import type { CompactionQueuedMessage, InteractiveModeContext } from "../../modes/types";
@@ -49,11 +50,12 @@ import { buildSkillCommandPrompt, invokeSkillCommandFromText, isKnownSkillComman
 import { createAssistantMessageComponent } from "./interactive-context-helpers";
 import {
 	assistantHasVisibleContent,
+	assistantUsageIsBilled,
 	buildAsyncResultBlock,
 	buildFileMentionBlock,
 	buildIrcMessageCard,
 	normalizeToolArgs,
-	resolveAssistantErrorMessage,
+	resolveAssistantErrorPresentation,
 } from "./transcript-render-helpers";
 
 type TextBlock = { type: "text"; text: string };
@@ -296,12 +298,16 @@ export class UiHelpers {
 		// read run so the row sits under it. Mirrors the live path, where the read
 		// group is created during streaming and the row is appended below it.
 		let pendingUsage: Usage | undefined;
+		let pendingUsageDuration: number | undefined;
+		let pendingUsageTtft: number | undefined;
 		const flushPendingUsage = () => {
 			if (!pendingUsage) return;
 			readGroup?.seal();
 			readGroup = null;
-			this.ctx.chatContainer.addChild(createUsageRowBlock(pendingUsage));
+			this.ctx.chatContainer.addChild(createUsageRowBlock(pendingUsage, pendingUsageDuration, pendingUsageTtft));
 			pendingUsage = undefined;
+			pendingUsageDuration = undefined;
+			pendingUsageTtft = undefined;
 		};
 		// Rebuild-time mirror of the event controller's displaceable-poll
 		// bookkeeping: a `job` poll that found every watched job still running is
@@ -312,7 +318,11 @@ export class UiHelpers {
 			const previous = waitingPoll;
 			if (!previous) return;
 			waitingPoll = null;
-			if (nextToolName === "job" && previous.isDisplaceableBlock()) {
+			if (
+				nextToolName === "job" &&
+				previous.isDisplaceableBlock() &&
+				this.ctx.chatContainer.isBlockUncommitted(previous)
+			) {
 				this.ctx.chatContainer.removeChild(previous);
 			}
 			// Sealing freezes the block and stops the waiting-poll spinner that
@@ -329,7 +339,9 @@ export class UiHelpers {
 			}
 			if (previous.canBeDisplacedBy(nextToolName)) {
 				todoSnapshot = null;
-				this.ctx.chatContainer.removeChild(previous);
+				if (this.ctx.chatContainer.isBlockUncommitted(previous)) {
+					this.ctx.chatContainer.removeChild(previous);
+				}
 				previous.seal();
 				return;
 			}
@@ -367,10 +379,9 @@ export class UiHelpers {
 					readGroup?.seal();
 					readGroup = null;
 				}
-				const { hasErrorStop, errorMessage } = resolveAssistantErrorMessage(
-					message,
-					this.ctx.viewSession.retryAttempt,
-				);
+				const errorPresentation = resolveAssistantErrorPresentation(message, this.ctx.viewSession.retryAttempt);
+				const hasErrorStop = errorPresentation.kind === "full";
+				const errorMessage = hasErrorStop ? errorPresentation.text : null;
 
 				// Render tool call components
 				for (const content of message.content) {
@@ -412,8 +423,18 @@ export class UiHelpers {
 					readGroup = null;
 					const tool = this.ctx.viewSession.getToolByName(content.name);
 					const partialJson = getStreamingPartialJson(content);
+					// Mid-stream rebuild (theme change, settings, focus replay): decode
+					// display args from the raw stream exactly like the live reveal path.
+					// The provider-parsed `arguments` lag the stream by up to a throttled
+					// parse window, so spreading them alone would freeze a long write/edit
+					// preview at its last full parse.
+					const rawInput = content.customWireName !== undefined;
 					const renderArgs = partialJson
-						? { ...content.arguments, __partialJson: partialJson }
+						? decodeStreamedToolArgs(partialJson, {
+								rawInput,
+								fullArgs: content.arguments,
+								streamingStringKeys: streamingStringKeysForTool(content.name, rawInput),
+							})
 						: content.arguments;
 					const component = new ToolExecutionComponent(
 						content.name,
@@ -443,7 +464,12 @@ export class UiHelpers {
 						this.ctx.pendingTools.set(content.id, component);
 					}
 				}
-				pendingUsage = this.ctx.settings.get("display.showTokenUsage") ? message.usage : undefined;
+				pendingUsage =
+					this.ctx.settings.get("display.showTokenUsage") && assistantUsageIsBilled(message.usage)
+						? message.usage
+						: undefined;
+				pendingUsageDuration = message.duration;
+				pendingUsageTtft = message.ttft;
 			} else if (message.role === "toolResult") {
 				const pendingReadComponent = this.ctx.pendingTools.get(message.toolCallId);
 				const isReadGroupResult =

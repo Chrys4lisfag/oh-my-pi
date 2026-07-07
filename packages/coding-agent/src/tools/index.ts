@@ -40,7 +40,7 @@ import { AstGrepTool } from "./ast-grep";
 import { BashTool } from "./bash";
 import { BrowserTool } from "./browser";
 import { type BuiltinToolName, normalizeToolNames } from "./builtin-names";
-import { type CheckpointState, CheckpointTool, RewindTool } from "./checkpoint";
+import { type CheckpointState, CheckpointTool, type CompletedRewindState, RewindTool } from "./checkpoint";
 import { DebugTool } from "./debug";
 import { EvalTool } from "./eval";
 import { resolveEvalBackends } from "./eval-backends";
@@ -332,6 +332,8 @@ export interface ToolSession {
 	getCheckpointState?: () => CheckpointState | undefined;
 	/** Set or clear active checkpoint state. */
 	setCheckpointState?: (state: CheckpointState | null) => void;
+	/** Get the most recent completed rewind, if this session just rewound a checkpoint. */
+	getLastCompletedRewind?: () => CompletedRewindState | undefined;
 
 	/** Per-session snapshot store of file contents as last shown to the model
 	 *  by `read`/`search`. Used by hashline anchor-stale recovery to
@@ -449,7 +451,7 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	eval: s => new EvalTool(s),
 	ssh: loadSshTool,
 	github: GithubTool.createIf,
-	glob: s => new GlobTool(s),
+	glob: s => new GlobTool(s, { rootPathAlias: true }),
 	grep: s => new GrepTool(s),
 	lsp: LspTool.createIf,
 	inspect_image: s => new InspectImageTool(s),

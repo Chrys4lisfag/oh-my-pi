@@ -41,9 +41,16 @@ export const isKimiK26ModelId = memo((modelId: string): boolean => {
 	return /(^|\/)kimi-k2(?:\.6|p6)(?:[-:]|$)/i.test(modelId);
 });
 
-/** Claude ids in any namespace form (`claude-*`, `vendor/claude.x`). */
+/**
+ * Claude ids in any namespace form: bare (`claude-*`), path-namespaced
+ * (`anthropic/claude.x`), or dot-prefixed (`us.anthropic.claude-…`,
+ * `global.anthropic.claude-…`, `au.anthropic.claude-…` — Bedrock cross-region
+ * inference profiles). Necessary because {@link parseAnthropicModel} only
+ * classifies kinds enumerated in its regex, so any dotted profile whose kind
+ * (e.g. `haiku`) is not enumerated would otherwise slip past this fallback.
+ */
 export const isClaudeModelId = memo((modelId: string): boolean => {
-	return /(^|\/)claude[-.]/i.test(modelId);
+	return /(^|[/.])claude[-.]/i.test(modelId);
 });
 
 /** `anthropic/`-namespaced ids (aggregator catalogs like OpenRouter). */
@@ -118,9 +125,20 @@ export const isOpenAIGptOssModelId = memo((modelId: string): boolean => {
 	return /(^|\/)gpt-oss[-:]/i.test(modelId);
 });
 
-/** OpenAI model ids (gpt-*, o1-*, o3-*, o4-*, or prefixed with openai/). */
+/** OpenAI model ids (gpt-*, chatgpt-*, o1/o3/o4 SKUs, codex-*, or openai/*). */
 export const isOpenAIModelId = memo((modelId: string): boolean => {
-	return /(^|\/)(gpt|o1|o3|o4)[-.]/i.test(modelId) || modelId.toLowerCase().includes("openai/");
+	return (
+		/(^|\/)(?:gpt|chatgpt|codex)[-.]/i.test(modelId) ||
+		/(^|\/)o[134](?:[-.]|$)/i.test(modelId) ||
+		modelId.toLowerCase().includes("openai/")
+	);
+});
+
+/** OpenAI models at or above the gpt-5.4 wire generation, keyed off the parsed version. */
+const isOpenAIWireGen54Plus = memo((modelId: string): boolean => {
+	const parsed = parseOpenAIModel(bareModelId(modelId));
+	if (!parsed) return false;
+	return semverGte(parsed.version, "5.4");
 });
 
 /**
@@ -133,11 +151,17 @@ export const isOpenAIModelId = memo((modelId: string): boolean => {
  * floor (not an allowlist) so 5.6/6.x inherit support automatically. Callers
  * fall back to omitting `context`, letting the server default to `current_turn`.
  */
-export const supportsAllTurnsReasoningContext = memo((modelId: string): boolean => {
-	const parsed = parseOpenAIModel(bareModelId(modelId));
-	if (!parsed) return false;
-	return semverGte(parsed.version, "5.4");
-});
+export const supportsAllTurnsReasoningContext = isOpenAIWireGen54Plus;
+
+/**
+ * OpenAI Codex models that accept `reasoning.summary`. Shares the gpt-5.4 wire
+ * floor with {@link supportsAllTurnsReasoningContext}: earlier Codex ids
+ * (`gpt-5.1-codex`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`) reject the field
+ * with `Unsupported parameter: 'reasoning.summary' is not supported with this
+ * model`. Callers omit `summary` for unsupported ids, letting the server skip
+ * the human-readable summary stream.
+ */
+export const supportsCodexReasoningSummary = isOpenAIWireGen54Plus;
 
 /**
  * Reasoning-capable GLM coding SKUs: glm-4.5 and up on the base / `-air` /

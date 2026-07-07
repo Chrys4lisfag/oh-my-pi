@@ -4,6 +4,33 @@ import type { FetchImpl } from "@oh-my-pi/pi-catalog/types";
 
 const ORIGINAL_LITELLM_BASE_URL = Bun.env.LITELLM_BASE_URL;
 const MODELS_DEV_URL = "https://models.dev/api.json";
+function makeLiteLLMSentinelPlaceholder(modelGroup: string) {
+	return {
+		model_group: modelGroup,
+		model_name: null,
+		providers: [],
+		max_input_tokens: null,
+		max_output_tokens: null,
+		supports_vision: null,
+		supports_reasoning: null,
+		supports_function_calling: null,
+		supported_openai_params: [],
+		litellm_params: {
+			model: null,
+			model_name: null,
+		},
+		model_info: {
+			max_input_tokens: null,
+			max_output_tokens: null,
+			supports_vision: null,
+			supports_reasoning: null,
+			supports_function_calling: null,
+			supported_openai_params: [],
+		},
+	} as const;
+}
+
+const ALL_TEAM_MODELS_PLACEHOLDER = makeLiteLLMSentinelPlaceholder("all-team-models");
 
 function restoreLiteLLMBaseUrl(): void {
 	if (ORIGINAL_LITELLM_BASE_URL === undefined) {
@@ -98,7 +125,7 @@ describe("LiteLLM provider discovery", () => {
 		const models = await options.fetchDynamicModels?.();
 
 		expect(options.cacheProviderId).toBe(
-			`litellm:rich-v1:${Bun.hash("http://litellm.example:4100/v1").toString(36)}`,
+			`litellm:rich-v3:${Bun.hash("http://litellm.example:4100/v1").toString(36)}`,
 		);
 		expect(fetchMock).toHaveBeenCalledTimes(6);
 		expect(models).toHaveLength(1);
@@ -121,7 +148,7 @@ describe("LiteLLM provider discovery", () => {
 		const models = await options.fetchDynamicModels?.();
 
 		expect(options.cacheProviderId).toBe(
-			`litellm:rich-v1:${Bun.hash("http://litellm-config.example:4200/v1/").toString(36)}`,
+			`litellm:rich-v3:${Bun.hash("http://litellm-config.example:4200/v1/").toString(36)}`,
 		);
 		expect(fetchMock).toHaveBeenCalledTimes(6);
 		expect(models).toHaveLength(1);
@@ -220,7 +247,7 @@ describe("LiteLLM provider discovery", () => {
 			if (url === "http://primary:4000/model_group/info") {
 				return Response.json({
 					data: [
-						{ model_group: "no-tools", supports_function_calling: false },
+						{ model_group: "no-tools", providers: ["openai"], supports_function_calling: false },
 						{ model_group: "params-tools", supported_openai_params: ["tools"] },
 					],
 				});
@@ -236,6 +263,113 @@ describe("LiteLLM provider discovery", () => {
 
 		expect(models?.find(model => model.id === "no-tools")?.supportsTools).toBe(false);
 		expect(models?.find(model => model.id === "params-tools")?.supportsTools).toBe(true);
+	});
+
+	test.each([
+		["all-team-models"],
+		["all-proxy-models"],
+		["no-default-models"],
+	])("falls back from %s placeholder to v2 model info", async sentinelModelId => {
+		const calls: string[] = [];
+		const fetchMock = vi.fn(async (input: string | URL | Request) => {
+			const url = inputUrl(input);
+			calls.push(url);
+			if (url === MODELS_DEV_URL) {
+				return Response.json({});
+			}
+			if (url === "http://primary:4000/model_group/info") {
+				return Response.json({ data: [makeLiteLLMSentinelPlaceholder(sentinelModelId)] });
+			}
+			if (url === "http://primary:4000/v2/model/info") {
+				return Response.json({
+					data: [
+						{
+							model_name: "example-real-model",
+							model_info: {
+								max_input_tokens: 200_000,
+								max_output_tokens: 12_000,
+								supports_vision: false,
+								supports_reasoning: true,
+							},
+						},
+					],
+				});
+			}
+			if (url === "http://primary:4000/v1/models") {
+				throw new Error("/v1/models should not be called when v2 metadata succeeds");
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		}) as FetchImpl;
+		const options = litellmModelManagerOptions({
+			apiKey: "sk-rich",
+			baseUrl: "http://primary:4000/v1",
+			fetch: fetchMock,
+		});
+
+		const models = await options.fetchDynamicModels?.();
+
+		expect(calls).toContain("http://primary:4000/model_group/info");
+		expect(calls).toContain("http://primary:4000/v2/model/info");
+		expect(calls).not.toContain("http://primary:4000/v1/models");
+		expect(models?.map(model => model.id)).toEqual(["example-real-model"]);
+		expect(models?.[0]).toMatchObject({
+			id: "example-real-model",
+			contextWindow: 200_000,
+			maxTokens: 12_000,
+			input: ["text"],
+			reasoning: true,
+		});
+	});
+
+	test("filters all-team-models placeholder from mixed model_group info", async () => {
+		const calls: string[] = [];
+		const fetchMock = vi.fn(async (input: string | URL | Request) => {
+			const url = inputUrl(input);
+			calls.push(url);
+			if (url === MODELS_DEV_URL) {
+				return Response.json({});
+			}
+			if (url === "http://primary:4000/model_group/info") {
+				return Response.json({
+					data: [
+						ALL_TEAM_MODELS_PLACEHOLDER,
+						{
+							model_group: "example-real-model",
+							model_name: "Example Real Model",
+							max_input_tokens: 96_000,
+							max_output_tokens: 8_000,
+							supports_function_calling: true,
+						},
+					],
+				});
+			}
+			if (url === "http://primary:4000/v2/model/info") {
+				throw new Error("/v2/model/info should not be called when model_group info has a real model");
+			}
+			if (url === "http://primary:4000/v1/models") {
+				throw new Error("/v1/models should not be called when model_group info has a real model");
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		}) as FetchImpl;
+		const options = litellmModelManagerOptions({
+			apiKey: "sk-rich",
+			baseUrl: "http://primary:4000/v1",
+			fetch: fetchMock,
+		});
+
+		const models = await options.fetchDynamicModels?.();
+
+		expect(calls).toContain("http://primary:4000/model_group/info");
+		expect(calls).not.toContain("http://primary:4000/v2/model/info");
+		expect(calls).not.toContain("http://primary:4000/v1/models");
+		expect(models?.map(model => model.id)).toEqual(["example-real-model"]);
+		expect(models?.[0]).toMatchObject({
+			id: "example-real-model",
+			name: "Example Real Model",
+			contextWindow: 96_000,
+			maxTokens: 8_000,
+			supportsTools: true,
+		});
 	});
 
 	test("falls back from missing model_group info to v2 model info", async () => {
@@ -317,6 +451,39 @@ describe("LiteLLM provider discovery", () => {
 		expect(models?.[0]).toMatchObject({ id: "legacy-gpt", contextWindow: 96_000 });
 	});
 
+	test("drops reseller usage suffix from LiteLLM rich model names", async () => {
+		const fetchMock = vi.fn(async (input: string | URL | Request) => {
+			const url = inputUrl(input);
+			if (url === MODELS_DEV_URL) {
+				return Response.json({});
+			}
+			if (url === "http://primary:4000/model_group/info") {
+				return Response.json({
+					data: [
+						{
+							model_group: "minimax-m3",
+							model_name: "MiniMax M3 (3x usage)",
+						},
+					],
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		}) as FetchImpl;
+		const options = litellmModelManagerOptions({
+			baseUrl: "http://primary:4000/v1",
+			fetch: fetchMock,
+		});
+
+		const models = await options.fetchDynamicModels?.();
+
+		expect(models?.[0]).toMatchObject({
+			id: "minimax-m3",
+			name: "MiniMax M3",
+			provider: "litellm",
+			baseUrl: "http://primary:4000/v1",
+		});
+	});
+
 	test("falls back to OpenAI models list when rich endpoints are unavailable", async () => {
 		const authByUrl = new Map<string, string | undefined>();
 		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -334,6 +501,11 @@ describe("LiteLLM provider discovery", () => {
 								tool_call: true,
 								limit: { context: 64_000, output: 8_000 },
 							},
+							"minimax-m3": {
+								name: "MiniMax M3 (3x usage)",
+								tool_call: true,
+								limit: { context: 262_144, output: 8_192 },
+							},
 						},
 					},
 				});
@@ -348,7 +520,7 @@ describe("LiteLLM provider discovery", () => {
 				return new Response("{}", { status: 404 });
 			}
 			if (url === "http://primary:4000/v1/models") {
-				return Response.json({ data: [{ id: "deepseek-v4-flash" }] });
+				return Response.json({ data: [{ id: "deepseek-v4-flash" }, { id: "minimax-m3" }] });
 			}
 			throw new Error(`Unexpected URL: ${url}`);
 		}) as FetchImpl;
@@ -367,6 +539,12 @@ describe("LiteLLM provider discovery", () => {
 			name: "DeepSeek V4 Flash",
 			contextWindow: 64_000,
 			maxTokens: 8_000,
+		});
+		expect(models?.find(model => model.id === "minimax-m3")).toMatchObject({
+			id: "minimax-m3",
+			name: "MiniMax M3",
+			contextWindow: 262_144,
+			maxTokens: 8_192,
 		});
 	});
 });

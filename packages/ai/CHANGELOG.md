@@ -2,6 +2,163 @@
 
 ## [Unreleased]
 
+## [16.3.11] - 2026-07-06
+
+### Fixed
+
+- Fixed `openai-codex-responses` fresh plan execution requests that contained only system/developer guidance by mirroring the final instruction as user input so Codex accepts the first turn. ([#4714](https://github.com/can1357/oh-my-pi/issues/4714))
+- Fixed Codex WebSocket compact/resume delta diagnostics to record request shape and raw-vs-displayed usage buckets, so persistent server-reported uncached suffixes without `orchestration_*` fields are visible in debug stats. ([#4707](https://github.com/can1357/oh-my-pi/issues/4707))
+
+## [16.3.10] - 2026-07-06
+
+### Fixed
+
+- Fixed Ollama/Ollama Cloud EOS-only completions to retry empty stops with a single output token before the agent loop can halt silently. ([#4659](https://github.com/can1357/oh-my-pi/issues/4659))
+- Fixed Claude Sonnet 5 failing every request on feature-gated gateways (Azure Foundry, OpenAI-compatible relays) that reject strict tools with "structured_outputs not supported" — the rejection is now classified as a strict-tool rejection, so the request retries without strict tools and the session remembers the downgrade.
+
+## [16.3.7] - 2026-07-05
+
+### Fixed
+
+- Fixed formatting of demoted reasoning blocks to prevent accidental concatenation with prose
+- Fixed terminal whitespace issues in assistant messages that caused rejections by Anthropic API
+- Fixed Cursor provider handling of empty-pattern grep arguments to return a clear, actionable error instead of a generic error and a broken TUI rendering.
+- Fixed Google Cloud Code Assist API (Antigravity) and Gemini CLI to immediately bubble up underlying API errors (such as safety or recitation blocks) instead of incorrectly retrying and hiding them behind a generic empty-response message.
+- Fixed GitHub Copilot OpenAI Responses replay to prevent empty reasoning-only assistant turns from being persisted in history and poisoning subsequent requests.
+- Fixed classification of provider gateway quota-insufficient errors so they are correctly identified as usage-limit errors rather than generic 403 failures.
+- Fixed OpenAI-compatible Responses models (such as DeepSeek endpoints) to preserve user-configured tool strictness settings unless strict mode is explicitly unsupported.
+- Fixed custom openai-codex-responses providers failing when no ChatGPT account ID claim is present by omitting the header when it cannot be derived.
+- Fixed token accounting for OpenAI Responses and Codex providers to correctly include provider-side orchestration tokens in billing totals without misclassifying them as uncached prompt input.
+- Fixed Google Gemini and Cloud Code Assist providers to preserve the requested reasoning tier when sending requests with hidden thinking summaries.
+- Fixed parallel OpenAI-compatible tool-call streaming to prevent argument data from bleeding across concurrent commands when identifiers are missing.
+- Fixed Anthropic Claude reasoning and thinking replay handling. Same-model replays now drop unsigned prior reasoning blocks to prevent reasoning-extraction refusals, while cross-model replays (including Bedrock cross-region profiles) correctly demote reasoning without emitting raw thinking tags or causing text-flattening formatting issues.
+- Fixed custom OpenAI-compatible relays serving standard OpenAI model IDs to be correctly classified as OpenAI-family targets for fast mode.
+
+## [16.3.6] - 2026-07-04
+
+### Added
+
+- Persisted credential rate-limit blocks across processes: `auth_credential_blocks` (auth schema v5) stores per-credential blocks keyed by row id + provider key + block scope with MAX-upsert semantics, `AuthStorage` merges persisted and in-memory blocks on read, and auth-broker snapshots/SSE carry per-entry blocks with `POST /v1/credential/:id/block` and `DELETE /v1/credential/:id/blocks` endpoints so gateway and sibling omp processes stop re-discovering exhausted accounts by burning a 429 each.
+
+### Fixed
+
+- Fixed Anthropic credential selection sampling Fable/Mythos-exhausted accounts on every new session: a Fable/Mythos weekly cap now proactively hard-blocks the credential when confirmed exhausted (server `exhausted` status or used fraction >= 1) with a live `resetsAt`, and a live Fable 429 extends the reactive block to the confirmed tier reset instead of the 60s default. Unconfirmed rows (missing/expired reset, below cap) remain ranking hints only, preserving the false-100% guard.
+- Fixed Ollama/Ollama Cloud tool requests failing with HTTP 400 by rewriting boolean subschemas (`true`/`false`) into a value-widening `anyOf` union of primitive types, stripping boolean `additionalProperties`/`unevaluatedProperties`, and flattening nullable `type` arrays before serializing tool parameters, so unconstrained fields still advertise "any JSON value" to grammar-constrained samplers (llama.cpp) instead of collapsing to an empty object. ([#4488](https://github.com/can1357/oh-my-pi/issues/4488))
+
+## [16.3.5] - 2026-07-04
+
+### Added
+
+- `OAuthCallbackFlow` now serves a `GET /launch` route on its loopback callback server that 302-redirects to the pending authorization URL, and exposes that short URL as `OAuthAuthInfo.launchUrl`. UIs can advertise it as a truncation-safe copy target (~30 chars) instead of the full authorize URL, so terminals narrower than the composed row cannot silently drop OAuth query parameters like `code_challenge_method=S256` ([#4418](https://github.com/can1357/oh-my-pi/issues/4418)).
+- Preserved explicit `tool.strict === false` on OpenAI-family function tool payloads (openai-responses, openai-codex-responses, openai-completions) so backends that distinguish `strict: false` from an omitted flag stop over-filling optional arguments ([#4336](https://github.com/can1357/oh-my-pi/issues/4336)).
+
+### Fixed
+
+- Fixed tool-call validation to strip stray trailing line terminators on schema-matching enum values and on well-known identifier fields (`path`, `paths`, `file`, `file_path`, `url`, `uri`, `title`, `label`) before dispatch, keeping ordinary trailing spaces and content-carrying fields (`content`, `input`, `code`, `command`, etc.) intact ([#4461](https://github.com/can1357/oh-my-pi/issues/4461)).
+
+## [16.3.4] - 2026-07-03
+
+### Added
+
+- Added support for Baseten as an AI provider
+
+### Changed
+
+- Improved Claude usage reliability by removing proactive hard-blocking for Fable and Mythos tiers
+
+### Fixed
+
+- Fixed Anthropic OAuth account rotation to exclude unreliable model-scoped Fable/Mythos weekly caps from proactive hard-blocking, ensuring they act only as ranking priority hints while still allowing reactive 429-fallback to rotate and reach serviceable siblings.
+
+## [16.3.3] - 2026-07-02
+
+### Added
+
+- Added comprehensive tracking and credential-ranking support for Anthropic per-tier and weekly usage limits, including Claude Fable weekly caps. This prevents a single exhausted model-scoped cap from blocking the entire OAuth credential and improves credential selection based on drain-rate pressure.
+
+### Changed
+
+- Updated Claude Fable reasoning replay to use bare text instead of wrapped thinking tags
+
+### Fixed
+
+- Improved robustness of single-argument tool calls by automatically remapping mislabeled string arguments.
+- Fixed Anthropic OAuth usage reporting to stop retrying on 429 rate-limit errors.
+- Fixed usage cache to correctly persist null values during cold-start failure backoff windows.
+- Fixed cursor-agent persisted transcripts losing tool-call structure for native execution tools, ensuring replayed tool results are correctly paired with their corresponding calls.
+- Fixed OpenAI-compatible streaming usage parsing to prefer non-zero nested cached token counts when the root cached_tokens value is zero.
+- Added automatic detection and remediation for custom proxies returning signature errors on Anthropic thinking blocks, allowing the client to automatically retry with unsigned blocks and prompt the user to adjust their configuration.
+- Fixed potential hangs in GitLab Duo Workflow setup by adding proper timeout and abort signal handling to REST fetches.
+- Fixed Cursor proxy tunnel setup hanging indefinitely by adding abort and timeout handling.
+- Fixed Devin Connect streaming reader vulnerability to corrupt frame lengths by capping payloads at 16 MiB and throwing an envelope error immediately.
+
+## [16.3.1] - 2026-07-02
+
+### Changed
+
+- Removed automated injection of reasoning suppression prompts in OpenAI responses
+
+## [16.3.0] - 2026-07-02
+
+### Added
+
+- Added opt-in support for Anthropic's server-side fallback beta (server-side-fallback-2026-06-01) on the anthropic-messages provider, including support for AnthropicOptions.fallbacks and automatic filtering of fallback blocks during cross-provider message transformations.
+
+### Changed
+
+- Improved stream healing for official first-party endpoints (Anthropic, OpenAI, and OpenAI Codex) by skipping leaked-thinking healing, preventing misfires on legitimate code blocks while maintaining healing for third-party gateways and custom base URLs.
+- Updated CoreWeave Serverless Inference login instructions to clarify persisting COREWEAVE_PROJECT in shell startup files.
+
+### Fixed
+
+- Fixed an issue where same-model Anthropic message replays incorrectly demoted unsigned thinking into textual content during API calls
+- Fixed a performance issue where broker usage fetch failures were not cached, causing redundant network requests when the broker is offline.
+- Fixed Xiaomi MiMo API key validation to use the supported mimo-v2.5 model.
+- Fixed certificate verification errors for custom gateways behind private CA bundles by ensuring NODE_EXTRA_CA_CERTS is respected across all provider fetches.
+- Fixed Claude Fable demoted-thinking replay to use markdown-italic assistant prose instead of <thinking> tags, preventing context issues after model switches.
+- Fixed OpenAI Responses replay errors (400 Bad Request) caused by missing reasoning items during history replay.
+
+## [16.2.13] - 2026-07-01
+
+### Fixed
+
+- Fixed pre-5.4 OpenAI Codex models (`gpt-5.1-codex`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`) rejecting requests with `Unsupported parameter: 'reasoning.summary' is not supported with this model` by gating `reasoning.summary` behind the same gpt-5.4 wire floor as `reasoning.context: "all_turns"`.
+
+## [16.2.12] - 2026-07-01
+
+### Changed
+
+- Improved streaming performance for Cursor and Devin providers by optimizing mid-stream tool-call argument parsing to prevent UI stalls when handling large payloads.
+
+### Fixed
+
+- Fixed issues with tool call streaming where tool call IDs, partial JSON payloads, or late-arriving IDs could be lost, filtered, or incorrectly initialized.
+- Fixed an issue where stream healing for leaked thinking blocks could replace live tool-call blocks with empty-id placeholders, breaking streamed tool arguments on Anthropic-compatible streams.
+- Fixed an issue where stalled auth-gateway SSE responses could hang indefinitely in pi-native streams by ensuring first-event and idle timeout watchdogs are properly honored.
+- Fixed cross-turn tool-call loops going undetected by adding a guard for consecutive identical tool calls. (#3971)
+
+## [16.2.11] - 2026-07-01
+
+### Fixed
+
+- Fixed streaming UI glitches and resolved an issue where invalid empty tool call IDs were persisted in the chat history.
+
+## [16.2.10] - 2026-06-30
+
+### Added
+
+- Added streaming support for keyed parameter argument deltas in XML-family in-band tool call scanners (Anthropic, DeepSeek, XML, Minimax)
+
+### Changed
+
+- Improved native tool-call passthrough in `wrapInbandToolStream` to accurately mirror live streaming IDs, arguments, and partial JSON states from the underlying provider
+
+### Fixed
+
+- Fixed a bug where tool calls with empty or missing IDs were not detected as malformed, causing API validation failures (e.g., 400 errors with Anthropic) on subsequent requests
+- Raised Gemini header runaway threshold to prevent premature interruption of complex reasoning loops
+- Fixed leaked ` ```thinking ` fences with nested language-tagged Markdown code blocks so inner fences remain inside structured thinking instead of leaking as visible reply text.
+
 ## [16.2.9] - 2026-06-30
 
 ### Added

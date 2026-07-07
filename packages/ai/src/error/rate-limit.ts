@@ -112,7 +112,7 @@ export function calculateRateLimitBackoffMs(reason: RateLimitReason): number {
  * of upstream's expanded pattern set.)
  */
 const USAGE_LIMIT_PATTERN =
-	/usage.?limit|usage_limit_reached|usage_not_included|limit_reached|quota.?exceeded|quota.?reached|exhausted your capacity|quota will reset|insufficient.?(?:balance|quota)/i;
+	/usage.?limit|usage_limit_reached|usage_not_included|limit_reached|quota.?(?:exceeded|reached|insufficient)|额度不足|额度耗尽|exhausted your capacity|quota will reset|insufficient.?(?:balance|quota)/i;
 
 /**
  * HTTP status codes that, absent richer body classification, represent an

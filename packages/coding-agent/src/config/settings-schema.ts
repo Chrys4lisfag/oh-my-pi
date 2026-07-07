@@ -233,7 +233,7 @@ interface StringDef {
 
 interface NumberDef {
 	type: "number";
-	default: number;
+	default: number | undefined;
 	ui?: UiNumber;
 }
 
@@ -285,6 +285,7 @@ const EMPTY_STRING_ARRAY: string[] = [];
 const EMPTY_STRING_RECORD: Record<string, string> = {};
 const EMPTY_NUMBER_RECORD: Record<string, number> = {};
 const DEFAULT_CYCLE_ORDER: string[] = ["smol", "default", "slow"];
+const DEFAULT_TOOL_CALL_LOOP_EXEMPT_TOOLS: string[] = ["job", "irc"];
 const EMPTY_MODEL_TAGS_RECORD: ModelTagsSettings = {};
 const HINDSIGHT_RECALL_TYPES_DEFAULT: string[] = ["world", "experience"];
 export const DEFAULT_BASH_INTERCEPTOR_RULES: BashInterceptorRule[] = [
@@ -989,7 +990,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "model",
 			group: "Thinking",
 			label: "Loop Guard",
-			description: "Enable automatic stream loop detection for Gemini and DeepSeek models",
+			description: "Enable automatic stream loop detection for model reasoning and prose",
 		},
 	},
 
@@ -1013,6 +1014,39 @@ export const SETTINGS_SCHEMA = {
 			label: "Loop Guard Tool-Call Reminder",
 			description:
 				"When a Gemini reasoning stream emits many consecutive planning headers without calling a tool, interrupt it and inject a reminder to issue a tool call (requires Loop Guard)",
+		},
+	},
+
+	"model.toolCallLoopGuard.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "model",
+			group: "Thinking",
+			label: "Tool-Call Loop Guard",
+			description: "Detect consecutive identical tool calls across turns and inject a corrective steer",
+		},
+	},
+
+	"model.toolCallLoopGuard.threshold": {
+		type: "number",
+		default: 5,
+		ui: {
+			tab: "model",
+			group: "Thinking",
+			label: "Tool-Call Loop Threshold",
+			description: "Consecutive identical tool calls required before the corrective steer is injected",
+		},
+	},
+
+	"model.toolCallLoopGuard.exemptTools": {
+		type: "array",
+		default: DEFAULT_TOOL_CALL_LOOP_EXEMPT_TOOLS,
+		ui: {
+			tab: "model",
+			group: "Thinking",
+			label: "Tool-Call Loop Exempt Tools",
+			description: "Tool names that may repeat consecutively without triggering the cross-turn loop guard",
 		},
 	},
 
@@ -1351,6 +1385,18 @@ export const SETTINGS_SCHEMA = {
 				},
 				{ value: "never", label: "Never", description: "Stay on the fallback model until manually changed" },
 			],
+		},
+	},
+
+	"providers.anthropic.serverSideFallback": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Anthropic Server-Side Fallback (Fable 5)",
+			description:
+				"When a Claude Fable 5 / Mythos 5 request is blocked by Anthropic's safety classifier, retry it on Claude Opus 4.8 server-side (Anthropic `server-side-fallback-2026-06-01` beta). Opt-in — leaving this off preserves the pre-fallback behavior for every request.",
 		},
 	},
 
@@ -1963,7 +2009,11 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-	"compaction.reserveTokens": { type: "number", default: 16384 },
+	// No default: an unset reserve tells the compaction layer the user never
+	// chose one, so small-window recovery may swap in the proportional reserve
+	// (see resolveBudgetReserveTokens). A materialized 16384 here would make
+	// every session look explicitly configured.
+	"compaction.reserveTokens": { type: "number", default: undefined },
 
 	"compaction.keepRecentTokens": { type: "number", default: 20000 },
 
@@ -2217,6 +2267,11 @@ export const SETTINGS_SCHEMA = {
 					label: "8x13 on 11px advance (tracking), black",
 					description:
 						"8x13 glyphs on an 11x16 cell — extra letter spacing so characters don't merge. Default for Anthropic.",
+				},
+				{
+					value: "silver16-bw",
+					label: "Silver 16, CJK",
+					description: "Embedded Silver TrueType font on a 16px grid for CJK and other non-Latin text.",
 				},
 				{
 					value: "doc-8on16-bw",
@@ -3115,18 +3170,6 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 	"bashInterceptor.patterns": { type: "array", default: DEFAULT_BASH_INTERCEPTOR_RULES },
-
-	"bash.stripTrailingHeadTail": {
-		type: "boolean",
-		default: true,
-		ui: {
-			tab: "shell",
-			group: "Bash",
-			label: "Strip head/tail Pipes",
-			description:
-				"Silently drop trailing `| head`/`| tail` pipes from single-line bash commands. Output is already truncated automatically.",
-		},
-	},
 
 	// Shell output minimizer
 	"shellMinimizer.enabled": {
@@ -4095,13 +4138,25 @@ export const SETTINGS_SCHEMA = {
 			group: "Subagents",
 			label: "Soft Subagent Request Budget",
 			description:
-				"Soft per-subagent request budget (assistant requests per run). Crossing it injects one steering notice asking the subagent to wrap up; at 1.5x the budget the run is aborted gracefully, salvaging partial output. 0 disables the guard. Bundled explore/sonic agents use a lower built-in budget.",
+				"Soft per-subagent request budget (assistant requests per run). Crossing it can inject a steering notice when task.softRequestBudgetNotice is enabled; at 1.5x the budget the run is aborted gracefully, salvaging partial output. 0 disables the guard. Bundled explore/sonic agents use a lower built-in budget.",
 			options: [
 				{ value: "0", label: "Disabled" },
 				{ value: "40", label: "40 requests" },
 				{ value: "90", label: "90 requests", description: "Default" },
 				{ value: "150", label: "150 requests" },
 			],
+		},
+	},
+
+	"task.softRequestBudgetNotice": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Soft Request Budget Notice",
+			description:
+				"Inject one steering notice when a subagent crosses its soft request budget. Off by default; enabling it asks the child to wrap up before the 1.5x graceful abort guard.",
 		},
 	},
 
@@ -4275,6 +4330,16 @@ export const SETTINGS_SCHEMA = {
 			description: "Providers that web_search should never use, even as fallbacks",
 		},
 	},
+	"providers.webSearchGeminiModel": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "providers",
+			group: "Services",
+			label: "Gemini web_search model",
+			description: "Model ID for Gemini Google Search grounding. Defaults to gemini-2.5-flash.",
+		},
+	},
 	"providers.antigravityEndpoint": {
 		type: "enum",
 		values: ["auto", "production", "sandbox"] as const,
@@ -4427,6 +4492,17 @@ export const SETTINGS_SCHEMA = {
 				{ value: "assistant", label: "Assistant messages" },
 				{ value: "yield", label: "Final message only" },
 			],
+		},
+	},
+	"speech.enhanced": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "providers",
+			group: "Services",
+			label: "Enhanced Speech Rewriting",
+			description:
+				"Rewrite assistant output into natural spoken prose with the tiny/smol model before synthesis (describes code, drops links and markdown). Falls back to mechanical cleanup on failure",
 		},
 	},
 	"speech.voice": {
@@ -4901,17 +4977,19 @@ export type SettingValue<P extends SettingPath> = Schema[P] extends { type: "boo
 		? boolean
 		: Schema[P] extends { type: "string" }
 			? string | undefined
-			: Schema[P] extends { type: "number" }
-				? number
-				: Schema[P] extends { type: "enum"; values: infer V }
-					? V extends readonly string[]
-						? V[number]
-						: never
-					: Schema[P] extends { type: "array"; default: infer D }
-						? D
-						: Schema[P] extends { type: "record"; default: infer D }
+			: Schema[P] extends { type: "number"; default: undefined }
+				? number | undefined
+				: Schema[P] extends { type: "number" }
+					? number
+					: Schema[P] extends { type: "enum"; values: infer V }
+						? V extends readonly string[]
+							? V[number]
+							: never
+						: Schema[P] extends { type: "array"; default: infer D }
 							? D
-							: never;
+							: Schema[P] extends { type: "record"; default: infer D }
+								? D
+								: never;
 
 /** Get the default value for a setting path */
 export function getDefault<P extends SettingPath>(path: P): SettingValue<P> {
@@ -4973,7 +5051,7 @@ export interface CompactionSettings {
 	strategy: "context-full" | "handoff" | "shake" | "snapcompact" | "off";
 	thresholdPercent: number;
 	thresholdTokens: number;
-	reserveTokens: number;
+	reserveTokens: number | undefined;
 	keepRecentTokens: number;
 	midTurnEnabled: boolean;
 	handoffSaveToDisk: boolean;

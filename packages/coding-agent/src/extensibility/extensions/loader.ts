@@ -18,7 +18,7 @@ import type { ExecOptions } from "../../exec/exec";
 import { execCommand } from "../../exec/exec";
 // Runtime self-reference: dereference this namespace only inside loader functions to keep the index.ts cycle safe.
 import * as PiCodingAgent from "../../index";
-import type { CustomMessage } from "../../session/messages";
+import type { CustomMessagePayload } from "../../session/messages";
 import { EventBus } from "../../utils/event-bus";
 import { installLegacyPiSpecifierShim, loadLegacyPiModule } from "../plugins/legacy-pi-compat";
 import { getAllPluginExtensionPaths } from "../plugins/loader";
@@ -203,7 +203,7 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 	}
 
 	sendMessage<T = unknown>(
-		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
+		message: CustomMessagePayload<T>,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): void {
 		this.runtime.sendMessage(message, options);
@@ -521,10 +521,17 @@ export async function discoverExtensionPaths(
 		}
 	};
 
-	// 1. Discover extension modules via capability API (native .omp/.pi only)
-	const discovered = await loadCapability<ExtensionModule>(extensionModuleCapability.id, loadOptions);
+	// 1. Discover extension modules via capability API (native .omp/.pi only).
+	// Scope the load to the native provider — the extension-module capability
+	// also has claude/codex/gemini/opencode providers, and their items were
+	// discarded here anyway (see #4198). The provider filter skips the walk
+	// entirely instead of running four foreign directory scans and dropping
+	// the results.
+	const discovered = await loadCapability<ExtensionModule>(extensionModuleCapability.id, {
+		...loadOptions,
+		providers: ["native"],
+	});
 	for (const ext of discovered.items) {
-		if (ext._source.provider !== "native") continue;
 		addPath(ext.path);
 	}
 

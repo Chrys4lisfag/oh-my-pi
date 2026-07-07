@@ -113,14 +113,18 @@ function primaryArg(name: string, args: Record<string, unknown> | undefined): st
 	}
 	if (name === "grep") {
 		const pattern = primaryArgValue(args.pattern);
-		const paths = primaryArgValue(args.paths);
+		const paths = primaryArgValue(args.path) || primaryArgValue(args.paths);
 		if (pattern && paths) return oneLine(`${pattern} @ ${paths}`);
 		if (pattern) return oneLine(pattern);
 		if (paths) return oneLine(paths);
 	}
 	if (name === "glob") {
-		const paths = primaryArgValue(args.paths);
+		const paths = primaryArgValue(args.path) || primaryArgValue(args.paths);
 		if (paths) return oneLine(paths);
+	}
+	if (name === "ast_grep") {
+		const pattern = primaryArgValue(args.pat);
+		if (pattern) return oneLine(pattern);
 	}
 	for (const key of PRIMARY_ARG_KEYS) {
 		const value = args[key];
@@ -224,6 +228,11 @@ function executionLine(
  * targets.
  */
 export const PRIMARY_CONTEXT_CUSTOM_TYPES: ReadonlySet<string> = new Set(["plan-mode-context", "plan-mode-reference"]);
+
+/** Hidden non-primary custom messages whose content is needed to understand visible transcript entries. */
+const CONTEXTUAL_NON_PRIMARY_HIDDEN_CUSTOM_TYPES: Record<string, true> = {
+	"image-attachment-description": true,
+};
 
 /** One-liner for custom/hook messages: `[irc] A → B: body…`. */
 function customOneLiner(msg: CustomMessage | HookMessage): string {
@@ -351,6 +360,13 @@ export function formatSessionHistoryMarkdown(messages: unknown[], opts?: History
 			case "custom":
 			case "hookMessage": {
 				const custom = msg as CustomMessage | HookMessage;
+				if (
+					custom.display === false &&
+					!PRIMARY_CONTEXT_CUSTOM_TYPES.has(custom.customType) &&
+					CONTEXTUAL_NON_PRIMARY_HIDDEN_CUSTOM_TYPES[custom.customType] !== true
+				) {
+					break;
+				}
 				if (opts?.expandPrimaryContext && PRIMARY_CONTEXT_CUSTOM_TYPES.has(custom.customType)) {
 					const text = contentToText(custom.content).trim();
 					if (text) {

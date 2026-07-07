@@ -158,7 +158,6 @@ export class SelectorController {
 						const result = await previewTheme(themeName);
 						if (result.success) {
 							this.ctx.statusLine.invalidate();
-							this.ctx.updateEditorTopBorder();
 							this.ctx.ui.invalidate();
 							this.ctx.ui.requestRender();
 						}
@@ -176,7 +175,6 @@ export class SelectorController {
 							compactThinkingLevel: settings.get("statusLine.compactThinkingLevel"),
 							...previewSettings,
 						});
-						this.ctx.updateEditorTopBorder();
 						this.ctx.ui.requestRender();
 					},
 					getStatusLinePreview: () => {
@@ -204,7 +202,6 @@ export class SelectorController {
 							transparent: settings.get("statusLine.transparent"),
 							compactThinkingLevel: settings.get("statusLine.compactThinkingLevel"),
 						});
-						this.ctx.updateEditorTopBorder();
 						this.ctx.ui.requestRender();
 					},
 				},
@@ -249,7 +246,6 @@ export class SelectorController {
 			const advisorRoleSel = resolveAdvisorRoleSelection(
 				this.ctx.settings,
 				this.ctx.session.modelRegistry.getAvailable(),
-				this.ctx.session.modelRegistry,
 			);
 			const defaultAdvisorModel = advisorRoleSel?.model;
 			const deps: AdvisorConfigDeps = {
@@ -458,7 +454,6 @@ export class SelectorController {
 			case "tui.tight":
 				setTuiTight(value as boolean);
 				this.ctx.ui.invalidate();
-				this.ctx.updateEditorTopBorder();
 				this.ctx.ui.requestRender();
 				break;
 
@@ -474,7 +469,7 @@ export class SelectorController {
 			case "theme": {
 				setTheme(value as string, true).then(result => {
 					this.ctx.statusLine.invalidate();
-					this.ctx.updateEditorTopBorder();
+					this.ctx.ui.requestRender();
 					this.ctx.ui.invalidate();
 					if (!result.success) {
 						this.ctx.showError(`Failed to load theme "${value}": ${result.error}\nFell back to dark theme.`);
@@ -485,7 +480,7 @@ export class SelectorController {
 			case "symbolPreset": {
 				setSymbolPreset(value as "unicode" | "nerd" | "ascii").then(() => {
 					this.ctx.statusLine.invalidate();
-					this.ctx.updateEditorTopBorder();
+					this.ctx.ui.requestRender();
 					this.ctx.ui.invalidate();
 				});
 				break;
@@ -559,7 +554,6 @@ export class SelectorController {
 					compactThinkingLevel: settings.get("statusLine.compactThinkingLevel"),
 				};
 				this.ctx.statusLine.updateSettings(statusLineSettings);
-				this.ctx.updateEditorTopBorder();
 				this.ctx.ui.requestRender();
 				break;
 			}
@@ -963,43 +957,65 @@ export class SelectorController {
 		// every project's history when the cwd has nothing to resume. See #3099.
 		const historyStorage = this.ctx.historyStorage;
 		const historyMatcher = historyStorage ? (query: string) => historyStorage.matchingSessionIds(query) : undefined;
-		this.showSelector(done => {
-			const selector = new SessionSelectorComponent(
-				sessions,
-				async (session: SessionInfo) => {
-					done();
-					await this.handleResumeSession(session.path);
+		// Fullscreen session picker on the alternate screen (the /settings idiom):
+		// the overlay borrows the alt buffer and enables mouse tracking (wheel
+		// scroll + click-to-resume) for its lifetime, leaving the transcript
+		// untouched underneath. Anchored top-left at full size so a mouse row maps
+		// directly to a rendered line (the overlay paints from screen row 0), and
+		// `fillHeight` pads the body so the footer pins to the screen bottom.
+		let overlayHandle: OverlayHandle | undefined;
+		const done = () => {
+			overlayHandle?.hide();
+			this.focusActiveEditorArea();
+			this.ctx.ui.requestRender();
+		};
+		const selector = new SessionSelectorComponent(
+			sessions,
+			async (session: SessionInfo) => {
+				done();
+				await this.handleResumeSession(session.path);
+			},
+			() => {
+				done();
+			},
+			() => {
+				// Release the alt buffer before teardown: shutdown() awaits flush/save/
+				// dispose/drain before stop() leaves the alt screen, so without this the
+				// fullscreen picker would freeze on screen for that window on Ctrl+C.
+				done();
+				void this.ctx.shutdown();
+			},
+			{
+				onDelete: async (session: SessionInfo) => {
+					if (!(await this.#detachActiveSessionBeforeDeletion(session.path))) {
+						return false;
+					}
+					const storage = new FileSessionStorage();
+					try {
+						await storage.deleteSessionWithArtifacts(session.path);
+						return true;
+					} catch (err) {
+						throw new Error(`Failed to delete session: ${err instanceof Error ? err.message : String(err)}`, {
+							cause: err,
+						});
+					}
 				},
-				() => {
-					done();
-					this.ctx.ui.requestRender();
-				},
-				() => {
-					void this.ctx.shutdown();
-				},
-				{
-					onDelete: async (session: SessionInfo) => {
-						if (!(await this.#detachActiveSessionBeforeDeletion(session.path))) {
-							return false;
-						}
-						const storage = new FileSessionStorage();
-						try {
-							await storage.deleteSessionWithArtifacts(session.path);
-							return true;
-						} catch (err) {
-							throw new Error(`Failed to delete session: ${err instanceof Error ? err.message : String(err)}`, {
-								cause: err,
-							});
-						}
-					},
-					historyMatcher,
-					loadAllSessions: () => SessionManager.listAll(),
-					getTerminalRows: () => this.ctx.ui.terminal.rows,
-				},
-			);
-			selector.setOnRequestRender(() => this.ctx.ui.requestRender());
-			return { component: selector, focus: selector };
+				historyMatcher,
+				loadAllSessions: () => SessionManager.listAll(),
+				getTerminalRows: () => this.ctx.ui.terminal.rows,
+				fillHeight: true,
+			},
+		);
+		selector.setOnRequestRender(() => this.ctx.ui.requestRender());
+		overlayHandle = this.ctx.ui.showOverlay(selector, {
+			anchor: "top-left",
+			width: "100%",
+			maxHeight: "100%",
+			margin: 0,
+			fullscreen: true,
 		});
+		this.ctx.ui.setFocus(selector);
+		this.ctx.ui.requestRender();
 	}
 
 	#refreshSessionTerminalTitle(): void {
@@ -1026,7 +1042,7 @@ export class SelectorController {
 		this.ctx.clearTransientSessionUi();
 		this.ctx.statusLine.invalidate();
 		this.ctx.statusLine.resetActiveTime();
-		this.ctx.updateEditorTopBorder();
+		this.ctx.ui.requestRender();
 		this.ctx.updateEditorBorderColor();
 		this.ctx.renderInitialMessages({ clearTerminalHistory: true });
 		await this.ctx.reloadTodos();
@@ -1102,11 +1118,19 @@ export class SelectorController {
 		const useManualInput = PASTE_CODE_LOGIN_PROVIDERS.has(providerId);
 		try {
 			await this.ctx.session.modelRegistry.authStorage.login(providerId as OAuthProvider, {
-				onAuth: (info: { url: string; instructions?: string }) => {
+				onAuth: (info: { url: string; launchUrl?: string; instructions?: string }) => {
 					const block = new TranscriptBlock();
+					// Full URL first: works from any machine, including SSH boxes
+					// where the OMP-hosted `launchUrl` would resolve against the
+					// user's local browser and fail.
 					block.addChild(new Text(theme.fg("dim", info.url), 1, 0));
 					const hyperlink = `\x1b]8;;${info.url}\x07Click here to login\x1b]8;;\x07`;
 					block.addChild(new Text(theme.fg("accent", hyperlink), 1, 0));
+					if (info.launchUrl && info.launchUrl !== info.url) {
+						block.addChild(
+							new Text(theme.fg("dim", `Local shortcut (this machine only): ${info.launchUrl}`), 1, 0),
+						);
+					}
 					if (info.instructions) {
 						block.addChild(new Spacer(1));
 						block.addChild(new Text(theme.fg("warning", info.instructions), 1, 0));
@@ -1489,18 +1513,27 @@ export class SelectorController {
 			sessionFile: this.ctx.sessionManager.getSessionFile() ?? null,
 		});
 
-		// The double-← gesture passes requireContent so it stays inert when there
-		// are no subagents to show; the explicit hub/observe keys still open the
-		// empty roster. The freshly built hub already ran the persisted-subagent
-		// scan, so its row count is the authoritative "is there anything to show".
+		const showReadyHub = () => {
+			// The double-← gesture passes requireContent so it stays inert when
+			// neither live nor persisted subagents are available. Persisted rows now
+			// load asynchronously, so defer the gate until that scan has refreshed the
+			// hub instead of treating the initial empty table as authoritative.
+			if (options?.requireContent && hub.isEmpty) {
+				hub.dispose();
+				return;
+			}
+
+			this.ctx.editorContainer.clear();
+			this.ctx.editorContainer.addChild(hub);
+			this.ctx.ui.setFocus(hub);
+			this.ctx.ui.requestRender();
+		};
+
 		if (options?.requireContent && hub.isEmpty) {
-			hub.dispose();
+			void hub.persistedSubagentsReady.then(showReadyHub);
 			return;
 		}
 
-		this.ctx.editorContainer.clear();
-		this.ctx.editorContainer.addChild(hub);
-		this.ctx.ui.setFocus(hub);
-		this.ctx.ui.requestRender();
+		showReadyHub();
 	}
 }

@@ -34,6 +34,7 @@ import { DynamicBorder } from "./dynamic-border";
 
 /** Refresh cadence for the relative-time column */
 const AGE_TICK_MS = 5_000;
+const DATA_CHANGE_RENDER_COALESCE_MS = 100;
 /** Double-tap window for the table's left-left "close hub" gesture. */
 const LEFT_TAP_WINDOW_MS = 500;
 
@@ -68,16 +69,23 @@ function statusBadge(status: AgentStatus): string {
 	}
 }
 
-function registerPersistedSubagents(registry: AgentRegistry, sessionFile: string | null | undefined): void {
+async function registerPersistedSubagents(
+	registry: AgentRegistry,
+	sessionFile: string | null | undefined,
+): Promise<void> {
 	if (!sessionFile?.endsWith(".jsonl")) return;
 	const root = sessionFile.slice(0, -6);
-	registerPersistedSubagentsFromDir(registry, root, undefined);
+	await registerPersistedSubagentsFromDir(registry, root, undefined);
 }
 
-function registerPersistedSubagentsFromDir(registry: AgentRegistry, dir: string, parentId: string | undefined): void {
+async function registerPersistedSubagentsFromDir(
+	registry: AgentRegistry,
+	dir: string,
+	parentId: string | undefined,
+): Promise<void> {
 	let entries: fs.Dirent[];
 	try {
-		entries = fs.readdirSync(dir, { withFileTypes: true });
+		entries = await fs.promises.readdir(dir, { withFileTypes: true });
 	} catch {
 		return;
 	}
@@ -126,8 +134,16 @@ function registerPersistedSubagentsFromDir(registry: AgentRegistry, dir: string,
 				status: "parked",
 			});
 		}
-		registerPersistedSubagentsFromDir(registry, path.join(dir, id), id);
+		await registerPersistedSubagentsFromDir(registry, path.join(dir, id), id);
 	}
+}
+
+/** Result of one host-backed transcript read for the Agent Hub viewer. */
+export interface AgentHubRemoteTranscript {
+	text: string;
+	newSize: number;
+	/** Terminal read failure reported by the host; guests should surface it instead of retrying hot. */
+	error?: string;
 }
 
 /** Guest-side proxy for hub actions executed on the collab host. */
@@ -135,8 +151,8 @@ export interface AgentHubRemote {
 	chat(id: string, text: string): void;
 	kill(id: string): void;
 	revive(id: string): void;
-	/** Mirrors readFileIncremental: text from fromByte (complete JSONL lines), newSize = next fromByte base; null = unavailable. */
-	readTranscript(id: string, fromByte: number): Promise<{ text: string; newSize: number } | null>;
+	/** Mirrors readFileIncremental: text from fromByte (complete JSONL lines), newSize = next fromByte base; null = temporarily unavailable. */
+	readTranscript(id: string, fromByte: number): Promise<AgentHubRemoteTranscript | null>;
 }
 
 export interface AgentHubDeps {
@@ -183,7 +199,10 @@ export class AgentHubOverlayComponent extends Container {
 	#hubKeys: KeyId[];
 	#unsubscribers: Array<() => void> = [];
 	#ageTimer: NodeJS.Timeout | undefined;
+	#dataChangeTimer?: NodeJS.Timeout;
 	#remote: AgentHubRemote | undefined;
+	/** Resolves after persisted historical subagents have been registered and rows refreshed. */
+	readonly persistedSubagentsReady: Promise<void>;
 
 	// Table state
 	#rows: AgentRef[] = [];
@@ -234,19 +253,28 @@ export class AgentHubOverlayComponent extends Container {
 		this.#expandKeys = deps.expandKeys ?? ["ctrl+o"];
 		this.#focusAgent = deps.focusAgent;
 
-		this.#unsubscribers.push(this.#registry.onChange(() => this.#onDataChange()));
-		this.#unsubscribers.push(this.#observers.onChange(() => this.#onDataChange()));
+		this.#unsubscribers.push(this.#registry.onChange(() => this.#scheduleDataChange()));
+		this.#unsubscribers.push(this.#observers.onChange(() => this.#scheduleDataChange()));
 		this.#ageTimer = setInterval(() => this.#requestRender(), AGE_TICK_MS);
 		this.#ageTimer.unref?.();
 
-		if (!this.#remote) registerPersistedSubagents(this.#registry, deps.sessionFile);
+		this.persistedSubagentsReady = this.#remote
+			? Promise.resolve()
+			: registerPersistedSubagents(this.#registry, deps.sessionFile)
+					.catch((error: unknown) => {
+						logger.warn("Failed to register persisted subagents", { error });
+					})
+					.then(() => {
+						this.#refreshRows();
+					})
+					.finally(() => this.#requestRender());
 		this.#refreshRows();
 	}
 
 	/**
-	 * Whether the table view has no agents to show (every registered agent except
-	 * Main, after the persisted-subagent scan in the constructor). The double-←
-	 * gesture reads this to stay inert when there is nothing to open.
+	 * Whether the current table view has no agents to show (every registered agent
+	 * except Main). Persisted historical rows may arrive later; callers that need
+	 * those included must wait for {@link persistedSubagentsReady} first.
 	 */
 	get isEmpty(): boolean {
 		return this.#rows.length === 0;
@@ -258,6 +286,10 @@ export class AgentHubOverlayComponent extends Container {
 		if (this.#ageTimer) {
 			clearInterval(this.#ageTimer);
 			this.#ageTimer = undefined;
+		}
+		if (this.#dataChangeTimer) {
+			clearTimeout(this.#dataChangeTimer);
+			this.#dataChangeTimer = undefined;
 		}
 		this.#closeTranscriptOverlay();
 	}
@@ -328,6 +360,15 @@ export class AgentHubOverlayComponent extends Container {
 	// ========================================================================
 	// Live data plumbing
 	// ========================================================================
+
+	#scheduleDataChange(): void {
+		if (this.#dataChangeTimer) return;
+		this.#dataChangeTimer = setTimeout(() => {
+			this.#dataChangeTimer = undefined;
+			this.#onDataChange();
+		}, DATA_CHANGE_RENDER_COALESCE_MS);
+		this.#dataChangeTimer.unref?.();
+	}
 
 	#onDataChange(): void {
 		this.#refreshRows();
