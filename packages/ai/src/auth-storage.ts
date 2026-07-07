@@ -929,6 +929,16 @@ export class AuthStorage {
 	#sessionLastCredential: Map<string, Map<string, { type: AuthCredential["type"]; index: number }>> = new Map();
 	/** Maps provider:type -> credentialIndex -> blockedUntilMs for temporary backoff. */
 	#credentialBackoff: Map<string, Map<number, number>> = new Map();
+	/**
+	 * Credential row ids the user has disabled FOR ROUTING (model requests) via
+	 * `/accounts`. A disabled credential is excluded from request selection
+	 * (round-robin / session-sticky / rate-limit failover) but is NOT logged out
+	 * and is NOT skipped by token refresh, health probes, or usage reporting — it
+	 * stays alive for everything except serving requests. Persisted per-row in the
+	 * store cache (key `routing:disabled:<credentialId>`) so it survives restart;
+	 * repopulated on {@link AuthStorage.reload}.
+	 */
+	#routingDisabledIds: Set<number> = new Set();
 	#usageProviderResolver?: (provider: Provider) => UsageProvider | undefined;
 	#rankingStrategyResolver?: (provider: Provider) => CredentialRankingStrategy | undefined;
 	#usageCache: UsageCache;
@@ -1152,6 +1162,72 @@ export class AuthStorage {
 		for (const provider of removedProviders) {
 			this.#setStoredCredentials(provider, []);
 		}
+		this.#loadRoutingDisabledFromCache(records.map(record => record.id));
+	}
+
+	/** Cache key holding the per-credential routing-disabled flag (survives restart). */
+	#routingDisabledCacheKey(credentialId: number): string {
+		return `routing:disabled:${credentialId}`;
+	}
+
+	/**
+	 * Rebuild {@link #routingDisabledIds} from the store cache for the credential
+	 * ids that currently exist. Ids no longer present are dropped implicitly (we
+	 * only re-add ones we see), so a deleted+re-added credential never inherits a
+	 * stale flag from a recycled row id.
+	 */
+	#loadRoutingDisabledFromCache(existingIds: number[]): void {
+		const next = new Set<number>();
+		for (const id of existingIds) {
+			try {
+				if (this.#store.getCache(this.#routingDisabledCacheKey(id)) === "1") {
+					next.add(id);
+				}
+			} catch (err) {
+				logger.debug("Failed to read routing-disabled flag from store cache", { err, credentialId: id });
+			}
+		}
+		this.#routingDisabledIds = next;
+	}
+
+	/** True when the credential at `index` in the provider array is routing-disabled. */
+	#isRoutingDisabledAtIndex(provider: string, index: number): boolean {
+		if (this.#routingDisabledIds.size === 0) return false;
+		const id = this.#getStoredCredentials(provider)[index]?.id;
+		return id !== undefined && this.#routingDisabledIds.has(id);
+	}
+
+	/** Whether a stored credential row is disabled for request routing (see {@link setRoutingEnabled}). */
+	isRoutingDisabled(credentialId: number): boolean {
+		return this.#routingDisabledIds.has(credentialId);
+	}
+
+	/**
+	 * Enable/disable a stored credential FOR ROUTING (model requests) without
+	 * logging it out. A disabled credential is excluded from request selection
+	 * but keeps refreshing, health-probing, and reporting usage. Persisted in the
+	 * store cache so it survives restart. Clears the provider's round-robin +
+	 * session-sticky assignments so the next request re-selects around the change
+	 * (and a now-disabled sticky account is dropped immediately).
+	 */
+	setRoutingEnabled(provider: string, credentialId: number, enabled: boolean): void {
+		const changed = enabled
+			? this.#routingDisabledIds.delete(credentialId)
+			: !this.#routingDisabledIds.has(credentialId);
+		if (!enabled) this.#routingDisabledIds.add(credentialId);
+		if (!changed) return;
+		try {
+			const key = this.#routingDisabledCacheKey(credentialId);
+			if (enabled) {
+				this.#store.setCache(key, "", 0);
+			} else {
+				// Far-future expiry ≈ permanent; mirrors the session-sticky cache pattern.
+				this.#store.setCache(key, "1", Math.floor(Date.now() / 1000) + 3650 * 24 * 60 * 60);
+			}
+		} catch (err) {
+			logger.debug("Failed to persist routing-disabled flag to store cache", { err, credentialId });
+		}
+		this.#resetProviderAssignments(provider);
 	}
 
 	/**
@@ -1456,7 +1532,10 @@ export class AuthStorage {
 
 		for (const idx of order) {
 			const candidate = credentials[idx];
-			if (!this.#isCredentialBlocked(providerKey, candidate.index)) {
+			if (
+				!this.#isCredentialBlocked(providerKey, candidate.index) &&
+				!this.#isRoutingDisabledAtIndex(provider, candidate.index)
+			) {
 				return candidate;
 			}
 		}
@@ -1795,7 +1874,16 @@ export class AuthStorage {
 		// filtered array would be off-by-N when any non-OAuth credential precedes the
 		// OAuth ones (e.g. [api_key, oauth_A, oauth_B] stored order).
 		const stickyCredential = sessionPref?.type === "oauth" ? allCredentials[sessionPref.index] : undefined;
-		return stickyCredential?.type === "oauth" ? stickyCredential : oauthCredentials[0];
+		// A routing-disabled account is never used for requests, so it must not be
+		// reported for account_uuid attribution either — skip a disabled sticky and
+		// fall back to the first routing-eligible OAuth account.
+		if (stickyCredential?.type === "oauth" && !this.#isRoutingDisabledAtIndex(provider, sessionPref?.index ?? -1)) {
+			return stickyCredential;
+		}
+		const firstRoutable = allCredentials.find(
+			(c, index): c is OAuthCredential => c.type === "oauth" && !this.#isRoutingDisabledAtIndex(provider, index),
+		);
+		return firstRoutable ?? oauthCredentials[0];
 	}
 
 	/**
@@ -3234,11 +3322,17 @@ export class AuthStorage {
 		sessionId?: string,
 		options?: AuthApiKeyOptions,
 	): Promise<OAuthResolutionResult | undefined> {
-		const credentials = this.#getCredentialsForProvider(provider)
+		const allOAuth = this.#getCredentialsForProvider(provider)
 			.map((credential, index) => ({ credential, index }))
 			.filter((entry): entry is { credential: OAuthCredential; index: number } => entry.credential.type === "oauth");
 
-		if (credentials.length === 0) return undefined;
+		if (allOAuth.length === 0) return undefined;
+
+		// Exclude routing-disabled accounts from request selection. If that would
+		// leave nothing (every OAuth account disabled), fall back to the full set
+		// rather than failing the request — a disabled flag must never brick auth.
+		const routable = allOAuth.filter(entry => !this.#isRoutingDisabledAtIndex(provider, entry.index));
+		const credentials = routable.length > 0 ? routable : allOAuth;
 
 		const providerKey = this.#getProviderTypeKey(provider, "oauth");
 		const order = this.#getCredentialOrder(providerKey, sessionId, credentials.length);

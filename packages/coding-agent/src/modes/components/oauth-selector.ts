@@ -60,7 +60,7 @@ export class OAuthSelectorComponent extends Container {
 	/** First provider index of the visible ScrollView window (last #updateList). */
 	#scrollStart = 0;
 	#visibleCount = 0;
-	#mode: "login" | "logout";
+	#mode: "login" | "logout" | "manage";
 	#authStorage: AuthStorage;
 	#onSelectCallback: (providerId: string) => void;
 	#onCancelCallback: () => void;
@@ -72,7 +72,7 @@ export class OAuthSelectorComponent extends Container {
 	#spinnerInterval?: NodeJS.Timeout;
 	#validationGeneration: number = 0;
 	constructor(
-		mode: "login" | "logout",
+		mode: "login" | "logout" | "manage",
 		authStorage: AuthStorage,
 		onSelect: (providerId: string) => void,
 		onCancel: () => void,
@@ -93,7 +93,12 @@ export class OAuthSelectorComponent extends Container {
 		this.addChild(new DynamicBorder());
 		this.addChild(new Spacer(1));
 		// Add title
-		const title = mode === "login" ? "Select provider to login:" : "Select provider to logout:";
+		const title =
+			mode === "login"
+				? "Select provider to login:"
+				: mode === "manage"
+					? "Select provider to manage accounts:"
+					: "Select provider to logout:";
 		this.addChild(new TruncatedText(theme.bold(title)));
 		this.addChild(new Spacer(1));
 		// Create list container
@@ -112,12 +117,13 @@ export class OAuthSelectorComponent extends Container {
 		this.#stopSpinner();
 	}
 	#hasSelectableAuth(providerId: string): boolean {
-		return this.#mode === "logout" ? this.#authStorage.has(providerId) : this.#authStorage.hasAuth(providerId);
+		// login needs any usable auth; logout/manage operate on STORED credentials only.
+		return this.#mode === "login" ? this.#authStorage.hasAuth(providerId) : this.#authStorage.has(providerId);
 	}
 
 	#loadProviders(): void {
 		const providers = getOAuthProviders();
-		if (this.#mode === "logout") {
+		if (this.#mode !== "login") {
 			// Logout stays unfiltered by `disabledProviders`: a now-disabled
 			// provider may still hold stored credentials worth removing.
 			this.#allProviders = providers.filter(provider => this.#hasSelectableAuth(provider.id));

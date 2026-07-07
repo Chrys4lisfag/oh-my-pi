@@ -7,11 +7,15 @@ export interface LogoutAccount {
 	detail: string;
 	type: "api_key" | "oauth";
 	active: boolean;
+	/** True when this credential is disabled for request routing (kept for refresh/usage). */
+	routingDisabled: boolean;
 }
 
 interface LogoutAccountOptions {
 	activeIdentity?: OAuthAccountIdentity;
 	activeApiKey?: boolean;
+	/** Per-credential routing-disabled lookup (from AuthStorage.isRoutingDisabled). */
+	isRoutingDisabled?: (credentialId: number) => boolean;
 }
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -79,6 +83,7 @@ export function toLogoutAccounts(
 				detail: oauthDetail(row, label),
 				type: row.credential.type,
 				active,
+				routingDisabled: options.isRoutingDisabled?.(row.id) ?? false,
 			} satisfies LogoutAccount;
 		})
 		.sort((left, right) => {

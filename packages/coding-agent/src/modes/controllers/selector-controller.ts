@@ -58,6 +58,7 @@ import { shortenPath } from "../../tools/render-utils";
 import { copyToClipboard } from "../../utils/clipboard";
 import { repo } from "../../utils/git";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
+import { AccountManagerSelectorComponent } from "../components/account-manager-selector";
 import { type AdvisorConfigDeps, AdvisorConfigOverlayComponent } from "../components/advisor-config";
 import { AgentDashboard } from "../components/agent-dashboard";
 import { AgentHubOverlayComponent } from "../components/agent-hub";
@@ -1223,6 +1224,92 @@ export class SelectorController {
 				account => {
 					done();
 					void this.#handleCredentialLogout(providerId, account);
+				},
+				() => {
+					done();
+					this.ctx.ui.requestRender();
+				},
+			);
+			return { component: selector, focus: selector };
+		});
+	}
+
+	/**
+	 * `/accounts [provider]` — manage whether each stored credential is used for
+	 * request ROUTING (model calls). Toggling here never logs the account out or
+	 * stops its background refresh/usage reporting; it only removes it from the
+	 * request-selection pool. With no provider, shows a provider picker (only
+	 * providers that have stored credentials).
+	 */
+	async showAccountsSelector(providerId?: string): Promise<void> {
+		if (providerId) {
+			await this.#showAccountManagerSelector(providerId);
+			return;
+		}
+		await this.#refreshOAuthProviderAuthState();
+		const withCredentials = getOAuthProviders().filter(provider =>
+			this.ctx.session.modelRegistry.authStorage.has(provider.id),
+		);
+		if (withCredentials.length === 0) {
+			this.ctx.showStatus("No stored provider credentials to manage. Use /login to add accounts.");
+			return;
+		}
+		if (withCredentials.length === 1) {
+			await this.#showAccountManagerSelector(withCredentials[0].id);
+			return;
+		}
+		this.showSelector(done => {
+			let selector: OAuthSelectorComponent;
+			selector = new OAuthSelectorComponent(
+				"manage",
+				this.ctx.session.modelRegistry.authStorage,
+				async (selectedProviderId: string) => {
+					selector.stopValidation();
+					done();
+					await this.#showAccountManagerSelector(selectedProviderId);
+				},
+				() => {
+					selector.stopValidation();
+					done();
+					this.ctx.ui.requestRender();
+				},
+			);
+			return { component: selector, focus: selector };
+		});
+	}
+
+	async #showAccountManagerSelector(providerId: string): Promise<void> {
+		const authStorage = this.ctx.session.modelRegistry.authStorage;
+		try {
+			await authStorage.reload();
+		} catch (error: unknown) {
+			this.ctx.showError(
+				`Could not load stored credentials: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return;
+		}
+		const provider = getOAuthProviders().find(candidate => candidate.id === providerId);
+		const accounts = toLogoutAccounts(providerId, authStorage.listStoredCredentials(providerId), {
+			activeIdentity: authStorage.getOAuthAccountIdentity(providerId, this.ctx.session.sessionId),
+			activeApiKey: authStorage.getCredentialOrigin(providerId)?.kind === "api_key",
+			isRoutingDisabled: credentialId => authStorage.isRoutingDisabled(credentialId),
+		});
+		if (accounts.length === 0) {
+			this.ctx.showError(`No stored credentials for ${providerId} to manage.`);
+			return;
+		}
+		if (accounts.length === 1) {
+			this.ctx.showStatus(`${providerId} has a single account; routing toggle needs 2+ accounts.`);
+			return;
+		}
+		this.showSelector(done => {
+			const selector = new AccountManagerSelectorComponent(
+				provider?.name ?? providerId,
+				accounts,
+				(account, nextDisabled) => {
+					// Persist the toggle immediately; the selector stays open.
+					authStorage.setRoutingEnabled(providerId, account.credentialId, !nextDisabled);
+					this.ctx.ui.requestRender();
 				},
 				() => {
 					done();

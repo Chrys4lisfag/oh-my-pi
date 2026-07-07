@@ -1237,6 +1237,28 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "accounts",
+		description: "Manage which logged-in accounts are used for model requests (routing)",
+		inlineHint: "[provider]",
+		allowArgs: true,
+		handleTui: (command, runtime) => {
+			const providerId = command.args.trim();
+			if (providerId) {
+				const matchedProvider = getOAuthProviders().find(provider => provider.id === providerId);
+				if (!matchedProvider) {
+					runtime.ctx.showWarning(`Unknown OAuth provider: ${providerId}`);
+					runtime.ctx.editor.setText("");
+					return;
+				}
+				void runtime.ctx.showAccountsSelector(matchedProvider.id);
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			void runtime.ctx.showAccountsSelector();
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
 		name: "mcp",
 		description: "Manage MCP servers (add, list, remove, test)",
 		acpDescription: "Manage MCP servers",
