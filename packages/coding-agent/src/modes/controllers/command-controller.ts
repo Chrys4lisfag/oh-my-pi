@@ -1152,12 +1152,11 @@ export class CommandController {
 		this.ctx.showStatus("Usage: /profiles [list|add|switch|delete|rename|save]");
 	}
 
-	/** Resolve the default model from current settings and apply it to the session. */
+	/** Apply a freshly-switched profile to the live session (primary model,
+	 *  thinking level, and advisor models). Delegates to the session so the sync
+	 *  logic lives in one tested place. */
 	async #applyProfileModelToSession(): Promise<void> {
-		const model = this.ctx.session.resolveRoleModel("default");
-		if (model) {
-			await this.ctx.session.setModel(model);
-		}
+		await this.ctx.session.applyProfileToSession();
 	}
 
 	async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {

@@ -1347,6 +1347,7 @@ export class AgentSession {
 	// Event subscription state
 	#unsubscribeAgent?: () => void;
 	#unsubscribeAppendOnly?: () => void;
+	#unsubscribeModelsUpdated?: () => void;
 	/** Last (enable, providerId) tuple resolved by `#syncAppendOnlyContext` — used to skip no-op invalidations. */
 	#lastAppendOnlyResolution?: { enable: boolean; providerId: string | undefined };
 	#eventListeners: AgentSessionEventListener[] = [];
@@ -1977,6 +1978,12 @@ export class AgentSession {
 
 		this.#advisorEnabled = this.settings.get("advisor.enabled") as boolean;
 		if (this.#advisorEnabled) this.#buildAdvisorRuntime();
+		// Retry a skipped advisor build once late-loading dynamic providers (ollama/
+		// litellm/extension catalogs) arrive: startup `refreshInBackground()` runs
+		// after the advisor is built, so a configured dynamic advisor model is not
+		// yet resolvable at construction. ensureAdvisorsBuilt() no-ops when the
+		// advisor is disabled or already active.
+		this.#unsubscribeModelsUpdated = this.#modelRegistry.onModelsUpdated(() => this.ensureAdvisorsBuilt());
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, hooks, auto-compaction, retry logic)
@@ -5146,6 +5153,10 @@ export class AgentSession {
 		if (this.#unsubscribeAppendOnly) {
 			this.#unsubscribeAppendOnly();
 			this.#unsubscribeAppendOnly = undefined;
+		}
+		if (this.#unsubscribeModelsUpdated) {
+			this.#unsubscribeModelsUpdated();
+			this.#unsubscribeModelsUpdated = undefined;
 		}
 		this.#eventListeners = [];
 	}
@@ -14594,6 +14605,70 @@ export class AgentSession {
 		this.#stopAdvisorRuntime();
 		this.#buildAdvisorRuntime(true);
 		return this.#advisors.length;
+	}
+
+	/**
+	 * Force-rebuild every advisor runtime from the CURRENT settings (model roles,
+	 * thinking level). Call after a change that alters advisor model resolution
+	 * but does NOT go through {@link applyAdvisorConfigs} — notably a profile
+	 * switch/cycle, which rewrites `settings.modelRoles` (incl. the `advisor`
+	 * role) but leaves the already-built advisor agents pinned to their old
+	 * model. No-op when the advisor is disabled or nothing is currently active
+	 * (nothing to refresh; the next enable/build reads fresh settings anyway).
+	 *
+	 * @returns the number of advisors active after the rebuild.
+	 */
+	refreshAdvisors(): number {
+		if (!this.#advisorEnabled) return 0;
+		if (this.#advisors.length === 0) return 0;
+		this.#stopAdvisorRuntime();
+		this.#buildAdvisorRuntime(true);
+		return this.#advisors.length;
+	}
+
+	/**
+	 * Build the advisor runtime if it is enabled but not yet active. Idempotent:
+	 * a no-op when the advisor is disabled or already running. Used to retry a
+	 * build that was skipped because the configured `advisor`-role model was not
+	 * in the registry yet — the startup `refreshInBackground()` populates dynamic
+	 * providers (ollama/litellm/extension catalogs) AFTER the session and its
+	 * advisors are constructed, so the first build silently skips such a model.
+	 * Wired to {@link ModelRegistry.onModelsUpdated} in the constructor.
+	 *
+	 * @returns true when an advisor is active after the call.
+	 */
+	ensureAdvisorsBuilt(): boolean {
+		if (this.#isDisposed) return false;
+		if (!this.#advisorEnabled) return false;
+		if (this.#advisors.length > 0) return true;
+		return this.#buildAdvisorRuntime(true);
+	}
+
+	/**
+	 * Apply the active profile's live settings snapshot to this running session
+	 * after a `/profiles` switch or cycle rewrote `settings.modelRoles` and
+	 * `settings.defaultThinkingLevel`. Keeps the live session in sync with the
+	 * profile in one place:
+	 *   1. primary model  — the `default` role's resolved model;
+	 *   2. thinking level — the profile's `defaultThinkingLevel` (which
+	 *      {@link setModel} does NOT apply: it re-clamps to the model's own
+	 *      default, so a profile that only changes thinking would otherwise be
+	 *      ignored);
+	 *   3. advisors       — rebuilt so they pick up the profile's `advisor`-role
+	 *      model instead of staying pinned to the previous profile's.
+	 *
+	 * A missing default-role model (e.g. providers still loading) is skipped
+	 * rather than throwing; the `onModelsUpdated` retry rebuilds advisors once
+	 * the catalog arrives. `setModel` still throws on a resolved-but-uncredentialed
+	 * model so the caller can surface it.
+	 */
+	async applyProfileToSession(): Promise<void> {
+		const model = this.resolveRoleModel("default");
+		if (model) {
+			await this.setModel(model);
+		}
+		this.setThinkingLevel(parseConfiguredThinkingLevel(this.settings.get("defaultThinkingLevel")));
+		this.refreshAdvisors();
 	}
 
 	/**

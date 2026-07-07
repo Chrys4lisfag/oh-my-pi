@@ -748,6 +748,8 @@ export class ModelRegistry {
 	#cacheDbPath?: string;
 	#suppressedSelectors: Map<string, number> = new Map();
 	#backgroundRefresh?: Promise<void>;
+	/** Listeners fired once per top-level refresh settle (see {@link onModelsUpdated}). */
+	#modelsUpdatedListeners: Set<() => void> = new Set();
 	#lastDiscoveryWarnings: Map<string, string> = new Map();
 	// Runtime extension model overlays — persist across refresh() cycles so that
 	// models registered by extensions survive the model selector's offline reload.
@@ -1854,6 +1856,35 @@ export class ModelRegistry {
 		if (this.#rebuildSuspended === 0 && this.#rebuildPending) {
 			this.#rebuildPending = false;
 			this.#canonicalIndexDirty = true;
+			// Top-level refresh settled with new/changed models — notify subscribers
+			// (e.g. AgentSession retries a skipped advisor build once dynamic
+			// providers like ollama/litellm finally arrive).
+			this.#emitModelsUpdated();
+		}
+	}
+
+	/**
+	 * Subscribe to model-catalog settle events — fired once per top-level
+	 * refresh/refreshProvider/refreshRuntimeProviders after the model list is
+	 * rebuilt. Returns an unsubscribe function. Used to retry work that depends
+	 * on late-loading dynamic providers (the startup `refreshInBackground()`
+	 * runs AFTER sessions/advisors are built, so a configured dynamic model is
+	 * not yet in the registry at build time).
+	 */
+	onModelsUpdated(listener: () => void): () => void {
+		this.#modelsUpdatedListeners.add(listener);
+		return () => {
+			this.#modelsUpdatedListeners.delete(listener);
+		};
+	}
+
+	#emitModelsUpdated(): void {
+		for (const listener of this.#modelsUpdatedListeners) {
+			try {
+				listener();
+			} catch (err) {
+				logger.debug("model-registry onModelsUpdated listener failed", { err: String(err) });
+			}
 		}
 	}
 

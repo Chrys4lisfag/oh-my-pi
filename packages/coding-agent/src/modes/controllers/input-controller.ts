@@ -1699,10 +1699,9 @@ export class InputController {
 			return;
 		}
 		try {
-			const model = this.ctx.session.resolveRoleModel("default");
-			if (model) {
-				await this.ctx.session.setModel(model);
-			}
+			// Apply the cycled profile (primary model, thinking level, advisors) via
+			// the centralized session method so the advisor model tracks the profile.
+			await this.ctx.session.applyProfileToSession();
 		} catch (err) {
 			this.ctx.showError(err instanceof Error ? err.message : String(err));
 			return;

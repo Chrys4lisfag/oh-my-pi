@@ -38,6 +38,27 @@ describe("profiles", () => {
 			expect(snapshot.defaultThinkingLevel).toBe("high");
 		});
 
+		it("round-trips an advisor role alongside default", () => {
+			// Regression: profile snapshots must carry every configured model role,
+			// including `advisor`, so a profile switch restores the advisor model
+			// (drives the `applyProfileToSession` advisor rebuild). A prior version
+			// captured only a subset of roles and silently dropped `advisor`.
+			const s = Settings.instance;
+			s.set("modelRoles", {
+				default: "anthropic/claude-sonnet-4",
+				advisor: "anthropic/claude-haiku",
+			});
+			s.set("defaultThinkingLevel", Effort.High);
+
+			const snapshot = captureCurrentSnapshot();
+			expect(snapshot.modelRoles).toEqual({
+				default: "anthropic/claude-sonnet-4",
+				advisor: "anthropic/claude-haiku",
+			});
+			expect(snapshot.modelRoles.advisor).toBe("anthropic/claude-haiku");
+			expect(snapshot.defaultThinkingLevel).toBe(Effort.High);
+		});
+
 		it("returns a copy, not a reference", () => {
 			const s = Settings.instance;
 			s.set("modelRoles", { default: "a/b" });
@@ -114,6 +135,41 @@ describe("profiles", () => {
 			expect(s.get("modelRoles")).toEqual({ default: "a/b" });
 			expect(s.get("defaultThinkingLevel")).toBe(Effort.High);
 			expect(getActiveProfileName()).toBe("first");
+		});
+
+		it("writes modelRoles (incl. advisor role) and defaultThinkingLevel to live settings", () => {
+			// Regression: `switchProfile` must restore every persisted model role
+			// AND the profile's `defaultThinkingLevel`. If either is silently
+			// dropped, the advisor keeps its previous model or the session ignores
+			// the profile's configured thinking effort. Two profiles with distinct
+			// advisor roles + distinct thinking levels prove the write is real
+			// (not a happy-path no-op that reads the live value back).
+			const s = Settings.instance;
+			s.set("modelRoles", {
+				default: "anthropic/claude-sonnet-4",
+				advisor: "anthropic/claude-haiku",
+			});
+			s.set("defaultThinkingLevel", Effort.High);
+			addProfile("with-haiku-advisor");
+
+			s.set("modelRoles", {
+				default: "anthropic/claude-sonnet-4",
+				advisor: "openai/gpt-4o-mini",
+			});
+			s.set("defaultThinkingLevel", Effort.Low);
+			addProfile("with-openai-advisor");
+
+			switchProfile("with-haiku-advisor");
+			expect(s.get("modelRoles")).toEqual({
+				default: "anthropic/claude-sonnet-4",
+				advisor: "anthropic/claude-haiku",
+			});
+			expect(s.get("modelRoles").advisor).toBe("anthropic/claude-haiku");
+			expect(s.get("defaultThinkingLevel")).toBe(Effort.High);
+
+			switchProfile("with-openai-advisor");
+			expect(s.get("modelRoles").advisor).toBe("openai/gpt-4o-mini");
+			expect(s.get("defaultThinkingLevel")).toBe(Effort.Low);
 		});
 
 		it("throws for nonexistent profile", () => {
