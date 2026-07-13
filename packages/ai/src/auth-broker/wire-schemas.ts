@@ -74,6 +74,7 @@ export const credentialBlockSnapshotSchema = type({
 	providerKey: type("string").atLeastLength(1),
 	blockScope: "string",
 	blockedUntilMs: "number",
+	"updatedAtMs?": "number",
 });
 
 export const snapshotEntrySchema = type({
@@ -253,6 +254,11 @@ export const credentialBlockResponseSchema = type({
 });
 
 export const credentialBlocksDeleteResponseSchema = type({
+	"+": "reject",
+	ok: "boolean",
+});
+
+export const usageStaleResponseSchema = type({
 	"+": "reject",
 	ok: "boolean",
 });

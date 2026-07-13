@@ -1,7 +1,6 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { FileType, glob } from "@oh-my-pi/pi-natives";
 import {
 	CONFIG_DIR_NAME,
@@ -17,7 +16,7 @@ import { invalidate as invalidateFsCache, readDirEntries, readFile } from "../ca
 import { parseRuleConditionAndScope, type Rule, type RuleFrontmatter } from "../capability/rule";
 import type { Skill, SkillFrontmatter } from "../capability/skill";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
-import { parseThinkingLevel } from "../thinking";
+import { type ConfiguredThinkingLevel, parseConfiguredThinkingLevel } from "../thinking";
 import { normalizeToolNames } from "../tools/builtin-names";
 
 import { buildPluginDirRoot } from "./plugin-dir-roots";
@@ -229,7 +228,7 @@ export interface ParsedAgentFields {
 	spawns?: string[] | "*";
 	model?: string[];
 	output?: unknown;
-	thinkingLevel?: ThinkingLevel;
+	thinkingLevel?: ConfiguredThinkingLevel;
 	autoloadSkills?: string[];
 	readSummarize?: boolean;
 	blocking?: boolean;
@@ -283,7 +282,7 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 				? frontmatter.thinking
 				: undefined;
 
-	const thinkingLevel = parseThinkingLevel(rawThinkingLevel);
+	const thinkingLevel = parseConfiguredThinkingLevel(rawThinkingLevel);
 	const model = parseModelList(frontmatter.model);
 	const blocking = parseBoolean(frontmatter.blocking);
 	const readSummarize = parseBoolean(frontmatter.readSummarize);
@@ -312,6 +311,15 @@ export interface ScanSkillsFromDirOptions {
 	providerId: string;
 	level: "user" | "project";
 	requireDescription?: boolean;
+	/**
+	 * When true, treat a `SKILL.md` sitting directly under `dir` as a single skill in addition to
+	 * scanning `<dir>/<name>/SKILL.md` children. Matches the Claude plugin manifest convention
+	 * that lets a skill path point at a directory containing `SKILL.md` directly (e.g.
+	 * `"skills": ["./"]`), where the frontmatter `name` determines the invocation name and the
+	 * directory basename is the fallback. Default `false` preserves the strict child-scan
+	 * semantic every non-Claude provider relies on.
+	 */
+	includeSelf?: boolean;
 }
 
 // Stable ordering used for skill lists in prompts: name (case-insensitive), then name, then path.
@@ -368,7 +376,13 @@ export async function scanSkillsFromDir(
 		}
 	};
 
-	const work = [];
+	const work: Promise<void>[] = [];
+	if (options.includeSelf) {
+		const selfSkillPath = path.join(dir, "SKILL.md");
+		if (fs.existsSync(selfSkillPath)) {
+			work.push(loadSkill(selfSkillPath));
+		}
+	}
 	for (const entry of entries) {
 		if (entry.name.startsWith(".")) continue;
 		if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;

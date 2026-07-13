@@ -114,7 +114,8 @@ describe("streamSimple resolver auth retry", () => {
 			{ lastChance: false, hasError: false },
 			{ lastChance: false, hasError: true },
 		]);
-		expect((contexts[1]?.error as { status?: number }).status).toBe(401);
+		expect(contexts[1]).toBeDefined();
+		expect((contexts[1]!.error as { status?: number }).status).toBe(401);
 	});
 
 	it("buffers the start event and retries on a 401 error event before content", async () => {
@@ -405,7 +406,7 @@ describe("streamSimple resolver auth retry", () => {
 			expect((await stream.result()).content).toEqual([{ type: "text", text: "ok" }]);
 			expect(keys).toEqual(["credential-A", "credential-B"]);
 			expect(eventTypes).toEqual(["start", "text_start", "text_delta", "text_end", "done"]);
-			expect(retryContexts.map(ctx => ctx.lastChance)).toEqual([false, true]);
+			expect(retryContexts.map(ctx => ctx.lastChance)).toEqual([true]);
 		}
 	});
 
@@ -501,10 +502,10 @@ describe("streamSimple resolver auth retry", () => {
 		expect((await stream.result()).content).toEqual([{ type: "text", text: "ok" }]);
 		expect(keys).toEqual(["old-key", "next-key"]);
 		expect(retryContexts.map(ctx => ({ lastChance: ctx.lastChance, hasError: ctx.error !== undefined }))).toEqual([
-			{ lastChance: false, hasError: true },
 			{ lastChance: true, hasError: true },
 		]);
-		expect((retryContexts[1]?.error as Error).message).toContain("Resource exhausted");
+		expect(retryContexts[0]).toBeDefined();
+		expect((retryContexts[0]!.error as Error).message).toContain("Resource exhausted");
 	});
 
 	it("surfaces the original error when the resolver declines every retry", async () => {

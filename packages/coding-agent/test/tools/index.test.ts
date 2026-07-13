@@ -208,6 +208,27 @@ describe("createTools", () => {
 		expect(names).toContain("ask");
 	});
 
+	it("excludes ask tool when ask.enabled is false", async () => {
+		const session = createTestSession({
+			hasUI: true,
+			settings: createSettingsWithOverrides({ "ask.enabled": false }),
+		});
+		const tools = await createTools(session);
+		expect(tools.map(t => t.name)).not.toContain("ask");
+
+		const requested = await createTools(session, ["ask", "read"]);
+		expect(requested.map(t => t.name)).toEqual(["read", "resolve"]);
+	});
+
+	it("includes ask tool when ask.enabled is true and hasUI is true", async () => {
+		const session = createTestSession({
+			hasUI: true,
+			settings: createSettingsWithOverrides({ "ask.enabled": true }),
+		});
+		const tools = await createTools(session);
+		expect(tools.map(t => t.name)).toContain("ask");
+	});
+
 	it("filters disabled builtin tools by settings", async () => {
 		const session = createTestSession({
 			settings: createSettingsWithOverrides({
@@ -216,6 +237,7 @@ describe("createTools", () => {
 				"astGrep.enabled": false,
 				"astEdit.enabled": false,
 				"bash.enabled": false,
+				"launch.enabled": false,
 				"web_search.enabled": false,
 				"browser.enabled": false,
 				"inspect_image.enabled": false,
@@ -225,6 +247,7 @@ describe("createTools", () => {
 		const names = tools.map(t => t.name);
 
 		expect(names).not.toContain("bash");
+		expect(names).not.toContain("launch");
 		expect(names).not.toContain("glob");
 		expect(names).not.toContain("grep");
 		expect(names).not.toContain("ast_grep");
@@ -262,6 +285,37 @@ describe("createTools", () => {
 		const names = tools.map(t => t.name);
 
 		expect(names).toEqual(["read", "goal", "resolve"]);
+	});
+
+	it("records active tools on the original session object", async () => {
+		const session = createTestSession();
+
+		await createTools(session, ["bash"]);
+
+		expect(session.isToolActive?.("bash")).toBe(true);
+		expect(session.isToolActive?.("read")).toBe(false);
+	});
+
+	it("renders bash guidance from the live active tool predicate", async () => {
+		const activeToolNames = new Set<string>();
+		const session = createTestSession({
+			isToolActive: name => activeToolNames.has(name),
+			setActiveToolNames: names => {
+				activeToolNames.clear();
+				for (const name of names) {
+					activeToolNames.add(name);
+				}
+			},
+		});
+
+		const tools = await createTools(session, ["bash", "grep", "read", "glob"]);
+		const bash = tools.find(tool => tool.name === "bash");
+
+		expect(bash?.description).toContain("`grep` tool");
+		session.setActiveToolNames?.(["bash"]);
+		expect(bash?.description).not.toContain("`grep` tool");
+		expect(bash?.description).not.toContain("`ls` → `read`");
+		expect(bash?.description).not.toContain("`find` → the `glob` tool");
 	});
 
 	it("includes search_tool_bm25 when MCP tool discovery is enabled and executable", async () => {

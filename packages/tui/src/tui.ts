@@ -503,6 +503,12 @@ export class Container implements Component {
 		this.#memoLines = undefined;
 	}
 
+	/** Dispose every child, then detach it from this container. */
+	disposeChildren(): void {
+		this.dispose();
+		this.clear();
+	}
+
 	invalidate(): void {
 		this.#memoLines = undefined;
 		for (const child of this.children) {
@@ -555,10 +561,9 @@ export class Container implements Component {
  * method owns the bytes written and the state update.
  *
  * - `fullPaint`: gesture-driven replay — initial paint, session replacement,
- *   resize, resetDisplay. Clears the viewport and (for destructive replaces,
- *   outside multiplexers) native scrollback via ED3, then writes the
- *   committed prefix and the visible window. The only ED3 callsite in the
- *   engine.
+ *   resize, resetDisplay. Rewrites the frame from home; destructive replaces
+ *   clear native scrollback via ED3 without first blanking the viewport. The
+ *   only ED3 callsite in the engine.
  * - `update`: ordinary frame. Commits the newly settled chunk at the
  *   scrollback seam (if any) and repaints the window with relative moves.
  */
@@ -1131,8 +1136,14 @@ export class TUI extends Container {
 				// Feed the engine's committed-row claim (from the previous frame's
 				// emit) before rendering so the child can skip re-deriving blocks
 				// that already live in immutable native scrollback. Reused segments
-				// skip this: they never call render(), so the signal is moot.
-				setNativeScrollbackCommittedRows(child, Math.max(0, this.#committedRows - offset));
+				// skip this: they never call render(), so the signal is moot. The
+				// claim is in the previous frame's coordinates and never exceeds
+				// the rows the child actually contributed there — history that
+				// advanced into LATER root children must not read as this child's
+				// own future rows being pre-committed.
+				const prevRows = previous !== undefined && previous.component === child ? previous.rowCount : 0;
+				const prevStart = previous !== undefined && previous.component === child ? previous.start : offset;
+				setNativeScrollbackCommittedRows(child, Math.min(prevRows, Math.max(0, this.#committedRows - prevStart)));
 				childLines = child.render(width);
 				const liveRegionStart = getNativeScrollbackLiveRegionStart(child);
 				if (liveRegionStart !== undefined) {
@@ -1824,6 +1835,159 @@ export class TUI extends Container {
 		this.#requestOrdinaryRender();
 	}
 
+	/**
+	 * Rewrite a quiet, visible component segment directly.
+	 *
+	 * Loader-style animation changes one already-positioned segment at a fixed
+	 * size. When the current frame geometry is still valid, rewrite just those
+	 * rows and update the diff baseline instead of scheduling a full render
+	 * cycle. Unsafe states fall back to `requestComponentRender()`, preserving
+	 * the ordinary renderer as the correctness path.
+	 */
+	requestDirectWrite(component: Component): void {
+		if (this.#stopped) return;
+		if (
+			this.#renderRequested ||
+			this.#postFullPaintSettleTimer !== undefined ||
+			this.#postFullPaintSettleUntilMs > 0
+		) {
+			this.requestComponentRender(component);
+			return;
+		}
+
+		const width = this.terminal.columns;
+		const height = this.terminal.rows;
+		if (!this.#hasEverRendered || this.#resizeEventPending) {
+			this.requestComponentRender(component);
+			return;
+		}
+		if (width !== this.#previousWidth || height !== this.#previousHeight || width !== this.#composeWidth) {
+			this.requestComponentRender(component);
+			return;
+		}
+		if (this.#clearScrollbackOnNextRender || this.#forceViewportRepaintOnNextRender) {
+			this.requestComponentRender(component);
+			return;
+		}
+		if (this.overlayStack.length > 0 || this.#altActive || !this.#imageBudget.quiescent) {
+			this.requestComponentRender(component);
+			return;
+		}
+
+		const children = this.children;
+		const segments = this.#frameSegments;
+		if (segments.length !== children.length) {
+			this.requestComponentRender(component);
+			return;
+		}
+		for (let i = 0; i < children.length; i++) {
+			if (segments[i]!.component !== children[i]) {
+				this.requestComponentRender(component);
+				return;
+			}
+		}
+
+		const root = this.#resolveComponentRoot(component);
+		if (root === null) {
+			this.requestComponentRender(component);
+			return;
+		}
+		const segmentIndex = segments.findIndex(segment => segment.component === root);
+		if (segmentIndex === -1) {
+			this.requestComponentRender(component);
+			return;
+		}
+		const segment = segments[segmentIndex]!;
+		const fullyLiveUncommittedSegment = segment.liveLocalStart === 0 && segment.start >= this.#committedRows;
+		if (
+			(segment.liveLocalStart !== undefined && !fullyLiveUncommittedSegment) ||
+			segment.start < this.#committedRows
+		) {
+			this.requestComponentRender(component);
+			return;
+		}
+
+		const windowTop = Math.max(this.#committedRows, this.#composedFrame.length - height, 0);
+		if (windowTop !== this.#windowTopRow) {
+			this.requestComponentRender(component);
+			return;
+		}
+		const screenStart = segment.start - windowTop;
+		if (screenStart < 0 || screenStart + segment.rowCount > height) {
+			this.requestComponentRender(component);
+			return;
+		}
+
+		const nextLines = root.render(width);
+		if (nextLines.length !== segment.rowCount) {
+			this.requestComponentRender(component);
+			return;
+		}
+		for (const line of nextLines) {
+			if (line.includes(CURSOR_MARKER)) {
+				this.requestComponentRender(component);
+				return;
+			}
+		}
+
+		let firstChanged = -1;
+		let lastChanged = -1;
+		const previousWindow = this.#previousWindow;
+		for (let i = 0; i < nextLines.length; i++) {
+			const frameRow = segment.start + i;
+			const raw = nextLines[i]!;
+			const prepared = this.#prepareLine(raw, width);
+			this.#composedFrame[frameRow] = raw;
+			this.#preparedMeta[frameRow] = prepared;
+			this.#preparedFrame[frameRow] = prepared.line;
+			if (previousWindow[screenStart + i] === prepared.line) continue;
+			previousWindow[screenStart + i] = prepared.line;
+			if (firstChanged === -1) firstChanged = i;
+			lastChanged = i;
+		}
+		segments[segmentIndex] = { ...segment, lines: nextLines };
+		this.#preparedValidRows = Math.max(this.#preparedValidRows, segment.start + nextLines.length);
+		this.#renderStablePrefixRows = Math.min(this.#renderStablePrefixRows, segment.start);
+
+		let cursorPos: { row: number; col: number } | null = null;
+		for (let i = this.#frameCursorMarkers.length - 1; i >= 0; i--) {
+			const marker = this.#frameCursorMarkers[i]!;
+			if (marker.row >= windowTop) {
+				cursorPos = marker;
+				break;
+			}
+		}
+
+		if (firstChanged === -1) {
+			this.#writeCursorPosition(cursorPos, this.#composedFrame.length);
+			this.#previousWidth = width;
+			this.#previousHeight = height;
+			return;
+		}
+
+		const currentScreenRow = Math.max(0, Math.min(height - 1, this.#hardwareCursorRow - windowTop));
+		const targetScreenRow = screenStart + firstChanged;
+		const rowDelta = targetScreenRow - currentScreenRow;
+		let buffer = this.#paintBeginSequence;
+		if (rowDelta > 0) buffer += `\x1b[${rowDelta}B`;
+		else if (rowDelta < 0) buffer += `\x1b[${-rowDelta}A`;
+		buffer += "\r";
+		for (let i = firstChanged; i <= lastChanged; i++) {
+			if (i > firstChanged) buffer += "\r\n";
+			buffer += this.#lineRewriteSequence(this.#preparedFrame[segment.start + i] ?? "", width);
+		}
+		const cursorControl = this.#cursorControlSequence(
+			cursorPos,
+			this.#composedFrame.length,
+			segment.start + lastChanged,
+		);
+		buffer += cursorControl.seq;
+		buffer += this.#paintEndSequence;
+		this.terminal.write(buffer);
+		this.#windowTopRow = windowTop;
+		this.#commit(this.#composedFrame, previousWindow, width, height, cursorControl);
+	}
+
 	/** Ordinary (non-forced) scheduling shared by full and component-scoped requests. */
 	#requestOrdinaryRender(): void {
 		// Coalesce non-forced renders inside the post-full-paint ConPTY settle
@@ -2075,12 +2239,12 @@ export class TUI extends Container {
 	}
 
 	#handleInput(data: string): void {
-		// Raw-mode Ctrl+C/Esc arrive as stdin data, not process signals. If the
-		// first key in a double-key gesture schedules an immediate slow repaint,
-		// the queued second key can sit behind that repaint long enough for the
-		// app-level double-press window to expire. Give the input queue one frame
-		// before ordinary paints; forced repaints still bypass this path.
-		this.#inputRenderGraceUntilMs = this.#renderScheduler.now() + TUI.#INPUT_RENDER_GRACE_MS;
+		// Ctrl+C/Esc use app-level double-press windows. Give those gestures one
+		// frame to drain queued input before an ordinary repaint; delaying every
+		// key would make idle navigation pay a full frame of latency.
+		if (matchesKey(data, "ctrl+c") || matchesKey(data, "escape")) {
+			this.#inputRenderGraceUntilMs = this.#renderScheduler.now() + TUI.#INPUT_RENDER_GRACE_MS;
+		}
 		if (this.#inputListeners.size > 0) {
 			let current = data;
 			for (const listener of this.#inputListeners) {
@@ -2796,6 +2960,7 @@ export class TUI extends Container {
 			this.#committedPrefixAuditRows = Math.min(chunkTo, finalBoundary);
 			this.#clearScrollbackOnNextRender = false;
 			this.#hasEverRendered = true;
+			this.#publishCommittedRows();
 			if (!firstPaint && frameLength > height) this.#armPostFullPaintSettle();
 			return;
 		}
@@ -2823,6 +2988,7 @@ export class TUI extends Container {
 		} else {
 			this.#committedPrefixAuditRows = Math.min(preAuditRows, this.#committedRows);
 		}
+		this.#publishCommittedRows();
 	}
 
 	/**
@@ -2844,6 +3010,25 @@ export class TUI extends Container {
 		if ($flag("PI_DEBUG_REDRAW")) {
 			const msg = `[${new Date().toISOString()}] commit resync: committed prefix diverged at row ${resyncTo}; recommitting\n`;
 			fs.appendFileSync(getDebugLogPath(), msg);
+		}
+	}
+
+	/**
+	 * Push the post-emit committed-row count to root children that implement
+	 * {@link NativeScrollbackCommittedRows}. Compose feeds the same signal
+	 * before each child render (see {@link render}), but guards that run
+	 * BETWEEN frames — e.g. a controller consulting the transcript's
+	 * committed boundary to decide whether a displaceable block may still be
+	 * retracted — would otherwise observe a count one frame stale and retract
+	 * rows that just entered immutable native scrollback, stranding an
+	 * orphaned copy above the repainted block.
+	 */
+	#publishCommittedRows(): void {
+		for (const segment of this.#frameSegments) {
+			setNativeScrollbackCommittedRows(
+				segment.component,
+				Math.min(segment.rowCount, Math.max(0, this.#committedRows - segment.start)),
+			);
 		}
 	}
 
@@ -3130,7 +3315,7 @@ export class TUI extends Container {
 	}
 
 	/**
-	 * Clear the viewport (optionally native scrollback) and replay the frame:
+	 * Replay the frame from home, optionally clearing native scrollback first:
 	 * committed prefix `[0, chunkTo)` followed by the visible window. ED3
 	 * (`CSI 3 J`) is emitted here and only here, and only for gesture-driven
 	 * paints (session replace, resize, resetDisplay, or an explicit
@@ -3188,7 +3373,10 @@ export class TUI extends Container {
 		}
 		let buffer = this.#paintBeginSequence + this.#leaveResizeAltSequence() + purgeSequence;
 		if (options.clearScrollback) {
-			buffer += "\x1b[2J\x1b[H\x1b[3J";
+			// Clear native history without blanking the live viewport first. The
+			// replay below rewrites every visible row from home, including blanks,
+			// so terminals without DEC 2026 never expose an ED2-cleared frame.
+			buffer += "\x1b[H\x1b[3J";
 		} else {
 			// Best-effort: push the pre-paint screen into scrollback on
 			// terminals that implement kitty's ED 22
@@ -3221,21 +3409,24 @@ export class TUI extends Container {
 		if (paintLines === null) {
 			// Common path: emit straight from the source arrays (the
 			// pre-merge two-loop form); byte-identical to replaying the
-			// merged array.
+			// merged array. Destructive history clears deliberately avoid ED2, so
+			// each row must self-clear stale cells left by the previous viewport.
 			for (let i = 0; i < chunkTo; i++) {
 				if (i > 0) buffer += "\r\n";
-				buffer += this.#terminalLine(frame[i] ?? "");
+				buffer += options.clearScrollback
+					? this.#lineRewriteSequence(frame[i] ?? "", width)
+					: this.#terminalLine(frame[i] ?? "");
 			}
 			for (let screenRow = 0; screenRow < height; screenRow++) {
 				if (chunkTo + screenRow > 0) buffer += "\r\n";
-				buffer += this.#terminalLine(visibleTexts ? (visibleTexts[screenRow] ?? "") : (window[screenRow] ?? ""));
+				const line = visibleTexts ? (visibleTexts[screenRow] ?? "") : (window[screenRow] ?? "");
+				buffer += options.clearScrollback ? this.#lineRewriteSequence(line, width) : this.#terminalLine(line);
 			}
 		} else {
 			for (let i = 0; i < paintLines.length; i++) {
 				if (i > 0) buffer += "\r\n";
-				buffer += this.#terminalLine(
-					visibleTexts && i >= visibleStart ? visibleTexts[i - visibleStart] : (paintLines[i] ?? ""),
-				);
+				const line = visibleTexts && i >= visibleStart ? visibleTexts[i - visibleStart] : (paintLines[i] ?? "");
+				buffer += options.clearScrollback ? this.#lineRewriteSequence(line, width) : this.#terminalLine(line);
 			}
 		}
 		buffer += fillSequence;
