@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed OpenAI Codex `k12` (ChatGPT Edu) accounts being classified as an "unknown" plan and excluded by the paid-model plan filter. A pool of healthy `k12` seats alongside a single exhausted `plus` seat funneled every paid-model request (e.g. `gpt-5.6`) to the lone `plus` account, which then surfaced `usage_limit_reached` on every turn (including fresh sessions) while the `k12` siblings sat idle with headroom. `k12` now classifies as a paid tier, so healthy educational seats are selected and the exhausted account is correctly ranked last.
+
 ## [16.5.0] - 2026-07-13
 
 ### Added
