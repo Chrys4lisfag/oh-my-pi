@@ -829,6 +829,7 @@ const OPENAI_CODEX_PAID_PLAN_TOKENS: Record<string, true> = {
 	enterprise: true,
 	edu: true,
 	education: true,
+	k12: true,
 	teacher: true,
 	teachers: true,
 	health: true,

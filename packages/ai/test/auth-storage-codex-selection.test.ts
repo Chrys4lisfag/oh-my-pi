@@ -228,6 +228,38 @@ describe("AuthStorage codex oauth ranking", () => {
 		expectWeightedPreference(counts, "api-acct-near", "api-acct-far");
 	});
 
+	test("selects a healthy k12 account over an exhausted plus account for a paid model", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+		// k12 is an educational paid tier: it must be plan-eligible for paid models
+		// (e.g. gpt-5.6), else the plan filter classifies it "unknown", excludes it,
+		// and funnels every request to the lone (exhausted) plus account.
+		await authStorage.set("openai-codex", [
+			{ type: "oauth", ...createCredential("acct-plus", "plus@example.com") },
+			{ type: "oauth", ...createCredential("acct-k12", "k12@example.com") },
+		]);
+		usageByAccount.set(
+			"acct-plus",
+			createCodexUsageReport({
+				accountId: "acct-plus",
+				primary: { usedFraction: 1, resetInMs: 6 * 24 * HOUR_MS },
+				secondary: { usedFraction: 0.95, resetInMs: 6 * 24 * HOUR_MS },
+				metadata: { planType: "plus", allowed: false, limitReached: true, email: "plus@example.com" },
+			}),
+		);
+		usageByAccount.set(
+			"acct-k12",
+			createCodexUsageReport({
+				accountId: "acct-k12",
+				primary: { usedFraction: 0.01, resetInMs: 4 * HOUR_MS },
+				secondary: { usedFraction: 0.1, resetInMs: 6 * 24 * HOUR_MS },
+				metadata: { planType: "k12", allowed: true, limitReached: false, email: "k12@example.com" },
+			}),
+		);
+
+		const apiKey = await authStorage.getApiKey("openai-codex", "k12-paid-model", { modelId: "gpt-5.6" });
+		expect(apiKey).toBe("api-acct-k12");
+	});
+
 	test("weights fresh 5h ticker account at 0% usage", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 

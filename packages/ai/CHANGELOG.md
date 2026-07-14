@@ -5,6 +5,7 @@
 ### Fixed
 
 - Fixed empty provider responses (e.g. "Cloud Code Assist API returned an empty response") being classified as non-retryable: `ProviderResponseError` with kind `empty-body` now carries the transient flag, so session retry and configured model-fallback chains engage instead of hard-failing the turn
+- Fixed OpenAI Codex `k12` (ChatGPT Edu) accounts being classified as an "unknown" plan and excluded by the paid-model plan filter: a pool of healthy `k12` seats plus one exhausted `plus` seat would funnel every paid-model request (e.g. `gpt-5.6`) to the lone `plus` account — which, once its limit was reached, surfaced `usage_limit_reached` on every turn (including fresh sessions) while the k12 siblings sat idle with headroom. `k12` now classifies as a paid tier, so healthy educational seats are selected and the exhausted account is correctly ranked last
 
 ## [16.4.6] - 2026-07-12
 
