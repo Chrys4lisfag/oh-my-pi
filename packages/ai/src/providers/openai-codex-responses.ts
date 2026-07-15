@@ -235,6 +235,24 @@ const CODEX_WEBSOCKET_TRANSPORT_ERROR_PREFIX = "Codex websocket transport error"
 const CODEX_RETRYABLE_EVENT_CODES = new Set(["model_error", "server_error", "internal_error"]);
 const CODEX_RETRYABLE_EVENT_MESSAGE =
 	/processing your request|retry your request|temporar(?:y|ily)|overloaded|service.?unavailable|internal error|server error/i;
+/**
+ * Content-moderation / safety-filter failures Codex surfaces via the `error`
+ * or `response.failed` stream events. Detected on the finalized errorMessage
+ * (which is what {@link handleCodexStreamFailure} exposes) so provider
+ * wording variants and future flag copies fall under the same treatment
+ * even when the raw `code` field is absent. Matches the visible text the
+ * server ships, e.g. "This content was flagged for possible cybersecurity
+ * risk.". Kept narrow: rate/quota/network errors MUST NOT match.
+ */
+const CODEX_CONTENT_FLAG_MESSAGE =
+	/flagged for possible|content[_ -]policy(?:[_ -]violation)?|content[_ -]filter(?:ed)?|sensitive content|content was blocked/i;
+/** OpenAI moderation error codes that pair with the message pattern above. */
+const CODEX_CONTENT_FLAG_CODES: Record<string, true> = {
+	content_policy_violation: true,
+	content_filter: true,
+	content_filtered: true,
+	moderation_blocked: true,
+};
 const CODEX_PROVIDER_SESSION_STATE_KEY = "openai-codex-responses";
 const X_CODEX_TURN_STATE_HEADER = "x-codex-turn-state";
 const X_MODELS_ETAG_HEADER = "x-models-etag";
@@ -1629,6 +1647,22 @@ function isCodexStalePreviousResponseError(error: unknown): boolean {
 	);
 }
 
+/**
+ * True when the finalized Codex failure looks like a content-moderation /
+ * safety-filter block ("This content was flagged for possible cybersecurity
+ * risk.", OpenAI `content_policy_violation`, `content_filter`, …). Marks the
+ * turn as a classifier refusal so the coding-agent's existing refusal path
+ * (skip session persistence, drop from active context, chain-consult without
+ * looping the failing model) fires instead of the generic retry ladder.
+ */
+export function isCodexContentFlagFailure(error: unknown, errorMessage: string | undefined): boolean {
+	if (error instanceof CodexProviderStreamError) {
+		const code = error.code?.toLowerCase();
+		if (code && Object.hasOwn(CODEX_CONTENT_FLAG_CODES, code)) return true;
+	}
+	return !!errorMessage && CODEX_CONTENT_FLAG_MESSAGE.test(errorMessage);
+}
+
 async function handleCodexStreamFailure(context: CodexStreamFailureContext, error: unknown): Promise<AssistantMessage> {
 	const { output } = context;
 	if (context.requestContext.websocketState) {
@@ -1645,6 +1679,14 @@ async function handleCodexStreamFailure(context: CodexStreamFailureContext, erro
 	output.errorStatus = result.status;
 	output.errorId = result.id;
 	output.errorMessage = result.message;
+	if (isCodexContentFlagFailure(error, output.errorMessage)) {
+		// A safety-filter block is a terminal provider decision, not a transient
+		// fault: marking `stopDetails.type = "sensitive"` routes the assistant
+		// message through the coding-agent's classifier-refusal path — skipped
+		// from session persistence, pruned from active context, and treated as
+		// non-retryable on the same model (fallback-chain consult still runs).
+		output.stopDetails = { type: "sensitive", explanation: output.errorMessage };
+	}
 	output.duration = performance.now() - context.startTime;
 	if (context.firstTokenTime) {
 		output.ttft = context.firstTokenTime - context.startTime;

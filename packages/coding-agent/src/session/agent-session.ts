@@ -699,6 +699,19 @@ function calculateRetryBackoffDelayMs(baseDelayMs: number, attempt: number): num
  */
 const SIBLING_UNBLOCK_BUFFER_MS = 1_000;
 const NON_WHITESPACE_RE = /\S/;
+/**
+ * Text-level fallback for {@link AgentSession.#isClassifierRefusal} covering
+ * safety-filter blocks that reach `errorMessage` without a
+ * `stopDetails.type = "refusal" | "sensitive"`. Kept in sync with the Codex
+ * provider's `CODEX_CONTENT_FLAG_MESSAGE` and the wording used by Anthropic
+ * Refusal / Google `promptFeedback.blockReason` / OpenAI `content_policy` /
+ * `content_filter` responses. Narrow on purpose — usage-limit, auth, and
+ * transport errors MUST NOT match.
+ */
+const AGENT_CLASSIFIER_REFUSAL_MESSAGE =
+	/flagged for possible|content[_ -]policy(?:[_ -]violation)?|content[_ -]filter(?:ed)?|sensitive content|content was blocked|refusal|blocked by (?:google|safety)/i;
+/** Marker prefix used by {@link AgentSession.#annotateAssistantErrorWithAccount}. */
+const ACCOUNT_ANNOTATION_PREFIX = /^\[oauth /;
 
 function hasNonWhitespace(value: string): boolean {
 	return NON_WHITESPACE_RE.test(value);
@@ -4333,6 +4346,7 @@ export class AgentSession {
 				await emitAgentEndNotification();
 				return;
 			}
+			this.#annotateAssistantErrorWithAccount(msg);
 
 			const successfulYieldMessage = this.#findSuccessfulYieldAssistantMessage(settledMessages);
 			const yieldOnThisMessage = this.#assistantEndedWithSuccessfulYield(msg);
@@ -13893,7 +13907,36 @@ export class AgentSession {
 	#isClassifierRefusal(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error") return false;
 		const stopType = message.stopDetails?.type;
-		return stopType === "refusal" || stopType === "sensitive";
+		if (stopType === "refusal" || stopType === "sensitive") return true;
+		// Defense-in-depth: some providers surface a safety-filter block through
+		// `errorMessage` text without setting `stopDetails.type`. The Codex
+		// provider layer marks these as `sensitive` at the source, but this
+		// catches Anthropic/Google/etc. wording variants and pre-fix Codex
+		// payloads that reach `errorMessage` unclassified, so they still skip
+		// persistence and drop out of active context here.
+		return AGENT_CLASSIFIER_REFUSAL_MESSAGE.test(message.errorMessage ?? "");
+	}
+
+	/**
+	 * Prepend a compact `[oauth <email|accountId>]` tag to a failed assistant
+	 * turn's `errorMessage` so the user can see which OAuth account was serving
+	 * the request when the provider errored. Especially useful for OpenAI Codex
+	 * content-flag blocks: a non-CVP-verified sibling flags more aggressively,
+	 * and the user needs to know which account to verify. Silent no-op on
+	 * successful turns, non-OAuth providers, unknown identities, or when the tag
+	 * has already been applied (e.g. across retry passes reusing the same
+	 * message object).
+	 */
+	#annotateAssistantErrorWithAccount(message: AssistantMessage): void {
+		if (message.stopReason !== "error") return;
+		if (!message.provider) return;
+		if (message.errorMessage && ACCOUNT_ANNOTATION_PREFIX.test(message.errorMessage)) return;
+		const identity = this.#modelRegistry.authStorage.getOAuthAccountIdentity?.(message.provider, this.sessionId);
+		if (!identity) return;
+		const label = identity.email ?? identity.accountId ?? identity.projectId;
+		if (!label) return;
+		const tag = `[oauth ${label}]`;
+		message.errorMessage = message.errorMessage ? `${tag} ${message.errorMessage}` : tag;
 	}
 
 	#getRetryFallbackChains(): RetryFallbackChains {

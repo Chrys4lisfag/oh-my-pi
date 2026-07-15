@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { createCodexProviderStreamError, isRetryableCodexFailureEvent } from "../openai-codex-responses";
+import {
+	createCodexProviderStreamError,
+	isCodexContentFlagFailure,
+	isRetryableCodexFailureEvent,
+} from "../openai-codex-responses";
 
 describe("isRetryableCodexFailureEvent", () => {
 	it("classifies retryable codes from nested error.code, error.type, then rawEvent.code", () => {
@@ -80,5 +84,43 @@ describe("createCodexProviderStreamError", () => {
 		expect(err.code).toBe("server_error");
 		expect(err.retryable).toBe(true);
 		expect(err.message).toContain("nested boom");
+	});
+});
+describe("isCodexContentFlagFailure", () => {
+	it("matches the visible Codex cybersecurity-flag copy the server ships", () => {
+		expect(
+			isCodexContentFlagFailure(
+				undefined,
+				"Codex error event: This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing…",
+			),
+		).toBe(true);
+	});
+
+	it("matches OpenAI content-policy / content-filter wording variants", () => {
+		expect(isCodexContentFlagFailure(undefined, "request rejected: content_policy_violation")).toBe(true);
+		expect(isCodexContentFlagFailure(undefined, "the response was blocked by our content filter")).toBe(true);
+		expect(isCodexContentFlagFailure(undefined, "sensitive content detected")).toBe(true);
+	});
+
+	it("matches on the CodexProviderStreamError code path even when the message is generic", () => {
+		const flagged = createCodexProviderStreamError({
+			type: "response.failed",
+			response: { error: { code: "content_policy_violation", message: "no reason" } },
+		});
+		expect(isCodexContentFlagFailure(flagged, "no reason")).toBe(true);
+	});
+
+	it("does NOT match usage-limit, rate-limit, auth, or transport errors", () => {
+		expect(isCodexContentFlagFailure(undefined, "The usage limit has been reached (code=usage_limit_reached)")).toBe(
+			false,
+		);
+		expect(isCodexContentFlagFailure(undefined, "429 Too Many Requests")).toBe(false);
+		expect(isCodexContentFlagFailure(undefined, "401 Unauthorized")).toBe(false);
+		expect(isCodexContentFlagFailure(undefined, "Codex websocket transport error: connection reset")).toBe(false);
+	});
+
+	it("returns false when both error and message are empty", () => {
+		expect(isCodexContentFlagFailure(undefined, undefined)).toBe(false);
+		expect(isCodexContentFlagFailure(undefined, "")).toBe(false);
 	});
 });
