@@ -2,14 +2,52 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Tool discovery (`search-tool-bm25`) and discovery mode settings removed
+- Plan approval workflow changed: `resolve { action: "apply", extra: { title } }` → write slug to `xd://propose`
+- `irc`, `job`, `launch` tools replaced by `hub` with unified API
+
 ### Added
 
-- Added automated image-dropping rescue tier to compaction dead-end recovery
-- Added visual warnings to the session timeline when compaction fails to free sufficient space
+- Added `xd://` virtual device protocol for mounting tools as URLs readable/writable via read/write tools
+- Added `hub` tool consolidating agent peer messaging, background job control, and supervised long-running processes (replacing `irc`, `job`, and `launch`)
+- Added `tools.xdev` setting to enable xd:// device mounting (default: true)
+- Added `edit.enforceSeenLines` setting for opt-in seen-line guard rejecting edits on lines not fully displayed (default: false)
+- Added `ToolLoadMode` type clarifying "essential" vs "discoverable" tool presentation
+- Added an optional `satisfies` predicate to `SoftToolRequirement`: compliance can now require a specific invocation shape (e.g. a `write` targeting a virtual device path) instead of any call to `toolName`; escalation still forces `toolName`.
 
 ### Changed
 
-- Improved compaction dead-end notifications with specific recovery instructions
+- Plan approval now uses `xd://propose` write instead of `resolve` tool action
+- Tool discovery system removed; `search-tool-bm25` tool no longer available
+- Tool loading behavior: discoverable tools now mounted under xd:// or surfaced via BM25 search instead of staying top-level
+
+### Removed
+
+- Removed `resolve` tool; plan approval and preview actions now use xd:// writes
+- Removed `irc`, `job`, and `launch` tools (consolidated into `hub`)
+- Removed tool discovery settings: `tools.discoveryMode`, `tools.essentialOverride`, `mcp.discoveryMode`, `mcp.discoveryDefaultServers`
+
+## [16.5.2] - 2026-07-14
+
+### Fixed
+
+- Improved session deadline abort signals to carry structured cancellation reasons, enabling timeout-aware tools to correctly classify deadline cancellations.
+- Fixed an issue where completed tool executions were incorrectly marked as skipped (clobbering their actual results) if a user message was queued while the tool was in flight.
+
+## [16.5.1] - 2026-07-14
+
+### Fixed
+
+- Fixed compatibility with Copilot gpt-5.6 models by correcting token escaping in compaction summaries.
+
+## [16.5.0] - 2026-07-13
+
+### Added
+
+- Added an automated image-dropping rescue tier to compaction dead-end recovery.
+- Added visual warnings and detailed recovery instructions to the session timeline when compaction fails to free sufficient space.
 
 ## [16.4.5] - 2026-07-11
 

@@ -9,6 +9,7 @@ import inspector from "node:inspector";
 import { isMainThread } from "node:worker_threads";
 import { logger } from ".";
 import { isEpipe } from "./fs-error";
+import { restoreTerminalStderr } from "./stderr-guard";
 
 // Cleanup reasons, in order of priority/meaning.
 export enum Reason {
@@ -167,6 +168,11 @@ if (isMainThread) {
 				logger.warn("Ignoring expected cleanup exception", { err });
 				return;
 			}
+			// fd 2 may be redirected to the log while a TUI owns the terminal
+			// (stderr-guard); re-point it at the real terminal so the fatal
+			// report is visible. Terminal modes are restored moments later by
+			// the terminal-restore cleanup callback inside runCleanup().
+			restoreTerminalStderr();
 			process.stderr.write(formatFatalError("Uncaught Exception", err));
 			logger.error("Uncaught exception", { err, stack: err.stack });
 			await runCleanup(Reason.UNCAUGHT_EXCEPTION);
@@ -208,6 +214,8 @@ if (isMainThread) {
 					});
 				}
 			}
+			// See uncaughtException above: surface the report on the real stderr.
+			restoreTerminalStderr();
 			process.stderr.write(formatFatalError("Unhandled Rejection", err));
 			logger.error("Unhandled rejection", { err, stack: err.stack });
 			await runCleanup(Reason.UNHANDLED_REJECTION);

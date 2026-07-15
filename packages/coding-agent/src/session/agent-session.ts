@@ -153,20 +153,23 @@ import {
 	AdvisorEmissionGuard,
 	type AdvisorMessageDetails,
 	type AdvisorNote,
+	AdvisorOutputQuarantinedError,
 	AdvisorRuntime,
 	type AdvisorSeverity,
 	AdvisorTranscriptRecorder,
 	advisorTranscriptFilename,
+	annotateForStaleness,
+	buildAdvisorQuarantineSourceText,
 	formatAdvisorBatchContent,
 	getOrCreateAdvisorProviderSessionId,
 	isAdvisorInterruptImmuneTurnActive,
 	isInterruptingSeverity,
+	quarantineAdvisorUnsafeOutput,
 	resolveAdvisorDeliveryChannel,
 	slugifyAdvisorName,
 } from "../advisor";
 import { type AsyncJob, type AsyncJobDeliveryState, AsyncJobManager } from "../async";
 import { classifyDifficulty } from "../auto-thinking/classifier";
-import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
 import { shouldEnableAppendOnlyContext } from "../config/append-only-context-mode";
 import type { ModelRegistry } from "../config/model-registry";
@@ -183,7 +186,7 @@ import {
 	resolveModelOverride,
 	resolveModelRoleValue,
 } from "../config/model-resolver";
-import { MODEL_ROLE_IDS, MODEL_ROLES } from "../config/model-roles";
+import { getKnownRoleIds, MODEL_ROLE_IDS, MODEL_ROLES } from "../config/model-roles";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import { buildServiceTierByFamily, serviceTierForAllFamilies, serviceTierSettingToTier } from "../config/service-tier";
 import type { Settings, SkillsSettings } from "../config/settings";
@@ -194,7 +197,6 @@ import {
 	validateProviderMaxInFlightRequests,
 } from "../config/settings";
 import { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
-import { loadCapability } from "../discovery";
 import { expandApplyPatchToEntries, normalizeDiff, normalizeToLF, ParseError, previewPatch, stripBom } from "../edit";
 import { getFileSnapshotStore } from "../edit/file-snapshot-store";
 import { disposeJuliaKernelSessionsByOwner } from "../eval/jl/executor";
@@ -259,9 +261,6 @@ import goalModeContextPrompt from "../prompts/goals/goal-mode-context.md" with {
 import goalTodoContextPrompt from "../prompts/goals/goal-todo-context.md" with { type: "text" };
 import parentIrcSteerTemplate from "../prompts/steering/parent-irc.md" with { type: "text" };
 import autoContinuePrompt from "../prompts/system/auto-continue.md" with { type: "text" };
-import downshiftChecklistPrompt from "../prompts/system/downshift-checklist.md" with { type: "text" };
-import downshiftContinuePrompt from "../prompts/system/downshift-continue.md" with { type: "text" };
-import downshiftPlanPrompt from "../prompts/system/downshift-plan.md" with { type: "text" };
 import eagerTaskPrompt from "../prompts/system/eager-task.md" with { type: "text" };
 import eagerTodoPrompt from "../prompts/system/eager-todo.md" with { type: "text" };
 import emptyStopRetryTemplate from "../prompts/system/empty-stop-retry.md" with { type: "text" };
@@ -276,6 +275,9 @@ import planModeToolDecisionReminderPrompt from "../prompts/system/plan-mode-tool
 	type: "text",
 };
 import planYoloHandoffPrompt from "../prompts/system/plan-yolo-handoff.md" with { type: "text" };
+import prewalkChecklistPrompt from "../prompts/system/prewalk-checklist.md" with { type: "text" };
+import prewalkContinuePrompt from "../prompts/system/prewalk-continue.md" with { type: "text" };
+import prewalkPlanPrompt from "../prompts/system/prewalk-plan.md" with { type: "text" };
 import rewindReportTemplate from "../prompts/system/rewind-report.md" with { type: "text" };
 import sideChannelNoToolsReminder from "../prompts/system/side-channel-no-tools.md" with { type: "text" };
 import thinkingLoopRedirectTemplate from "../prompts/system/thinking-loop-redirect.md" with { type: "text" };
@@ -292,7 +294,6 @@ import {
 	obfuscateProviderContext,
 	type SecretObfuscator,
 } from "../secrets/obfuscator";
-import { invalidateHostMetadata } from "../ssh/connection-manager";
 import { usesCodexTaskPrompt } from "../task/prompt-policy";
 import {
 	AUTO_THINKING,
@@ -307,27 +308,24 @@ import {
 } from "../thinking";
 import { formatTitleConversationContext, type TitleConversationTurn } from "../tiny/message-preproc";
 import { shutdownTinyTitleClient } from "../tiny/title-client";
-import { countToolsForAutoDiscovery, resolveEffectiveToolDiscoveryMode } from "../tool-discovery/mode";
-import {
-	buildDiscoverableToolSearchIndex,
-	collectDiscoverableTools,
-	type DiscoverableTool,
-	type DiscoverableToolSearchIndex,
-	filterBySource,
-	isMCPToolName,
-	selectDiscoverableToolNamesByServer,
-} from "../tool-discovery/tool-index";
 import { assertEditableFile } from "../tools/auto-generated-guard";
 import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
-import { normalizeToolNames } from "../tools/builtin-names";
+import { isMCPToolName, normalizeToolNames } from "../tools/builtin-names";
 import type { CheckpointState, CompletedRewindState } from "../tools/checkpoint";
 import { outputMeta, wrapToolWithMetaNotice } from "../tools/output-meta";
 import { normalizeLocalScheme, resolveToCwd } from "../tools/path-utils";
-import { isAutoQaEnabled } from "../tools/report-tool-issue";
-import { buildResolveReminderMessage, type ResolveToolDetails, runResolveInvocation } from "../tools/resolve";
+import {
+	buildResolveReminderMessage,
+	isPreviewResolutionToolCall,
+	isProposeToolCall,
+	type PlanProposalHandler,
+	PROPOSE_DEVICE_NAME,
+	writeDeviceDispatch,
+} from "../tools/resolve";
 import { getLatestTodoPhasesFromEntries, type TodoItem, type TodoPhase } from "../tools/todo";
 import { ToolAbortError, ToolError } from "../tools/tool-errors";
 import { clampTimeout } from "../tools/tool-timeouts";
+import { isMountableUnderXdev, type XdevRegistry } from "../tools/xdev";
 import { parseCommandArgs } from "../utils/command-args";
 import { type EditMode, resolveEditMode } from "../utils/edit-mode";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
@@ -350,6 +348,7 @@ import {
 import { findCompactMode } from "./compact-modes";
 import {
 	collectPendingToolCalls,
+	createInterruptedTurnAbortMessage,
 	SESSION_EXIT_CUSTOM_TYPE,
 	type SessionExitData,
 	summarizeToolArguments,
@@ -391,7 +390,6 @@ import { YieldQueue } from "./yield-queue";
 
 const SESSION_STOP_CONTINUATION_CAP = 8;
 const PLAN_MODE_REMINDER_MAX = 3;
-const PLAN_DECISION_TOOLS = new Set(["ask", "resolve"]);
 
 /**
  * Mutating tool results (`bash`/`eval`/`edit`/`write`/`ast_edit`) without the
@@ -416,32 +414,85 @@ const MID_RUN_TODO_NUDGE_MUTATING_TOOLS: Record<string, true> = {
 	write: true,
 	ast_edit: true,
 };
+const MARKDOWN_PROMPT_PREFIX_RE = /^(?:>\s*)?(?:(?:[-*+]|\d+[.)])\s+)*/;
+const PROMPT_LABEL_RE = /^(?:q(?:uestion)?|ask)\s*\d*\s*[:.)-]\s*/i;
+const QUESTION_PROMPT_RE =
+	/^(?:what|which|when|where|why|how|who|whom|whose|do|does|did|can|could|would|will|should|is|are|am|may|shall)\b/i;
+const USER_DIRECTED_PROMPT_RE = /\b(?:you|your|we|our)\b/i;
+const USER_RESPONSE_CUE_RE =
+	/^(?:please\s+)?(?:confirm|reply|choose|pick|decide|advise)\b|^(?:please\s+)?answer\b|^(?:please\s+)?(?:let\s+me\s+know|tell\s+me)\b/i;
+
+function assistantText(message: AssistantMessage): string {
+	return message.content
+		.filter((content): content is TextContent => content.type === "text")
+		.map(content => content.text)
+		.join("\n")
+		.trim();
+}
+
+interface PromptLine {
+	text: string;
+	hadPromptLabel: boolean;
+}
+
+function promptLine(line: string): PromptLine {
+	const withoutMarkdownPrefix = line.trim().replace(MARKDOWN_PROMPT_PREFIX_RE, "").trim();
+	const withoutPromptLabel = withoutMarkdownPrefix.replace(PROMPT_LABEL_RE, "").trim();
+	return {
+		text: withoutPromptLabel,
+		hadPromptLabel: withoutPromptLabel !== withoutMarkdownPrefix,
+	};
+}
+
+function isQuestionPromptLine(line: string): boolean {
+	const candidate = promptLine(line);
+	if (!/[?？]\s*$/.test(candidate.text)) return false;
+	return (
+		candidate.hadPromptLabel ||
+		QUESTION_PROMPT_RE.test(candidate.text) ||
+		USER_DIRECTED_PROMPT_RE.test(candidate.text)
+	);
+}
+
+function isResponseCueLine(line: string): boolean {
+	const candidate = promptLine(line)
+		.text.replace(/[.!?。！？]+$/, "")
+		.trim();
+	return USER_RESPONSE_CUE_RE.test(candidate);
+}
+
+function isAwaitingUserAnswer(message: AssistantMessage): boolean {
+	const text = assistantText(message);
+	if (!text) return false;
+	const lastLine = text.split(/\r?\n/).at(-1)?.trim();
+	return lastLine !== undefined && (isQuestionPromptLine(lastLine) || isResponseCueLine(lastLine));
+}
 /** `customType` for the hidden mid-run todo nudge; `display: false`, so it reaches
  *  the model but never renders in the TUI or transcript. */
 const MID_RUN_TODO_NUDGE_MESSAGE_TYPE = "mid-run-todo-nudge";
-/** Hidden plan nudge injected by downshift; scrubbed from the LLM context
+/** Hidden plan nudge injected by prewalk; scrubbed from the LLM context
  *  when the switch happens. */
-const DOWNSHIFT_PLAN_MESSAGE_TYPE = "downshift-plan";
+const PREWALK_PLAN_MESSAGE_TYPE = "prewalk-plan";
 /** Hidden safety-net nudge forcing one more turn after a text-only reply to
  *  the plan nudge, which would otherwise end the run with no code written. */
-const DOWNSHIFT_CONTINUE_MESSAGE_TYPE = "downshift-continue";
+const PREWALK_CONTINUE_MESSAGE_TYPE = "prewalk-continue";
 /** Hidden "verify before finishing" checklist steered into the run at the
  *  switch, aimed at the fast model's specific failure patterns: partial
  *  multi-site fixes, unnecessarily broad rewrites, and reported-test-only
  *  verification. */
-const DOWNSHIFT_CHECKLIST_MESSAGE_TYPE = "downshift-checklist";
+const PREWALK_CHECKLIST_MESSAGE_TYPE = "prewalk-checklist";
 /** Tools whose first successful call triggers the switch — once the todo
- *  gate is open (see {@link AgentSession.#downshiftTodoSeen}). Bash is
+ *  gate is open (see {@link AgentSession.#prewalkTodoSeen}). Bash is
  *  deliberately excluded: it doubles as exploration (ls/cat) and fired
  *  turn-1 switches in practice. `todo` is deliberately NOT a trigger: firing
  *  at the todo init handed the fast model 100% of the implementation with
  *  zero started work and measurably regressed pass rates. */
-const DOWNSHIFT_ACTION_TOOLS: Record<string, true> = {
+const PREWALK_ACTION_TOOLS: Record<string, true> = {
 	edit: true,
 	write: true,
 };
 /** `customType` for the hidden hand-off message steered to the target model
- *  once PlanYolo auto-approves the plan. Unlike downshift's plan nudge this
+ *  once PlanYolo auto-approves the plan. Unlike prewalk's plan nudge this
  *  is never scrubbed — it IS the instruction the target model acts on. */
 const PLAN_YOLO_HANDOFF_MESSAGE_TYPE = "plan-yolo-handoff";
 /** Abort reason for the Gemini reasoning-header runaway interrupt. Surfaced on the
@@ -725,7 +776,7 @@ export interface AsyncJobSnapshot {
 
 export type { ShakeMode, ShakeResult };
 /**
- * Downshift: switches an active session one-way from its starting model to
+ * Prewalk: switches an active session one-way from its starting model to
  * a fast/cheap `target` at the first completed turn that runs an edit/write
  * tool once the todo list exists. A hidden plan nudge asks the starting
  * model to write a plan, initialize its todo list from it, and start; the
@@ -735,7 +786,7 @@ export type { ShakeMode, ShakeResult };
  * finishing. Both are always on — this is the one mechanism that won out
  * over turn-count and ungated variants in testing.
  */
-export interface Downshift {
+export interface Prewalk {
 	target: Model;
 	thinkingLevel?: ConfiguredThinkingLevel;
 }
@@ -767,10 +818,10 @@ export interface AgentSessionConfig {
 	scopedModels?: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>;
 	/** Initial session thinking selector. */
 	thinkingLevel?: ConfiguredThinkingLevel;
-	/** Downshift from the starting model to a fast/cheap target at the first edit/write once the todo list exists. */
-	downshift?: Downshift;
+	/** Prewalk from the starting model to a fast/cheap target at the first edit/write once the todo list exists. */
+	prewalk?: Prewalk;
 	/** Force read-only plan mode at start, auto-approve on the model's first
-	 *  `resolve` call, then switch to the target to implement. */
+	 *  plan proposal (`write xd://propose`), then switch to the target to implement. */
 	planYolo?: PlanYolo;
 
 	/** Initial per-family service tiers (OpenAI / Anthropic / Google) for the live session. */
@@ -838,8 +889,12 @@ export interface AgentSessionConfig {
 	rebuildSystemPrompt?: (toolNames: string[], tools: Map<string, AgentTool>) => Promise<{ systemPrompt: string[] }>;
 	/** Local calendar date provider used by prompt-cache invalidation. Defaults to the host local date. */
 	getLocalCalendarDate?: () => string;
-	/** Rebuild the SSH tool from current capability discovery results. */
-	reloadSshTool?: () => Promise<AgentTool | null>;
+	/** Entries of tools mounted under `xd://` (name + one-line summary), for /tools display. */
+	getXdevToolEntries?: () => Array<{ name: string; summary: string }>;
+	/** Session-owned `xd://` device registry; reconciled as the active tool set changes. */
+	xdevRegistry?: XdevRegistry;
+	/** Discoverable tools mounted under `xd://` in the initial enabled set (startup partition in `sdk.ts`). */
+	initialMountedXdevToolNames?: string[];
 	requestedToolNames?: ReadonlySet<string>;
 	/**
 	 * Optional accessor for live MCP server instructions. Read by the session's
@@ -848,16 +903,6 @@ export interface AgentSessionConfig {
 	 * signature comparison and silently keep a stale prompt cached.
 	 */
 	getMcpServerInstructions?: () => Map<string, string> | undefined;
-	/** Enable hidden-by-default MCP tool discovery for this session. */
-	mcpDiscoveryEnabled?: boolean;
-	/** MCP tool names to activate for the current session when discovery mode is enabled. */
-	initialSelectedMCPToolNames?: string[];
-	/** Whether constructor-provided MCP defaults should be persisted immediately. */
-	persistInitialMCPToolSelection?: boolean;
-	/** MCP server names whose tools should seed discovery-mode sessions whenever those servers are connected. */
-	defaultSelectedMCPServerNames?: string[];
-	/** MCP tool names that should seed brand-new sessions created from this AgentSession. */
-	defaultSelectedMCPToolNames?: string[];
 	/** TTSR manager for time-traveling stream rules */
 	ttsrManager?: TtsrManager;
 	/** Secret obfuscator for deobfuscating streaming edit content */
@@ -1520,6 +1565,21 @@ function isAdvisorCard(message: AgentMessage): message is CustomMessage {
 	return message.role === "custom" && message.customType === "advisor";
 }
 
+function isTerminalTextAssistantAnswer(message: AgentMessage | undefined): message is AssistantMessage {
+	if (message?.role !== "assistant" || message.stopReason !== "stop") return false;
+	let hasText = false;
+	for (const part of message.content) {
+		if (part.type === "toolCall") return false;
+		if (part.type === "text") {
+			if (part.text.trim().length > 0) hasText = true;
+			continue;
+		}
+		if (part.type === "thinking" || part.type === "redactedThinking" || part.type === "fallback") continue;
+		return false;
+	}
+	return hasText;
+}
+
 /**
  * A queued message the user can restore to the editor / pull back as a draft.
  * Only genuinely user-authored messages qualify: plain user turns, or custom
@@ -1670,6 +1730,8 @@ export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
 	readonly settings: Settings;
+	/** Entries of tools mounted under `xd://`; empty when virtual devices are unmounted. */
+	getXdevToolEntries: () => Array<{ name: string; summary: string }>;
 	readonly yieldQueue: YieldQueue;
 	fileSnapshotStore?: InMemorySnapshotStore;
 	#autoApprove: boolean;
@@ -1685,13 +1747,13 @@ export class AgentSession {
 	#autoThinking: boolean = false;
 	/** The level `auto` last resolved to (for UI); undefined until a turn is classified. */
 	#autoResolvedLevel: Effort | undefined;
-	#downshift: Downshift | undefined;
+	#prewalk: Prewalk | undefined;
 	/** True once the plan nudge has been queued; scrubbed from context at the switch. */
-	#downshiftPlanInjected = false;
-	/** True once any successful `todo` call landed — opens the downshift
+	#prewalkPlanInjected = false;
+	/** True once any successful `todo` call landed — opens the prewalk
 	 *  trigger gate: the switch fires at the first edit/write AFTER the todo
-	 *  list exists (sessions without a todo tool skip the gate). */
-	#downshiftTodoSeen = false;
+	 *  list exists (sessions without an ACTIVE todo tool skip the gate). */
+	#prewalkTodoSeen = false;
 	#planYolo: PlanYolo | undefined;
 	#planYoloPreviousTools: string[] | undefined;
 	#planYoloArmed = false;
@@ -1875,7 +1937,6 @@ export class AgentSession {
 		| undefined;
 	#getLocalCalendarDate: () => string;
 	#getMcpServerInstructions: (() => Map<string, string> | undefined) | undefined;
-	#reloadSshTool: (() => Promise<AgentTool | null>) | undefined;
 	#setActiveToolNames: ((names: Iterable<string>) => void) | undefined;
 	#disconnectOwnedMcpManager: (() => Promise<void>) | undefined;
 	#requestedToolNames: ReadonlySet<string> | undefined;
@@ -1895,17 +1956,12 @@ export class AgentSession {
 	 * to decide whether the cached prompt is stale.
 	 */
 	#promptModelKey: string | undefined;
-	#mcpDiscoveryEnabled = false;
-	#discoverableMCPTools = new Map<string, DiscoverableTool>();
-	#selectedMCPToolNames = new Set<string>();
-	// Generic tool discovery (covers built-in + MCP + extension when tools.discoveryMode === "all")
-	#discoverableToolSearchIndex: DiscoverableToolSearchIndex | null = null;
-	#selectedDiscoveredToolNames = new Set<string>();
 	#builtInToolNames = new Set<string>();
 	#rpcHostToolNames = new Set<string>();
-	#defaultSelectedMCPServerNames = new Set<string>();
-	#defaultSelectedMCPToolNames = new Set<string>();
-	#sessionDefaultSelectedMCPToolNames = new Map<string, string[]>();
+	/** Session-owned `xd://` device registry (built-ins + dynamic mounts); `undefined` when the transport is off. */
+	#xdevRegistry: XdevRegistry | undefined;
+	/** Names of discoverable tools currently mounted under `xd://` (dynamic mounts only, not built-in devices). */
+	#mountedXdevToolNames = new Set<string>();
 
 	// TTSR manager for time-traveling stream rules
 	#ttsrManager: TtsrManager | undefined = undefined;
@@ -1920,7 +1976,7 @@ export class AgentSession {
 	#ttsrResumeResolve: (() => void) | undefined = undefined;
 
 	/** One-shot flag for expected internal plan-mode aborts. Approval actions may
-	 *  abort the post-`resolve` continuation before compaction, execution, or
+	 *  abort the post-approval continuation before compaction, execution, or
 	 *  manual refinement. Consumed inside `#handleAgentEvent` for the matching
 	 *  `message_end` + `stopReason: "aborted"`; callers clear it in `finally` so
 	 *  it cannot leak into later unrelated aborts. */
@@ -1956,6 +2012,7 @@ export class AgentSession {
 	// on `agent_end` can fire its next `prompt` before #promptWithMessage's finally
 	#emptyStopRetryCount = 0;
 	#unexpectedStopRetryCount = 0;
+	#acceptTerminalEmptyStopForPrompt = false;
 	#promptGeneration = 0;
 	#pendingAgentEndEmit: AgentSessionEvent | undefined;
 	#pendingContextSnapshot:
@@ -1996,6 +2053,7 @@ export class AgentSession {
 		this.#emptyStopRetryCount = 0;
 		this.#unexpectedStopRetryCount = 0;
 		this.#yieldTerminationPending = false;
+		this.#acceptTerminalEmptyStopForPrompt = false;
 	}
 
 	#acquirePowerAssertion(): void {
@@ -2181,10 +2239,10 @@ export class AgentSession {
 		this.#emit(pending);
 	}
 
-	/** Advance the one-way downshift switch at a completed assistant-turn boundary. */
-	async #advanceDownshift(liveMessages: AgentMessage[], context: AgentTurnEndContext | undefined): Promise<void> {
-		const downshift = this.#downshift;
-		if (!downshift || context?.message.role !== "assistant") return;
+	/** Advance the one-way prewalk switch at a completed assistant-turn boundary. */
+	async #advancePrewalk(liveMessages: AgentMessage[], context: AgentTurnEndContext | undefined): Promise<void> {
+		const prewalk = this.#prewalk;
+		if (!prewalk || context?.message.role !== "assistant") return;
 
 		// Structural safety net: every branch below assumes the agent loop will
 		// run another turn. It won't if THIS turn had no tool calls — the loop
@@ -2194,11 +2252,11 @@ export class AgentSession {
 		// silently killing production SWE-bench runs before any code was ever
 		// written. Force one more turn only in that specific, self-created
 		// hazard window.
-		if (this.#downshiftPlanInjected && context.toolResults.length === 0) {
+		if (this.#prewalkPlanInjected && context.toolResults.length === 0) {
 			this.agent.steer({
 				role: "custom",
-				customType: DOWNSHIFT_CONTINUE_MESSAGE_TYPE,
-				content: downshiftContinuePrompt,
+				customType: PREWALK_CONTINUE_MESSAGE_TYPE,
+				content: prewalkContinuePrompt,
 				attribution: "agent",
 				display: false,
 				timestamp: Date.now(),
@@ -2209,27 +2267,26 @@ export class AgentSession {
 		// todo list from it and start" — so the switch waits until a todo list
 		// exists AND the model has actually started implementing (first
 		// edit/write). The todo call itself never triggers: firing there handed
-		// the fast model the whole implementation cold. Sessions without a todo
-		// tool skip the gate.
-		if (context.toolResults.some(result => result.toolName === "todo")) {
-			this.#downshiftTodoSeen = true;
-		}
-		const todoGateOpen = this.#downshiftTodoSeen || !this.#toolRegistry.has("todo");
+		// the fast model the whole implementation cold. The gate keys on the
+		// ACTIVE tool set, not the registry: a registered-but-deactivated todo
+		// (e.g. a restricted active-tool slate) is uncallable and would
+		// deadlock the switch.
+		const todoGateOpen = this.#prewalkTodoSeen || !this.getActiveToolNames().includes("todo");
 		const action = todoGateOpen
-			? context.toolResults.find(result => DOWNSHIFT_ACTION_TOOLS[result.toolName])
+			? context.toolResults.find(result => PREWALK_ACTION_TOOLS[result.toolName])
 			: undefined;
 		if (!action) {
-			if (!this.#downshiftPlanInjected) {
-				this.#downshiftPlanInjected = true;
+			if (!this.#prewalkPlanInjected) {
+				this.#prewalkPlanInjected = true;
 				this.agent.steer({
 					role: "custom",
-					customType: DOWNSHIFT_PLAN_MESSAGE_TYPE,
-					content: downshiftPlanPrompt,
+					customType: PREWALK_PLAN_MESSAGE_TYPE,
+					content: prewalkPlanPrompt,
 					display: false,
 					attribution: "agent",
 					timestamp: Date.now(),
 				});
-				this.emitNotice("info", "Downshift: injected deep-plan nudge.", "downshift");
+				this.emitNotice("info", "Prewalk: injected deep-plan nudge.", "prewalk");
 			}
 			return;
 		}
@@ -2239,24 +2296,24 @@ export class AgentSession {
 			await this.#waitForSessionMessagePersistence(toolResult);
 		}
 
-		this.#scrubDownshiftPlanNudge(liveMessages);
-		const target = downshift.target;
+		this.#scrubPrewalkPlanNudge(liveMessages);
+		const target = prewalk.target;
 		if (this.model && modelsAreEqual(this.model, target)) {
-			this.#downshift = undefined;
+			this.#prewalk = undefined;
 			return;
 		}
 
-		await this.setModelTemporary(target, downshift.thinkingLevel, { ephemeral: true });
-		this.#downshift = undefined;
+		await this.setModelTemporary(target, prewalk.thinkingLevel, { ephemeral: true });
+		this.#prewalk = undefined;
 		this.emitNotice(
 			"info",
-			`Downshift: switched to ${target.provider}/${target.id} after first ${action.toolName} call.`,
-			"downshift",
+			`Prewalk: switched to ${target.provider}/${target.id} after first ${action.toolName} call.`,
+			"prewalk",
 		);
 		this.agent.steer({
 			role: "custom",
-			customType: DOWNSHIFT_CHECKLIST_MESSAGE_TYPE,
-			content: downshiftChecklistPrompt,
+			customType: PREWALK_CHECKLIST_MESSAGE_TYPE,
+			content: prewalkChecklistPrompt,
 			attribution: "agent",
 			display: false,
 			timestamp: Date.now(),
@@ -2264,35 +2321,35 @@ export class AgentSession {
 	}
 
 	/**
-	 * Arm downshift outside the normal startup path (the `/downshift` slash
+	 * Arm prewalk outside the normal startup path (the `/prewalk` slash
 	 * command): sets the target and immediately steers the plan nudge rather
 	 * than waiting for the next turn boundary, since an explicit manual
-	 * invocation means "start this now." A no-op with a notice if a downshift
+	 * invocation means "start this now." A no-op with a notice if a prewalk
 	 * is already armed and waiting.
 	 */
-	armDownshift(target: Model, thinkingLevel?: ConfiguredThinkingLevel): void {
-		if (this.#downshift) {
+	armPrewalk(target: Model, thinkingLevel?: ConfiguredThinkingLevel): void {
+		if (this.#prewalk) {
 			this.emitNotice(
 				"info",
-				`Downshift: already armed for ${this.#downshift.target.provider}/${this.#downshift.target.id}, waiting for the first edit/write.`,
-				"downshift",
+				`Prewalk: already armed for ${this.#prewalk.target.provider}/${this.#prewalk.target.id}, waiting for the first edit/write.`,
+				"prewalk",
 			);
 			return;
 		}
-		this.#downshift = { target, thinkingLevel };
-		this.#downshiftPlanInjected = true;
+		this.#prewalk = { target, thinkingLevel };
+		this.#prewalkPlanInjected = true;
 		this.agent.steer({
 			role: "custom",
-			customType: DOWNSHIFT_PLAN_MESSAGE_TYPE,
-			content: downshiftPlanPrompt,
+			customType: PREWALK_PLAN_MESSAGE_TYPE,
+			content: prewalkPlanPrompt,
 			display: false,
 			attribution: "agent",
 			timestamp: Date.now(),
 		});
 		this.emitNotice(
 			"info",
-			`Downshift: armed for ${target.provider}/${target.id} — will switch at the first edit/write once the todo list exists.`,
-			"downshift",
+			`Prewalk: armed for ${target.provider}/${target.id} — will switch at the first edit/write once the todo list exists.`,
+			"prewalk",
 		);
 	}
 
@@ -2302,12 +2359,12 @@ export class AgentSession {
 	 * Splices the loop's live context array in place (the run streams from
 	 * it) and mirrors the removal into agent state. The persisted transcript
 	 * keeps the message for audit; a session reload re-materializes it,
-	 * which is acceptable for downshift's single-run lifecycle.
+	 * which is acceptable for prewalk's single-run lifecycle.
 	 */
-	#scrubDownshiftPlanNudge(liveMessages: AgentMessage[]): void {
-		if (!this.#downshiftPlanInjected) return;
+	#scrubPrewalkPlanNudge(liveMessages: AgentMessage[]): void {
+		if (!this.#prewalkPlanInjected) return;
 		const isPlanNudge = (m: AgentMessage): boolean =>
-			m.role === "custom" && m.customType === DOWNSHIFT_PLAN_MESSAGE_TYPE;
+			m.role === "custom" && m.customType === PREWALK_PLAN_MESSAGE_TYPE;
 		for (let i = liveMessages.length - 1; i >= 0; i--) {
 			if (isPlanNudge(liveMessages[i])) liveMessages.splice(i, 1);
 		}
@@ -2318,18 +2375,17 @@ export class AgentSession {
 
 	/**
 	 * Lazily arm PlanYolo before the first prompt is built: restricts tools to
-	 * the plan-mode read-only set (plus `resolve`/`write`, both normally
-	 * discovery-hidden), marks plan-mode state so `#buildPlanModeMessage`
-	 * injects the standard plan-mode-active instructions on this and every
-	 * following prompt, and registers the auto-approve resolve handler.
+	 * the plan-mode read-only set (plus `write`, which carries the resolution
+	 * devices including `xd://propose`), marks plan-mode state so
+	 * `#buildPlanModeMessage` injects the standard plan-mode-active instructions
+	 * on this and every following prompt, and registers the auto-approve plan-proposal handler.
 	 * Idempotent — a no-op once armed or when PlanYolo is not configured.
 	 */
 	async #armPlanYoloIfNeeded(): Promise<void> {
 		if (!this.#planYolo || this.#planYoloArmed) return;
 		this.#planYoloArmed = true;
-		const previousTools = this.getActiveToolNames();
-		const augmentations = ["resolve"];
-		if (this.hasBuiltInTool("write")) augmentations.push("write");
+		const previousTools = this.getEnabledToolNames();
+		const augmentations = this.hasBuiltInTool("write") ? ["write"] : [];
 		await this.setActiveToolsByName([...new Set([...previousTools, ...augmentations])]);
 		this.#planYoloPreviousTools = previousTools;
 		this.setPlanModeState({
@@ -2337,63 +2393,58 @@ export class AgentSession {
 			planFilePath: this.getPlanReferencePath() || "local://PLAN.md",
 			workflow: "parallel",
 		});
-		this.setStandingResolveHandler(input => this.#runPlanYoloApprovalResolve(input));
+		this.setPlanProposalHandler(title => this.#approvePlanYoloProposal(title));
 	}
 
 	/**
-	 * Standing resolve handler while PlanYolo's plan phase is active. Auto-
-	 * approves the instant the model calls `resolve { action: "apply" }` for
-	 * the plan — no interactive review, the headless counterpart to plan
-	 * mode's "Approve and execute" — then restores tools, exits plan-mode
-	 * state, switches to the configured `target`, and hands off the approved
-	 * plan for it to implement.
+	 * Plan-proposal handler while PlanYolo's plan phase is active. Auto-approves
+	 * the instant the model writes the plan slug/title to `xd://propose` — no
+	 * interactive review, the headless counterpart to plan mode's "Approve and
+	 * execute" — then restores tools, exits plan-mode state, switches to the
+	 * configured `target`, and hands off the approved plan for it to implement.
 	 */
-	#runPlanYoloApprovalResolve(input: unknown): Promise<AgentToolResult<ResolveToolDetails>> {
-		return runResolveInvocation(input as Parameters<typeof runResolveInvocation>[0], {
-			sourceToolName: "plan_approval",
-			label: "Plan ready for approval",
-			apply: async (_reason, extra) => {
-				const planYolo = this.#planYolo;
-				const state = this.getPlanModeState();
-				if (!planYolo || !state?.enabled) {
-					throw new ToolError("Plan mode is not active.");
-				}
-				const { planFilePath, title } = await resolveApprovedPlan({
-					suppliedTitle: extra?.title,
-					statePlanFilePath: state.planFilePath,
-					readPlan: url => this.#readPlanYoloFile(url),
-					listPlanFiles: () => this.#listPlanYoloFiles(),
-				});
-				const previousTools = this.#planYoloPreviousTools;
-				if (previousTools) {
-					await this.setActiveToolsByName(previousTools);
-				}
-				this.setStandingResolveHandler(null);
-				this.setPlanModeState(undefined);
-				this.#planYolo = undefined;
-				this.#planYoloPreviousTools = undefined;
-				await this.setModelTemporary(planYolo.target, planYolo.thinkingLevel, { ephemeral: true });
-				this.emitNotice(
-					"info",
-					`Plan-yolo: plan approved, switched to ${planYolo.target.provider}/${planYolo.target.id} to implement "${title}".`,
-					"plan-yolo",
-				);
-				this.agent.steer({
-					role: "custom",
-					customType: PLAN_YOLO_HANDOFF_MESSAGE_TYPE,
-					content: prompt.render(planYoloHandoffPrompt, { planFilePath, title }),
-					attribution: "agent",
-					display: false,
-					timestamp: Date.now(),
-				});
-				return {
-					content: [
-						{ type: "text" as const, text: `Plan approved. Implementing now with ${planYolo.target.id}.` },
-					],
-					details: { planFilePath, title, planExists: true },
-				};
-			},
+	#approvePlanYoloProposal(title: string): Promise<AgentToolResult<unknown>> {
+		return this.#finalizePlanYoloProposal(title);
+	}
+
+	async #finalizePlanYoloProposal(title: string): Promise<AgentToolResult<unknown>> {
+		const planYolo = this.#planYolo;
+		const state = this.getPlanModeState();
+		if (!planYolo || !state?.enabled) {
+			throw new ToolError("Plan mode is not active.");
+		}
+		const { planFilePath, title: resolvedTitle } = await resolveApprovedPlan({
+			suppliedTitle: title,
+			statePlanFilePath: state.planFilePath,
+			readPlan: url => this.#readPlanYoloFile(url),
+			listPlanFiles: () => this.#listPlanYoloFiles(),
 		});
+		const previousTools = this.#planYoloPreviousTools;
+		if (previousTools) {
+			await this.setActiveToolsByName(previousTools);
+		}
+		this.setPlanProposalHandler(null);
+		this.setPlanModeState(undefined);
+		this.#planYolo = undefined;
+		this.#planYoloPreviousTools = undefined;
+		await this.setModelTemporary(planYolo.target, planYolo.thinkingLevel, { ephemeral: true });
+		this.emitNotice(
+			"info",
+			`Plan-yolo: plan approved, switched to ${planYolo.target.provider}/${planYolo.target.id} to implement "${resolvedTitle}".`,
+			"plan-yolo",
+		);
+		this.agent.steer({
+			role: "custom",
+			customType: PLAN_YOLO_HANDOFF_MESSAGE_TYPE,
+			content: prompt.render(planYoloHandoffPrompt, { planFilePath, title: resolvedTitle }),
+			attribution: "agent",
+			display: false,
+			timestamp: Date.now(),
+		});
+		return {
+			content: [{ type: "text" as const, text: `Plan approved. Implementing now with ${planYolo.target.id}.` }],
+			details: { planFilePath, title: resolvedTitle, planExists: true },
+		};
 	}
 
 	async #readPlanYoloFile(planFilePath: string): Promise<string | null> {
@@ -2448,8 +2499,8 @@ export class AgentSession {
 		} else {
 			this.#thinkingLevel = config.thinkingLevel;
 		}
-		if (config.downshift) {
-			this.#downshift = config.downshift;
+		if (config.prewalk) {
+			this.#prewalk = config.prewalk;
 		}
 		if (config.planYolo) {
 			this.#planYolo = config.planYolo;
@@ -2528,11 +2579,11 @@ export class AgentSession {
 				});
 				if (detection) this.#maybeInjectToolCallLoopRedirect(messages, detection);
 			}
-			await this.#advanceDownshift(messages, context);
+			await this.#advancePrewalk(messages, context);
 			this.#advisorPrimaryTurnsCompleted++;
 			if (this.#advisors.length > 0) {
 				for (const a of this.#advisors) {
-					if (!a.runtime.disposed) a.runtime.onTurnEnd(messages);
+					if (!a.runtime.disposed) a.runtime.onTurnEnd(messages, { willContinue: context?.willContinue });
 				}
 				const syncBacklog = this.settings.get("advisor.syncBacklog");
 				if (syncBacklog !== "off") {
@@ -2562,7 +2613,7 @@ export class AgentSession {
 		// Background-job completions / late diagnostics are pulled into the run at
 		// each step boundary as non-interrupting asides. Peer IRCs share the aside
 		// injection boundary, but also expose a non-consuming interrupt peek so
-		// `job poll` / `irc wait` can return early before the boundary drains them.
+		// `hub` waits can return early before the boundary drains them.
 		this.agent.hasIrcInterrupts = () => this.#pendingIrcInterrupts.length > 0;
 		this.agent.setAsideMessageProvider(() => {
 			const pendingIrc = [...this.#pendingIrcInterrupts, ...this.#pendingIrcAsides];
@@ -2579,32 +2630,13 @@ export class AgentSession {
 		this.#rebuildSystemPrompt = config.rebuildSystemPrompt;
 		this.#getLocalCalendarDate = config.getLocalCalendarDate ?? formatLocalCalendarDate;
 		this.#getMcpServerInstructions = config.getMcpServerInstructions;
-		this.#reloadSshTool = config.reloadSshTool;
+		this.getXdevToolEntries = config.getXdevToolEntries ?? (() => []);
+		this.#xdevRegistry = config.xdevRegistry;
+		this.#mountedXdevToolNames = new Set(config.initialMountedXdevToolNames ?? []);
 		this.#setActiveToolNames = config.setActiveToolNames;
 		this.#disconnectOwnedMcpManager = config.disconnectOwnedMcpManager;
 		this.#baseSystemPrompt = this.agent.state.systemPrompt;
 		this.#promptModelKey = this.#currentPromptModelKey();
-		this.#mcpDiscoveryEnabled = config.mcpDiscoveryEnabled ?? false;
-		this.#setDiscoverableMCPTools(this.#collectDiscoverableMCPToolsFromRegistry());
-		this.#selectedMCPToolNames = new Set(config.initialSelectedMCPToolNames ?? []);
-		this.#defaultSelectedMCPServerNames = new Set(config.defaultSelectedMCPServerNames ?? []);
-		this.#defaultSelectedMCPToolNames = new Set(config.defaultSelectedMCPToolNames ?? []);
-		this.#pruneSelectedMCPToolNames();
-		const persistedSelectedMCPToolNames = this.buildDisplaySessionContext().selectedMCPToolNames;
-		const currentSelectedMCPToolNames = this.getSelectedMCPToolNames();
-		const persistInitialMCPToolSelection =
-			config.persistInitialMCPToolSelection ?? this.sessionManager.getBranch().length === 0;
-		if (
-			this.#mcpDiscoveryEnabled &&
-			persistInitialMCPToolSelection &&
-			!this.#selectedMCPToolNamesMatch(persistedSelectedMCPToolNames, currentSelectedMCPToolNames)
-		) {
-			this.sessionManager.appendMCPToolSelection(currentSelectedMCPToolNames);
-		}
-		this.#rememberSessionDefaultSelectedMCPToolNames(
-			this.sessionManager.getSessionFile(),
-			this.#getConfiguredDefaultSelectedMCPToolNames(),
-		);
 		this.#ttsrManager = config.ttsrManager;
 		this.#obfuscator = config.obfuscator;
 		this.#agentId = config.agentId;
@@ -2882,6 +2914,14 @@ export class AgentSession {
 
 			const names = config.tools === undefined ? ADVISOR_DEFAULT_TOOL_NAMES : new Set(config.tools);
 			const tools = (this.#advisorTools ?? []).filter(t => names.has(t.name));
+			const availableAdvisorToolNames = new Set<string>();
+			availableAdvisorToolNames.add(adviseTool.name);
+			for (const tool of tools) {
+				availableAdvisorToolNames.add(tool.name);
+				if (tool.customWireName !== undefined) availableAdvisorToolNames.add(tool.customWireName);
+			}
+			let quarantinedAdvisorOutput: string | undefined;
+			let currentAdvisorInput = "";
 
 			const primaryProviderSessionId = this.sessionId;
 			const advisorSessionLabel = slug
@@ -2937,6 +2977,13 @@ export class AgentSession {
 				onSseEvent: this.#onSseEvent,
 				transformProviderContext: this.#transformProviderContext,
 				intentTracing: false,
+				transformAssistantMessage: message => {
+					quarantinedAdvisorOutput = quarantineAdvisorUnsafeOutput(
+						message,
+						availableAdvisorToolNames,
+						buildAdvisorQuarantineSourceText(currentAdvisorInput, advisorAgent.state.messages),
+					);
+				},
 				telemetry: advisorTelemetry,
 				serviceTier: undefined,
 				serviceTierResolver: advisorServiceTierResolver,
@@ -2944,7 +2991,19 @@ export class AgentSession {
 			advisorAgent.setDisableReasoning(shouldDisableReasoning(advisorThinkingLevel));
 
 			const advisorAgentFacade: AdvisorAgent = {
-				prompt: input => advisorAgent.prompt(input),
+				prompt: async input => {
+					let quarantined: string | undefined;
+					try {
+						quarantinedAdvisorOutput = undefined;
+						currentAdvisorInput = input;
+						await advisorAgent.prompt(input);
+						quarantined = quarantinedAdvisorOutput;
+					} finally {
+						quarantinedAdvisorOutput = undefined;
+						currentAdvisorInput = "";
+					}
+					if (quarantined) throw new AdvisorOutputQuarantinedError(quarantined);
+				},
 				abort: reason => advisorAgent.abort(reason),
 				reset: () => {
 					advisorAgent.reset();
@@ -3054,18 +3113,33 @@ export class AgentSession {
 	/**
 	 * Route one accepted advice note from `advisor` to the primary. Concern and
 	 * blocker interrupt the running agent through the steering channel; once the
-	 * loop has yielded, `triggerTurn` resumes it. After a deliberate user interrupt
-	 * auto-resume is suppressed while idle/unwinding (the note becomes a preserved
-	 * card re-entering on resume); a live-streaming turn is steered in directly. A
-	 * plain nit always rides the non-interrupting YieldQueue aside. Suppression by
-	 * the per-advisor emission guard drops the note silently — the model still saw
-	 * `Recorded.`, so it isn't tempted to rephrase the same note past the dedupe.
+	 * loop has yielded, `triggerTurn` resumes it. If the loop already ended with a
+	 * terminal text answer and no queued work remains, the note is preserved as an
+	 * advisor card instead of waking a duplicate completion turn. After a deliberate
+	 * user interrupt auto-resume is suppressed while idle/unwinding (the note
+	 * becomes a preserved card re-entering on resume); a live-streaming turn is
+	 * steered in directly. A plain nit always rides the non-interrupting YieldQueue
+	 * aside. Suppression by the per-advisor emission guard drops the note silently —
+	 * the model still saw `Recorded.`, so it isn't tempted to rephrase the same note
+	 * past the dedupe.
 	 */
+	#hasTerminalTextAnswerWithoutQueuedWork(): boolean {
+		if (this.agent.hasQueuedMessages() || this.#pendingNextTurnMessages.length > 0) return false;
+		const messages = this.agent.state.messages;
+		let tail = messages.length - 1;
+		while (tail >= 0 && isAdvisorCard(messages[tail])) tail--;
+		return isTerminalTextAssistantAnswer(messages[tail]);
+	}
+
 	#routeAdvice(advisor: ActiveAdvisor, note: string, severity?: AdvisorSeverity): void {
 		if (!advisor.emissionGuard.accept(note)) {
 			logger.debug("advisor advice suppressed by emission guard", { severity, advisor: advisor.name });
 			return;
 		}
+		// When newer primary turns already arrived while the advisor model was
+		// processing this batch, the advice was generated without seeing them.
+		// Append a lightweight staleness caveat so the primary can weigh recency.
+		const deliveredNote = annotateForStaleness(note, advisor.runtime.hasFreshBacklog);
 		// The implicit single ("default") advisor stamps no source name, so its
 		// agent-facing `<advisory>` bytes stay identical to the pre-multi-advisor path.
 		const source = advisor.slug ? advisor.name : undefined;
@@ -3078,13 +3152,14 @@ export class AgentSession {
 			// loop consumes a steer at its next boundary.
 			streaming: this.agent.state.isStreaming,
 			aborting: this.#abortInProgress,
+			terminalAnswerNoQueuedWork: this.#hasTerminalTextAnswerWithoutQueuedWork(),
 			interruptImmuneTurnActive: interrupting && this.#isAdvisorInterruptImmuneTurnActive(),
 		});
 		if (channel === "aside") {
-			this.yieldQueue.enqueue("advisor", { note, severity, advisor: source });
+			this.yieldQueue.enqueue("advisor", { note: deliveredNote, severity, advisor: source });
 			return;
 		}
-		const notes: AdvisorNote[] = [{ note, severity, advisor: source }];
+		const notes: AdvisorNote[] = [{ note: deliveredNote, severity, advisor: source }];
 		const content = formatAdvisorBatchContent(notes);
 		const details = { notes } satisfies AdvisorMessageDetails;
 		if (channel === "preserve") {
@@ -3370,7 +3445,8 @@ export class AgentSession {
 	 *      consuming (advances the queue generator);
 	 *   2. else, when a non-forcing preview is pending, a {@link SoftToolRequirement} — a
 	 *      PEEK (advances/pops nothing), so the agent-loop injects the reminder once per head
-	 *      and escalates to a forced `resolve` only if the model declines. A compliant turn
+	 *      and escalates to a forced `write` only if the model declines to
+	 *      resolve via `xd://resolve` or `xd://reject`. A compliant turn
 	 *      pays ZERO tool_choice change (no prompt-cache messages-cache invalidation);
 	 *   3. else undefined.
 	 */
@@ -3382,19 +3458,23 @@ export class AgentSession {
 			return {
 				soft: true,
 				id: head.id,
-				toolName: "resolve",
+				// Preview resolution is a `write` to xd://resolve or xd://reject;
+				// only those exact shapes satisfy the requirement — a plain write
+				// elsewhere is a detour.
+				toolName: "write",
+				satisfies: isPreviewResolutionToolCall,
 				reminder: [buildResolveReminderMessage(head.sourceToolName)],
 			};
 		}
 		return undefined;
 	}
 
-	/** Peek the head non-forcing pending preview invoker, for the `resolve` tool's dispatch. */
+	/** Peek the head non-forcing pending preview invoker, for the preview-resolution dispatch. */
 	peekPendingInvoker(): ((input: unknown) => Promise<unknown> | unknown) | undefined {
 		return this.#toolChoiceQueue.peekPendingInvoker();
 	}
 
-	/** Clear stale non-forcing pending preview invokers after `resolve` proves none can run. */
+	/** Clear stale non-forcing pending preview invokers after a resolve dispatch proves none can run. */
 	clearPendingInvokers(): void {
 		this.#toolChoiceQueue.clearPendingInvokers();
 	}
@@ -3425,22 +3505,20 @@ export class AgentSession {
 		return this.#toolChoiceQueue;
 	}
 
-	/** Peek the in-flight directive's invocation handler for use by the resolve tool. */
+	/** Peek the in-flight directive's invocation handler for the preview-resolution dispatch. */
 	peekQueueInvoker(): ((input: unknown) => Promise<unknown> | unknown) | undefined {
 		return this.#toolChoiceQueue.peekInFlightInvoker();
 	}
 
-	/** Standing (long-lived) handler the `resolve` tool falls back to when no
-	 *  queue invoker is in flight. Used by plan mode so the agent can submit
-	 *  approval via `resolve` without forcing the tool choice every turn. */
-	#standingResolveHandler: ((input: unknown) => Promise<unknown> | unknown) | undefined;
+	/** Plan-proposal handler consulted by `xd://propose` while plan mode is active. */
+	#planProposalHandler: PlanProposalHandler | undefined;
 
-	peekStandingResolveHandler(): ((input: unknown) => Promise<unknown> | unknown) | undefined {
-		return this.#standingResolveHandler;
+	peekPlanProposalHandler(): PlanProposalHandler | undefined {
+		return this.#planProposalHandler;
 	}
 
-	setStandingResolveHandler(handler: ((input: unknown) => Promise<unknown> | unknown) | null): void {
-		this.#standingResolveHandler = handler ?? undefined;
+	setPlanProposalHandler(handler: PlanProposalHandler | null): void {
+		this.#planProposalHandler = handler ?? undefined;
 	}
 
 	#sessionSwitchReconciler: (() => Promise<void>) | undefined;
@@ -3557,7 +3635,7 @@ export class AgentSession {
 	 * a settle observed now is a scheduling pause rather than a terminal stop:
 	 * stop-time passes (todo reminder, session_stop hooks) defer to the settle
 	 * reached once the session is fully idle. Suppressed deliveries
-	 * (acknowledged, or watched by an in-flight `job` poll) never wake the loop,
+	 * (acknowledged, or watched by an in-flight `hub` wait) never wake the loop,
 	 * so they don't count.
 	 */
 	#hasPendingAsyncWake(): boolean {
@@ -4089,7 +4167,10 @@ export class AgentSession {
 				await this.#goalRuntime.onToolCompleted(event.toolName);
 			}
 			this.#planModeReminderAwaitingProgress = false;
-			if (this.#isPlanDecisionTool(event.toolName)) {
+			if (
+				event.toolName === "ask" ||
+				writeDeviceDispatch(event.toolName, event.result)?.tool === PROPOSE_DEVICE_NAME
+			) {
 				this.#planModeReminderCount = 0;
 				this.#planModeReminderAwaitingProgress = false;
 			}
@@ -4548,7 +4629,7 @@ export class AgentSession {
 					await emitAgentEndNotification();
 					return;
 				}
-				const todoContinuationScheduled = await this.#checkTodoCompletion();
+				const todoContinuationScheduled = await this.#checkTodoCompletion(msg);
 				if (todoContinuationScheduled) {
 					await emitAgentEndNotification();
 					return;
@@ -6418,72 +6499,8 @@ export class AgentSession {
 		return this.#retryAttempt;
 	}
 
-	#collectDiscoverableMCPToolsFromRegistry(): Map<string, DiscoverableTool> {
-		const mcpTools = filterBySource(collectDiscoverableTools(this.#toolRegistry.values()), "mcp");
-		return new Map(mcpTools.map(tool => [tool.name, tool] as const));
-	}
-
-	#setDiscoverableMCPTools(discoverableMCPTools: Map<string, DiscoverableTool>): void {
-		this.#discoverableMCPTools = discoverableMCPTools;
-		this.#invalidateDiscoveryCaches();
-	}
-
-	/** Single point for invalidating cached discovery indices. Call after any change that can
-	 *  affect which tools should be discoverable: registry mutations (refreshMCPTools,
-	 *  refreshRpcHostTools) or active-tool mutations (#applyActiveToolsByName). */
-	#invalidateDiscoveryCaches(): void {
-		this.#discoverableToolSearchIndex = null;
-	}
-
-	#filterSelectableMCPToolNames(toolNames: Iterable<string>): string[] {
-		return Array.from(toolNames).filter(name => this.#discoverableMCPTools.has(name) && this.#toolRegistry.has(name));
-	}
-
-	#getConfiguredDefaultSelectedMCPToolNames(): string[] {
-		return this.#filterSelectableMCPToolNames([
-			...this.#defaultSelectedMCPToolNames,
-			...selectDiscoverableToolNamesByServer(
-				this.#discoverableMCPTools.values(),
-				this.#defaultSelectedMCPServerNames,
-			),
-		]);
-	}
-
-	#pruneSelectedMCPToolNames(): void {
-		this.#selectedMCPToolNames = new Set(this.#filterSelectableMCPToolNames(this.#selectedMCPToolNames));
-	}
-
-	#selectedMCPToolNamesMatch(left: string[], right: string[]): boolean {
-		return left.length === right.length && left.every((name, index) => name === right[index]);
-	}
-
-	#rememberSessionDefaultSelectedMCPToolNames(
-		sessionFile: string | null | undefined,
-		toolNames: Iterable<string>,
-	): void {
-		if (!sessionFile) return;
-		this.#sessionDefaultSelectedMCPToolNames.set(
-			path.resolve(sessionFile),
-			this.#filterSelectableMCPToolNames(toolNames),
-		);
-	}
-
-	#getSessionDefaultSelectedMCPToolNames(sessionFile: string | null | undefined): string[] {
-		if (!sessionFile) return [];
-		return this.#sessionDefaultSelectedMCPToolNames.get(path.resolve(sessionFile)) ?? [];
-	}
-
-	#persistSelectedMCPToolNamesIfChanged(previousSelectedMCPToolNames: string[]): void {
-		if (!this.#mcpDiscoveryEnabled) return;
-		const nextSelectedMCPToolNames = this.getSelectedMCPToolNames();
-		if (this.#selectedMCPToolNamesMatch(previousSelectedMCPToolNames, nextSelectedMCPToolNames)) {
-			return;
-		}
-		this.sessionManager.appendMCPToolSelection(nextSelectedMCPToolNames);
-	}
-
 	#getActiveNonMCPToolNames(): string[] {
-		return this.getActiveToolNames().filter(name => !isMCPToolName(name) && this.#toolRegistry.has(name));
+		return this.getEnabledToolNames().filter(name => !isMCPToolName(name) && this.#toolRegistry.has(name));
 	}
 
 	/**
@@ -6492,6 +6509,22 @@ export class AgentSession {
 	 */
 	getActiveToolNames(): string[] {
 		return this.agent.state.tools.map(t => t.name);
+	}
+
+	/**
+	 * Enabled tool names: top-level active tools plus discoverable tools mounted
+	 * under `xd://`. Reconcile callers (MCP refresh, discovery, plan/goal mode)
+	 * build their next active set from this so a mount survives an active-set
+	 * change; {@link getActiveToolNames} stays the top-level-only view.
+	 */
+	getEnabledToolNames(): string[] {
+		if (this.#mountedXdevToolNames.size === 0) return this.getActiveToolNames();
+		return [...this.getActiveToolNames(), ...this.#mountedXdevToolNames];
+	}
+
+	/** Names of discoverable tools currently mounted under `xd://` (dynamic mounts). */
+	getMountedXdevToolNames(): string[] {
+		return [...this.#mountedXdevToolNames];
 	}
 
 	/** Whether the edit tool is registered in this session. */
@@ -6555,7 +6588,6 @@ export class AgentSession {
 		for (const name of this.#installedVibeToolNames) {
 			this.#toolRegistry.delete(name);
 			this.#builtInToolNames.delete(name);
-			this.#selectedDiscoveredToolNames.delete(name);
 		}
 		this.#installedVibeToolNames.clear();
 		await this.#applyActiveToolsByName(nextToolNames);
@@ -6589,146 +6621,10 @@ export class AgentSession {
 		}
 	}
 
-	isMCPDiscoveryEnabled(): boolean {
-		return this.#mcpDiscoveryEnabled;
-	}
-
-	/**
-	 * Flip MCP discovery on after deferred discovery learns the real tool count.
-	 * UI sessions resolve `tools.discoveryMode: "auto"` before MCP servers
-	 * connect, so a large MCP toolset discovered later must be able to upgrade
-	 * the session from the force-activate path to the discovery path. One-way:
-	 * discovery is never downgraded mid-session.
-	 */
-	enableMCPDiscovery(): void {
-		this.#mcpDiscoveryEnabled = true;
-	}
-
 	getSelectedMCPToolNames(): string[] {
-		if (!this.#mcpDiscoveryEnabled) {
-			return this.getActiveToolNames().filter(name => isMCPToolName(name) && this.#toolRegistry.has(name));
-		}
-		return this.#filterSelectableMCPToolNames(this.#selectedMCPToolNames);
-	}
-
-	async activateDiscoveredMCPTools(toolNames: string[]): Promise<string[]> {
-		const nextSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
-		const activated: string[] = [];
-		for (const name of toolNames) {
-			if (!isMCPToolName(name) || !this.#discoverableMCPTools.has(name) || !this.#toolRegistry.has(name)) {
-				continue;
-			}
-			nextSelectedMCPToolNames.add(name);
-			activated.push(name);
-		}
-		if (activated.length === 0) {
-			return [];
-		}
-		const nextActive = [
-			...this.#getActiveNonMCPToolNames(),
-			...this.#filterSelectableMCPToolNames(nextSelectedMCPToolNames),
-		];
-		await this.setActiveToolsByName(nextActive);
-		return [...new Set(activated)];
-	}
-
-	// ── Generic tool discovery (covers built-in + MCP + extension) ────────────
-
-	/** Resolve effective discovery mode from the current registry size. */
-	#resolveEffectiveDiscoveryMode(): "off" | "mcp-only" | "all" {
-		const mode = resolveEffectiveToolDiscoveryMode(
-			this.settings,
-			countToolsForAutoDiscovery(this.#toolRegistry.keys()),
-		);
-		if (mode !== "off") return mode;
-		return this.#mcpDiscoveryEnabled ? "mcp-only" : "off";
-	}
-
-	isToolDiscoveryEnabled(): boolean {
-		return this.#resolveEffectiveDiscoveryMode() !== "off";
-	}
-
-	getDiscoverableTools(filter?: { source?: DiscoverableTool["source"] }): DiscoverableTool[] {
-		// For "all" mode we combine built-in registry entries + MCP tools.
-		// For "mcp-only" mode we only return MCP tools.
-		const mode = this.#resolveEffectiveDiscoveryMode();
-		const activeNames = new Set(this.getActiveToolNames());
-		const mcpTools = Array.from(this.#discoverableMCPTools.values()).filter(t => !activeNames.has(t.name));
-		const builtinTools: DiscoverableTool[] = mode === "all" ? this.#collectDiscoverableBuiltinTools() : [];
-		const allTools = [...builtinTools, ...mcpTools];
-		return filter?.source ? allTools.filter(t => t.source === filter.source) : allTools;
-	}
-
-	/** Collect built-in tools the model can discover via search_tool_bm25. Restricted to tool
-	 *  definitions whose `loadMode === "discoverable"`. This keeps hidden/internal tools
-	 *  (resolve, yield, report_finding, report_tool_issue) out of the index
-	 *  and avoids mislabeling extension/custom default-inactive tools as built-ins. */
-	#collectDiscoverableBuiltinTools(): DiscoverableTool[] {
-		const activeNames = new Set(this.getActiveToolNames());
-		const result: DiscoverableTool[] = [];
-		for (const tool of this.#toolRegistry.values()) {
-			if (tool.loadMode !== "discoverable") continue;
-			if (activeNames.has(tool.name)) continue;
-			const collected = collectDiscoverableTools([tool], { source: "builtin" });
-			result.push(...collected);
-		}
-		return result;
-	}
-
-	getDiscoverableToolSearchIndex(): DiscoverableToolSearchIndex {
-		if (!this.#discoverableToolSearchIndex) {
-			this.#discoverableToolSearchIndex = buildDiscoverableToolSearchIndex(this.getDiscoverableTools());
-		}
-		return this.#discoverableToolSearchIndex;
-	}
-
-	/** Invalidate the generic search index cache (call after tool set changes).
-	 *  Delegates to {@link #invalidateDiscoveryCaches} so all discovery-related caches stay in sync. */
-	#invalidateDiscoverableToolSearchIndex(): void {
-		this.#invalidateDiscoveryCaches();
-	}
-
-	getSelectedDiscoveredToolNames(): string[] {
-		// Union of MCP-selected and generic non-MCP selected. Non-MCP selections are only
-		// selected while they are still active; otherwise BM25 must be able to rediscover them.
-		const activeNames = new Set(this.getActiveToolNames());
-		const mcpSelected = this.getSelectedMCPToolNames();
-		const nonMcpSelected = Array.from(this.#selectedDiscoveredToolNames).filter(
-			name => activeNames.has(name) && this.#toolRegistry.has(name) && !isMCPToolName(name),
-		);
-		return [...new Set([...mcpSelected, ...nonMcpSelected])];
-	}
-
-	async activateDiscoveredTools(toolNames: string[]): Promise<string[]> {
-		const mcpNames = toolNames.filter(isMCPToolName);
-		const nonMcpNames = toolNames.filter(name => !isMCPToolName(name));
-		const activated: string[] = [];
-
-		// Activate MCP tools via existing path
-		if (mcpNames.length > 0) {
-			const activatedMcp = await this.activateDiscoveredMCPTools(mcpNames);
-			activated.push(...activatedMcp);
-		}
-
-		// Activate non-MCP tools (built-ins that are in the registry but not currently active)
-		if (nonMcpNames.length > 0) {
-			const currentActiveNames = new Set(this.getActiveToolNames());
-			const newlyAdded: string[] = [];
-			for (const name of nonMcpNames) {
-				if (this.#toolRegistry.has(name) && !currentActiveNames.has(name)) {
-					newlyAdded.push(name);
-					this.#selectedDiscoveredToolNames.add(name);
-					activated.push(name);
-				}
-			}
-			if (newlyAdded.length > 0) {
-				const nextActive = [...this.getActiveToolNames(), ...newlyAdded];
-				await this.setActiveToolsByName(nextActive);
-				this.#invalidateDiscoverableToolSearchIndex();
-			}
-		}
-
-		return [...new Set(activated)];
+		// Every connected MCP tool is enabled; presentation (top-level vs xd://) is
+		// decided by loadMode. Return the enabled MCP tools in the current set.
+		return this.getEnabledToolNames().filter(name => isMCPToolName(name) && this.#toolRegistry.has(name));
 	}
 
 	/**
@@ -6849,48 +6745,31 @@ export class AgentSession {
 		);
 	}
 
-	async #applyActiveToolsByName(
-		toolNames: string[],
-		options?: { persistMCPSelection?: boolean; previousSelectedMCPToolNames?: string[] },
-	): Promise<void> {
+	async #applyActiveToolsByName(toolNames: string[]): Promise<void> {
 		toolNames = normalizeToolNames(toolNames);
-		const previousSelectedMCPToolNames = options?.previousSelectedMCPToolNames ?? this.getSelectedMCPToolNames();
 		const tools: AgentTool[] = [];
 		const validToolNames: string[] = [];
+		const mountedTools: AgentTool[] = [];
 		for (const name of toolNames) {
 			const tool = this.#toolRegistry.get(name);
-			if (tool) {
+			if (!tool) continue;
+			// Discoverable tools are presented as `xd://` devices (kept out of the
+			// top-level schema) when the transport is active; everything else stays
+			// top-level. `loadMode` decides presentation only — selection is upstream.
+			if (this.#xdevRegistry && isMountableUnderXdev(tool)) {
+				mountedTools.push(tool);
+			} else {
 				tools.push(this.#wrapToolForAcpPermission(tool));
 				validToolNames.push(name);
 			}
 		}
-		// Auto-QA tool must survive any runtime tool-set mutation.
-		if (isAutoQaEnabled(this.settings) && !validToolNames.includes("report_tool_issue")) {
-			const qaTool = this.#toolRegistry.get("report_tool_issue");
-			if (qaTool) {
-				tools.push(this.#wrapToolForAcpPermission(qaTool));
-				validToolNames.push("report_tool_issue");
-			}
-		}
-		if (this.#mcpDiscoveryEnabled) {
-			this.#selectedMCPToolNames = new Set(
-				validToolNames.filter(
-					name => isMCPToolName(name) && this.#discoverableMCPTools.has(name) && this.#toolRegistry.has(name),
-				),
-			);
-		}
+		// Reconcile the dynamic `xd://` mounts: newly-active discoverable tools are
+		// mounted, deactivated ones dropped (built-in devices are preserved). A
+		// removed or disconnected tool must not stay callable through a stale device.
+		this.#mountedXdevToolNames = new Set(mountedTools.map(tool => tool.name));
+		this.#xdevRegistry?.reconcile(mountedTools);
 		this.#setActiveToolNames?.(validToolNames);
-		const activeNameSet = new Set(validToolNames);
-		for (const name of Array.from(this.#selectedDiscoveredToolNames)) {
-			if (!activeNameSet.has(name) || isMCPToolName(name) || !this.#toolRegistry.has(name)) {
-				this.#selectedDiscoveredToolNames.delete(name);
-			}
-		}
 		this.agent.setTools(tools);
-
-		// Active tool set changed → discoverable tool list (which excludes already-active tools)
-		// is now stale. Invalidate before any prompt-template hook reads the discovery list.
-		this.#invalidateDiscoveryCaches();
 
 		// Rebuild base system prompt with new tool set, but only when the tool set
 		// actually changed. MCP servers can reconnect at arbitrary times and call
@@ -6911,48 +6790,6 @@ export class AgentSession {
 				this.#promptModelKey = this.#currentPromptModelKey();
 			}
 		}
-		if (options?.persistMCPSelection !== false) {
-			this.#persistSelectedMCPToolNamesIfChanged(previousSelectedMCPToolNames);
-		}
-	}
-
-	/**
-	 * Reload the SSH tool from disk-backed capability discovery and make the
-	 * refreshed definition visible to the next model call without restarting.
-	 */
-	async refreshSshTool(options?: { activateIfAvailable?: boolean }): Promise<void> {
-		resetCapabilities();
-		if (!this.#reloadSshTool) return;
-		const previousSshTool = this.#toolRegistry.get("ssh");
-		const previousActiveToolNames = this.getActiveToolNames();
-		const hadSshTool = previousSshTool !== undefined;
-		const wasActive = previousActiveToolNames.includes("ssh");
-		const previousHostNames =
-			previousSshTool && "hostNames" in previousSshTool && Array.isArray(previousSshTool.hostNames)
-				? [...previousSshTool.hostNames]
-				: [];
-		const candidateHostNames = new Set(previousHostNames);
-		const capability = await loadCapability<{ name: string }>("ssh", { cwd: this.sessionManager.getCwd() });
-		for (const host of capability.items) {
-			if (typeof host?.name === "string") {
-				candidateHostNames.add(host.name);
-			}
-		}
-		await invalidateHostMetadata(candidateHostNames);
-		const sshAllowed = this.#requestedToolNames === undefined || this.#requestedToolNames.has("ssh");
-		const refreshedTool = await this.#reloadSshTool();
-		if (refreshedTool) {
-			this.#toolRegistry.set(refreshedTool.name, refreshedTool);
-		} else {
-			this.#toolRegistry.delete("ssh");
-			this.#selectedDiscoveredToolNames.delete("ssh");
-		}
-
-		const nextActive = previousActiveToolNames.filter(name => name !== "ssh" && this.#toolRegistry.has(name));
-		if (refreshedTool && sshAllowed && (wasActive || (options?.activateIfAvailable && !hadSshTool))) {
-			nextActive.push(refreshedTool.name);
-		}
-		await this.#applyActiveToolsByName(nextActive);
 	}
 
 	/**
@@ -6965,25 +6802,6 @@ export class AgentSession {
 		await this.#applyActiveToolsByName(toolNames);
 	}
 
-	async #restoreMCPSelectionsForSessionContext(
-		sessionContext: SessionContext,
-		options?: { fallbackSelectedMCPToolNames?: Iterable<string> },
-	): Promise<void> {
-		if (!this.#mcpDiscoveryEnabled) return;
-		const nextActiveNonMCPToolNames = this.#getActiveNonMCPToolNames();
-		const fallbackSelectedMCPToolNames =
-			options?.fallbackSelectedMCPToolNames ?? this.#getConfiguredDefaultSelectedMCPToolNames();
-		const restoredMCPToolNames = sessionContext.hasPersistedMCPToolSelection
-			? this.#filterSelectableMCPToolNames(sessionContext.selectedMCPToolNames)
-			: this.#filterSelectableMCPToolNames(fallbackSelectedMCPToolNames);
-		this.#rememberSessionDefaultSelectedMCPToolNames(
-			this.sessionFile,
-			this.#getConfiguredDefaultSelectedMCPToolNames(),
-		);
-		await this.#applyActiveToolsByName([...nextActiveNonMCPToolNames, ...restoredMCPToolNames], {
-			persistMCPSelection: false,
-		});
-	}
 	/** Rebuild the base system prompt using the current active tool set. */
 	async refreshBaseSystemPrompt(): Promise<void> {
 		if (!this.#rebuildSystemPrompt) return;
@@ -7096,17 +6914,6 @@ export class AgentSession {
 		const describeTool = (tool: AgentTool): string =>
 			`${tool.name}=${tool.label ?? ""}|${tool.description ?? ""}|${tool.customWireName ?? ""}`;
 		const descriptionSegment = tools.map(describeTool).join("\u0002");
-		let registrySegment = "";
-		if (this.#mcpDiscoveryEnabled) {
-			// Registry iteration order is not load-bearing for the prompt content, so we
-			// sort to keep the signature insensitive to incidental insertion order.
-			const entries: string[] = [];
-			for (const tool of this.#toolRegistry.values()) {
-				entries.push(describeTool(tool));
-			}
-			entries.sort();
-			registrySegment = entries.join("\u0004");
-		}
 		let instructionsSegment = "";
 		const serverInstructions = this.#getMcpServerInstructions?.();
 		if (serverInstructions && serverInstructions.size > 0) {
@@ -7118,21 +6925,20 @@ export class AgentSession {
 			entries.sort();
 			instructionsSegment = entries.join("\u0006");
 		}
+		// The xd:// device inventory (built-in + dynamic mounts) is rendered into the
+		// prompt, so a mount/unmount must differ the signature and trigger a rebuild.
+		const mountedSegment = this.#xdevRegistry ? this.#xdevRegistry.list().map(describeTool).join("\u0008") : "";
 		const date = this.#getLocalCalendarDate();
-		return `${nameSegment}\u0003${descriptionSegment}\u0005${registrySegment}\u0007${instructionsSegment}|${date}`;
+		return `${nameSegment}\u0003${descriptionSegment}\u0007${instructionsSegment}\u0009${mountedSegment}|${date}`;
 	}
 
 	/**
-	 * Replace MCP tools in the registry and recompute the visible MCP tool set immediately.
-	 * This allows /mcp add/remove/reauth to take effect without restarting the session.
-	 *
-	 * @param mcpTools The new MCP tools to register.
-	 * @param options.activateAll When true, force-activates every newly registered MCP tool
-	 *   regardless of prior selection state. Used when MCP discovery is disabled and tools
-	 *   arrive after initial session activation.
+	 * Replace MCP tools in the registry and enable them immediately. Every
+	 * connected MCP tool becomes available (mounted under `xd://` when that
+	 * transport is active, else top-level). Lets `/mcp add/remove/reauth` take
+	 * effect without restarting the session.
 	 */
-	async refreshMCPTools(mcpTools: CustomTool[], options?: { activateAll?: boolean }): Promise<void> {
-		const previousSelectedMCPToolNames = this.getSelectedMCPToolNames();
+	async refreshMCPTools(mcpTools: CustomTool[]): Promise<void> {
 		const existingNames = Array.from(this.#toolRegistry.keys());
 		for (const name of existingNames) {
 			if (isMCPToolName(name)) {
@@ -7149,6 +6955,8 @@ export class AgentSession {
 			abort: () => {
 				this.agent.abort();
 			},
+			settings: this.settings,
+			localProtocolOptions: this.#localProtocolOptions(),
 		});
 
 		for (const customTool of mcpTools) {
@@ -7159,33 +6967,10 @@ export class AgentSession {
 			this.#toolRegistry.set(finalTool.name, finalTool);
 		}
 
-		this.#setDiscoverableMCPTools(this.#collectDiscoverableMCPToolsFromRegistry());
-		this.#pruneSelectedMCPToolNames();
-		if (!this.buildDisplaySessionContext().hasPersistedMCPToolSelection) {
-			this.#selectedMCPToolNames = new Set([
-				...this.#selectedMCPToolNames,
-				...this.#getConfiguredDefaultSelectedMCPToolNames(),
-			]);
-		}
-		this.#rememberSessionDefaultSelectedMCPToolNames(
-			this.sessionFile,
-			this.#getConfiguredDefaultSelectedMCPToolNames(),
-		);
-
-		if (options?.activateAll) {
-			// Force-activate every newly registered MCP tool. This path is used
-			// when MCP discovery is disabled and tools arrive after initial
-			// activation — without it, getSelectedMCPToolNames() returns only
-			// already-active tools (circular deadlock: tools can only become
-			// active if they're already active).
-			const newMcpNames = mcpTools.map(t => t.name);
-			const nextActive = [...new Set([...this.#getActiveNonMCPToolNames(), ...newMcpNames])];
-			await this.#applyActiveToolsByName(nextActive, { previousSelectedMCPToolNames });
-			return;
-		}
-
-		const nextActive = [...this.#getActiveNonMCPToolNames(), ...this.getSelectedMCPToolNames()];
-		await this.#applyActiveToolsByName(nextActive, { previousSelectedMCPToolNames });
+		// Every connected MCP tool is enabled; re-derive the active set from the
+		// current non-MCP tools plus all freshly registered MCP tools.
+		const nextActive = [...new Set([...this.#getActiveNonMCPToolNames(), ...mcpTools.map(tool => tool.name)])];
+		await this.#applyActiveToolsByName(nextActive);
 	}
 
 	/**
@@ -7205,7 +6990,7 @@ export class AgentSession {
 		}
 
 		const previousRpcHostToolNames = new Set(this.#rpcHostToolNames);
-		const previousActiveToolNames = this.getActiveToolNames();
+		const previousActiveToolNames = this.getEnabledToolNames();
 		for (const name of previousRpcHostToolNames) {
 			this.#toolRegistry.delete(name);
 		}
@@ -7219,11 +7004,6 @@ export class AgentSession {
 			this.#toolRegistry.set(finalTool.name, finalTool);
 			this.#rpcHostToolNames.add(finalTool.name);
 		}
-
-		// Registry contents changed — invalidate discovery caches so the next BM25 lookup sees
-		// the new RPC-host tool set. (#applyActiveToolsByName below also invalidates, but doing
-		// it here too keeps the contract local to "registry mutated".)
-		this.#invalidateDiscoveryCaches();
 
 		const activeNonRpcToolNames = previousActiveToolNames.filter(name => !previousRpcHostToolNames.has(name));
 		const preservedRpcToolNames = previousActiveToolNames.filter(
@@ -7498,6 +7278,11 @@ export class AgentSession {
 		return this.#planModeState;
 	}
 
+	/** Prewalk state, if armed and active */
+	getPrewalkState(): Prewalk | undefined {
+		return this.#prewalk;
+	}
+
 	setPlanModeState(state: PlanModeState | undefined): void {
 		this.#planModeState = state;
 		if (state?.enabled) {
@@ -7688,6 +7473,30 @@ export class AgentSession {
 		return this.#resolveRoleModelFull(role, this.#modelRegistry.getAvailable(), this.model);
 	}
 
+	/**
+	 * Resolve the explicit thinking suffix that should apply when a temporary
+	 * picker selects a model already assigned to a configured role.
+	 */
+	resolveTemporaryModelThinkingLevel(model: Model): ConfiguredThinkingLevel | undefined {
+		const availableModels = this.#modelRegistry.getAvailable();
+		if (availableModels.length === 0) return undefined;
+
+		const matchPreferences = getModelMatchPreferences(this.settings);
+		for (const role of getKnownRoleIds(this.settings)) {
+			const roleValue = this.settings.getModelRole(role);
+			if (!roleValue) continue;
+
+			const resolved = resolveModelRoleValue(roleValue, availableModels, {
+				settings: this.settings,
+				matchPreferences,
+			});
+			if (!resolved.explicitThinkingLevel || resolved.thinkingLevel === undefined || !resolved.model) continue;
+			if (modelsAreEqual(resolved.model, model)) return resolved.thinkingLevel;
+		}
+
+		return undefined;
+	}
+
 	get promptTemplates(): ReadonlyArray<PromptTemplate> {
 		return this.#promptTemplates;
 	}
@@ -7826,12 +7635,8 @@ export class AgentSession {
 
 	#buildGoalTodoContext(): string | undefined {
 		if (!this.settings.get("todo.enabled")) return undefined;
-		const activeToolNames = this.getActiveToolNames();
-		const canCallTodoTool = activeToolNames.includes("todo");
-		const canDiscoverTodoTool =
-			!canCallTodoTool && this.getDiscoverableTools({ source: "builtin" }).some(tool => tool.name === "todo");
-		const canActivateTodoTool = canDiscoverTodoTool && activeToolNames.includes("search_tool_bm25");
-		if (!canCallTodoTool && !canDiscoverTodoTool) return undefined;
+		const canCallTodoTool = this.getActiveToolNames().includes("todo");
+		if (!canCallTodoTool) return undefined;
 		const phases = this.getTodoPhases().filter(phase => phase.tasks.length > 0);
 		if (phases.length === 0) return undefined;
 
@@ -7853,7 +7658,6 @@ export class AgentSession {
 
 		return prompt.render(goalTodoContextPrompt, {
 			canCallTodoTool,
-			canActivateTodoTool,
 			closed: String(closed),
 			open: String(open),
 			phases: promptPhases,
@@ -8192,6 +7996,7 @@ export class AgentSession {
 		options?: Pick<PromptOptions, "toolChoice" | "images" | "skipCompactionCheck"> & {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
+			acceptTerminalEmptyStop?: boolean;
 		},
 	): Promise<void> {
 		this.#beginInFlight();
@@ -8208,6 +8013,7 @@ export class AgentSession {
 			this.#mutationsSinceLastTodoTouch = 0;
 			this.#midRunNudgeCount = 0;
 			this.#resetPromptMaintenanceState();
+			this.#acceptTerminalEmptyStopForPrompt = options?.acceptTerminalEmptyStop === true;
 
 			await this.#maybeRestoreRetryFallbackPrimary();
 
@@ -8749,12 +8555,21 @@ export class AgentSession {
 		}
 	}
 
-	async #promptAgentInitiatedMessage(message: CustomMessage): Promise<void> {
+	async #promptAgentInitiatedMessage(
+		message: CustomMessage,
+		options?: { acceptTerminalEmptyStop?: boolean },
+	): Promise<void> {
 		this.#beginInFlight();
 		try {
+			const acceptTerminalEmptyStop = options?.acceptTerminalEmptyStop === true;
+			if (acceptTerminalEmptyStop) {
+				this.#resetPromptMaintenanceState();
+			}
+			this.#acceptTerminalEmptyStopForPrompt = acceptTerminalEmptyStop;
 			await this.agent.prompt(message);
 			await this.#waitForPostPromptRecovery();
 		} finally {
+			this.#acceptTerminalEmptyStopForPrompt = false;
 			this.#endInFlight();
 		}
 	}
@@ -8809,7 +8624,12 @@ export class AgentSession {
 	 */
 	async sendCustomMessage<T = unknown>(
 		message: CustomMessagePayload<T>,
-		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn"; queueChipText?: string },
+		options?: {
+			triggerTurn?: boolean;
+			deliverAs?: "steer" | "followUp" | "nextTurn";
+			queueChipText?: string;
+			acceptTerminalEmptyStop?: boolean;
+		},
 	): Promise<boolean> {
 		const normalizedPayload = normalizeCustomMessagePayload<T>(message);
 		const details =
@@ -8852,7 +8672,9 @@ export class AgentSession {
 					this.#queueHiddenNextTurnMessage(normalizedAppMessage, false);
 					return false;
 				}
-				await this.#promptAgentInitiatedMessage(normalizedAppMessage);
+				await this.#promptAgentInitiatedMessage(normalizedAppMessage, {
+					acceptTerminalEmptyStop: options.acceptTerminalEmptyStop === true,
+				});
 				return true;
 			}
 			this.agent.appendMessage(normalizedAppMessage);
@@ -9228,12 +9050,6 @@ export class AgentSession {
 	 */
 	async newSession(options?: NewSessionOptions): Promise<boolean> {
 		const previousSessionFile = this.sessionFile;
-		const nextDiscoverySessionToolNames = this.#mcpDiscoveryEnabled
-			? [
-					...this.#getActiveNonMCPToolNames(),
-					...this.#filterSelectableMCPToolNames(this.#defaultSelectedMCPToolNames),
-				]
-			: undefined;
 
 		// Emit session_before_switch event with reason "new" (can be cancelled)
 		if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
@@ -9286,16 +9102,6 @@ export class AgentSession {
 
 		this.sessionManager.appendThinkingLevelChange(this.thinkingLevel, this.configuredThinkingLevel());
 		this.sessionManager.appendServiceTierChange(this.#serviceTierEntry());
-		if (nextDiscoverySessionToolNames) {
-			await this.#applyActiveToolsByName(nextDiscoverySessionToolNames, { persistMCPSelection: false });
-			if (this.getSelectedMCPToolNames().length > 0) {
-				this.sessionManager.appendMCPToolSelection(this.getSelectedMCPToolNames());
-			}
-		}
-		this.#rememberSessionDefaultSelectedMCPToolNames(
-			this.sessionFile,
-			this.#getConfiguredDefaultSelectedMCPToolNames(),
-		);
 
 		this.#todoReminderCount = 0;
 		this.#todoReminderAwaitingProgress = false;
@@ -9674,7 +9480,7 @@ export class AgentSession {
 		const all = this.#modelRegistry.getAvailable();
 		const patterns = this.settings.get("enabledModels");
 		if (!patterns || patterns.length === 0) return all;
-		return filterAvailableModelsByEnabledPatterns(all, patterns);
+		return filterAvailableModelsByEnabledPatterns(all, patterns, this.settings);
 	}
 
 	// =========================================================================
@@ -10289,24 +10095,37 @@ export class AgentSession {
 
 			// Strategy honored on manual /compact too. Custom instructions (public
 			// user focus OR internal plan-mode guidance) imply a directed LLM
-			// summary; a text-only model cannot read snapcompact frames. When
-			// snapcompact itself was requested, fail locally instead of silently
-			// converting the "no LLM call" path into a provider-backed summary.
+			// summary; a text-only model cannot read snapcompact frames.
 			const wantsSnapcompact =
 				compactionPrep.kind !== "fromHook" &&
 				effectiveSettings.strategy === "snapcompact" &&
 				!customInstructions &&
 				!options?.internalGuidance;
-			const snapcompactReady = wantsSnapcompact;
+			// `/compact snapcompact` is an explicit no-LLM archive request: honor
+			// its contract by failing locally rather than silently shipping the
+			// transcript to a provider. The default-configured snapcompact
+			// strategy, in contrast, falls back to LLM compaction (mirroring the
+			// auto-compaction path) so a routine /compact still completes on a
+			// text-only model (issue #5064).
+			const explicitSnapcompact = compactMode?.name === "snapcompact";
+			let snapcompactReady = wantsSnapcompact;
 			const snapcompactShapeSetting = this.settings.get("snapcompact.shape");
 			let snapcompactShape: snapcompact.Shape | undefined;
 			if (wantsSnapcompact && !this.model.input.includes("image")) {
+				if (explicitSnapcompact) {
+					this.emitNotice(
+						"warning",
+						`snapcompact needs a vision-capable model (${this.model.id} is text-only)`,
+						"compaction",
+					);
+					throw new Error(`snapcompact cannot run locally: ${this.model.id} is text-only.`);
+				}
 				this.emitNotice(
 					"warning",
-					`snapcompact needs a vision-capable model (${this.model.id} is text-only)`,
+					`snapcompact needs a vision-capable model (${this.model.id} is text-only); falling back to LLM compaction`,
 					"compaction",
 				);
-				throw new Error(`snapcompact cannot run locally: ${this.model.id} is text-only.`);
+				snapcompactReady = false;
 			} else if (snapcompactReady) {
 				const text = snapcompact.serializeConversation(
 					convertToLlm(preparation.messagesToSummarize.concat(preparation.turnPrefixMessages)),
@@ -11364,6 +11183,13 @@ export class AgentSession {
 			return false;
 		}
 
+		if (this.#acceptTerminalEmptyStopForPrompt && assistantMessage.stopReason === "stop") {
+			this.#acceptTerminalEmptyStopForPrompt = false;
+			this.#discardAcceptedTerminalEmptyStop(assistantMessage);
+			this.#emptyStopRetryCount = 0;
+			return false;
+		}
+
 		this.#emptyStopRetryCount++;
 		if (this.#emptyStopRetryCount > EMPTY_STOP_MAX_RETRIES) {
 			const attempts = this.#emptyStopRetryCount - 1;
@@ -11581,6 +11407,38 @@ export class AgentSession {
 		this.agent.appendMessage(assistantMessage);
 	}
 
+	#discardAcceptedTerminalEmptyStop(assistantMessage: AssistantMessage): void {
+		const branch = this.sessionManager.getBranch();
+		const branchEntry = branch
+			.slice()
+			.reverse()
+			.find(
+				entry =>
+					entry.type === "message" &&
+					entry.message.role === "assistant" &&
+					this.#isSameAssistantMessage(entry.message, assistantMessage),
+			);
+		const parentEntry =
+			branchEntry?.parentId === null || branchEntry?.parentId === undefined
+				? undefined
+				: branch.find(entry => entry.id === branchEntry.parentId);
+		const prunePrompt = parentEntry?.type === "custom_message";
+
+		this.#removeAssistantMessageFromActiveContext(assistantMessage, "accepted-terminal-empty-stop");
+		if (prunePrompt && this.agent.state.messages.at(-1)?.role === "custom") {
+			this.agent.replaceMessages(this.agent.state.messages.slice(0, -1));
+		}
+
+		if (!branchEntry) return;
+		const targetParentId = prunePrompt ? parentEntry.parentId : branchEntry.parentId;
+		if (targetParentId === null) {
+			this.sessionManager.resetLeaf();
+		} else {
+			this.sessionManager.branch(targetParentId);
+		}
+		this.sessionManager.appendCustomEntry("accepted-terminal-empty-stop");
+	}
+
 	/**
 	 * Drop an assistant turn from BOTH the live agent context and the persisted
 	 * session branch (reparenting the leaf to the turn's parent), so a discarded
@@ -11696,7 +11554,6 @@ export class AgentSession {
 		if (activeMessages) {
 			activeMessages.splice(0, activeMessages.length, ...sessionContext.messages);
 		}
-		await this.#restoreMCPSelectionsForSessionContext(sessionContext);
 		this.agent.replaceMessages(activeMessages ?? sessionContext.messages);
 		this.#resetAdvisorSessionState();
 		this.#syncTodoPhasesFromBranch();
@@ -11704,8 +11561,9 @@ export class AgentSession {
 		this.#checkpointState = undefined;
 		this.#pendingRewindReport = undefined;
 	}
-	#isPlanDecisionTool(name: string): boolean {
-		return PLAN_DECISION_TOOLS.has(name);
+	/** Plan-mode decision affordances: `ask`, or plan approval via `write xd://propose`. */
+	#isPlanDecisionTool(toolCall: { name: string; arguments?: Record<string, unknown> }): boolean {
+		return toolCall.name === "ask" || isProposeToolCall(toolCall);
 	}
 
 	async #enforcePlanModeDecisionAtSettle(): Promise<boolean> {
@@ -11721,7 +11579,7 @@ export class AgentSession {
 		}
 
 		const calledDecisionTool = assistantMessage.content.some(
-			content => content.type === "toolCall" && this.#isPlanDecisionTool(content.name),
+			content => content.type === "toolCall" && this.#isPlanDecisionTool(content),
 		);
 		if (calledDecisionTool) {
 			this.#planModeReminderCount = 0;
@@ -11740,9 +11598,9 @@ export class AgentSession {
 			logger.debug("Plan mode convergence: reminder cap reached; yielding to user");
 			return false;
 		}
-		const hasRequiredTools = this.#toolRegistry.has("ask") && this.#toolRegistry.has("resolve");
+		const hasRequiredTools = this.#toolRegistry.has("ask") && this.#toolRegistry.has("write");
 		if (!hasRequiredTools) {
-			logger.warn("Plan mode enforcement skipped because ask/resolve tools are unavailable", {
+			logger.warn("Plan mode enforcement skipped because ask/write tools are unavailable", {
 				activeToolNames: this.agent.state.tools.map(tool => tool.name),
 			});
 			return false;
@@ -11910,7 +11768,7 @@ export class AgentSession {
 	/**
 	 * Check if agent stopped with incomplete todos and prompt to continue.
 	 */
-	async #checkTodoCompletion(): Promise<boolean> {
+	async #checkTodoCompletion(message: AssistantMessage): Promise<boolean> {
 		// Skip todo reminders when the most recent turn was driven by an explicit user force —
 		// the user wanted exactly that tool, not a follow-up nag about incomplete todos.
 		const lastServedLabel = this.#toolChoiceQueue.consumeLastServedLabel();
@@ -11972,6 +11830,13 @@ export class AgentSession {
 		if (incomplete.length === 0) {
 			this.#todoReminderCount = 0;
 			this.#todoReminderAwaitingProgress = false;
+			return false;
+		}
+
+		if (isAwaitingUserAnswer(message)) {
+			logger.debug("Todo completion: assistant is waiting for user input; skipping reminder", {
+				incomplete: incomplete.length,
+			});
 			return false;
 		}
 
@@ -13849,19 +13714,23 @@ export class AgentSession {
 	}
 
 	/**
-	 * Retry an empty, reason-less provider abort: a turn that ended `aborted`
-	 * with no content and the generic sentinel (bare `abort()`), but only while
-	 * the session is neither aborting nor tearing down. A user/lifecycle abort
-	 * (`#abortInProgress`), a dispose-driven abort (`#isDisposed`), or a
-	 * session-induced streaming-edit guard abort (`#streamingEditAbortTriggered` —
-	 * auto-generated-file guard or failed-patch preview) is deliberate and MUST
-	 * settle the turn instead: routing it through retry would orphan
-	 * `#retryPromise` on a continuation the guard skips (hanging the in-flight
-	 * `prompt()`) or silently undo the guard's intended abort.
+	 * Retry an empty, reason-less provider abort: a turn with no content that
+	 * carries the generic sentinel (bare `abort()`), whether the provider
+	 * finalized it as `stopReason: "aborted"` or leaked it as `stopReason:
+	 * "error"` (a stalled/dropped stream reported as an error rather than an
+	 * abort — issue #5375). Only fires while the session is neither aborting nor
+	 * tearing down. A user/lifecycle abort (`#abortInProgress`), a dispose-driven
+	 * abort (`#isDisposed`), or a session-induced streaming-edit guard abort
+	 * (`#streamingEditAbortTriggered` — auto-generated-file guard or failed-patch
+	 * preview) is deliberate and MUST settle the turn instead: routing it through
+	 * retry would orphan `#retryPromise` on a continuation the guard skips
+	 * (hanging the in-flight `prompt()`) or silently undo the guard's intended
+	 * abort. Deliberate user interrupts (`UserInterrupt`) and silent aborts carry
+	 * their own marker, not the generic sentinel, so they never match here.
 	 */
 	#isRetryableReasonlessAbort(message: AssistantMessage): boolean {
 		if (
-			message.stopReason !== "aborted" ||
+			(message.stopReason !== "aborted" && message.stopReason !== "error") ||
 			message.content.length !== 0 ||
 			this.#abortInProgress ||
 			this.#isDisposed ||
@@ -13871,7 +13740,7 @@ export class AgentSession {
 		}
 
 		const id = this.#classifyRetryMessage(message);
-		if (AIError.is(id, AIError.Flag.Abort)) return true;
+		if (message.stopReason === "aborted" && AIError.is(id, AIError.Flag.Abort)) return true;
 		if (!this.#isGenericAbortSentinel(message)) return false;
 
 		message.errorId = AIError.create(AIError.Flag.Abort);
@@ -15535,16 +15404,12 @@ export class AgentSession {
 		const previousAutoThinking = this.#autoThinking;
 		const previousAutoResolvedLevel = this.#autoResolvedLevel;
 		const previousServiceTierByFamily = this.#serviceTierByFamily;
-		const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
 		const previousTools = [...this.agent.state.tools];
 		const previousBaseSystemPrompt = this.#baseSystemPrompt;
 		const previousSystemPrompt = this.agent.state.systemPrompt;
 		const previousBaseSystemPromptBeforeMemoryPromotion = this.#baseSystemPromptBeforeMemoryPromotion;
 		const previousFreshProviderSessionId = this.#freshProviderSessionId;
 		const previousInheritedProviderPromptCacheKey = this.#inheritedProviderPromptCacheKey;
-		const previousFallbackSelectedMCPToolNames = previousSessionFile
-			? this.#getSessionDefaultSelectedMCPToolNames(previousSessionFile)
-			: undefined;
 
 		// Snapshot the full checkpoint runtime state: the success path calls
 		// #rehydrateCheckpointRewindState(), which clears and rebuilds all four
@@ -15570,12 +15435,10 @@ export class AgentSession {
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 			this.#rekeyMnemopiMemoryForCurrentSessionId();
 
-			const sessionContext = this.buildDisplaySessionContext();
+			let sessionContext = this.buildDisplaySessionContext();
 			const didReloadConversationChange =
 				previousSessionContext !== undefined &&
 				this.#didSessionMessagesChange(previousSessionContext.messages, sessionContext.messages);
-			const fallbackSelectedMCPToolNames = this.#getSessionDefaultSelectedMCPToolNames(sessionPath);
-			await this.#restoreMCPSelectionsForSessionContext(sessionContext, { fallbackSelectedMCPToolNames });
 			this.#rehydrateCheckpointRewindState();
 
 			// Emit session_switch event to hooks
@@ -15625,6 +15488,20 @@ export class AgentSession {
 					} else {
 						this.agent.setModel(match);
 					}
+				}
+			}
+
+			const model = this.model;
+			if (model) {
+				const interruptedTurnAbort = createInterruptedTurnAbortMessage(this.sessionManager.getBranch(), {
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+				});
+				if (interruptedTurnAbort) {
+					this.sessionManager.appendMessage(interruptedTurnAbort);
+					sessionContext = this.buildDisplaySessionContext();
+					this.agent.replaceMessages(sessionContext.messages);
 				}
 			}
 
@@ -15689,28 +15566,7 @@ export class AgentSession {
 			this.#syncAgentSessionId(previousSessionState.sessionId);
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 			this.#rekeyMnemopiMemoryForCurrentSessionId();
-			let restoreMcpError: unknown;
-			try {
-				// `previousSessionContext` was skipped on different-session switches to
-				// avoid materializing the previous session's heavy compaction payload
-				// in the success path; rebuild it here on demand from the restored
-				// state so MCP selection restoration still has its inputs.
-				const mcpRestoreContext = previousSessionContext ?? this.buildDisplaySessionContext();
-				await this.#restoreMCPSelectionsForSessionContext(mcpRestoreContext, {
-					fallbackSelectedMCPToolNames: previousFallbackSelectedMCPToolNames,
-				});
-			} catch (mcpError) {
-				restoreMcpError = mcpError;
-				logger.warn("Failed to restore MCP selections after switch error", {
-					previousSessionFile,
-					targetSessionFile: sessionPath,
-					error: String(mcpError),
-				});
-				this.#selectedMCPToolNames = new Set(previousSelectedMCPToolNames);
-				this.agent.setTools(previousTools);
-				this.#baseSystemPrompt = previousBaseSystemPrompt;
-				this.agent.setSystemPrompt(previousSystemPrompt);
-			}
+			this.agent.setTools(previousTools);
 			this.#baseSystemPrompt = previousBaseSystemPrompt;
 			this.#baseSystemPromptBeforeMemoryPromotion = previousBaseSystemPromptBeforeMemoryPromotion;
 			this.agent.setSystemPrompt(previousSystemPrompt);
@@ -15734,9 +15590,6 @@ export class AgentSession {
 			this.#syncTodoPhasesFromBranch();
 			this.#resetAllAdvisorRuntimes();
 			this.#reconnectToAgent();
-			if (restoreMcpError) {
-				throw restoreMcpError;
-			}
 			throw error;
 		}
 	}
@@ -15802,8 +15655,6 @@ export class AgentSession {
 
 		// Reload messages from entries (works for both file and in-memory mode)
 		const sessionContext = this.buildDisplaySessionContext();
-
-		await this.#restoreMCPSelectionsForSessionContext(sessionContext);
 
 		// Emit session_branch event to hooks (after branch completes)
 		if (this.#extensionRunner) {
@@ -15895,7 +15746,6 @@ export class AgentSession {
 		await this.#resetMemoryContextForNewTranscript();
 
 		const sessionContext = this.buildDisplaySessionContext();
-		await this.#restoreMCPSelectionsForSessionContext(sessionContext);
 
 		if (this.#extensionRunner) {
 			await this.#extensionRunner.emit({
@@ -16042,7 +15892,7 @@ export class AgentSession {
 			// User message: leaf = parent (null if root), text goes to editor
 			newLeafId = targetEntry.parentId;
 			editorText = this.#extractUserMessageText(targetEntry.message.content);
-		} else if (targetEntry.type === "custom_message") {
+		} else if (targetEntry.type === "custom_message" && targetEntry.customType !== SKILL_PROMPT_MESSAGE_TYPE) {
 			// Custom message: leaf = parent (null if root), text goes to editor
 			newLeafId = targetEntry.parentId;
 			editorText =
@@ -16053,7 +15903,10 @@ export class AgentSession {
 							.map(c => c.text)
 							.join("");
 		} else {
-			// Non-user message: leaf = selected node
+			// Non-user message (or a user-invoked skill-prompt injection): land the
+			// leaf on the selected node so it stays on the active branch. Skill
+			// prompts are custom_message entries but must not be re-editable — their
+			// content is a large expanded body, not a user turn (issue #5374).
 			newLeafId = targetId;
 		}
 
@@ -16076,7 +15929,6 @@ export class AgentSession {
 		// Update agent state — build display context to populate agent messages.
 		const stateContext = this.sessionManager.buildSessionContext();
 		const displayContext = deobfuscateSessionContext(stateContext, this.#obfuscator);
-		await this.#restoreMCPSelectionsForSessionContext(displayContext);
 		this.agent.replaceMessages(displayContext.messages);
 		this.#rehydrateCheckpointRewindState();
 		this.#resetAdvisorSessionState();
@@ -16406,10 +16258,12 @@ export class AgentSession {
 	}
 
 	#ingestProviderUsageHeaders(response: ProviderResponseMetadata, model?: Model): void {
-		if (model?.provider !== "anthropic") return;
-		this.#modelRegistry.authStorage.ingestUsageHeaders("anthropic", response.headers, {
+		const provider = model?.provider;
+		if (!provider) return;
+		// No-op for providers whose usage strategy lacks a header parser.
+		this.#modelRegistry.authStorage.ingestUsageHeaders(provider, response.headers, {
 			sessionId: this.agent.sessionId,
-			baseUrl: this.#modelRegistry.getProviderBaseUrl?.("anthropic"),
+			baseUrl: this.#modelRegistry.getProviderBaseUrl?.(provider),
 		});
 	}
 

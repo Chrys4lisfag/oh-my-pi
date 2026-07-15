@@ -67,6 +67,7 @@ import type {
 	AgentToolResult,
 	AgentTurnEndContext,
 	AsideMessage,
+	SoftToolRequirement,
 	SteeringInterruptSource,
 	SteeringQueueState,
 	StreamFn,
@@ -766,12 +767,13 @@ async function runLoopBody(
 	let deadlineTimer: Timer | undefined;
 	if (config.deadline !== undefined) {
 		const deadlineAbortController = new AbortController();
+		const deadlineReason = new DOMException("Deadline exceeded", "TimeoutError");
 		const delay = config.deadline - Date.now();
 		if (delay <= 0) {
-			deadlineAbortController.abort("Deadline exceeded");
+			deadlineAbortController.abort(deadlineReason);
 		} else {
 			deadlineTimer = setTimeout(() => {
-				deadlineAbortController.abort("Deadline exceeded");
+				deadlineAbortController.abort(deadlineReason);
 			}, delay);
 		}
 		signal = signal ? AbortSignal.any([signal, deadlineAbortController.signal]) : deadlineAbortController.signal;
@@ -802,6 +804,7 @@ async function runLoopBody(
 		// getToolChoice is never advanced twice; the flag resets at the message boundary.
 		let hostToolChoice: ToolChoice | undefined;
 		let softRequiredTool: string | undefined;
+		let softSatisfies: SoftToolRequirement["satisfies"];
 		let directiveResolvedForTurn = false;
 
 		// Outer loop: continues when queued follow-up messages arrive after agent would stop
@@ -860,6 +863,7 @@ async function runLoopBody(
 					const softReq = isSoftToolRequirement(directive) ? directive : undefined;
 					hostToolChoice = directive === undefined || isSoftToolRequirement(directive) ? undefined : directive;
 					softRequiredTool = softReq?.toolName;
+					softSatisfies = softReq?.satisfies;
 					if (softReq !== undefined) {
 						if (softReq.id !== softRequirementId) {
 							softRequirementId = softReq.id;
@@ -1023,7 +1027,7 @@ async function runLoopBody(
 				const calledOnlyRequiredTool =
 					softRequiredTool !== undefined &&
 					toolCalls.length > 0 &&
-					toolCalls.every(toolCall => toolCall.name === softRequiredTool);
+					toolCalls.every(toolCall => softSatisfies?.(toolCall) ?? toolCall.name === softRequiredTool);
 				const softGateActive =
 					softRequiredTool !== undefined && !hardToolChoiceBlocks(config.toolChoice, softRequiredTool);
 				const softNonCompliant = softGateActive && !calledOnlyRequiredTool;
@@ -2132,19 +2136,21 @@ async function executeToolCalls(
 
 		const interrupted = interruptState.triggered;
 		const perToolAborted = record.signal.aborted;
-		const abortedDuringExecution = perToolAborted && isError;
-		if (interrupted && perToolAborted && isError) {
-			// This tool's own signal fired AND it failed — it was cut off before producing
-			// a usable result, so report it as skipped.
+		const abortedDuringExecution = perToolAborted && isError && !completedToolExecution;
+		if (interrupted && perToolAborted && isError && !completedToolExecution) {
+			// This tool's own signal fired AND it failed to produce a result: `tool.execute()`
+			// never returned (it threw on the abort), so it was genuinely cut off before
+			// producing usable output. Report it as skipped.
 			record.skipped = true;
 			emitToolResult(record, createSkippedToolResult(interruptState.source), true);
 		} else {
-			// No interrupt on this signal, or the tool finished (successfully or with a
-			// genuine error) before the interrupt landed. Keep its real result: a completed
-			// tool already ran its side effects, so the model must see what actually
-			// happened rather than a false "skipped". A peer-IRC interrupt on the batch
-			// leaves non-interruptible tools' signals untouched — their genuine errors
-			// survive here instead of being clobbered into "skipped".
+			// No interrupt on this signal, or the tool finished before the interrupt landed
+			// (`completedToolExecution`) — even if the signal aborted around completion. Keep
+			// its real result: a completed tool already ran its side effects, so the model must
+			// see what actually happened (a genuine non-zero exit / error result) rather than a
+			// false "skipped" that discards work the tool performed (#4752). A peer-IRC interrupt
+			// on the batch leaves non-interruptible tools' signals untouched — their genuine
+			// errors survive here too.
 			emitToolResult(record, result, isError);
 		}
 

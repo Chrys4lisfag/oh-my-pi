@@ -36,12 +36,18 @@ import {
 	stripRawOutputArtifactNotice,
 } from "./output-meta";
 import { resolveToCwd } from "./path-utils";
-import { capPreviewLines, formatToolWorkingDirectory, previewWindowRows, replaceTabs } from "./render-utils";
+import {
+	capPreviewLines,
+	DEFAULT_TERMINAL_PREVIEW_LINES,
+	formatToolWorkingDirectory,
+	previewWindowRows,
+	replaceTabs,
+} from "./render-utils";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout, TOOL_TIMEOUTS } from "./tool-timeouts";
 
-export const BASH_DEFAULT_PREVIEW_LINES = 10;
+export const BASH_DEFAULT_PREVIEW_LINES = DEFAULT_TERMINAL_PREVIEW_LINES;
 
 const BASH_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS = 60_000;
@@ -397,7 +403,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			hasGrep: isToolActive("grep", this.session.settings.get("grep.enabled")),
 			hasGlob: isToolActive("glob", this.session.settings.get("glob.enabled")),
 			hasRead: isToolActive("read", true),
-			hasLaunch: isToolActive("launch", this.session.settings.get("launch.enabled")),
+			hasLaunch: isToolActive("hub", this.session.settings.get("launch.enabled")),
 			hasEval: isToolActive(
 				"eval",
 				evalBackends.python || evalBackends.js || evalBackends.ruby || evalBackends.julia,
@@ -745,6 +751,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		const internalUrlOptions: InternalUrlExpansionOptions = {
 			skills: this.session.skills ?? [],
 			internalRouter: InternalUrlRouter.instance(),
+			cwd: this.session.cwd,
 			localOptions: {
 				getArtifactsDir: this.session.getArtifactsDir,
 				getSessionId: this.session.getSessionId,

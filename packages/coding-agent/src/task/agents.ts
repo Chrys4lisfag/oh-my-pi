@@ -25,6 +25,7 @@ interface AgentFrontmatter {
 	model?: string | string[];
 	thinkingLevel?: string;
 	blocking?: boolean;
+	prewalk?: boolean | string;
 }
 
 interface EmbeddedAgentDef {
@@ -50,8 +51,11 @@ const EMBEDDED_AGENT_DEFS: EmbeddedAgentDef[] = [
 			name: "task",
 			description: "General-purpose subagent with full capabilities for delegated multi-step tasks",
 			spawns: "*",
-			model: "pi/task",
+			model: "@task",
 			thinkingLevel: AUTO_THINKING,
+			// Strong model plans and starts the implementation, then hands off to
+			// the smol role. Per-agent opt-out via /agents (task.agentPrewalk).
+			prewalk: true,
 		},
 		template: taskMd,
 	},
@@ -60,7 +64,7 @@ const EMBEDDED_AGENT_DEFS: EmbeddedAgentDef[] = [
 		frontmatter: {
 			name: "sonic",
 			description: "Low-reasoning agent for strictly mechanical updates or data collection only",
-			model: "pi/smol",
+			model: "@smol",
 			thinkingLevel: Effort.Medium,
 		},
 		template: taskMd,

@@ -308,7 +308,7 @@ enabledModels:
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `modelRoles` | record | `{}` | Map of role name -> model id. Built-in roles: `default`, `smol`, `slow`, `vision`, `plan`, `designer`, `commit`, `tiny`, `task`, `advisor`. The `tiny` role overrides the online model for lightweight background tasks (titles, memory, auto-thinking, unexpected-stop), else `pi/smol`. Per-role env/flags exist only for `--model`/`--smol`/`--slow`/`--plan`; configure the advisor with `modelRoles.advisor`. |
+| `modelRoles` | record | `{}` | Map of role name -> model id. Built-in roles: `default`, `smol`, `slow`, `vision`, `plan`, `designer`, `commit`, `tiny`, `task`, `advisor`. The `tiny` role overrides the online model for lightweight background tasks (titles, memory, auto-thinking, unexpected-stop), else `@smol`. Per-role env/flags exist only for `--model`/`--smol`/`--slow`/`--plan`; configure the advisor with `modelRoles.advisor`. |
 | `modelTags` | record | `{}` | Custom role/tag metadata; can introduce additional roles. |
 | `modelProviderOrder` | array | `[]` | Preferred provider order when a model id is ambiguous. |
 | `cycleOrder` | array | `["smol","default","slow"]` | Roles cycled by the model switcher. |
@@ -432,7 +432,6 @@ tools:
   approval:
     bash: prompt
     edit: allow
-  discoveryMode: auto
   maxTimeout: 0
   intentTracing: true
 ```
@@ -441,8 +440,6 @@ tools:
 |---|---|---|---|
 | `tools.approvalMode` | enum | `yolo` | `always-ask` (auto-approve read-only), `write` (auto-approve read + workspace-write), `yolo` (auto-approve all tiers). `--approval-mode` and `--auto-approve`/`--yolo` override per run. |
 | `tools.approval` | record | `{}` | Per-tool policy keyed by tool name; each value is `allow`, `deny`, or `prompt`. e.g. `omp config set tools.approval '{"bash":"prompt"}'`. |
-| `tools.discoveryMode` | enum | `auto` | `auto`, `off`, `mcp-only`, `all`. Controls dynamic tool discovery. |
-| `tools.essentialOverride` | array | `[]` | Tool names kept available even when tools are narrowed. |
 | `tools.maxTimeout` | number | `0` | Max tool runtime in seconds; `0` = no cap. |
 | `tools.intentTracing` | boolean | `true` | Record per-call intent strings. |
 | `tools.outputMaxColumns` | number | `768` | Per-line byte cap for streaming output; `0` disables. |

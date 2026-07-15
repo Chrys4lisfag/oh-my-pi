@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { type AutocompleteItem, Spacer } from "@oh-my-pi/pi-tui";
 import { APP_NAME, getProjectDir, setProjectDir } from "@oh-my-pi/pi-utils";
+import { reset as resetCapabilities } from "../capability";
 import { COLLAB_GUEST_ALLOWED_COMMANDS, CollabGuestLink } from "../collab/guest";
 import { CollabHost } from "../collab/host";
 import { expandRoleAlias, getModelMatchPreferences, resolveCliModel } from "../config/model-resolver";
@@ -462,11 +463,11 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
-		name: "downshift",
-		description: "Switch to a fast/cheap model at the next action (works even without --downshift)",
-		acpDescription: "Downshift at the next action",
+		name: "prewalk",
+		description: "Switch to a fast/cheap model at the next action (works even without --prewalk)",
+		acpDescription: "Prewalk at the next action",
 		handle: async (_command, runtime) => {
-			const rolePattern = expandRoleAlias("pi/smol", runtime.settings);
+			const rolePattern = expandRoleAlias("@smol", runtime.settings);
 			const resolved = resolveCliModel({
 				cliModel: rolePattern,
 				modelRegistry: runtime.session.modelRegistry,
@@ -478,9 +479,9 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			if (!runtime.session.modelRegistry.hasConfiguredAuth(resolved.model)) {
 				return usage(`No API key for ${resolved.model.provider}/${resolved.model.id}`, runtime);
 			}
-			runtime.session.armDownshift(resolved.model, resolved.thinkingLevel);
+			runtime.session.armPrewalk(resolved.model, resolved.thinkingLevel);
 			await runtime.output(
-				`Downshift on: switching to ${resolved.model.provider}/${resolved.model.id} at the next edit/write (todo-gated).`,
+				`Prewalk on: switching to ${resolved.model.provider}/${resolved.model.id} at the next edit/write (todo-gated).`,
 			);
 			return commandConsumed();
 		},
@@ -1176,7 +1177,11 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				await runtime.output("No tools are available.");
 				return commandConsumed();
 			}
-			await runtime.output(all.map(name => `${active.includes(name) ? "*" : "-"} ${name}`).join("\n"));
+			const lines = all.map(name => `${active.includes(name) ? "*" : "-"} ${name}`);
+			for (const mounted of runtime.session.getXdevToolEntries()) {
+				lines.push(`~ xd://${mounted.name}`);
+			}
+			await runtime.output(lines.join("\n"));
 			return commandConsumed();
 		},
 		handleTui: (_command, runtime) => {
@@ -2272,7 +2277,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			const projectPath = await resolveActiveProjectRegistryPath(runtime.ctx.sessionManager.getCwd());
 			clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
 			await runtime.ctx.refreshSlashCommandState();
-			await runtime.ctx.session.refreshSshTool({ activateIfAvailable: true });
+			resetCapabilities();
 			runtime.ctx.showStatus("Plugins reloaded.");
 			runtime.ctx.editor.setText("");
 		},
@@ -2638,7 +2643,7 @@ export async function executeBuiltinSlashCommand(
 				const projectPath = await resolveActiveProjectRegistryPath(ctx.sessionManager.getCwd());
 				clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
 				await ctx.refreshSlashCommandState();
-				await ctx.session.refreshSshTool({ activateIfAvailable: true });
+				resetCapabilities();
 			},
 		};
 		const result = await command.handle(parsed, adapted);

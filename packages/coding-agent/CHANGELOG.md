@@ -4,31 +4,33 @@
 
 ### Breaking Changes
 
-- Replaced the `--reasoning-slide-*` flag family (`--reasoning-slide-model`, `--reasoning-slide-turns`, `--reasoning-slide-on-action`, `--reasoning-slide-plan`, `--reasoning-slide-plan-at`, `--reasoning-slide-checklist`) with a single downshift mechanism: `--downshift` switches from the starting model to a fast/cheap target at the first completed turn that starts execution — the todo-list init the plan nudge asks for, or any edit/write tool — always with the hidden plan nudge before the switch and the verify-before-finishing checklist after it (the configuration that won benchmark testing). `--downshift-into <model>` overrides the default "smol"-role target and implies `--downshift`; `--no-downshift` force-disables. The fixed-turn trigger and per-piece plan/checklist toggles are gone.
+- Merged the `irc`, `job`, and `launch` tools into a single `hub` tool (`loadMode: "essential"`). Messaging keeps its op names (`send`/`inbox`/`list`); job control maps `{poll}` → `op:"wait"` + `ids`, `{cancel}` → `op:"cancel"` + `ids`, and `{list:true}` → `op:"jobs"`; process supervision keeps `start`/`logs`/`stop`/`restart`/`describe` with the broker's `list` renamed to `op:"ps"`, and `send`/`wait` route to a process when they carry `name`. The unified `wait` races watched background jobs against incoming peer messages and returns on the first event, replacing the old `irc wait` / `job poll` split. TUI and collab-web rendering are unchanged per op family. SDK: `IrcTool`, `JobTool`, `LaunchTool`, `IrcDetails`, and `JobToolDetails` are removed; use `HubTool`, `CoordinationDetails`, `LaunchToolDetails`, and `hubToolRenderer` from `tools/hub` (`isIrcEnabled`, `isWaitingPollDetails`, and `createIrcMessageCard` moved there). The default `model.toolCallLoopGuard.exemptTools` is now `["hub"]`.
+- Removed the hidden `resolve` tool. Staged actions now finalize through three plain-text resolution devices: `xd://resolve` (apply preview), `xd://reject` (discard preview), and `xd://propose` (submit a plan slug/title for approval). The `write` tool is auto-included whenever a deferrable tool is present (`createTools`) or plan mode is enabled (`createAgentSession`), replacing the auto-included `resolve` tool. SDK: `ResolveTool` and `HIDDEN_TOOLS.resolve` are removed; use `dispatchResolutionDevice()` / `queueResolveHandler()` from `tools/resolve`. Plan-mode prompts and the preview reminder now teach the device-write call shapes when they become relevant.
+- Unified tool presentation on `loadMode` (`essential` | `discoverable`), replacing the custom-tool `xdev?: boolean` opt-out. Custom, extension, MCP, RPC host, image-generation, and TTS tools now default to `discoverable` and mount under `xd://` when enabled (set `loadMode: "essential"` to stay top-level). `generate_image`/`tts`/MCP tools are exposed as `xd://` devices in a default session instead of shipping their schemas top-level.
+- Removed the BM25 tool-discovery system: the `search_tool_bm25` tool, the `tools.discoveryMode` / `mcp.discoveryMode` / `mcp.discoveryDefaultServers` settings, and per-tool MCP selection. `xd://` is now the sole transport for discoverable tools; every connected MCP tool is enabled and mounted under `xd://`. SDK: `search_tool_bm25`, the `tool-discovery` module, and the `AgentSession` discovery/MCP-selection methods (`getDiscoverableTools`, `activateDiscoveredTools`, `isMCPDiscoveryEnabled`, …) are removed.
 
 ### Added
 
-- Added `--downshift` / `--downshift-into <model>` / `--no-downshift`: start on a strong model, then hand off to a fast/cheap one (default the `smol` role) at the first edit/write tool call *after* the todo list has been initialized. The starting model handles all planning and todo initialization, and begins implementation, before handing off; the fast model includes a verify checklist before finishing. Enable per-user with the `downshift.enabled` setting; force it mid-session with the new `/downshift` slash command, which arms the switch.
-- Added display setting to toggle between collapsing or keeping compacted history inline, now applied to live session displays
-- Added a compact session-only model picker (Alt+P) for quick model switching without changing roles
-- Added `@` search to the Alt+P / `/switch` picker: it lists configured Ctrl+P quick roles in matching segment colors and applies the selected role's model and thinking for the current session.
-- Redesigned Agent Hub entries as two-line cards: identity (status glyph, name, agent type, parent when nested) on the left, active model + reasoning level and age right-aligned, with the task description on its own line; dropped the redundant `sub · of Main` noise
-- Added a project-scoped `launch` tool for shared long-running services and debuggers, with readiness probes, bounded logs, PTY input, restart policies, and automatic teardown after the last omp instance exits. Gated behind the `launch.enabled` setting (default on); when disabled the tool is withdrawn and the bash prompt drops its "use launch" guidance.
-- Added `detached` `launch` starts for standalone services that survive every omp instance and broker shutdown, then reconnect to the next broker for logs and explicit stop.
+- Added the `edit.enforceSeenLines` setting (default off) to gate the hashline seen-line guard. When off, hashline tags validate on content hash alone and any anchor into the tagged content applies; when on, edits anchored on lines a prior `read`/`grep` never displayed are rejected.
+- Added per-agent prewalk for subagents: a `prewalk` frontmatter field (`true` = hand off to the default prewalk target, a string = custom target model pattern) and a `task.agentPrewalk` settings override toggled per agent from the `/agents` dashboard with `P`. The bundled generic `task` agent ships with prewalk enabled by default (skipped when the target resolves to the subagent's own starting model, and never armed for plan-mode spawns). Prewalk-armed subagents keep the normally parent-owned `todo` tool so the plan-nudge → todo → hand-off flow works, and the prewalk todo gate now keys on the active tool set instead of the registry so a deactivated todo tool can no longer stall the switch.
+- Added `xd://` virtual tool devices (setting `tools.xdev`, default on): built-ins declaring `loadMode: "discoverable"` (browser, debug, lsp, ast_grep/ast_edit, github, web_search, ...) are unmounted from the request's tools array entirely and driven through the tools the model already has: `read xd://` lists mounted devices, `read xd://<tool>` returns docs + JSON schema, and `write xd://<tool>` with a JSON args object as content executes the tool. Args validate against the mounted tool's real schema (returned on mismatch), and the tools array (and prompt-cache prefix) never changes shape when devices mount or unmount mid-session. `todo`, `ask`, and `grep` stay top-level for their harness integrations; `/tools` lists mounted devices; and `xd://` writes render with the mounted tool's own TUI renderer — streamed call previews draw nothing until the path is provably not an `xd://` device, then forward the incrementally decoded JSON content as live inner args. Explicit `--tools read,...,xdev` lists opt lean sets into the same mounting; `tools.discoveryMode: "all"` takes precedence when active. Full docs + JSON schema for every mounted device are inlined into the system prompt's `xd://` section, so no discovery `read` is required before first use; `read xd://<tool>` remains available for on-demand re-fetch.
 
 ### Changed
 
-- Refined the downshift planning instructions to require a super-detailed todo list with one item per concrete step, each specifying its target and verification method
-- Updated tangential agent forks to ignore parent session history and focus exclusively on the new request
-- Hardened `/tan` fork isolation: the clone's inherited todo list is cleared at fork (parent todo reminders no longer drag the tan back onto the parent's task), the fork notice warns that the parent is concurrently editing the same working directory, and the notice is re-injected after each compaction so the fork boundary survives summarization
-- Added visual markers in the transcript for elided tool calls that have no corresponding result
-- Updated status event log to prioritize the most recent entries in the display window
-- Updated the snapcompact shape preview transcript to use the compact scope format shown to models during compaction.
+- Made the hashline seen-line guard opt-in and off by default (see `edit.enforceSeenLines`), and stopped excluding column-clipped (>512-char) lines from a snapshot's seen set: a displayed line now counts as seen even when its display was column-truncated, so single-line edits on long lines found via `read`/`grep` apply without a separate full-width re-read.
+- Changed the default `astGrep.enabled` setting to `false`
+- Batched todo operations with real tool calls to prevent solo todo turns and extra round trips
+- Changed every bundled TTSR rule to warn without interrupting generation.
+- Renamed the system prompt's project-context section wrapper from `<context>` to `<repo-rules>` to stop it colliding with the `task` tool's `context` parameter under in-band XML tool dialects: models were closing `<parameter name="context">` with a stray `</context>` (primed by the ambient section tag) and emitting sibling params as bare `<tasks>` elements, so `tasks` arrived missing.
+- Rendered `read xd://` calls in the compact grouped read view instead of a full tool-execution card; other internal URLs (`skill://`, `agent://`, …) still render full so their resolved content stays visible.
 
 ### Removed
 
-- Removed the `--downshift-boomerang` feature and its associated configuration setting
-- Removed the unreliable Bing and Yahoo HTML-scraping web search providers
+- Removed the `tools.essentialOverride` setting; essential tools are configured through device mounting
+- Removed `mcp_tool_selection` session message type; MCP tool discovery now uses device mounting instead
+- Removed the legacy `report_finding` tool; reviewer agents record findings through incremental `yield` sections (`type: ["findings"]`). SDK: `reportFindingTool` and `HIDDEN_TOOLS.report_finding` are removed (the `FindingDetails` shape and `parseFindingDetails` helper remain for reviewer rendering).
+- Removed the `ssh` agent tool (remote command execution). The `ssh://` read/write/search protocol, the `omp ssh` host-management CLI, and SSH host discovery are retained. SDK: `SshTool`/`loadSshTool`, the `ssh/ssh-executor` module, and `AgentSession.refreshSshTool` are removed.
+- Removed the `xdev` `--tools` token; the `xd://` device system now mounts only via the `tools.xdev` setting (the `--tools ...,xdev` opt-in and `HIDDEN_TOOLS.xdev` are gone).
 
 ### Fixed
 
@@ -46,8 +48,149 @@
 - Fixed the remaining GNU-flavored shell builtins that broke under macOS/BSD muscle memory, using the same unambiguous-detection approach as the `stat` fix (only invocations that are invalid or nonsensical under GNU semantics are reinterpreted; unsupported BSD forms fail loudly instead of producing wrong output): `date -r <epoch>` formats the epoch when no such file exists (GNU `-r FILE` mtime preserved), signed `date -v±N<unit>` adjustments translate to `-d` relative dates and `-j` is accepted (`-j -f` strptime parse mode and field-set `-v` error clearly); `sed -i '' 's/…/…/' file` drops the BSD empty backup-suffix token instead of treating it as the script; `mktemp -t prefix` without X's creates `$TMPDIR/prefix.XXXXXXXXXX` (the GNU `too few X's` error path); `tail -r` reverses input by delegating to `tac` (with `-n`/`-c`/`-f` combinations erroring clearly); `find -E` maps to `-regextype posix-extended` ahead of the expression; `base64 -D` decodes as an alias of `-d`; and `ln -sfh` works via a `-h` alias of `--no-dereference` (clap's `-h` help short is dropped to match real GNU/BSD ln; `--help` unchanged)
 - Fixed OpenAI Codex safety-filter blocks (e.g. `Codex error event: This content was flagged for possible cybersecurity risk. If this seems wrong, try rephras…`) sticking in session history and being replayed as an assistant turn on every subsequent request. `#isClassifierRefusal` now also recognises the content-flag / policy-violation wording in `errorMessage` as a fallback for providers that surface the block without setting `stopDetails.type = "refusal" | "sensitive"` — paired with the pi-ai change that marks Codex flags at the source, the coding-agent skips persistence, prunes the stub from active context, and consults the fallback chain instead of looping the same model
 - Added an `[oauth <email>]` prefix on failed assistant `errorMessage`s for OAuth-backed providers (OpenAI Codex, Anthropic Claude, Gemini CLI, …) so the user can see which pool credential served the request that errored. Particularly useful for Codex content-flag rejections: OpenAI applies stricter moderation to non-CVP-verified accounts, so the tag directly names the account that needs verifying instead of leaving the user to guess. Uses `AuthStorage.getOAuthAccountIdentity` (session-sticky at error time; falls back to `accountId` / `projectId` when no email is stored), silently skips non-OAuth providers and successful turns, and is idempotent across retry passes
+- Fixed Bash internal URLs remaining unresolved when used as unquoted arguments inside command substitutions ([#5535](https://github.com/can1357/oh-my-pi/issues/5535)).
+- Fixed `--tools` silently dropping hidden tool names (`xdev`, `yield`, ...); hidden built-ins are now addressable per the `hidden` tool contract.
+- Fixed the built-in `fd` printing `fd: Broken pipe (os error 32)` when a downstream pipeline reader exited early (e.g. `fd … | head`); it now exits silently with 141 (128+SIGPIPE), matching real fd.
+- Fixed prewalk repeatedly continuing after a bash-only task such as `commit` had already completed ([#5551](https://github.com/can1357/oh-my-pi/issues/5551)).
+- Fixed the Bash tool hanging when in-process commands read process substitution operands such as `<(cmd)` ([#5557](https://github.com/can1357/oh-my-pi/issues/5557)).
+- Fixed `/share` and `/export` web views rendering inline Markdown inside list items as literal text ([#5567](https://github.com/can1357/oh-my-pi/issues/5567)).
+
+## [16.5.2] - 2026-07-14
+
+### Breaking Changes
+
+- Removed the separate `selector` parameters from `read` and `grep`; line ranges and read modes must now be appended to `path`.
+
+### Added
+
+- Added a `generate_image.enabled` setting (Settings › Tools › Generate Image) to allow toggling the image generation tool.
+
+### Changed
+
+- Expanded provider rate-limit response header ingestion to all supported providers with header parsers (previously Anthropic-only), enabling proactive account rotation for multi-account sessions before hitting 429 errors.
+- Restored CPU model metadata in workstation prompts on non-Linux hosts.
+
+### Fixed
+
+- Fixed `omp config list --json` output truncation at 64 KiB when stdout is piped.
+- Fixed vim-style navigation (`h`/`j`/`k`/`l`) under the Kitty keyboard protocol.
+- Fixed `/guided-goal` throwing `Model not found` errors on websocket-only Codex models by routing the interview through the session's provider transport and reusing a single isolated side session.
+- Fixed `tool_result` extension handlers being unable to rewrite the model-visible content of a thrown tool failure.
+- Fixed intermittent Perplexity OAuth web search failures (401 errors) caused by transient transport drops on the ask endpoint.
+- Fixed the `generate_image` tool ignoring `--no-tools` and explicit tool whitelists.
+- Fixed markerless prose thinking preambles incorrectly becoming session titles when title models omit the `<title>` marker.
+- Fixed the agent recreating a todo list immediately after a user clears it with `/todo rm`.
+- Fixed internal-URL autocomplete (`agent://`, `skill://`, `omp://`, etc.) not triggering inside slash command arguments.
+- Fixed the browser tool hanging indefinitely during tab closure when the headless Chromium process is wedged on Windows.
+- Fixed `history://` URLs failing to resolve for unregistered, released, or resumed subagents by falling back to scanning artifacts directories on disk.
+- Fixed eval cells treating `timeout: 0` as a one-second deadline and reporting session-deadline cancellations as user aborts.
+- Fixed MCP OAuth dynamic client registration for pathful authorization-server issuers by preserving the discovered registration endpoint.
+- Fixed the `launch` tool failing to start Windows executables due to double-escaped PTY commands and arguments.
+- Fixed the built-in advisor warning `Advisor unavailable` for silent reviews: a content-less stop is a valid "nothing to add" outcome and is never retried or warned about, regardless of reported token usage ([#5212](https://github.com/can1357/oh-my-pi/issues/5212) follow-up).
+- Fixed `read`, `edit`, and `grep` tools failing on paths with a stray leading colon emitted by some models.
+- Fixed git plugin re-installs retaining stale commits by fetching Bun's cached clone before updating the lockfile pin.
+- Fixed overlapping Bash timeout and interrupt cleanup to explicitly abort isolated shells instead of leaving child processes running.
+- Fixed a bug where generic provider aborts arriving as `stopReason: "error"` were not auto-retried.
+- Fixed switching from a vision model to a text-only model mid-session sending historical image blocks to the new provider.
+- Fixed inline images in Agent Hub transcripts by routing replayed images through the shared image budget and Kitty placeholder renderer.
+- Fixed OSC 5522 paste in direct API-key login prompts being routed to the hidden main chat editor instead of the focused credential field.
+- Fixed plugin installation failures when an ES module extension synchronously requires CommonJS helpers.
+- Fixed GitHub code search rejecting empty optional date placeholders.
+- Fixed `/tree` navigation onto a `/skill:` injection node landing on the incorrect entry.
+- Fixed interactive TUI sessions crashing with concurrent JS runtime errors when the JS eval worker falls back to the in-process inline path.
+- Fixed compaction aborting instead of trying an authenticated fallback model when Amazon Bedrock credential resolution fails.
+- Fixed full-context forks and `/tan` clones cold-missing OpenAI prompt caches by properly persisting and inheriting provider prompt-cache keys.
+- Fixed Codex advisor requests using local session labels as provider session IDs.
+- Fixed macOS stdio MCP servers launching in a detached session, allowing the TCC Apple Events permission prompt to trigger.
+- Fixed the ask tool timeout to auto-select the recommended option when the UI selector does not settle.
+- Fixed LSP workspace diagnostics for Go workspaces to correctly recognize `go.work` roots and include all used modules.
+- Fixed interactive OAuth login success messages waiting on background model discovery.
+- Fixed Windows bash tool crashes when an explicit timeout fires while a piped command is still streaming.
+- Fixed subagent `yield` tool calls being discarded when the soft request budget hard-aborted the same assistant turn.
+- Fixed `--tools` filtering in interactive sessions disabling deferred MCP tools.
+- Fixed kept-alive task subagents entering repeated provider-call loops after an IRC wake and terminal yield.
+- Fixed manual `/compact` with the snapcompact strategy hard-failing on text-only active models.
+- Fixed the empty-editor `←←` gesture trapping input when opening the Agent Hub from persisted/parked subagents.
+- Fixed eval `read()` URI handling in Python and JS runtimes to correctly delegate URI reads and pass pagination arguments.
+- Fixed discovered plugin `.mcp.json` stdio servers launching relative `command` or `cwd` values against the session cwd instead of the plugin's config directory.
+- Fixed Model Hub DEFAULT role assignments with `auto` retaining a stale concrete reasoning suffix after restart.
+- Fixed configured `retry.fallbackChains` failing to engage on non-retryable provider errors.
+- Fixed backgrounded Bash blocks continuing to repaint with live output after completion.
+- Fixed `--reasoning-slide-plan` silently ending the run with no code written when the model answered with a text-only reply.
+- Fixed launch tool rendering issues, including stacked pending headers and confusing start/wait results when readiness timed out.
+- Fixed the in-process `stat` and other GNU-flavored shell builtins (such as `date`, `sed`, `mktemp`, `tail`, `find`, `base64`, and `ln`) mangling or failing on macOS/BSD-style invocations.
+
+## [16.5.1] - 2026-07-14
+
+### Changed
+
+- Enhanced Anthropic credential and usage management to support organization-scoped accounts, including displaying organization names in /usage, /logout, omp token --list, and OAuth login success messages, resolving active-account matching for shared organizations, and deduplicating identities during migration.
+
+### Fixed
+
+- Fixed compatibility of GNU-flavored shell builtins (such as stat, date, sed, mktemp, tail, find, base64, and ln) when invoked with macOS/BSD-style arguments.
+- Fixed subagent model and thinking level resolution to correctly respect the configured modelRoles.task selector instead of intermittently falling back to the parent session's model.
+- Fixed TUI rendering issues, including preventing macOS runtime diagnostics from painting into the viewport, bounding transcript retention in long sessions, and fixing scrollback repainting when collapsing history.
+- Fixed /tan and /fork clones failing to inherit or persist the parent session's prompt cache keys.
+- Fixed Python and JavaScript evaluation kernels suspending the CLI on subprocess foregrounding, deadlocking on non-serializable values, or losing in-flight subagent work during external aborts.
+- Fixed configured retry.fallbackChains failing to engage when encountering non-retryable provider errors.
+- Improved auto-compaction to automatically drop images and elide content when context is tight, and added persistent warning badges to the compaction divider when manual intervention is required.
+- Fixed the downshift plan nudge silently ending runs with no code written when the model answered with a text-only reply.
+- Fixed launch tool rendering and status reporting, including resolving contradictory readiness timeout messages and preventing backgrounded Bash blocks from continuing to repaint.
+- Fixed Advisor containment and timing issues, preventing hallucinated tool calls from contaminating later advice and ensuring late-arriving transcript deltas are coalesced before advisor calls.
+- Fixed omp update on npm-managed Windows installations to prevent downloaded release binaries from overwriting npm launchers.
+- Fixed --max-time duration values (e.g., 5s, 10m, 1h) being ignored instead of setting a session deadline.
+- Fixed omp plugin install --force failing with a dependency loop when replacing an existing pinned Git plugin source.
+- Fixed MCP tools receiving session image attachments as raw local:// URIs instead of resolving them to local filesystem paths.
+- Fixed Pyright LSP semantic requests hanging during startup.
+- Fixed Codex web search requests for GPT-5.6 Responses-Lite models.
+- Fixed custom model/provider configuration discovery to correctly load ~/.omp/agent/models.yaml when models.yml is absent.
+
+## [16.5.0] - 2026-07-13
+
+### Breaking Changes
+
+- Replaced the `--reasoning-slide-*` flag family with a unified `--prewalk` mechanism (`--prewalk`, `--prewalk-into <model>`, and `--no-prewalk`) to manage model handoffs during execution.
+
+### Added
+
+- Added a new `--prewalk` execution flow (with `--prewalk-into <model>` and `--no-prewalk` overrides) that starts tasks on a strong model for planning and todo initialization before handing off to a faster, cheaper model for implementation.
+ - Added a status line annotation for the active prewalk phase (armed or active).
+ - Added the `tui.scrollbackRebuild` setting to gate the erase-and-replay native scrollback rebuild mechanism (defaults to off).
+- Added a display setting to toggle between collapsing or keeping compacted history inline in live session displays.
+- Added a compact session-only model picker (Alt+P) for quick model switching, featuring `@` search to quickly list and apply configured quick roles.
+- Redesigned Agent Hub entries into a cleaner two-line card layout showing identity, active model, reasoning level, age, and task description.
+- Added a project-scoped `launch` tool (gated by `launch.enabled`) for managing shared long-running services and debuggers, featuring readiness probes, bounded logs, PTY input, restart policies, and automatic teardown.
+- Added support for `detached` launches, allowing standalone services to survive broker shutdowns and reconnect to subsequent sessions.
+
+### Changed
+
+- Updated JSON logs (`--mode json`) to include provider payloads in auto-compaction events.
+- Updated tangential agent forks (`/tan`) to ignore parent session history and focus exclusively on the new request, hardening isolation with cleared todo lists and concurrent editing warnings.
+- Added visual markers in the transcript for elided tool calls that have no corresponding result.
+- Updated the status event log to prioritize the most recent entries in the display window.
+- Upgraded `@agentclientprotocol/sdk` to version 1.2.1.
+
+### Fixed
+
+- Fixed terminal scrollback duplication issues with expanded streaming edit previews (Ctrl+O) by using a viewport-sized tail window.
+- Fixed custom model role resolution and alias parsing, ensuring canonical role selectors (`@role`) and thinking suffixes resolve correctly across all configuration surfaces.
+- Fixed quadratic growth in JSON logs by eliding redundant message snapshots and payloads.
+- Fixed prompt cache misses and incorrect cache key pinning for `/tan` and `/fork` clones.
+- Fixed inconsistent history rendering and scrollback repainting when toggling the display setting for compacted items.
+- Fixed `retry.fallbackChains` failing to engage on non-retryable provider errors, ensuring the agent correctly falls back to the next candidate model.
+- Improved auto-compaction to automatically drop images and elide content when context is tight, and added persistent warning badges when manual intervention is required.
+- Fixed backgrounded Bash blocks continuing to repaint with live output; they now freeze with a compact job notice while completion is delivered separately.
+- Fixed rendering, status display, and PTY control sequence formatting issues in the `launch` tool.
+- Fixed in-process shell builtins (including `stat`, `date`, `sed`, `mktemp`, `tail`, `find`, `base64`, and `ln`) to correctly detect and translate macOS/BSD-style arguments and flags, preventing failures caused by GNU-only assumptions.
+
+### Removed
+
+- Removed the `--prewalk-boomerang` feature and its associated configuration setting.
+- Removed the unreliable Bing and Yahoo HTML-scraping web search providers.
 
 ## [16.4.8] - 2026-07-12
+
 ### Added
 
 - Added a predicate form to the browser run's `wait()` helper: `wait(fn, { timeout?, interval? })` polls the function (sync or async) until truthy and resolves with that value, failing with a named timeout error (deadline clamped under the cell budget so it always beats the opaque whole-cell timeout) instead of Bun's `sleep expects a number` or a whole-cell stall from in-page polling Promises; both `wait` forms now register in the stall diagnosis of cell timeouts
@@ -335,6 +478,7 @@
 - Fixed retry fallback model recovery by exposing `retry.fallbackChains` in `/settings`, adding a `/model` action to assign the selected default fallback model, and clearing a selected model's retry cooldown marker on manual model switches. ([#4533](https://github.com/can1357/oh-my-pi/issues/4533))
 - Fixed `/handoff` and auto-handoff skipping extension lifecycle hooks by emitting cancellable `session_before_switch` hooks and a `session_switch` with `reason: "handoff"` after the replacement session is ready ([#4434](https://github.com/can1357/oh-my-pi/issues/4434)).
 - Fixed TTSR stream interrupts so only the tool call whose stream matched a rule receives the rule-named abort result; sibling tool-call placeholders now use a neutral abort reason ([#2783](https://github.com/can1357/oh-my-pi/issues/2783)).
+- Fixed TTSR rules with a leading `(?i)`/`(?m)`/`(?s)` inline regex flag never registering: `new RegExp("(?i)...")` throws in Bun/JS, so the condition failed to compile and the rule was silently dropped. Leading inline flag groups are now translated to native `RegExp` flags. Also recover `scope` tokens and sibling values from malformed frontmatter (e.g. `scope: "text","thinking"`), which previously left literal quotes on the parsed values ([#4796](https://github.com/can1357/oh-my-pi/issues/4796)).
 
 ## [16.3.11] - 2026-07-06
 

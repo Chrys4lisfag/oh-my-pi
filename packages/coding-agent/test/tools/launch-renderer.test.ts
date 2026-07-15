@@ -6,8 +6,9 @@
  */
 import { describe, expect, it } from "bun:test";
 import type { DaemonSnapshot } from "@oh-my-pi/pi-coding-agent/launch/protocol";
+import { renderTerminalOutput } from "@oh-my-pi/pi-coding-agent/launch/terminal-output";
 import { getThemeByName } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import { type LaunchToolDetails, launchToolRenderer } from "@oh-my-pi/pi-coding-agent/tools/launch";
+import { hubToolRenderer, type LaunchToolDetails } from "@oh-my-pi/pi-coding-agent/tools/hub";
 import { toolRenderers } from "@oh-my-pi/pi-coding-agent/tools/renderers";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 
@@ -34,16 +35,16 @@ const daemon = (overrides: Partial<DaemonSnapshot>): DaemonSnapshot => ({
 	...overrides,
 });
 
-describe("launchToolRenderer", () => {
+describe("hub launch rendering", () => {
 	it("is registered with merged call/result so the pending header is replaced, not stacked", () => {
-		expect(Object.is(toolRenderers.launch.renderResult, launchToolRenderer.renderResult)).toBe(true);
-		expect(toolRenderers.launch.mergeCallAndResult).toBe(true);
+		expect(Object.is(toolRenderers.hub.renderResult, hubToolRenderer.renderResult)).toBe(true);
+		expect(toolRenderers.hub.mergeCallAndResult).toBe(true);
 	});
 
 	it("folds a stop result into one header with op, name, and exit state", async () => {
 		const uiTheme = await theme();
 		const rendered = lines(
-			launchToolRenderer.renderResult(
+			hubToolRenderer.renderResult(
 				{
 					content: [{ type: "text", text: "Stopped pyc-profile-run: exited exit=0 uptime=22.6s restarts=0" }],
 					details: {
@@ -66,7 +67,7 @@ describe("launchToolRenderer", () => {
 	it("renders log lines without the trailing cursor-status suffix, surfacing it as header meta", async () => {
 		const uiTheme = await theme();
 		const rendered = lines(
-			launchToolRenderer.renderResult(
+			hubToolRenderer.renderResult(
 				{
 					content: [{ type: "text", text: "line one\nline two\n[web: running; cursor=2210]" }],
 					details: { op: "logs", cursor: 2210, timedOut: false, state: "running" } satisfies LaunchToolDetails,
@@ -78,23 +79,60 @@ describe("launchToolRenderer", () => {
 		);
 		expect(rendered[0]).toContain("Launch logs");
 		expect(rendered[0]).toContain("cursor 2210");
-		expect(rendered).toContain("line one");
-		expect(rendered).toContain("line two");
+		expect(rendered.some(line => line.includes("line one"))).toBe(true);
+		expect(rendered.some(line => line.includes("line two"))).toBe(true);
 		expect(rendered.some(line => line.includes("[web: running"))).toBe(false);
+		expect(rendered[0]).toContain("╭");
+		expect(rendered.some(line => line.includes("Output"))).toBe(true);
+		expect(rendered.at(-1)).toContain("╰");
+	});
+
+	it("replays terminal screen rows so cursor rewrites retain their final color and weight", async () => {
+		const terminalRows = await renderTerminalOutput(
+			"\x1b[1;31mold\x1b[0m\r\x1b[2K\x1b[12G\x1b[1;32mready\x1b[0m\x1b[K",
+			{
+				head: false,
+				maxRows: 10,
+			},
+		);
+		if (terminalRows === undefined) throw new Error("terminal replay failed");
+		expect(Bun.stripANSI(terminalRows[0] ?? "")).toBe("           ready");
+
+		const uiTheme = await theme();
+		const component = hubToolRenderer.renderResult(
+			{
+				content: [{ type: "text", text: "ready\n[web: running; cursor=2210]" }],
+				details: {
+					op: "logs",
+					cursor: 2210,
+					timedOut: false,
+					state: "running",
+					terminalRows,
+				} satisfies LaunchToolDetails,
+			},
+			{ expanded: false, isPartial: false },
+			uiTheme,
+			{ op: "logs", name: "web" },
+		);
+		const raw = component.render(200).join("\n");
+		const plain = Bun.stripANSI(raw);
+		expect(plain).toContain("ready");
+		expect(plain).not.toContain("old");
+		expect(raw).toContain("\x1b[1;38;5;2mready");
 	});
 
 	it("caps a collapsed list to the preview item limit with a more-items row", async () => {
 		const uiTheme = await theme();
 		const daemons = Array.from({ length: 11 }, (_, i) => daemon({ name: `svc-${i}`, id: `d-${i}` }));
 		const rendered = lines(
-			launchToolRenderer.renderResult(
+			hubToolRenderer.renderResult(
 				{
 					content: [{ type: "text", text: "" }],
 					details: { op: "list", daemons } satisfies LaunchToolDetails,
 				},
 				{ expanded: false, isPartial: false },
 				uiTheme,
-				{ op: "list" },
+				{ op: "ps" },
 			),
 		);
 		expect(rendered[0]).toContain("11 processes");
@@ -106,7 +144,7 @@ describe("launchToolRenderer", () => {
 	it("marks a failed start with the daemon's exit reason even though the result is not an error", async () => {
 		const uiTheme = await theme();
 		const rendered = lines(
-			launchToolRenderer.renderResult(
+			hubToolRenderer.renderResult(
 				{
 					content: [{ type: "text", text: "Failed to launch web: failed exit=127" }],
 					details: {
@@ -132,7 +170,7 @@ describe("launchToolRenderer", () => {
 	it("names the unmet readiness condition instead of a contradictory Ready + timed-out pair", async () => {
 		const uiTheme = await theme();
 		const rendered = lines(
-			launchToolRenderer.renderResult(
+			hubToolRenderer.renderResult(
 				{
 					content: [{ type: "text", text: "" }],
 					details: {

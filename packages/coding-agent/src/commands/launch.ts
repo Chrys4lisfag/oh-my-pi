@@ -4,7 +4,7 @@
 
 import { APP_NAME } from "@oh-my-pi/pi-utils";
 import { Args, Command, Flags } from "@oh-my-pi/pi-utils/cli";
-import { parseArgs } from "../cli/args";
+import { type Args as ParsedArgs, parseArgs, reportCliUsageError } from "../cli/args";
 import { runRootCommand } from "../main";
 import { prepareAcpTerminalAuthArgs } from "../modes/acp/terminal-auth";
 import { CLI_THINKING_LEVELS } from "../thinking";
@@ -34,15 +34,15 @@ export default class Index extends Command {
 		plan: Flags.string({
 			description: "Plan model for architectural planning (or PI_PLAN_MODEL env)",
 		}),
-		downshift: Flags.boolean({
+		prewalk: Flags.boolean({
 			description:
-				"Switch from the active model to a fast/cheap model at the first edit/write after the plan's todo list exists (default off; see downshift.enabled)",
+				"Switch from the active model to a fast/cheap model at the first edit/write after the plan's todo list exists (default off; see prewalk.enabled)",
 		}),
-		"no-downshift": Flags.boolean({
-			description: "Disable downshift even if downshift.enabled is set",
+		"no-prewalk": Flags.boolean({
+			description: "Disable prewalk even if prewalk.enabled is set",
 		}),
-		"downshift-into": Flags.string({
-			description: 'Target model for downshift (default the "smol" role)',
+		"prewalk-into": Flags.string({
+			description: 'Target model for prewalk (default the "smol" role)',
 		}),
 		"plan-yolo": Flags.boolean({
 			description:
@@ -157,7 +157,7 @@ export default class Index extends Command {
 			description: "Include thinking blocks in print mode text output",
 		}),
 		"max-time": Flags.string({
-			description: "Stop the session after this many seconds",
+			description: "Stop the session after this duration (e.g., 600, 10m, 1h)",
 		}),
 		// `--auto-approve` / `--yolo`: declared here so oclif's auto-generated `--help` lists it.
 		// Runtime parsing happens in `cli/args.ts parseArgs` (line 176 in that file) — `runRootCommand`
@@ -193,7 +193,16 @@ export default class Index extends Command {
 
 	async run(): Promise<void> {
 		const { args } = prepareAcpTerminalAuthArgs(this.argv);
-		const parsed = parseArgs(args);
+		let parsed: ParsedArgs;
+		try {
+			parsed = parseArgs(args);
+		} catch (error) {
+			if (reportCliUsageError(error)) {
+				process.exitCode = 2;
+				return;
+			}
+			throw error;
+		}
 		await runRootCommand(parsed, args);
 	}
 }
