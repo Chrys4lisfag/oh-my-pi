@@ -2,13 +2,47 @@
 
 ## [Unreleased]
 
+## [17.0.2] - 2026-07-17
+
 ### Fixed
 
 - Fixed empty provider responses (e.g. "Cloud Code Assist API returned an empty response") being classified as non-retryable: `ProviderResponseError` with kind `empty-body` now carries the transient flag, so session retry and configured model-fallback chains engage instead of hard-failing the turn
 - Fixed OpenAI Codex `k12` (ChatGPT Edu) accounts being classified as an "unknown" plan and excluded by the paid-model plan filter: a pool of healthy `k12` seats plus one exhausted `plus` seat would funnel every paid-model request (e.g. `gpt-5.6`) to the lone `plus` account — which, once its limit was reached, surfaced `usage_limit_reached` on every turn (including fresh sessions) while the k12 siblings sat idle with headroom. `k12` now classifies as a paid tier, so healthy educational seats are selected and the exhausted account is correctly ranked last
 - Fixed OpenAI Codex content-moderation blocks (e.g. `Codex error event: This content was flagged for possible cybersecurity risk. If this seems wrong, try rephras…`, `content_policy_violation`, `content_filter`) being persisted into session history and replayed on every subsequent turn (matching the pre-fix Anthropic classifier-refusal bug). `handleCodexStreamFailure` now sets `stopDetails: { type: "sensitive", explanation }` on the finalized assistant message when the failure matches the safety-filter code set (`content_policy_violation`, `content_filter`, `content_filtered`, `moderation_blocked`) or wording pattern, so the coding-agent's existing refusal path skips persistence, prunes the stub from active context, and consults the fallback chain without looping the same model. Exported `isCodexContentFlagFailure` for regression pinning
+- Automatically invalidate and rotate OAuth credentials when an "invalidated oauth token" error occurs.
+- Fixed auth-broker snapshot validation rejecting API keys stored via the `/login` flow, restoring support for gateway/broker setups serving login-sourced keys on custom hosts.
+- Fixed an issue where literal reasoning tags (e.g., `<think>`) inside Markdown code blocks or inline code were incorrectly treated as reasoning boundaries, which corrupted the rendered Markdown.
+- Classified HTTP 402 and "balance exhausted" quota responses as persistent usage limits, enabling automatic rotation of multi-account requests to a sibling credential.
+- Fixed `kimi-code` Anthropic-format requests ignoring custom provider base URLs.
+- Fixed an issue where GPT-5.6 Codex Responses-Lite requests failed with an HTTP 400 error due to invalid `tool_choice` parameters after tools were rewritten, by automatically downgrading forced hosted choices to `tool_choice: "auto"` while preserving explicit tool-use constraints.
+- Fixed Cursor streams prematurely reporting success before late CONNECT or gRPC terminal failures were observed, and resolved issues rejecting transport ends without a `turnEnded` signal.
+
+## [17.0.1] - 2026-07-16
+
+### Fixed
+
+- Fixed OpenRouter cost reporting to use the provider's authoritative account charge instead of catalog token-price estimates on both Responses and Chat Completions streams.
+- Fixed OpenAI Responses and Chat Completions requests forwarding unsupported sampling parameters such as `temperature` to o-series and GPT-5+ models, preventing 400 errors for mnemopi memory calls through GitHub Copilot GPT-5.6 Luna. ([#5606](https://github.com/can1357/oh-my-pi/issues/5606))
+- Fixed boolean JSON Schema subschemas (`true`/`false`) in MCP tool inputs triggering `400 INVALID_ARGUMENT` on the Google/Cloud Code Assist (Antigravity) transport by coercing them to their object equivalents (`true` → `{}`, `false` → `{ not: {} }`) before sending ([#5604](https://github.com/can1357/oh-my-pi/issues/5604)).
+- Fixed thinking-enabled Claude requests routed to `google-vertex` sending the `effort-2025-11-24` beta as an `anthropic-beta` HTTP header, which Vertex rawPredict rejects with a 400. The effort beta and the `output_config.effort` field are now gated off the Vertex path the same way `context-management-2025-06-27` already is ([#5614](https://github.com/can1357/oh-my-pi/issues/5614)).
+- Fixed custom and Foundry-routed Anthropic endpoints receiving first-party eager/legacy tool-streaming controls ([#5572](https://github.com/can1357/oh-my-pi/issues/5572)).
 - Parsed Ollama NDJSON response bytes directly instead of decoding and buffering every network chunk as text. ([#5542](https://github.com/can1357/oh-my-pi/issues/5542))
 - Fixed Amazon Bedrock stream error handling for non-`Error` values that `JSON.stringify` cannot serialize ([#5539](https://github.com/can1357/oh-my-pi/issues/5539)).
+- Fixed concurrent provider OAuth refreshes by serializing rotating-token updates across processes, fencing stale writes, and preventing background usage probes from disabling otherwise usable credentials ([#5396](https://github.com/can1357/oh-my-pi/issues/5396)).
+- Fixed OpenAI Codex WebSocket connections ignoring `PI_PROXY`, provider-specific proxy settings, and standard HTTPS/ALL proxy variables ([#5384](https://github.com/can1357/oh-my-pi/issues/5384)).
+- Fixed Anthropic account quota exhaustion (`This request would exceed your account's monthly spend limit`) hanging until the local deadline instead of surfacing the error: the `rate_limit_error` "spend limit" wording is now classified as a persistent usage limit, so it fails fast and rotates to a sibling credential rather than looping in the provider retry backoff. ([#4787](https://github.com/can1357/oh-my-pi/issues/4787))
+- Fixed OpenRouter daily free-model allowance errors (`free-models-per-day`) being treated as transient rate limits, so requests rotate from an exhausted API key to a healthy sibling credential. ([#4832](https://github.com/can1357/oh-my-pi/issues/4832))
+
+## [17.0.0] - 2026-07-15
+
+### Changed
+
+- Improved Ollama streaming performance by parsing NDJSON response bytes directly instead of decoding and buffering network chunks as text.
+
+### Fixed
+
+- Fixed Cursor TLS connection resets causing process-fatal uncaught exceptions, allowing the active turn to fail or retry gracefully without terminating the session.
+- Fixed Amazon Bedrock stream error handling to correctly handle non-Error values that cannot be serialized by JSON.stringify.
 
 ## [16.5.2] - 2026-07-14
 

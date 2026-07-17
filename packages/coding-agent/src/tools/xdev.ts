@@ -45,14 +45,25 @@ import { ToolError } from "./tool-errors";
 export const XDEV_KEEP_TOP_LEVEL: Record<string, true> = { todo: true, ask: true, grep: true };
 
 /**
+ * Tools that carry the `xd://` transport itself and therefore can never be
+ * mounted as devices: `read xd://` lists/documents devices and
+ * `write xd://<tool>` executes them. Demoting either leaves every mounted
+ * device unreachable (issue #5764), so they stay top-level regardless of a
+ * declared `loadMode`.
+ */
+export const XDEV_TRANSPORT_TOOLS: Record<string, true> = { read: true, write: true };
+
+/**
  * Whether an enabled tool is presented under `xd://` (rather than top-level)
  * while the `xd://` transport is active. Discoverable tools mount unless they
- * are pinned top-level by {@link XDEV_KEEP_TOP_LEVEL}; essential tools never do.
- * The caller gates this on the transport being active (a session-owned
+ * are pinned top-level by {@link XDEV_KEEP_TOP_LEVEL} or carry the transport
+ * itself ({@link XDEV_TRANSPORT_TOOLS}); essential tools never do. The caller
+ * gates this on the transport being active (a session-owned
  * {@link XdevRegistry} existing).
  */
 export function isMountableUnderXdev(tool: { name: string; loadMode?: ToolLoadMode }): boolean {
-	return tool.loadMode === "discoverable" && !(tool.name in XDEV_KEEP_TOP_LEVEL);
+	if (tool.name in XDEV_TRANSPORT_TOOLS || tool.name in XDEV_KEEP_TOP_LEVEL) return false;
+	return tool.loadMode === "discoverable";
 }
 
 /** Dispatch metadata carried on write-tool details for renderer delegation. */
@@ -84,18 +95,22 @@ function schemaDeclaresIntentField(schema: unknown): boolean {
 	return !!props && typeof props === "object" && "i" in props;
 }
 
-function renderDocs(inst: Tool, heading = "#"): string {
+function renderDocs(inst: Tool, heading = "#", descriptionCap?: number): string {
 	const schema = JSON.stringify(toolWireSchema(inst as AiTool), null, 1);
+	let description = inst.description ?? "";
+	if (descriptionCap !== undefined && description.length > descriptionCap) {
+		description = `${description.slice(0, descriptionCap).trimEnd()}… (full docs: read ${XD_URL_PREFIX}${inst.name})`;
+	}
 	return [
 		`${heading} ${inst.name}${inst.label ? ` — ${inst.label}` : ""}`,
 		"",
-		inst.description ?? "",
+		description,
 		"",
-		`${heading}# Parameters (JSON schema)`,
+		`${heading}# Schema`,
 		"```json",
 		schema,
 		"```",
-		`Execute by writing the JSON args object to ${XD_URL_PREFIX}${inst.name}.`,
+		`Execute by writing JSON to ${XD_URL_PREFIX}${inst.name}.`,
 	].join("\n");
 }
 
@@ -227,11 +242,55 @@ export class XdevRegistry {
 		return renderDocs(this.#resolve(name));
 	}
 
-	/** Full docs + schema for every mounted device, nested under a `##` heading for system-prompt embedding. */
+	/**
+	 * Char budget for the full docs inlined into the system prompt. Large MCP
+	 * catalogs previously shipped every schema top-level; without a cap they
+	 * would bloat every request. Devices past the budget fall back to a
+	 * one-line summary — their docs stay one `read xd://<tool>` away.
+	 */
+	static readonly DOCS_TOTAL_BUDGET = 48_000;
+	/** A single device's docs above this size never inline: one pathological
+	 *  MCP description must not starve every later device. */
+	static readonly DOCS_PER_DEVICE_CAP = 10_000;
+	/** Description cap for EXTERNAL devices (dynamic mounts: MCP, custom,
+	 *  extension, …) in the system-prompt embedding. Built-in devices inline
+	 *  their full curated docs; external descriptions are server-controlled
+	 *  prose the model can re-fetch, so only the lede earns prompt space. */
+	static readonly EXTERNAL_DESCRIPTION_CAP = 200;
+
+	/**
+	 * Docs + schema for mounted devices, nested under `##` headings for
+	 * system-prompt embedding. Inlines full docs in catalog order (built-ins
+	 * first) until {@link DOCS_TOTAL_BUDGET} is spent; the rest are listed by
+	 * name + summary with a pointer to on-demand `read xd://<tool>` docs.
+	 * Dynamic mounts embed at most {@link EXTERNAL_DESCRIPTION_CAP} description
+	 * chars (schema always intact); `read xd://<tool>` returns the full text.
+	 */
 	docsAll(): string {
-		return this.list()
-			.map(tool => renderDocs(tool, "##"))
-			.join("\n\n");
+		const sections: string[] = [];
+		const overflow: Tool[] = [];
+		let used = 0;
+		for (const tool of this.list()) {
+			const descriptionCap = this.#dynamic.has(tool.name) ? XdevRegistry.EXTERNAL_DESCRIPTION_CAP : undefined;
+			const docs = renderDocs(tool, "##", descriptionCap);
+			if (docs.length > XdevRegistry.DOCS_PER_DEVICE_CAP || used + docs.length > XdevRegistry.DOCS_TOTAL_BUDGET) {
+				overflow.push(tool);
+				continue;
+			}
+			used += docs.length;
+			sections.push(docs);
+		}
+		if (overflow.length > 0) {
+			sections.push(
+				[
+					"## Additional devices (docs on demand)",
+					...overflow.map(tool => `- ${XD_URL_PREFIX}${tool.name} — ${toolSummary(tool)}`),
+					"",
+					`Read ${XD_URL_PREFIX}<tool> for full docs + JSON schema before first use.`,
+				].join("\n"),
+			);
+		}
+		return sections.join("\n\n");
 	}
 
 	#resolve(name: string): Tool {

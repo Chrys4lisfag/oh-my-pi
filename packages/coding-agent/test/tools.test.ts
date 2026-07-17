@@ -1328,10 +1328,10 @@ function b() {
 
 		it("should write truncated output to artifacts", async () => {
 			const result = await bashTool.execute("test-call-8-artifact", {
-				// A single line past the 768-byte column cap is the minimal output
-				// that trips truncation + artifact spill; the old 60K-arg brace
-				// expansion paid ~60ms of shell time to prove the same path.
-				command: "printf 'a%.0s' {1..2000}",
+				// Emit well past the ~50KB inline window across many lines so the
+				// output is genuinely window-truncated (not merely column-capped),
+				// which is what allocates the spill artifact.
+				command: "seq 1 30000",
 			});
 
 			const artifactId = result.details?.meta?.truncation?.artifactId;
@@ -1520,10 +1520,14 @@ function b() {
 		it("should respect timeout", async () => {
 			// Reduce the effective timeout through the production clamp seam; the
 			// real subprocess kill-on-timeout path is still exercised, just faster.
+			// Timeouts settle as a flagged result (rendered as a warning) rather
+			// than a thrown error since #5546; ACP keeps its rejection semantics.
 			vi.spyOn(toolTimeouts, "clampTimeout").mockReturnValue(0.05);
-			await expect(bashTool.execute("test-call-10", { command: "sleep 5", timeout: 1 })).rejects.toThrow(
-				/timed out/i,
-			);
+			const result = await bashTool.execute("test-call-10", { command: "sleep 5", timeout: 1 });
+			expect(result.isError).toBe(true);
+			expect((result.details as { timedOut?: boolean } | undefined)?.timedOut).toBe(true);
+			const text = result.content.find(c => c.type === "text")?.text ?? "";
+			expect(text).toMatch(/timed out/i);
 		});
 
 		it("should abort and recover for subsequent commands", async () => {
