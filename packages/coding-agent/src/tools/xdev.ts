@@ -40,9 +40,17 @@ import { ToolError } from "./tool-errors";
  * active: `todo` feeds the todo prelude/prewalk machinery, `ask` is the
  * model's user-interaction affordance, and `grep` is the redirect target of
  * the bash interceptor rules — each loses its harness integration if hidden
- * behind dispatch.
+ * behind dispatch. `recall`/`reflect` (fork) are pinned top-level so the
+ * long-term-memory read path stays a first-class tool the model reaches for
+ * by default rather than through `write xd://…`.
  */
-export const XDEV_KEEP_TOP_LEVEL: Record<string, true> = { todo: true, ask: true, grep: true };
+export const XDEV_KEEP_TOP_LEVEL: Record<string, true> = {
+	todo: true,
+	ask: true,
+	grep: true,
+	recall: true,
+	reflect: true,
+};
 
 /**
  * Tools that carry the `xd://` transport itself and therefore can never be

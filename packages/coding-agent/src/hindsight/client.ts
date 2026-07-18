@@ -115,6 +115,8 @@ export interface ReflectOptions extends HindsightRequestOptions {
 	budget?: Budget;
 	tags?: string[];
 	tagsMatch?: TagsMatch;
+	/** Per-request timeout override (ms). Reflect passes a longer budget than the 30s default. */
+	timeoutMs?: number;
 }
 
 export interface CreateBankOptions extends HindsightRequestOptions {
@@ -216,6 +218,8 @@ interface RequestOptions {
 	/** Return null instead of throwing on a 404 response. */
 	allow404?: boolean;
 	signal?: AbortSignal;
+	/** Per-request timeout override (ms); defaults to HINDSIGHT_REQUEST_TIMEOUT_MS. */
+	timeoutMs?: number;
 }
 
 export class HindsightApi {
@@ -319,6 +323,7 @@ export class HindsightApi {
 					tags_match: options?.tagsMatch,
 				},
 				signal: options?.signal,
+				timeoutMs: options?.timeoutMs,
 			},
 		);
 	}
@@ -506,10 +511,11 @@ export class HindsightApi {
 			if (qs) url += `?${qs}`;
 		}
 
+		const timeoutMs = opts?.timeoutMs ?? HINDSIGHT_REQUEST_TIMEOUT_MS;
 		const init: RequestInit = {
 			method,
 			headers: this.#headers,
-			signal: withTimeoutSignal(HINDSIGHT_REQUEST_TIMEOUT_MS, opts?.signal),
+			signal: withTimeoutSignal(timeoutMs, opts?.signal),
 		};
 		if (opts?.body !== undefined) {
 			init.body = JSON.stringify(pruneUndefined(opts.body));
@@ -520,7 +526,7 @@ export class HindsightApi {
 			response = await fetch(url, init);
 		} catch (err) {
 			const message = isTimeoutError(err)
-				? `${operation} request timed out after 30s`
+				? `${operation} request timed out after ${Math.round(timeoutMs / 1000)}s`
 				: `${operation} request failed: ${err instanceof Error ? err.message : String(err)}`;
 			throw new HindsightError(message, undefined, err);
 		}

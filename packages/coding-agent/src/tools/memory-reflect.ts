@@ -73,6 +73,7 @@ export class MemoryReflectTool implements AgentTool<typeof memoryReflectSchema> 
 					budget: state.config.recallBudget,
 					tags: state.recallTags,
 					tagsMatch: state.recallTagsMatch,
+					timeoutMs: state.config.reflectTimeoutMs,
 				});
 				const text = response.text?.trim() || "No relevant information found to reflect on.";
 				return {

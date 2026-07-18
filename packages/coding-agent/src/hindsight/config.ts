@@ -39,6 +39,7 @@ export interface HindsightConfig {
 	recallContextTurns: number;
 	recallMaxQueryChars: number;
 	recallPromptPreamble: string;
+	reflectTimeoutMs: number;
 
 	debug: boolean;
 
@@ -115,6 +116,7 @@ export function loadHindsightConfig(settings: Settings, env: NodeJS.ProcessEnv =
 	const recallContextTurnsEnv = envInt(env.HINDSIGHT_RECALL_CONTEXT_TURNS);
 	const recallMaxQueryCharsEnv = envInt(env.HINDSIGHT_RECALL_MAX_QUERY_CHARS);
 	const retainEveryNTurnsEnv = envInt(env.HINDSIGHT_RETAIN_EVERY_N_TURNS);
+	const reflectTimeoutMsEnv = envInt(env.HINDSIGHT_REFLECT_TIMEOUT_MS);
 
 	// Read from settings (each falls back to its schema default).
 	const settingsRetainMode = pickRetainMode(settings.get("hindsight.retainMode"));
@@ -155,6 +157,7 @@ export function loadHindsightConfig(settings: Settings, env: NodeJS.ProcessEnv =
 		recallContextTurns: recallContextTurnsEnv ?? settings.get("hindsight.recallContextTurns"),
 		recallMaxQueryChars: recallMaxQueryCharsEnv ?? settings.get("hindsight.recallMaxQueryChars"),
 		recallPromptPreamble: DEFAULT_PREAMBLE,
+		reflectTimeoutMs: reflectTimeoutMsEnv ?? settings.get("hindsight.reflectTimeoutMs"),
 
 		debug: debugEnv ?? settings.get("hindsight.debug"),
 

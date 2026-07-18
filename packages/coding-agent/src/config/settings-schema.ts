@@ -2858,6 +2858,18 @@ export const SETTINGS_SCHEMA = {
 	"hindsight.recallContextTurns": { type: "number", default: 1 },
 	"hindsight.recallMaxQueryChars": { type: "number", default: 800 },
 	"hindsight.recallTypes": { type: "array", default: HINDSIGHT_RECALL_TYPES_DEFAULT },
+	"hindsight.reflectTimeoutMs": {
+		type: "number",
+		default: 60_000,
+		ui: {
+			tab: "memory",
+			group: "Hindsight",
+			label: "Hindsight Reflect Timeout (ms)",
+			description:
+				"Client-side timeout for `reflect` synthesis calls, which are slower than recall/retain (LLM synthesis over the bank). Applies to reflect only; other Hindsight requests keep the fixed 30s timeout.",
+			condition: "hindsightActive",
+		},
+	},
 
 	"hindsight.debug": { type: "boolean", default: false },
 
