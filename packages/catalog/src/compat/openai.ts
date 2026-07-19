@@ -259,6 +259,12 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 		modelMatchesHost(hostModel, "anthropic") || isClaudeModelId(spec.id) || isAnthropicNamespacedModelId(spec.id);
 	const isAlibaba = modelMatchesHost(hostModel, "alibabaDashscope");
 	const isNvidiaNim = modelMatchesHost(hostModel, "nvidia");
+	// Venice (`api.venice.ai`) is a strict OpenAI-compat reseller whose schema is
+	// additionalProperties:false and 400s on the top-level `enable_thinking` field
+	// the "qwen" dialect emits (same failure class as NVIDIA NIM #2299). Route its
+	// Qwen models to the standard "openai" reasoning_effort dialect, mirroring the
+	// Fireworks Qwen carve-out.
+	const isVenice = modelMatchesHost(hostModel, "venice");
 	const isQwen = isQwenModelId(spec.id);
 	// DeepSeek V4 (and other reasoning-capable DeepSeek models) reject follow-up requests in
 	// thinking mode unless prior assistant tool-call turns include `reasoning_content`. The
@@ -400,7 +406,7 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 				? "openrouter"
 				: isQwen && isNvidiaNim
 					? "qwen-chat-template"
-					: isQwen && isFireworks
+					: isQwen && (isFireworks || isVenice)
 						? "openai"
 						: isAlibaba || isQwen
 							? "qwen"

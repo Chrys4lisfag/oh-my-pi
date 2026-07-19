@@ -2769,10 +2769,20 @@ export function veniceModelManagerOptions(
 				mapModel: (entry, defaults) => {
 					const reference = references.get(defaults.id);
 					const model = mapWithBundledReference(entry, defaults, reference);
+					// Venice reports per-model function-calling support under
+					// `model_spec.capabilities.supportsFunctionCalling`. Models without it
+					// (the `e2ee-*` end-to-end-encrypted and several `-uncensored` variants)
+					// 400 with "tools is not supported by this model" when sent a native
+					// `tools` array, so mark them `supportsTools: false` — the agent then
+					// routes them through a prompted (in-band) tool dialect instead.
+					const spec = isRecord(entry.model_spec) ? entry.model_spec : undefined;
+					const capabilities = spec && isRecord(spec.capabilities) ? spec.capabilities : undefined;
+					const supportsFunctionCalling = capabilities?.supportsFunctionCalling;
 					return {
 						...model,
 						maxTokens: clampKimiK27CodeMaxTokens(defaults.id, model.maxTokens),
 						compat: { ...model.compat, supportsUsageInStreaming: false },
+						...(supportsFunctionCalling === false ? { supportsTools: false } : {}),
 					};
 				},
 				fetch: config?.fetch,
