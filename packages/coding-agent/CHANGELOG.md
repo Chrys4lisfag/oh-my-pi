@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `hindsight.reflectTimeoutMs` setting (default 60000; env `HINDSIGHT_REFLECT_TIMEOUT_MS`): a client-side timeout applied **only** to Hindsight `reflect` synthesis calls, which are far slower than `recall`/`retain` (server-side LLM synthesis over the whole bank — observed ~14–20s). Threaded via a new per-request `timeoutMs` override in `HindsightApi.#request`, so raising reflect's budget no longer requires bumping the shared 30s constant for every Hindsight call; other requests keep the 30s default, and the timeout-error message now reports the actual budget instead of a hardcoded "30s".
+
+### Changed
+
+- Pinned the Hindsight `recall` and `reflect` tools top-level (added to `XDEV_KEEP_TOP_LEVEL`) so the long-term-memory read path is a first-class native tool the model reaches for by default, instead of being mounted behind the `xd://` device (`write xd://reflect`). They still only exist when `memory.backend` is `hindsight`/`mnemopi`, so there is no clutter when memory is off; `retain` and other discoverable tools stay xd://-mounted.
+
+### Fixed
+
+- Fixed profiles being lost when multiple omp instances run against one `config.yml`. `Settings.#saveNow` re-read the config under a cross-process file lock but re-applied whole modified *paths*, and `profiles.items` is a single path holding the entire profile map — so a second instance's save overwrote the map with its stale copy, dropping a profile the first instance had just added (the lock prevented file corruption, not the logical lost update). Profile writes now go through per-key `Settings.setProfileItem` / `deleteProfileItem`, which track only the touched profile names and merge them into the freshest on-disk `profiles.items` at save time, leaving a concurrent instance's independently added/edited/deleted profiles intact. `profiles.active` and live `modelRoles` stay last-writer-wins (per-session runtime state).
+
 ## [17.0.2] - 2026-07-17
 
 ### Added

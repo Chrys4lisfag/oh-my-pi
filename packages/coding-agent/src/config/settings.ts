@@ -328,6 +328,8 @@ export class Settings {
 
 	/** Paths modified during this session (for partial save) */
 	#modified = new Set<string>();
+	/** Profile names whose `profiles.items` entry changed this session; merged per-key on save so concurrent omp instances don't clobber each other's profiles. */
+	#modifiedProfileItems = new Map<string, "upsert" | "delete">();
 	/** Individual project model roles modified during this session */
 	#modifiedProjectModelRoles = new Set<string>();
 	/**
@@ -487,6 +489,36 @@ export class Settings {
 	}
 
 	/**
+	 * Upsert a single profile snapshot with per-key persistence. Unlike
+	 * `set("profiles.items", wholeMap)`, only the touched profile name is marked
+	 * dirty, so the background save merges it into the freshest on-disk
+	 * `profiles.items` under the file lock — a concurrent omp instance's
+	 * independently-added profiles survive instead of being clobbered by this
+	 * instance's stale full map.
+	 */
+	setProfileItem(name: string, snapshot: { modelRoles: Record<string, string>; defaultThinkingLevel: string }): void {
+		setByPath(this.#global, ["profiles", "items", name], snapshot);
+		this.#modifiedProfileItems.set(name, "upsert");
+		this.#rebuildMerged();
+		this.#queueSave();
+	}
+
+	/**
+	 * Delete a single profile with per-key persistence (multi-instance safe;
+	 * see {@link setProfileItem}). The deletion is propagated to the freshest
+	 * on-disk map at save time without disturbing sibling profiles.
+	 */
+	deleteProfileItem(name: string): void {
+		const items = getByPath(this.#global, ["profiles", "items"]);
+		if (items && typeof items === "object") {
+			delete (items as Record<string, unknown>)[name];
+		}
+		this.#modifiedProfileItems.set(name, "delete");
+		this.#rebuildMerged();
+		this.#queueSave();
+	}
+
+	/**
 	 * Apply runtime overrides (not persisted).
 	 */
 	override<P extends SettingPath>(path: P, value: SettingValue<P>): void {
@@ -549,7 +581,7 @@ export class Settings {
 		if (this.#projectSavePromise) {
 			await this.#projectSavePromise;
 		}
-		if (this.#modified.size > 0) {
+		if (this.#modified.size > 0 || this.#modifiedProfileItems.size > 0) {
 			await this.#saveNow();
 		}
 		if (this.#modifiedProjectModelRoles.size > 0) {
@@ -1632,11 +1664,14 @@ export class Settings {
 	}
 
 	async #saveNow(): Promise<void> {
-		if (!this.#persist || !this.#configPath || this.#modified.size === 0) return;
+		if (!this.#persist || !this.#configPath) return;
+		if (this.#modified.size === 0 && this.#modifiedProfileItems.size === 0) return;
 
 		const configPath = this.#configPath;
 		const modifiedPaths = [...this.#modified];
 		this.#modified.clear();
+		const modifiedProfileItems = new Map(this.#modifiedProfileItems);
+		this.#modifiedProfileItems.clear();
 
 		try {
 			await withFileLock(configPath, async () => {
@@ -1650,6 +1685,24 @@ export class Settings {
 					setByPath(current, segments, value);
 				}
 
+				// Merge touched profile keys individually so a concurrent omp
+				// instance's independently added/edited profiles survive: never
+				// overwrite the whole `profiles.items` map from this stale copy.
+				for (const [profileName, op] of modifiedProfileItems) {
+					if (op === "delete") {
+						const items = getByPath(current, ["profiles", "items"]);
+						if (items && typeof items === "object") {
+							delete (items as Record<string, unknown>)[profileName];
+						}
+					} else {
+						setByPath(
+							current,
+							["profiles", "items", profileName],
+							getByPath(this.#global, ["profiles", "items", profileName]),
+						);
+					}
+				}
+
 				// Update our global with any external changes we preserved
 				this.#global = current;
 				await Bun.write(configPath, YAML.stringify(this.#global, null, 2));
@@ -1659,6 +1712,11 @@ export class Settings {
 			// Re-add failed paths for retry
 			for (const p of modifiedPaths) {
 				this.#modified.add(p);
+			}
+			for (const [profileName, op] of modifiedProfileItems) {
+				if (!this.#modifiedProfileItems.has(profileName)) {
+					this.#modifiedProfileItems.set(profileName, op);
+				}
 			}
 		}
 

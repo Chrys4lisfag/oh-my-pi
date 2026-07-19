@@ -65,7 +65,7 @@ export function getActiveProfileName(): string | undefined {
  * Throws if the name already exists.
  */
 export function addProfile(name: string, snapshot?: ProfileSnapshot): void {
-	const items = { ...settings.get("profiles.items") };
+	const items = settings.get("profiles.items");
 
 	if (name in items) {
 		throw new Error(`Profile "${name}" already exists`);
@@ -73,11 +73,10 @@ export function addProfile(name: string, snapshot?: ProfileSnapshot): void {
 
 	// Auto-create "default" from current config if no profiles exist
 	if (Object.keys(items).length === 0 && name !== "default") {
-		items.default = captureCurrentSnapshot();
+		settings.setProfileItem("default", captureCurrentSnapshot());
 	}
 
-	items[name] = snapshot ?? captureCurrentSnapshot();
-	settings.set("profiles.items", items);
+	settings.setProfileItem(name, snapshot ?? captureCurrentSnapshot());
 	settings.set("profiles.active", name);
 }
 
@@ -86,9 +85,8 @@ export function addProfile(name: string, snapshot?: ProfileSnapshot): void {
  * Throws if profile not found.
  */
 export function switchProfile(name: string): void {
-	const items = { ...settings.get("profiles.items") };
-	const raw = items[name];
-	const snapshot = asSnapshot(raw);
+	const items = settings.get("profiles.items");
+	const snapshot = asSnapshot(items[name]);
 	if (!snapshot) {
 		throw new Error(`Profile "${name}" not found`);
 	}
@@ -103,17 +101,13 @@ export function switchProfile(name: string): void {
 		return;
 	}
 
-	// Auto-save live config back to the active profile before switching.
-	// Capture everything verbatim — retry fallbacks update the in-memory
-	// model only (they do NOT call setModelRole), so anything landing in
-	// `settings.modelRoles` is explicit user intent (selector, /model, cycle
-	// keybinding) and must be preserved.
+	// Auto-save live config back to the active profile before switching, then
+	// pin the target. Both go through the per-key `setProfileItem` so a
+	// concurrent instance's other profiles are never clobbered on save.
 	if (active && active in items) {
-		items[active] = captureCurrentSnapshot();
+		settings.setProfileItem(active, captureCurrentSnapshot());
 	}
-
-	items[name] = snapshot; // keep the validated copy
-	settings.set("profiles.items", items);
+	settings.setProfileItem(name, snapshot); // keep the validated copy
 	settings.set("modelRoles", snapshot.modelRoles);
 	settings.set("defaultThinkingLevel", snapshot.defaultThinkingLevel as SettingValue<"defaultThinkingLevel">);
 	settings.set("profiles.active", name);
@@ -121,13 +115,12 @@ export function switchProfile(name: string): void {
 
 /** Delete a profile. Throws if not found. Clears active if deleting the active profile. */
 export function deleteProfile(name: string): void {
-	const items = { ...settings.get("profiles.items") };
+	const items = settings.get("profiles.items");
 	if (!(name in items)) {
 		throw new Error(`Profile "${name}" not found`);
 	}
 
-	delete items[name];
-	settings.set("profiles.items", items);
+	settings.deleteProfileItem(name);
 
 	if (getActiveProfileName() === name) {
 		settings.set("profiles.active", "");
@@ -136,7 +129,7 @@ export function deleteProfile(name: string): void {
 
 /** Rename a profile. Throws if old not found or new already exists. */
 export function renameProfile(oldName: string, newName: string): void {
-	const items = { ...settings.get("profiles.items") };
+	const items = settings.get("profiles.items");
 	if (!(oldName in items)) {
 		throw new Error(`Profile "${oldName}" not found`);
 	}
@@ -144,9 +137,12 @@ export function renameProfile(oldName: string, newName: string): void {
 		throw new Error(`Profile "${newName}" already exists`);
 	}
 
-	items[newName] = items[oldName];
-	delete items[oldName];
-	settings.set("profiles.items", items);
+	const snapshot = asSnapshot(items[oldName]);
+	if (!snapshot) {
+		throw new Error(`Profile "${oldName}" is malformed`);
+	}
+	settings.setProfileItem(newName, snapshot);
+	settings.deleteProfileItem(oldName);
 
 	if (getActiveProfileName() === oldName) {
 		settings.set("profiles.active", newName);
@@ -160,9 +156,7 @@ export function saveActiveProfile(): void {
 		throw new Error("No active profile to save");
 	}
 
-	const items = { ...settings.get("profiles.items") };
-	items[active] = captureCurrentSnapshot();
-	settings.set("profiles.items", items);
+	settings.setProfileItem(active, captureCurrentSnapshot());
 }
 
 /**
