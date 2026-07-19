@@ -123,7 +123,12 @@ import type { LspStartupServerInfo } from "../tools";
 import { normalizeLocalScheme } from "../tools/path-utils";
 import { replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "../tools/render-utils";
 import { setAutoQaConsentHandler } from "../tools/report-tool-issue";
-import { formatPhaseDisplayName, todoMatchesAnyDescription } from "../tools/todo";
+import {
+	formatPhaseDisplayName,
+	selectCollapsedTodos,
+	setActiveTodoDescriptionsProvider,
+	todoMatchesAnyDescription,
+} from "../tools/todo";
 import { ToolError } from "../tools/tool-errors";
 import { vocalizer } from "../tts/vocalizer";
 import { renderTreeList } from "../tui/tree-list";
@@ -202,6 +207,8 @@ import type {
 	TodoPhase,
 } from "./types";
 import { UiHelpers } from "./utils/ui-helpers";
+
+const STILL_CLOSING_DELAY_MS = 3_000;
 
 const HINT_SHIMMER_PALETTE: ShimmerPalette = {
 	low: "dim",
@@ -446,6 +453,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	vibeModeEnabled = false;
 	planModePlanFilePath: string | undefined = undefined;
 	loopModeEnabled = false;
+	loopModePaused = false;
 	loopPrompt: string | undefined = undefined;
 	loopLimit: LoopLimitRuntime | undefined = undefined;
 	#loopAutoSubmitTimer: NodeJS.Timeout | undefined;
@@ -691,6 +699,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.errorBannerContainer = new AnchoredLiveContainer();
 		this.modelCycleContainer = new AnchoredLiveContainer();
 		this.editor = new CustomEditor(getEditorTheme());
+		this.ui.enableScopedInputRender(this.editor);
 		this.editor.setUseTerminalCursor(this.ui.getShowHardwareCursor());
 		this.editor.setImeSafeCursorLayout(settings.get("tui.imeSafeCursor"));
 		this.editor.setAutocompleteMaxVisible(settings.get("autocompleteMaxVisible"));
@@ -951,6 +960,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#observerRegistry.onChange(kind => {
 			this.#scheduleObserverUiSync(kind);
 		});
+		// Let the transient todo tool result light up pending todos executed by a
+		// live subagent, matching the sticky HUD's active set (#5873).
+		setActiveTodoDescriptionsProvider(() => this.#getActiveSubagentDescriptions());
 
 		// Load initial todos
 		await this.#loadTodoList();
@@ -1341,6 +1353,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.disableLoopMode("Loop limit reached. Loop mode disabled.");
 			return;
 		}
+		this.#syncLoopModeStatus();
 
 		if (action === "compact") {
 			await this.handleCompactCommand();
@@ -1350,17 +1363,34 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#submitLoopPromptWhenReady(prompt);
 	}
 
+	#syncLoopModeStatus(): void {
+		const state: "waiting" | "running" | "paused" = this.loopModePaused
+			? "paused"
+			: this.loopPrompt
+				? "running"
+				: "waiting";
+		this.statusLine.setLoopModeStatus(this.loopModeEnabled ? { state, limit: this.loopLimit } : undefined);
+		this.ui.requestRender();
+	}
+
 	disableLoopMode(message = "Loop mode disabled."): void {
 		const wasEnabled = this.loopModeEnabled;
 		this.loopModeEnabled = false;
+		this.loopModePaused = false;
 		this.loopPrompt = undefined;
 		this.loopLimit = undefined;
 		this.#cancelLoopAutoSubmit();
-		this.statusLine.setLoopModeStatus(undefined);
-		this.ui.requestRender();
+		this.#syncLoopModeStatus();
 		if (wasEnabled) {
 			this.showStatus(message);
 		}
+	}
+
+	setLoopPrompt(prompt: string): void {
+		if (!this.loopModeEnabled) return;
+		this.loopPrompt = prompt;
+		this.loopModePaused = false;
+		this.#syncLoopModeStatus();
 	}
 
 	/**
@@ -1370,7 +1400,9 @@ export class InteractiveMode implements InteractiveModeContext {
 	 */
 	pauseLoop(): void {
 		this.loopPrompt = undefined;
+		this.loopModePaused = true;
 		this.#cancelLoopAutoSubmit();
+		this.#syncLoopModeStatus();
 	}
 
 	async handleLoopCommand(args = ""): Promise<string | undefined> {
@@ -1384,10 +1416,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			return undefined;
 		}
 		this.loopModeEnabled = true;
+		this.loopModePaused = false;
 		this.loopPrompt = undefined;
 		this.loopLimit = createLoopLimitRuntime(parsed.limit);
-		this.statusLine.setLoopModeStatus({ enabled: true });
-		this.ui.requestRender();
+		this.#syncLoopModeStatus();
 		const limitSuffix = parsed.limit ? ` Limited to ${describeLoopLimit(parsed.limit)}.` : "";
 		const remainingSuffix = this.loopLimit ? ` ${describeLoopLimitRuntime(this.loopLimit)}.` : "";
 		const tail = parsed.prompt ? "Repeating it after each turn." : "Your next prompt will repeat after each turn.";
@@ -1895,15 +1927,29 @@ export class InteractiveMode implements InteractiveModeContext {
 		const isMatched = (todo: TodoItem): boolean =>
 			activeDescs.length > 0 && todoMatchesAnyDescription(todo.content, activeDescs);
 
-		// Task subtree for a phase. Collapsed previews the first open tasks — the
-		// stage's `done/total` makes the hidden count obvious, so there is no
-		// "… more" row; expanded lists every task.
+		// Task subtree for a phase. Collapsed runs the shared walking-viewport
+		// policy (completed/abandoned omitted, active work pulled to the head,
+		// then following pending tasks) so the HUD and the transient tool result
+		// can never disagree about the current work (#5873). Expanded lists all.
 		const renderTasks = (phase: TodoPhase): string[] => {
-			const open = phase.tasks.filter(t => t.status === "pending" || t.status === "in_progress");
-			const base = expanded ? phase.tasks : open.length > 0 ? open : phase.tasks;
-			const items = expanded ? base : base.slice(0, activeTaskCap);
+			if (expanded) {
+				return renderTreeList(
+					{
+						items: phase.tasks,
+						expanded: true,
+						renderItem: todo => this.#formatTodoLine(todo, "", isMatched(todo)),
+					},
+					theme,
+				);
+			}
+			const selection = selectCollapsedTodos(phase.tasks, isMatched, activeTaskCap);
 			return renderTreeList(
-				{ items, expanded: true, renderItem: todo => this.#formatTodoLine(todo, "", isMatched(todo)) },
+				{
+					items: selection.items,
+					itemType: "task",
+					trailingSummary: selection.summary,
+					renderItem: todo => this.#formatTodoLine(todo, "", isMatched(todo)),
+				},
 				theme,
 			);
 		};
@@ -3724,10 +3770,17 @@ export class InteractiveMode implements InteractiveModeContext {
 		// first runs the work, the other awaits the same settled promise.
 		// The teardown is registered lazily in `init()` — a `/exit` reached
 		// before `init()` completed falls back to a direct dispose.
-		if (this.#signalTeardown) {
-			await this.#signalTeardown();
-		} else {
-			await this.session.dispose({ mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS });
+		const stillClosingTimer = setTimeout(() => {
+			this.showStatus("Still closing… (flushing memory backend / network)");
+		}, STILL_CLOSING_DELAY_MS);
+		try {
+			if (this.#signalTeardown) {
+				await this.#signalTeardown();
+			} else {
+				await this.session.dispose({ mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS });
+			}
+		} finally {
+			clearTimeout(stillClosingTimer);
 		}
 
 		// Do not force a final render during teardown: disposed session/UI state can
@@ -3772,6 +3825,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		const nextEditor = factory
 			? factory(this.ui, getEditorTheme(), this.keybindings)
 			: new CustomEditor(getEditorTheme());
+		if (!factory) this.ui.enableScopedInputRender(nextEditor);
 
 		nextEditor.setUseTerminalCursor(this.ui.getShowHardwareCursor());
 		nextEditor.setImeSafeCursorLayout(this.settings.get("tui.imeSafeCursor"));
