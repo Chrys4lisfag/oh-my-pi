@@ -15,24 +15,20 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 
 const SNAP = { modelRoles: { default: "anthropic/claude-sonnet-4" }, defaultThinkingLevel: "high" };
 
 describe("profiles multi-instance persistence", () => {
 	let dir: string;
-	const created: Settings[] = [];
 
 	beforeEach(async () => {
 		dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-profiles-"));
 	});
 
 	afterEach(async () => {
-		// Close each instance's agent.db handle so Windows can delete the temp dir.
-		for (const s of created.splice(0)) {
-			try {
-				s.getStorage()?.close();
-			} catch {}
-		}
+		// Close all agent.db handles so Windows can delete the temp dir.
+		AgentStorage.resetInstance();
 		try {
 			await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 		} catch {
@@ -42,7 +38,6 @@ describe("profiles multi-instance persistence", () => {
 
 	async function load() {
 		const s = await Settings.loadIsolated({ agentDir: dir, cwd: dir });
-		created.push(s);
 		return s;
 	}
 

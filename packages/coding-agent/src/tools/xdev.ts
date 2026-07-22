@@ -38,11 +38,14 @@ import { ToolError } from "./tool-errors";
 /**
  * Discoverable built-ins that must stay top-level even when xdev mounting is
  * active: `todo` feeds the todo prelude/prewalk machinery, `ask` is the
- * model's user-interaction affordance, and `grep` is the redirect target of
- * the bash interceptor rules — each loses its harness integration if hidden
- * behind dispatch. `recall`/`reflect` (fork) are pinned top-level so the
- * long-term-memory read path stays a first-class tool the model reaches for
- * by default rather than through `write xd://…`.
+ * model's user-interaction affordance, `grep` is the redirect target of the
+ * bash interceptor rules, and `web_search` is invoked directly by most models
+ * (which have no notion of the `xd://` protocol) so hiding it behind dispatch
+ * makes it unreachable in practice (issue #5973) — each loses its harness
+ * integration or usability if hidden behind dispatch. `recall`/`reflect`
+ * (fork) are pinned top-level so the long-term-memory read path stays a
+ * first-class tool the model reaches for by default rather than through
+ * `write xd://…`.
  */
 export const XDEV_KEEP_TOP_LEVEL: Record<string, true> = {
 	todo: true,
@@ -50,6 +53,7 @@ export const XDEV_KEEP_TOP_LEVEL: Record<string, true> = {
 	grep: true,
 	recall: true,
 	reflect: true,
+	web_search: true,
 };
 
 /**

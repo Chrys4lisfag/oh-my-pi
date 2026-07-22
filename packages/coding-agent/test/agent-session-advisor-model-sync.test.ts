@@ -25,11 +25,11 @@
  * The reference harness (real ModelRegistry(authStorage) + new AgentSession)
  * mirrors `advisor-toggle.test.ts` and `model-registry-models-updated.test.ts`.
  */
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { Effort, type Model } from "@oh-my-pi/pi-ai";
-import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { type GeneratedProvider, getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -50,7 +50,7 @@ const SWAP_MODEL_ID = "claude-haiku-4-5"; // model B (same provider, so one key 
 const LATE_PROVIDER = "kimi-code";
 const LATE_MODEL_ID = "kimi-for-coding"; // model C — held back by missing runtime key
 
-function getModelOrThrow(provider: string, id: string): Model {
+function getModelOrThrow(provider: GeneratedProvider, id: string): Model {
 	const model = getBundledModel(provider, id);
 	if (!model) throw new Error(`Expected bundled model ${provider}/${id}`);
 	return model;

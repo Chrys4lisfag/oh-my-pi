@@ -22,6 +22,7 @@ import {
 	saveActiveProfile,
 	switchProfile,
 } from "../../config/profiles";
+import { type BashResult, isPersistentShellCdCommand } from "../../exec/bash-executor";
 import { type LoadedCustomShare, loadCustomShare } from "../../export/custom-share";
 import { shareSession } from "../../export/share";
 import type { CompactOptions } from "../../extensibility/extensions/types";
@@ -1221,6 +1222,12 @@ export class CommandController {
 
 	async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {
 		const isDeferred = this.ctx.session.isStreaming;
+		const shouldPersistCwd = isPersistentShellCdCommand(command);
+		if (isDeferred && shouldPersistCwd) {
+			this.ctx.showWarning("Wait for the current response to finish or abort it before changing directories.");
+			return;
+		}
+
 		this.ctx.bashComponent = new BashExecutionComponent(command, this.ctx.ui, excludeFromContext);
 
 		if (isDeferred) {
@@ -1241,13 +1248,21 @@ export class CommandController {
 				},
 				{ excludeFromContext, useUserShell: true },
 			);
-
 			if (this.ctx.bashComponent) {
 				const meta = outputMeta().truncationFromSummary(result, { direction: "tail" }).get();
 				this.ctx.bashComponent.setComplete(result.exitCode, result.cancelled, {
 					output: result.output,
 					truncation: meta?.truncation,
 				});
+			}
+			try {
+				if (shouldPersistCwd) await this.#applyBashResultCwd(result);
+			} catch (error) {
+				this.ctx.showError(
+					`Bash command completed, but OMP failed to update its working directory: ${
+						error instanceof Error ? error.message : "Unknown error"
+					}`,
+				);
 			}
 		} catch (error) {
 			if (this.ctx.bashComponent) {
@@ -1258,6 +1273,31 @@ export class CommandController {
 
 		this.ctx.bashComponent = undefined;
 		this.ctx.ui.requestRender();
+	}
+
+	async #moveInteractiveCwd(resolvedPath: string): Promise<void> {
+		await this.ctx.sessionManager.moveTo(resolvedPath);
+		await this.ctx.applyCwdChange(resolvedPath);
+		this.ctx.updateEditorBorderColor();
+		await this.ctx.reloadTodos();
+	}
+
+	async #applyBashResultCwd(result: BashResult): Promise<void> {
+		if (result.cancelled || result.exitCode !== 0 || !result.workingDir) return;
+		if (!path.isAbsolute(result.workingDir)) return;
+
+		const resolvedPath = path.resolve(result.workingDir);
+		if (resolvedPath === path.resolve(this.ctx.sessionManager.getCwd())) return;
+
+		let isDirectory = false;
+		try {
+			isDirectory = (await fs.stat(resolvedPath)).isDirectory();
+		} catch {
+			isDirectory = false;
+		}
+		if (!isDirectory) return;
+
+		await this.#moveInteractiveCwd(resolvedPath);
 	}
 
 	async handlePythonCommand(code: string, excludeFromContext = false): Promise<void> {
