@@ -13,17 +13,32 @@ import type { HindsightConfig } from "./config";
 
 const USER_AGENT = "oh-my-pi-coding-agent";
 const DEFAULT_USER_AGENT = USER_AGENT;
-const HINDSIGHT_REQUEST_TIMEOUT_MS = 30_000;
+/** Fallback deadlines (ms) applied when the caller supplies no override. */
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_REFLECT_TIMEOUT_MS = 120_000;
+const DEFAULT_RECALL_TIMEOUT_MS = 30_000;
+const DEFAULT_RETAIN_TIMEOUT_MS = 60_000;
 
 export type Budget = "low" | "mid" | "high" | string;
 export type TagsMatch = "any" | "all" | "any_strict" | "all_strict";
 export type UpdateMode = "replace" | "append";
 export type ConsolidationState = "failed" | "pending" | "done";
 
+/** Per-operation request deadlines (ms). Each falls back to a built-in default. */
+export interface HindsightTimeouts {
+	/** Default deadline for ops without a specific override. */
+	request?: number;
+	reflect?: number;
+	recall?: number;
+	retain?: number;
+}
+
 export interface HindsightApiOptions {
 	baseUrl: string;
 	apiKey?: string;
 	userAgent?: string;
+	/** Per-op deadlines; unset entries fall back to built-in defaults. */
+	timeouts?: HindsightTimeouts;
 }
 
 /** Caller cancellation shared by Hindsight request option bags. */
@@ -218,13 +233,17 @@ interface RequestOptions {
 	/** Return null instead of throwing on a 404 response. */
 	allow404?: boolean;
 	signal?: AbortSignal;
-	/** Per-request timeout override (ms); defaults to HINDSIGHT_REQUEST_TIMEOUT_MS. */
+	/** Op deadline (ms); defaults to the client's request timeout. */
 	timeoutMs?: number;
 }
 
 export class HindsightApi {
 	#baseUrl: string;
 	#headers: Record<string, string>;
+	#reflectTimeoutMs: number;
+	#recallTimeoutMs: number;
+	#retainTimeoutMs: number;
+	#requestTimeoutMs: number;
 
 	constructor(options: HindsightApiOptions) {
 		this.#baseUrl = options.baseUrl.replace(/\/+$/, "");
@@ -235,6 +254,11 @@ export class HindsightApi {
 		if (options.apiKey) {
 			this.#headers.Authorization = `Bearer ${options.apiKey}`;
 		}
+		const timeouts = options.timeouts;
+		this.#requestTimeoutMs = timeouts?.request ?? DEFAULT_REQUEST_TIMEOUT_MS;
+		this.#reflectTimeoutMs = timeouts?.reflect ?? DEFAULT_REFLECT_TIMEOUT_MS;
+		this.#recallTimeoutMs = timeouts?.recall ?? DEFAULT_RECALL_TIMEOUT_MS;
+		this.#retainTimeoutMs = timeouts?.retain ?? DEFAULT_RETAIN_TIMEOUT_MS;
 	}
 
 	async retain(bankId: string, content: string, options?: RetainOptions): Promise<RetainResponse> {
@@ -255,6 +279,7 @@ export class HindsightApi {
 			{
 				body: { items: [item], async: options?.async },
 				signal: options?.signal,
+				timeoutMs: this.#retainTimeoutMs,
 			},
 		);
 	}
@@ -286,6 +311,7 @@ export class HindsightApi {
 					async: options?.async,
 				},
 				signal: options?.signal,
+				timeoutMs: this.#retainTimeoutMs,
 			},
 		);
 	}
@@ -305,6 +331,7 @@ export class HindsightApi {
 					tags_match: options?.tagsMatch,
 				},
 				signal: options?.signal,
+				timeoutMs: this.#recallTimeoutMs,
 			},
 		);
 	}
@@ -323,7 +350,7 @@ export class HindsightApi {
 					tags_match: options?.tagsMatch,
 				},
 				signal: options?.signal,
-				timeoutMs: options?.timeoutMs,
+				timeoutMs: options?.timeoutMs ?? this.#reflectTimeoutMs,
 			},
 		);
 	}
@@ -511,7 +538,7 @@ export class HindsightApi {
 			if (qs) url += `?${qs}`;
 		}
 
-		const timeoutMs = opts?.timeoutMs ?? HINDSIGHT_REQUEST_TIMEOUT_MS;
+		const timeoutMs = opts?.timeoutMs ?? this.#requestTimeoutMs;
 		const init: RequestInit = {
 			method,
 			headers: this.#headers,
@@ -645,5 +672,11 @@ export function createHindsightClient(config: HindsightConfig & { hindsightApiUr
 		baseUrl: config.hindsightApiUrl,
 		apiKey: config.hindsightApiToken ?? undefined,
 		userAgent: USER_AGENT,
+		timeouts: {
+			request: config.requestTimeoutMs,
+			reflect: config.reflectTimeoutMs,
+			recall: config.recallTimeoutMs,
+			retain: config.retainTimeoutMs,
+		},
 	});
 }
