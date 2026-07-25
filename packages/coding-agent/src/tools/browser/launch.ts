@@ -34,10 +34,10 @@ const ENABLE_AUTOMATION_FLAG = "--enable-automation";
 // them via `ignoreDefaultArgs` (the supported escape hatch) to mirror xxxx's
 // chromiumSwitches patch. `--enable-automation` is the loudest: it normally sets
 // navigator.webdriver=true and shows the "controlled by automated software" infobar.
-// Edge is the launch-stability exception: it can exit before CDP opens when this
-// default flag is stripped, so Edge keeps Puppeteer's flag while our explicit
+// Launch-stability exceptions keep that flag while our explicit
 // `--disable-blink-features=AutomationControlled` launch arg still handles
-// navigator.webdriver.
+// navigator.webdriver. Edge needs it on every platform; current Windows Chrome
+// can otherwise exit cleanly before opening CDP, with no stderr.
 // `ignoreDefaultArgs` does exact-string matching, so each entry must be a flag that
 // puppeteer emits verbatim. The default `--disable-features=...` string can't be
 // matched this way; it is neutralized in the puppeteer-core patch (ChromeLauncher).
@@ -65,7 +65,9 @@ function isMicrosoftEdgeExecutable(executablePath: string | undefined): boolean 
 }
 
 function stealthIgnoreDefaultArgs(executablePath: string | undefined): string[] {
-	if (!isMicrosoftEdgeExecutable(executablePath)) return [...STEALTH_IGNORE_DEFAULT_ARGS];
+	if (process.platform !== "win32" && !isMicrosoftEdgeExecutable(executablePath)) {
+		return [...STEALTH_IGNORE_DEFAULT_ARGS];
+	}
 	return STEALTH_IGNORE_DEFAULT_ARGS.filter(arg => arg !== ENABLE_AUTOMATION_FLAG);
 }
 

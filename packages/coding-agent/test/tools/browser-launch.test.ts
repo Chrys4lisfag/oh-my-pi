@@ -25,11 +25,15 @@ describe("browser launch stealth defaults", () => {
 		}
 	});
 
-	it("continues filtering Puppeteer's automation default for Chrome and Chromium executables", () => {
+	it("keeps Puppeteer's automation default for Chrome on Windows", () => {
 		for (const executablePath of CHROME_EXECUTABLE_PATHS) {
 			const ignoreDefaultArgs = stealthIgnoreDefaultArgsForTest(executablePath);
 
-			expect(ignoreDefaultArgs).toContain(AUTOMATION_FLAG);
+			if (process.platform === "win32") {
+				expect(ignoreDefaultArgs).not.toContain(AUTOMATION_FLAG);
+			} else {
+				expect(ignoreDefaultArgs).toContain(AUTOMATION_FLAG);
+			}
 		}
 	});
 });
