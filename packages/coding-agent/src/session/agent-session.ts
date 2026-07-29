@@ -35,6 +35,8 @@ import {
 	type AgentTurnEndContext,
 	AppendOnlyContextManager,
 	type AsideMessage,
+	type BeforeToolCallContext,
+	type BeforeToolCallResult,
 	resolveTelemetry,
 	type StreamFn,
 	TERMINAL_TOOL_RESULT_ABORT_REASON,
@@ -70,8 +72,9 @@ import type {
 	ToolChoice,
 	ToolResultMessage,
 	UsageReport,
+	UserMessage,
 } from "@oh-my-pi/pi-ai";
-import { deriveClaudeDeviceId, type Effort, streamSimple } from "@oh-my-pi/pi-ai";
+import { type Effort, streamSimple } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
@@ -81,7 +84,6 @@ import {
 	escapeXmlText,
 	formatDuration,
 	getAgentDbPath,
-	getInstallId,
 	isBunTestRuntime,
 	isEnoent,
 	isInteractiveHost,
@@ -134,6 +136,7 @@ import type { CompactOptions, ContextUsage } from "../extensibility/extensions/t
 import type { HookCommandContext } from "../extensibility/hooks/types";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
+import { normalizeToolEventInput, resolveToolEventInput } from "../extensibility/tool-event-input";
 import { GoalRuntime } from "../goals/runtime";
 import type { GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
@@ -177,6 +180,7 @@ import {
 	toReasoningEffort,
 } from "../thinking";
 import { shutdownTinyTitleClient } from "../tiny/title-client";
+import { resolveApproval } from "../tools/approval";
 import { type AskToolDetails, type AskToolInput, recoverAskQuestions } from "../tools/ask";
 import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
 import type { CheckpointState, CompletedRewindState } from "../tools/checkpoint";
@@ -197,6 +201,7 @@ import type { EditMode } from "../utils/edit-mode";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { extractFileMentions, generateFileMentionMessages } from "../utils/file-mentions";
 import { normalizeModelContextImages } from "../utils/image-loading";
+import type { InspectImageMode } from "../utils/inspect-image-mode";
 import { generateSessionTitle } from "../utils/title-generator";
 import { buildNamedToolChoice, isToolChoiceActive } from "../utils/tool-choice";
 import type { VibeModeState } from "../vibe/state";
@@ -229,7 +234,6 @@ import {
 	type AsyncResultEntry,
 	buildAsyncResultBatchMessage,
 } from "./async-job-delivery";
-import type { AuthStorage } from "./auth-storage";
 import { BashRunner, type BashRunnerHost } from "./bash-runner";
 import {
 	checkpointStartedAtFromEntry,
@@ -304,6 +308,7 @@ import {
 } from "./session-maintenance";
 import { cleanupEmptyMoveSession, type SessionManager } from "./session-manager";
 import { SessionMemory, type SessionMemoryHost } from "./session-memory";
+import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
 import { SessionTools, type SessionToolsHost } from "./session-tools";
@@ -329,53 +334,6 @@ const PLAN_MODE_REMINDER_MAX = 3;
 // ============================================================================
 // Constants
 // ============================================================================
-
-/** Standard thinking levels */
-
-/**
- * Build the per-request `metadata` payload for the Anthropic provider, shaped
- * like real Claude Code's `getAPIMetadata` output (`{ session_id, account_uuid,
- * device_id }`) so the backend buckets requests under one session and attributes
- * them to the authenticated OAuth account when available. Resolved at request
- * time so token refreshes and login/logout transitions don't strand a stale
- * account UUID in memory. `account_uuid` and `device_id` are omitted for
- * non-Anthropic providers to avoid leaking the user's Claude identity to
- * third-party APIs (including Anthropic-format-compatible proxies such as
- * cloudflare-ai-gateway or gitlab-duo).
- *
- * `provider` is the target provider string (e.g. `"anthropic"`) and gates the
- * `account_uuid` and `device_id` lookups — only `"anthropic"` requests carry them.
- *
- * `sessionId` is forwarded to the auth-storage session-sticky lookup so that
- * multi-credential setups attribute to the same OAuth account used for the
- * actual API request rather than always picking the first credential.
- *
- * `authStorage` is treated as optional so test fixtures that stub `modelRegistry`
- * without a real storage layer still work; the resolver simply skips the lookup
- * and emits `{ session_id }` alone, matching the no-OAuth-credential path.
- */
-function buildSessionMetadata(
-	sessionId: string,
-	provider: string,
-	authStorage: AuthStorage | undefined,
-): Record<string, unknown> {
-	const userId: Record<string, string> = { session_id: sessionId };
-	// Only look up account_uuid when the request is going to Anthropic. Injecting
-	// a Claude OAuth account_uuid into requests bound for other providers (including
-	// Anthropic-format-compatible proxies like cloudflare-ai-gateway or gitlab-duo)
-	// would leak the user's Anthropic identity to unrelated third-party APIs.
-	if (provider === "anthropic") {
-		const accountUuid = authStorage?.getOAuthAccountId("anthropic", sessionId);
-		if (typeof accountUuid === "string" && accountUuid.length > 0) {
-			userId.account_uuid = accountUuid;
-			// Claude Code's `device_id` is a stable 64-hex account-scoped install
-			// identifier. Include both omp's persistent install id and the Claude
-			// account UUID so two accounts on the same install do not share a device.
-			userId.device_id = deriveClaudeDeviceId(getInstallId(), accountUuid);
-		}
-	}
-	return { user_id: JSON.stringify(userId) };
-}
 
 const noOpUIContext: ExtensionUIContext = {
 	select: async (_title, _options, _dialogOptions) => undefined,
@@ -429,7 +387,7 @@ type ScheduledAgentContinueOptions = {
 	generation?: number;
 	shouldContinue?: () => boolean;
 	onSkip?: (reason: AgentContinueSkipReason) => void;
-	onError?: () => void;
+	onError?: (error: unknown) => void;
 };
 
 type SessionTitleSource = "auto" | "user";
@@ -478,6 +436,8 @@ export class AgentSession {
 	#scheduledHiddenNextTurnGeneration: number | undefined = undefined;
 	#queuedMessageDrainScheduled = false;
 	#planModeState: PlanModeState | undefined;
+	/** Session-scoped `/vision` override; undefined = follow persisted `inspect_image.mode`. */
+	#inspectImageModeOverride: InspectImageMode | undefined;
 	#vibeModeState: VibeModeState | undefined;
 	#goalModeState: GoalModeState | undefined;
 	#goalRuntime: GoalRuntime;
@@ -528,6 +488,13 @@ export class AgentSession {
 	readonly #asyncJobManager: AsyncJobManager | undefined;
 	/** Clears this session's owner delivery sink registration; set when a manager + agent id exist. */
 	#unregisterAsyncDeliverySink: (() => void) | undefined;
+	/**
+	 * Async-delivery generation, bumped on every session transition that evicts
+	 * this owner's jobs (see {@link AgentSession.#cancelOwnAsyncJobs}). Stamped
+	 * onto each queued async-result follow-up so a delivery formatted or drained
+	 * across a `/new` is dropped regardless of job-id reuse.
+	 */
+	#asyncDeliveryEpoch = 0;
 
 	readonly #irc: IrcBridge;
 	// Agent identity (registry id) used for IRC routing and job ownership.
@@ -902,6 +869,7 @@ export class AgentSession {
 			agent: this.agent,
 			sessionManager: this.sessionManager,
 			model: () => this.model,
+			configuredThinkingLevel: () => this.configuredThinkingLevel(),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
 			setModelTemporary: (model, thinkingLevel, options) => this.setModelTemporary(model, thinkingLevel, options),
 			setActiveToolsByName: names => this.setActiveToolsByName(names),
@@ -959,6 +927,7 @@ export class AgentSession {
 		this.#models = new ModelControls(modelControlsHost, {
 			scopedModels: config.scopedModels,
 			thinkingLevel: config.thinkingLevel,
+			thinkingLevelCeiling: config.thinkingLevelCeiling,
 			serviceTierByFamily: config.serviceTierByFamily,
 		});
 
@@ -976,6 +945,7 @@ export class AgentSession {
 			thinkingLevel: () => this.thinkingLevel,
 			configuredThinkingLevel: () => this.configuredThinkingLevel(),
 			setThinkingLevel: level => this.setThinkingLevel(level),
+			thinkingLevelCeiling: () => this.#models.thinkingLevelCeiling,
 			isDisposed: () => this.#isDisposed,
 			isStreaming: () => this.isStreaming,
 			isCompacting: () => this.isCompacting,
@@ -1127,20 +1097,24 @@ export class AgentSession {
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
 			notifyCommandMetadataChanged: () => this.#notifyCommandMetadataChanged(),
 			localProtocolOptions: () => this.#localProtocolOptions(),
+			getInspectImageModeOverride: () => this.#inspectImageModeOverride,
+			setInspectImageModeOverride: mode => {
+				this.#inspectImageModeOverride = mode;
+			},
 		};
 		this.#tools = new SessionTools(sessionToolsHost, {
 			autoApprove: config.autoApprove,
 			toolRegistry: config.toolRegistry,
 			createVibeTools: config.createVibeTools,
 			createComputerTool: config.createComputerTool,
+			createInspectImageTool: config.createInspectImageTool,
 			builtInToolNames: config.builtInToolNames,
 			presentationPinnedToolNames: config.presentationPinnedToolNames,
 			ensureWriteRegistered: config.ensureWriteRegistered,
 			rebuildSystemPrompt: config.rebuildSystemPrompt,
 			getLocalCalendarDate: config.getLocalCalendarDate,
 			getMcpServerInstructions: config.getMcpServerInstructions,
-			xdevRegistry: config.xdevRegistry,
-			initialMountedXdevToolNames: config.initialMountedXdevToolNames,
+			xdev: config.xdev,
 			setActiveToolNames: config.setActiveToolNames,
 			baseSystemPrompt: this.agent.state.systemPrompt,
 			skills: config.skills,
@@ -1207,7 +1181,7 @@ export class AgentSession {
 				this.#deliverAsyncJobResult(manager, jobId, text, job),
 			);
 			this.yieldQueue.register<AsyncResultEntry>("async-result", {
-				isStale: entry => manager.isDeliverySuppressed(entry.jobId),
+				isStale: entry => entry.epoch !== this.#asyncDeliveryEpoch || manager.isDeliverySuppressed(entry.jobId),
 				build: buildAsyncResultBatchMessage,
 			});
 		}
@@ -1223,6 +1197,10 @@ export class AgentSession {
 		});
 		// Tool-result hook owns synchronous post-tool actions that must affect the current loop.
 		this.agent.afterToolCall = ctx => this.#afterToolCall(ctx);
+		// Pre-scheduling tool_call wiring: extension handlers run at arg-prep
+		// time so a block/revision lands before concurrency resolution,
+		// tool_execution_start, and the wrapper's approval gate.
+		this.agent.beforeToolCall = ctx => this.#beforeToolCall(ctx);
 		this.agent.providerSessionState = this.#providerSessionState;
 		this.#syncAgentSessionId();
 		this.#todo.syncFromBranch();
@@ -1523,7 +1501,7 @@ export class AgentSession {
 
 		this.#toolChoiceQueue.pushSequence([forced, "none"], {
 			label: "user-force",
-			onRejected: () => "requeue",
+			onRejected: info => (info.reason === "unavailable" ? "drop_sequence" : "requeue"),
 		});
 	}
 
@@ -1646,7 +1624,9 @@ export class AgentSession {
 	 * transitions (newSession, switchSession, handoff, dispose) so a subagent
 	 * cleans up its own background work without touching its parent's jobs.
 	 *
-	 * Cancellation runs against this session's scoped manager. Subagents have
+	 * Cleanup runs against this session's scoped manager: running jobs are
+	 * cancelled, finished rows are evicted with their pending deliveries, and any
+	 * async-result follow-up already queued for injection is dropped. Subagents have
 	 * unique agent ids and inherit the parent's manager to clean up their own
 	 * jobs. A secondary in-process top-level session gets no scoped manager,
 	 * because it defaults to `MAIN_AGENT_ID`; reaching through the global
@@ -1659,6 +1639,12 @@ export class AgentSession {
 		if (!this.#agentId) return;
 		const manager = this.#asyncJobManager;
 		manager?.cancelAll({ ownerId: this.#agentId });
+		manager?.evictCompletedJobs({ ownerId: this.#agentId });
+		// Invalidate this owner's in-flight/drained deliveries against the new
+		// generation, then drop any async-result follow-up already queued, so a
+		// prior session's background result cannot inject into the next transcript.
+		this.#asyncDeliveryEpoch += 1;
+		this.yieldQueue.clear("async-result");
 	}
 
 	/**
@@ -1724,10 +1710,17 @@ export class AgentSession {
 	async #deliverAsyncJobResult(manager: AsyncJobManager, jobId: string, text: string, job?: AsyncJob): Promise<void> {
 		if (this.#isDisposed) return;
 		if (manager.isDeliverySuppressed(jobId)) return;
+		// Snapshot the generation before the async format step: a `/new` during it
+		// bumps the epoch, so this delivery belongs to the replaced session and
+		// must not enqueue — the suppression marker alone is unreliable because
+		// job-id reuse clears it.
+		const epoch = this.#asyncDeliveryEpoch;
 		const formatted = await this.#formatAsyncResultForFollowUp(text);
+		if (this.#isDisposed) return;
+		if (epoch !== this.#asyncDeliveryEpoch) return;
 		if (manager.isDeliverySuppressed(jobId)) return;
 		const durationMs = job ? Math.max(0, Date.now() - job.startTime) : undefined;
-		this.yieldQueue.enqueue<AsyncResultEntry>("async-result", { jobId, result: formatted, job, durationMs });
+		this.yieldQueue.enqueue<AsyncResultEntry>("async-result", { jobId, result: formatted, job, durationMs, epoch });
 	}
 
 	async #formatAsyncResultForFollowUp(result: string): Promise<string> {
@@ -2254,7 +2247,7 @@ export class AgentSession {
 		// Deobfuscate assistant message content for display emission — the LLM echoes back
 		// obfuscated placeholders, but listeners (TUI, extensions, exporters) must see real
 		// values. The original event.message stays obfuscated so the persistence path below
-		// writes `#HASH#` tokens to the session file; convertToLlm re-obfuscates outbound
+		// writes `$$HASH$$` tokens to the session file; convertToLlm re-obfuscates outbound
 		// traffic on the next turn. Walks text, thinking, and toolCall arguments/intent.
 		let displayEvent: AgentEvent = event;
 		const obfuscator = this.#obfuscator;
@@ -2638,8 +2631,14 @@ export class AgentSession {
 				return;
 			}
 
-			if (this.#recovery.isRetryableReasonlessAbort(msg)) {
-				const didRetry = await this.#recovery.handleRetryableError(msg, { allowModelFallback: false });
+			const resolvedInterruptedToolTurn = this.#recovery.classifyResolvedInterruptedToolTurn(msg);
+			if (this.#recovery.isRetryableReasonlessAbort(msg) || resolvedInterruptedToolTurn === "reasonless-abort") {
+				const didRetry = await this.#recovery.handleRetryableError(
+					msg,
+					resolvedInterruptedToolTurn === "reasonless-abort"
+						? { allowModelFallback: false, preserveFailedTurn: true }
+						: { allowModelFallback: false },
+				);
 				if (didRetry) {
 					await emitAgentEndNotification({ willContinue: true });
 					return;
@@ -2665,7 +2664,7 @@ export class AgentSession {
 					return;
 				}
 			}
-			const resumeResolvedStreamStall = this.#recovery.canResumeResolvedStreamStall(msg);
+			const resumeResolvedStreamStall = resolvedInterruptedToolTurn === "stream-stall";
 			if (resumeResolvedStreamStall || this.#recovery.isRetryableError(msg)) {
 				const didRetry = await this.#recovery.handleRetryableError(
 					msg,
@@ -2865,7 +2864,7 @@ export class AgentSession {
 						error: error instanceof Error ? error.message : String(error),
 						stack: error instanceof Error ? error.stack : undefined,
 					});
-					options?.onError?.();
+					options?.onError?.(error);
 				} finally {
 					this.#endInFlight();
 				}
@@ -3006,6 +3005,50 @@ export class AgentSession {
 		}
 		return this.#ttsr.afterToolCall(ctx);
 	}
+	/**
+	 * Emits the extension `tool_call` event for a loop-dispatched call at
+	 * arg-prep time — before concurrency scheduling, `tool_execution_start`,
+	 * and the wrapper's approval gate. A handler block becomes a blocked tool
+	 * result; a handler `input` revision becomes the arguments the loop
+	 * schedules, displays, persists, and executes, so approval resolves against
+	 * what actually runs. Marks the dispatch so `ExtensionToolWrapper` does not
+	 * emit a second event (nested xd:// device dispatches and direct non-loop
+	 * execution still emit there).
+	 */
+	async #beforeToolCall(ctx: BeforeToolCallContext): Promise<BeforeToolCallResult | undefined> {
+		const runner = this.#extensionRunner;
+		if (!runner?.hasHandlers("tool_call")) return undefined;
+		const metadata = ctx.toolCall.providerMetadata;
+		const computer = metadata?.type === "computer" ? metadata : undefined;
+		// Parity with the wrapper's pre-emit short-circuit: an already-denied
+		// call never reaches extensions. Deny is mode-independent (tool decision
+		// or user policy), so resolving under the most permissive mode is exact;
+		// the wrapper still enforces the mode-accurate gate before execution.
+		const userPolicies = (this.settings.get("tools.approval") ?? {}) as Record<string, unknown>;
+		const approvalArgs = computer ? { actions: computer.actions } : ctx.args;
+		if (resolveApproval(ctx.tool, approvalArgs, "yolo", userPolicies).policy === "deny") {
+			return undefined;
+		}
+		const eventArgs = computer
+			? { actions: computer.actions, pendingSafetyChecks: computer.pendingSafetyChecks }
+			: ctx.args;
+		runner.markToolCallEmitted(ctx.toolCall.id, ctx.tool.name);
+		const callResult = await runner.emitToolCall({
+			type: "tool_call",
+			toolName: ctx.tool.name,
+			toolCallId: ctx.toolCall.id,
+			input: normalizeToolEventInput(ctx.tool.name, resolveToolEventInput(ctx.tool, eventArgs)),
+		});
+		if (callResult?.block) {
+			return { block: true, reason: callResult.reason || "Tool execution was blocked by an extension" };
+		}
+		// A computer call's event input is a synthetic {actions, pendingSafetyChecks}
+		// view, not the execution params — a revision cannot map back onto them.
+		if (callResult?.input !== undefined && !computer) {
+			return { args: callResult.input };
+		}
+		return undefined;
+	}
 
 	/** Find the last assistant message in agent state (including aborted ones) */
 	#findLastAssistantMessage(): AssistantMessage | undefined {
@@ -3084,6 +3127,7 @@ export class AgentSession {
 			session_id: this.sessionId,
 			session_file: this.sessionFile,
 			stop_hook_active: this.#sessionStopHookActive,
+			signal: this.#postPromptTasksAbortController.signal,
 		});
 		if (this.#promptGeneration !== generation || this.#abortInProgress || this.#isDisposed) {
 			this.#resetSessionStopContinuationState();
@@ -3342,6 +3386,12 @@ export class AgentSession {
 		this.agent.setMetadataResolver((provider: string) =>
 			buildSessionMetadata(sid, provider, this.#modelRegistry.authStorage),
 		);
+		// Keep every live advisor's provider identity in lockstep with the primary's
+		// across every session-boundary transition — including branch paths that
+		// skip conversation restore — so advisors never emit the previous
+		// conversation's session id/metadata (issue #6625). Guarded because this
+		// runs once during construction before the advisor controller exists.
+		if (this.#advisors) this.#advisors.refreshProviderIdentity();
 	}
 
 	/** Run one abortable auto-learn capture outside the primary agent loop. */
@@ -3992,6 +4042,34 @@ export class AgentSession {
 		return this.#tools.setComputerToolEnabled(enabled);
 	}
 
+	/**
+	 * Session-scoped inspect_image mode (`/vision`). `auto` clears the override
+	 * and returns to the persisted `inspect_image.mode` setting; `on`/`off`
+	 * force the tool for this session only. See {@link SessionTools.setInspectImageMode}.
+	 */
+	setInspectImageMode(mode: InspectImageMode): Promise<boolean> {
+		return this.#tools.setInspectImageMode(mode);
+	}
+
+	/** Effective inspect_image state for `/vision status`. */
+	inspectImageState(): { mode: InspectImageMode; active: boolean; model: string | undefined } {
+		return this.#tools.inspectImageState();
+	}
+
+	/** Session-scoped `/vision` override; undefined means "follow the persisted setting". */
+	getInspectImageModeOverride(): InspectImageMode | undefined {
+		return this.#inspectImageModeOverride;
+	}
+
+	/**
+	 * Reconciles the inspect_image tool set after the persisted
+	 * `inspect_image.mode` setting changed (e.g. via the settings selector), so
+	 * the new value takes effect immediately instead of on the next model switch.
+	 */
+	applyInspectImageModeChange(): Promise<boolean> {
+		return this.#tools.reconcileInspectImageTool();
+	}
+
 	/** Cancels the local rollout-memory startup owned by this session. */
 	cancelLocalMemoryStartup(): void {
 		this.#memory.cancelLocalMemoryStartup();
@@ -4107,10 +4185,7 @@ export class AgentSession {
 	 * Transcript for TUI display. Full history is kept for export/resume-style
 	 * callers; live chat can collapse compacted history to keep the hot render
 	 * surface bounded. Display-only — NEVER feed the result to
-	 * `agent.replaceMessages` or a provider. Because it is never re-obfuscated,
-	 * it opts into legacy index-derived alias restoration so pre-keyed sessions
-	 * still render their secrets; the agent-feeding paths
-	 * (`buildDisplaySessionContext`) keep the keyed-only default.
+	 * `agent.replaceMessages` or a provider.
 	 */
 	buildTranscriptSessionContext(
 		options?: Pick<BuildSessionContextOptions, "collapseCompactedHistory" | "keepDanglingToolCalls">,
@@ -4269,6 +4344,7 @@ export class AgentSession {
 
 	/** Drop mutable tool decisions and directives owned by the previous logical session. */
 	#clearSessionScopedToolState(): void {
+		this.agent.clearDeferredToolDirectives();
 		this.#toolChoiceQueue.clear();
 		this.#tools.clearAcpPermissionDecisions();
 	}
@@ -4521,7 +4597,9 @@ export class AgentSession {
 		return {
 			role: "custom",
 			customType: "vibe-mode-context",
-			content: prompt.render(vibeModeActivePrompt),
+			content: prompt.render(vibeModeActivePrompt, {
+				todoAvailable: this.getActiveToolNames().includes("todo"),
+			}),
 			display: false,
 			attribution: "agent",
 			timestamp: Date.now(),
@@ -5948,6 +6026,10 @@ export class AgentSession {
 				additionalDirectories: this.settings.get("workspace.additionalDirectories"),
 			});
 			this.#bash.markSessionTransition(bashTransition);
+			// The new session owns the transcript from here, so the previous
+			// conversation's advisor spend is retired with it. Clearing at the commit
+			// point keeps the status line honest even if a later step below throws.
+			this.#advisors.clearCost();
 			sessionTransitioned = true;
 		} finally {
 			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
@@ -6370,7 +6452,7 @@ export class AgentSession {
 			activeMessages.splice(0, activeMessages.length, ...sessionContext.messages);
 		}
 		this.agent.replaceMessages(activeMessages ?? sessionContext.messages);
-		this.#advisors.resetSessionState();
+		this.#advisors.resetSessionState({ preserveCost: true });
 		this.#todo.syncFromBranch();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 		this.#checkpointState = undefined;
@@ -6445,7 +6527,7 @@ export class AgentSession {
 		return true;
 	}
 
-	#setModelWithProviderSessionReset(model: Model): void {
+	async #setModelWithProviderSessionReset(model: Model): Promise<void> {
 		const currentModel = this.model;
 		if (currentModel) {
 			this.#closeProviderSessionsForModelSwitch(currentModel, model);
@@ -6457,6 +6539,16 @@ export class AgentSession {
 
 		// Re-evaluate append-only context mode — provider or setting may have changed
 		this.#syncAppendOnlyContext(model);
+
+		// inspect_image auto mode keys off model image capability. Reconcile
+		// centrally here so retry-fallback model changes (turn-recovery.ts),
+		// which bypass syncAfterModelChange, cannot leave the tool set stale —
+		// callers await, so a scheduled retry never races the reconciled slate.
+		try {
+			await this.#tools.reconcileInspectImageAfterModelChange();
+		} catch (error) {
+			logger.warn("inspect_image reconcile after model change failed", { error: String(error) });
+		}
 	}
 
 	#closeCodexProviderSessionsForHistoryRewrite(): void {
@@ -6988,7 +7080,7 @@ export class AgentSession {
 			}
 
 			this.agent.replaceMessages(sessionContext.messages);
-			this.#advisors.resetSessionState();
+			this.#advisors.resetSessionState({ preserveCost: true });
 			this.#todo.syncFromBranch();
 			if (switchingToDifferentSession) {
 				this.#closeAllProviderSessions("session switch");
@@ -7021,7 +7113,7 @@ export class AgentSession {
 								currentModel.id !== match.id ||
 								currentModel.api !== match.api));
 					if (shouldResetProviderState) {
-						this.#setModelWithProviderSessionReset(match);
+						await this.#setModelWithProviderSessionReset(match);
 					} else {
 						this.agent.setModel(match);
 					}
@@ -7097,6 +7189,9 @@ export class AgentSession {
 					error: String(refreshErr),
 				});
 			}
+			// Only a committed switch retires the previous conversation's advisor spend:
+			// an earlier clear would be lost work if any step above rolled the switch back.
+			if (switchingToDifferentSession) this.#advisors.clearCost();
 			this.#bash.finishSessionTransition(bashTransition, true);
 			return true;
 		} catch (error) {
@@ -7145,10 +7240,12 @@ export class AgentSession {
 	 * @param entryId ID of the entry to branch from
 	 * @returns Object with:
 	 *   - selectedText: The text of the selected user message (for editor pre-fill)
+	 *   - selectedImages: Image attachments of the selected user message (for editor draft restore)
 	 *   - cancelled: True if a hook cancelled the branch
 	 */
 	async branch(entryId: string): Promise<{
 		selectedText: string;
+		selectedImages: ImageContent[];
 		cancelled: boolean;
 	}> {
 		const previousSessionFile = this.sessionFile;
@@ -7159,6 +7256,7 @@ export class AgentSession {
 		}
 
 		const selectedText = this.#extractUserMessageText(selectedEntry.message.content);
+		const selectedImages = this.#extractUserMessageImages(selectedEntry.message.content);
 
 		let skipConversationRestore = false;
 
@@ -7170,7 +7268,7 @@ export class AgentSession {
 			})) as SessionBeforeBranchResult | undefined;
 
 			if (result?.cancel) {
-				return { selectedText, cancelled: true };
+				return { selectedText, selectedImages, cancelled: true };
 			}
 			skipConversationRestore = result?.skipConversationRestore ?? false;
 		}
@@ -7195,6 +7293,7 @@ export class AgentSession {
 				this.sessionManager.createBranchedSession(selectedEntry.parentId);
 			}
 			this.#bash.markSessionTransition(bashTransition);
+			this.#advisors.clearCost();
 			sessionTransitioned = true;
 		} finally {
 			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
@@ -7225,7 +7324,7 @@ export class AgentSession {
 			this.#closeCodexProviderSessionsForHistoryRewrite();
 		}
 
-		return { selectedText, cancelled: false };
+		return { selectedText, selectedImages, cancelled: false };
 	}
 
 	async branchFromBtw(
@@ -7292,6 +7391,7 @@ export class AgentSession {
 		try {
 			this.sessionManager.createBranchedSession(leafId);
 			this.#bash.markSessionTransition(bashTransition);
+			this.#advisors.clearCost();
 			sessionTransitioned = true;
 		} finally {
 			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
@@ -7339,7 +7439,7 @@ export class AgentSession {
 	 * @param targetId The entry ID to navigate to
 	 * @param options.summarize Whether user wants to summarize abandoned branch
 	 * @param options.customInstructions Custom instructions for summarizer
-	 * @returns Result with editorText (if user message) and cancelled status
+	 * @returns Result with editorText/editorImages (if user message) and cancelled status
 	 */
 	async navigateTree(
 		targetId: string,
@@ -7369,6 +7469,8 @@ export class AgentSession {
 		} = {},
 	): Promise<{
 		editorText?: string;
+		/** Image attachments of the target user message, parallel to the positional `[Image #N]` markers in {@link editorText}. */
+		editorImages?: ImageContent[];
 		cancelled: boolean;
 		aborted?: boolean;
 		summaryEntry?: BranchSummaryEntry;
@@ -7383,6 +7485,14 @@ export class AgentSession {
 		 * (issue #5642).
 		 */
 		reopenAsk?: { toolCallId: string; questions: AskToolInput["questions"] };
+		/**
+		 * `true` when this call committed a new sibling answer for an `ask`
+		 * re-answer (`reanswerAskResult` was applied). The interactive caller
+		 * resumes the agent via {@link resumeAfterAskReanswer} *after* rebuilding
+		 * its transcript, so the resumed turn never renders against the stale
+		 * pre-rebuild UI (issue #6483).
+		 */
+		askReanswerCommitted?: boolean;
 	}> {
 		await this.#bash.flushPending();
 		const oldLeafId = this.sessionManager.getLeafId();
@@ -7533,11 +7643,18 @@ export class AgentSession {
 		// Determine the new leaf position based on target type
 		let newLeafId: string | null;
 		let editorText: string | undefined;
+		let editorImages: ImageContent[] | undefined;
+		// Set when the second-pass `ask` re-answer branch below actually commits a
+		// new sibling answer — the trigger for resuming the agent afterwards so the
+		// model consumes it, mirroring a live `ask` completion (issue #6483).
+		let isAskReanswerCompletion = false;
 
 		if (targetEntry.type === "message" && targetEntry.message.role === "user") {
 			// User message: leaf = parent (null if root), text goes to editor
 			newLeafId = targetEntry.parentId;
 			editorText = this.#extractUserMessageText(targetEntry.message.content);
+			const targetImages = this.#extractUserMessageImages(targetEntry.message.content);
+			if (targetImages.length > 0) editorImages = targetImages;
 		} else if (targetEntry.type === "custom_message" && targetEntry.customType !== SKILL_PROMPT_MESSAGE_TYPE) {
 			// Custom message: leaf = parent (null if root), text goes to editor
 			newLeafId = targetEntry.parentId;
@@ -7569,6 +7686,7 @@ export class AgentSession {
 				timestamp: Date.now(),
 			};
 			newLeafId = this.sessionManager.appendMessageToBranch(toolResultMessage, targetEntry.parentId);
+			isAskReanswerCompletion = true;
 		} else {
 			// Non-user message (or a user-invoked skill-prompt injection): land the
 			// leaf on the selected node so it stays on the active branch. Skill
@@ -7608,11 +7726,19 @@ export class AgentSession {
 		const displayContext = deobfuscateSessionContext(stateContext, this.#obfuscator);
 		this.agent.replaceMessages(displayContext.messages);
 		this.#rehydrateCheckpointRewindState();
-		this.#advisors.resetSessionState();
+		this.#advisors.resetSessionState({ preserveCost: true });
 		this.#todo.syncFromBranch();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 
 		this.#branchSummaryAbortController = undefined;
+
+		// Report a committed `ask` re-answer so the interactive caller can resume
+		// the agent via `resumeAfterAskReanswer()` *after* rebuilding its
+		// transcript. Scheduling the continue here instead would start a fresh
+		// streaming turn whose `agent_start`/`turn_start` events could render
+		// against the stale pre-rebuild UI and then be clobbered by the caller's
+		// `renderInitialMessages(...)` (issue #6483). Plain leaf moves and the
+		// read-only `reopenAsk` probe leave the flag unset.
 
 		// Emit session_tree event; only handlers can mutate session entries, so skip
 		// the emit and the context rebuild when no handlers are registered (mirrors
@@ -7626,9 +7752,36 @@ export class AgentSession {
 				fromExtension: summaryText ? fromExtension : undefined,
 			});
 			const rawContext = this.sessionManager.buildSessionContext();
-			return { editorText, cancelled: false, summaryEntry, sessionContext: rawContext };
+			return {
+				editorText,
+				editorImages,
+				cancelled: false,
+				summaryEntry,
+				sessionContext: rawContext,
+				askReanswerCommitted: isAskReanswerCompletion,
+			};
 		}
-		return { editorText, cancelled: false, summaryEntry, sessionContext: stateContext };
+		return {
+			editorText,
+			editorImages,
+			cancelled: false,
+			summaryEntry,
+			sessionContext: stateContext,
+			askReanswerCommitted: isAskReanswerCompletion,
+		};
+	}
+
+	/**
+	 * Resume the agent after the interactive `/tree` caller has committed an
+	 * `ask` re-answer (`navigateTree` returned `askReanswerCommitted`) and
+	 * rebuilt its transcript. Mirrors how a live `ask` completion drives a
+	 * follow-up turn, but is deferred to the caller so the resumed turn renders
+	 * against the rebuilt UI rather than the stale pre-navigation transcript
+	 * (issue #6483). The scheduled continue honors the same disposed/compacting
+	 * guards as every other post-prompt continuation.
+	 */
+	resumeAfterAskReanswer(): void {
+		this.#scheduleAgentContinue();
 	}
 
 	/**
@@ -7727,6 +7880,14 @@ export class AgentSession {
 				.join("");
 		}
 		return "";
+	}
+
+	/** Image parts of a stored user message, in submission order — index N-1 backs the
+	 *  `[Image #N]` marker in the message text, so restoring them alongside the text keeps
+	 *  positional markers resolvable on resubmit. */
+	#extractUserMessageImages(content: UserMessage["content"]): ImageContent[] {
+		if (!Array.isArray(content)) return [];
+		return content.filter((c): c is ImageContent => c.type === "image");
 	}
 
 	/**
@@ -8281,6 +8442,11 @@ export class AgentSession {
 	 */
 	getAdvisorStatusOverview(): { configured: boolean; advisors: { name: string; status: AdvisorRuntimeStatus }[] } {
 		return this.#advisors.getAdvisorStatusOverview();
+	}
+
+	/** Return cumulative cost recorded for the current session's advisor activity. */
+	getAdvisorCost(): number {
+		return this.#advisors.getAdvisorCost();
 	}
 	/**
 	 * Return structured advisor stats for the status command and TUI panel.

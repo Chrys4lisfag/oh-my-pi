@@ -421,6 +421,11 @@ export class SelectorController {
 				this.ctx.session.setAutoCompactionEnabled(value as boolean);
 				this.ctx.statusLine.setAutoCompactEnabled(value as boolean);
 				break;
+			case "advisor.enabled":
+				this.ctx.session.setAdvisorEnabled(value as boolean);
+				this.ctx.statusLine.invalidate();
+				this.ctx.ui.requestRender();
+				break;
 			case "steeringMode":
 				this.ctx.session.setSteeringMode(value as "all" | "one-at-a-time");
 				break;
@@ -449,6 +454,11 @@ export class SelectorController {
 			case "memory.backend":
 				void this.ctx.session.applyMemoryBackend().catch(err => {
 					this.ctx.showError(`Failed to apply memory backend: ${err}`);
+				});
+				break;
+			case "inspect_image.mode":
+				void this.ctx.session.applyInspectImageModeChange().catch(err => {
+					this.ctx.showError(`Failed to apply vision mode: ${err}`);
 				});
 				break;
 
@@ -1093,7 +1103,7 @@ export class SelectorController {
 					}
 
 					this.ctx.renderInitialMessages({ clearTerminalHistory: true });
-					this.ctx.editor.setText(result.selectedText);
+					this.ctx.editor.setDraft(result.selectedText, result.selectedImages);
 					done();
 					this.ctx.showStatus("Branched to new session");
 				},
@@ -1268,9 +1278,18 @@ export class SelectorController {
 						this.ctx.renderInitialMessages({ clearTerminalHistory: true });
 						await this.ctx.reloadTodos();
 						if (result.editorText && !this.ctx.editor.getText().trim()) {
-							this.ctx.editor.setText(result.editorText);
+							this.ctx.editor.setDraft(result.editorText, result.editorImages);
 						}
 						this.ctx.showStatus("Navigated to selected point");
+
+						// Re-answering a past `ask` commits a new sibling answer but,
+						// unlike a live `ask`, leaves the agent idle. Resume it now —
+						// after the transcript rebuild above — so the model consumes the
+						// new answer without the resumed turn rendering against the stale
+						// pre-rebuild UI (issue #6483).
+						if (result.askReanswerCommitted) {
+							this.ctx.session.resumeAfterAskReanswer();
+						}
 					} catch (error) {
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
 					} finally {

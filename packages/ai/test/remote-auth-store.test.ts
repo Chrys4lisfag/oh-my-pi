@@ -786,7 +786,10 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 						},
 						identityKey: "email:remote@example.com",
 						rotatesInMs: null,
-						blocks: [{ providerKey: "anthropic:oauth", blockScope: "tier:fable", blockedUntilMs: futureBlock }],
+						blocks: [
+							{ providerKey: "anthropic:oauth", blockScope: "tier:fable", blockedUntilMs: futureBlock },
+							{ providerKey: "anthropic:oauth", blockScope: "shared", blockedUntilMs: futureBlock },
+						],
 					},
 				],
 			},
@@ -807,6 +810,9 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 				blockScope: "tier:fable",
 				blockedUntilMs: laterBlock,
 			});
+			remoteStore.deleteCredentialBlock(7, "anthropic:oauth", "tier:fable");
+			expect(remoteStore.getCredentialBlock(7, "anthropic:oauth", "tier:fable")).toBe(laterBlock);
+			expect(remoteStore.getCredentialBlock(7, "anthropic:oauth", "shared")).toBe(futureBlock);
 		} finally {
 			remoteStore.close();
 		}
@@ -1215,6 +1221,79 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		});
 		try {
 			expect(await remoteStore.fetchUsageReports()).toEqual([reports[0]]);
+		} finally {
+			remoteStore.close();
+		}
+	});
+
+	test("usage report filter memoizes per (reports, snapshot) and invalidates when the snapshot changes", async () => {
+		const brokerClient = new AuthBrokerClient({ url: "http://127.0.0.1:9", token: "unused" });
+		const now = Date.now();
+		const oauthCredential = {
+			type: "oauth" as const,
+			access: "oauth-access",
+			refresh: REMOTE_REFRESH_SENTINEL,
+			expires: now + 120_000,
+			accountId: "oauth-account",
+			email: "oauth@example.com",
+		};
+		const matchingReport: UsageReport = {
+			provider: "anthropic",
+			fetchedAt: now,
+			limits: [],
+			metadata: { accountId: "oauth-account", email: "oauth@example.com" },
+		};
+		const strangerReport: UsageReport = {
+			provider: "anthropic",
+			fetchedAt: now,
+			limits: [],
+			metadata: { accountId: "stranger-account", email: "stranger@example.com" },
+		};
+		const nonPooledReport: UsageReport = {
+			provider: "openai-codex",
+			fetchedAt: now,
+			limits: [],
+			metadata: { accountId: "codex-account" },
+		};
+		const reports: UsageReport[] = [matchingReport, strangerReport, nonPooledReport];
+		const fetchSpy = vi.spyOn(brokerClient, "fetchUsage").mockResolvedValue({ generatedAt: now, reports });
+		vi.spyOn(brokerClient, "disableCredential").mockResolvedValue({ ok: true });
+		const oauthIdentity = "email:oauth@example.com";
+		const remoteStore = new RemoteAuthCredentialStore({
+			client: brokerClient,
+			streamSnapshots: false,
+			accountPool: new Map([["anthropic", new Set([oauthIdentity])]]),
+			initialSnapshot: {
+				generation: 1,
+				generatedAt: now,
+				serverNowMs: now,
+				refresher: { enabled: false, intervalMs: 0, skewMs: 0, nextSweepInMs: Number.MAX_SAFE_INTEGER },
+				credentials: [
+					{
+						id: 1,
+						provider: "anthropic",
+						credential: oauthCredential,
+						identityKey: oauthIdentity,
+						rotatesInMs: null,
+					},
+				],
+			},
+		});
+		try {
+			// Semantics: matching oauth report kept, pooled report without a
+			// matching credential dropped, non-pooled provider passed through.
+			const first = await remoteStore.fetchUsageReports();
+			expect(first).toEqual([matchingReport, nonPooledReport]);
+			// Same cached reports array + same snapshot → memoized output, same identity.
+			const second = await remoteStore.fetchUsageReports();
+			expect(second).toBe(first!);
+			expect(fetchSpy).toHaveBeenCalledTimes(1);
+			// Snapshot replacement (credential removal) invalidates the memo: the
+			// previously matching report is no longer attributable and disappears.
+			remoteStore.deleteAuthCredential(1, "test");
+			const third = await remoteStore.fetchUsageReports();
+			expect(third).not.toBe(first!);
+			expect(third).toEqual([nonPooledReport]);
 		} finally {
 			remoteStore.close();
 		}

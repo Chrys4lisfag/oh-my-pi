@@ -30,7 +30,7 @@ import type {
 	ServiceTier,
 	SimpleStreamOptions,
 } from "@oh-my-pi/pi-ai";
-import { isUsageLimitOutcome, resolveModelServiceTier } from "@oh-my-pi/pi-ai";
+import { isUsageLimitOutcome, resolveModelServiceTier, streamSimple } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { extractHttpStatusFromError, extractRetryHint, logger } from "@oh-my-pi/pi-utils";
@@ -48,7 +48,6 @@ import {
 	type AdvisorSeverity,
 	AdvisorTranscriptRecorder,
 	advisorTranscriptFilename,
-	annotateForStaleness,
 	buildAdvisorQuarantineSourceText,
 	formatAdvisorBatchContent,
 	getOrCreateAdvisorProviderSessionId,
@@ -93,8 +92,10 @@ import { formatSessionDumpText } from "./session-dump-format";
 import type { CompactionEntry, SessionEntry } from "./session-entries";
 import { formatSessionHistoryMarkdown } from "./session-history-format";
 import type { SessionManager } from "./session-manager";
+import { buildSessionMetadata } from "./session-metadata";
 import type { YieldQueue } from "./yield-queue";
 
+const ADVISOR_CODEX_SSE_MAX_ATTEMPTS = 1;
 /** Advisor statistics for the advisor status command. */
 export interface AdvisorStats {
 	configured: boolean;
@@ -252,6 +253,7 @@ export class SessionAdvisors {
 	#advisorConfigs: AdvisorConfig[] | undefined;
 	#advisorStatuses = new Map<string, { name: string; status: AdvisorRuntimeStatus }>();
 	#advisorProviderSessionIds = new Map<string, string>();
+	#advisorCosts = new Map<string, number>();
 	#advisorRecorderClosed: Promise<void> = Promise.resolve();
 	#advisorAutoResumeSuppressed = false;
 	#preserveAdvisorAdvice = false;
@@ -324,8 +326,24 @@ export class SessionAdvisors {
 	}
 
 	/** Re-primes advisor transcript views across a conversation boundary. */
-	resetSessionState(): void {
-		this.#resetAdvisorSessionState();
+	resetSessionState(options: { preserveCost?: boolean } = {}): void {
+		this.#resetAdvisorSessionState(options.preserveCost === true);
+	}
+
+	/** Drop the recorded spend once a conversation boundary has committed. */
+	clearCost(): void {
+		this.#advisorCosts.clear();
+	}
+
+	/**
+	 * Rebind every live advisor to the active primary conversation's provider
+	 * identity (session id, prompt-cache key, credential + metadata resolvers,
+	 * telemetry). Invoked on every provider-session change — including branch
+	 * paths that skip conversation restore — so advisors never keep emitting the
+	 * previous conversation's session id/metadata (issue #6625).
+	 */
+	refreshProviderIdentity(): void {
+		for (const advisor of this.#advisors) this.#refreshAdvisorProviderIdentity(advisor);
 	}
 
 	/** Re-primes advisor transcript views after an in-conversation history rewrite. */
@@ -391,6 +409,38 @@ export class SessionAdvisors {
 		this.#advisorInterruptImmuneTurnStart = this.#advisorPrimaryTurnsCompleted + 1;
 	}
 
+	/** Rebind one advisor to the active primary conversation's provider identity. */
+	#refreshAdvisorProviderIdentity(advisor: ActiveAdvisor): void {
+		const primaryProviderSessionId = this.#host.sessionId();
+		const providerSessionId = getOrCreateAdvisorProviderSessionId(
+			this.#advisorProviderSessionIds,
+			primaryProviderSessionId,
+			advisor.slug,
+		);
+		advisor.providerSessionId = providerSessionId;
+		advisor.agent.sessionId = providerSessionId;
+		advisor.agent.promptCacheKey = this.#host.agent.promptCacheKey ?? providerSessionId;
+		advisor.agent.getApiKey = requestModel => this.#host.modelRegistry.resolver(requestModel, providerSessionId);
+		advisor.agent.setMetadataResolver(
+			providerSessionId
+				? provider => buildSessionMetadata(providerSessionId, provider, this.#host.modelRegistry.authStorage)
+				: undefined,
+		);
+
+		const telemetry = advisor.agent.telemetry;
+		if (telemetry?.agent) {
+			advisor.agent.setTelemetry({
+				...telemetry,
+				agent: {
+					...telemetry.agent,
+					id: advisor.slug
+						? `${primaryProviderSessionId}-advisor-${advisor.slug}`
+						: `${primaryProviderSessionId}-advisor`,
+				},
+			});
+		}
+	}
+
 	/**
 	 * Re-prime the advisor across a conversation boundary: `/new`, `/branch`,
 	 * `/btw`, `/tree`, and session switch/resume. Beyond {@link AdvisorRuntime.reset}
@@ -406,7 +456,8 @@ export class SessionAdvisors {
 	 * agent steer/follow-up queues, and preserved cards deferred to the next turn —
 	 * so none of them inject into the new conversation.
 	 */
-	#resetAdvisorSessionState(): void {
+	#resetAdvisorSessionState(preserveCost: boolean): void {
+		if (!preserveCost) this.#advisorCosts.clear();
 		// Mute the recorder across the re-prime: AdvisorRuntime.reset() aborts the advisor
 		// loop, and that abort can emit an `aborted` message_end we must not attribute to
 		// either session's transcript. Detach, reset, then re-attach the live agent's feed.
@@ -644,6 +695,15 @@ export class SessionAdvisors {
 				tools: advisorToolMap,
 				allowNativeDelete: advisorCanMutateFiles,
 			});
+			const baseAdvisorStreamFn = this.#advisorStreamFn ?? streamSimple;
+			const advisorStreamFn: StreamFn = (requestModel, context, options) =>
+				baseAdvisorStreamFn(
+					requestModel,
+					context,
+					requestModel.api === "openai-codex-responses"
+						? { ...options, codexSseMaxAttempts: ADVISOR_CODEX_SSE_MAX_ATTEMPTS }
+						: options,
+				);
 			const advisorAgent = new Agent({
 				initialState: {
 					systemPrompt,
@@ -659,7 +719,7 @@ export class SessionAdvisors {
 				cwdResolver: () => this.#host.sessionManager.getCwd(),
 				preferWebsockets: this.#host.preferWebsockets,
 				getApiKey: requestModel => this.#host.modelRegistry.resolver(requestModel, advisorProviderSessionId),
-				streamFn: this.#advisorStreamFn,
+				streamFn: advisorStreamFn,
 				onPayload: this.#host.onPayload,
 				onResponse: this.#host.onResponse,
 				onSseEvent: this.#host.onSseEvent,
@@ -772,6 +832,7 @@ export class SessionAdvisors {
 				retryFallbackPendingSuccess: false,
 				signature,
 			};
+			this.#refreshAdvisorProviderIdentity(advisorRef);
 			this.#attachAdvisorRecorderFeed(advisorRef);
 			if (seedToCurrent) runtime.seedTo(this.#host.agent.state.messages.length);
 			this.#advisorStatuses.set(slug, { name: advisorName, status: "running" });
@@ -828,10 +889,6 @@ export class SessionAdvisors {
 			logger.debug("advisor advice suppressed by emission guard", { severity, advisor: advisor.name });
 			return;
 		}
-		// When newer primary turns already arrived while the advisor model was
-		// processing this batch, the advice was generated without seeing them.
-		// Append a lightweight staleness caveat so the primary can weigh recency.
-		const deliveredNote = annotateForStaleness(note, advisor.runtime.hasFreshBacklog);
 		// The implicit single ("default") advisor stamps no source name, so its
 		// agent-facing `<advisory>` bytes stay identical to the pre-multi-advisor path.
 		const source = advisor.slug ? advisor.name : undefined;
@@ -849,10 +906,10 @@ export class SessionAdvisors {
 			interruptImmuneTurnActive: interrupting && this.#isAdvisorInterruptImmuneTurnActive(),
 		});
 		if (channel === "aside") {
-			this.#host.yieldQueue.enqueue("advisor", { note: deliveredNote, severity, advisor: source });
+			this.#host.yieldQueue.enqueue("advisor", { note, severity, advisor: source });
 			return;
 		}
-		const notes: AdvisorNote[] = [{ note: deliveredNote, severity, advisor: source }];
+		const notes: AdvisorNote[] = [{ note, severity, advisor: source }];
 		const content = formatAdvisorBatchContent(notes);
 		const details = { notes } satisfies AdvisorMessageDetails;
 		if (channel === "preserve") {
@@ -904,8 +961,7 @@ export class SessionAdvisors {
 			.catch(err => logger.debug("advisor delivery failed", { err: String(err) }));
 	}
 
-	/** Re-prime every advisor's transcript view (compaction/shake/rewind) without the
-	 *  session-level latch reset {@link #resetAdvisorSessionState} performs. */
+	/** Re-prime every advisor's transcript view after an in-conversation history rewrite. */
 	#resetAllAdvisorRuntimes(): void {
 		for (const a of this.#advisors) a.runtime.reset();
 	}
@@ -930,12 +986,18 @@ export class SessionAdvisors {
 		this.#advisorYieldQueueUnsubscribe = undefined;
 	}
 
+	#recordAdvisorCost(advisor: ActiveAdvisor, message: AssistantMessage): void {
+		this.#advisorCosts.set(advisor.slug, (this.#advisorCosts.get(advisor.slug) ?? 0) + message.usage.cost.total);
+	}
+
 	/** Subscribe the advisor agent's finalized messages into the transcript recorder.
 	 *  Idempotent-by-replacement: callers detach the prior feed first. Kept separate
 	 *  so the re-prime path can mute the feed across an abort-driven reset. */
 	#attachAdvisorRecorderFeed(advisor: ActiveAdvisor): void {
 		advisor.agentUnsubscribe = advisor.agent.subscribe(event => {
-			if (event.type === "message_end") advisor.recorder.record(event.message);
+			if (event.type !== "message_end") return;
+			if (event.message.role === "assistant") this.#recordAdvisorCost(advisor, event.message);
+			advisor.recorder.record(event.message);
 		});
 	}
 
@@ -1247,7 +1309,15 @@ export class SessionAdvisors {
 		for (const candidate of candidates) {
 			const apiKey = await this.#host.modelRegistry.getApiKey(candidate, advisorProviderSessionId);
 			if (!apiKey) continue;
-
+			// The advisor overflow-compaction one-shot bypasses the advisor `Agent`,
+			// so its installed metadata resolver never runs. Emit the same
+			// `metadata.user_id` identity here (resolved per candidate provider,
+			// after the session-sticky credential is selected) so summarization
+			// requests carry the advisor session id like every other advisor call
+			// (issue #6625).
+			const advisorMetadata = advisorProviderSessionId
+				? buildSessionMetadata(advisorProviderSessionId, candidate.provider, this.#host.modelRegistry.authStorage)
+				: undefined;
 			try {
 				compactResult = await compact(
 					preparation,
@@ -1262,6 +1332,7 @@ export class SessionAdvisors {
 						tools: agent.state.tools,
 						sessionId: advisorProviderSessionId,
 						promptCacheKey: advisorProviderSessionId,
+						metadata: advisorMetadata,
 						providerSessionState: this.#host.providerSessionState,
 						codexCompaction,
 					},
@@ -1443,6 +1514,13 @@ export class SessionAdvisors {
 		}));
 		return { configured: this.#advisorEnabled, advisors };
 	}
+
+	/** Return cumulative advisor cost recorded for the current session. */
+	getAdvisorCost(): number {
+		let cost = 0;
+		for (const advisorCost of this.#advisorCosts.values()) cost += advisorCost;
+		return cost;
+	}
 	/**
 	 * Return structured advisor stats for the status command and TUI panel.
 	 */
@@ -1466,12 +1544,13 @@ export class SessionAdvisors {
 					contextWindow: 0,
 					contextTokens: 0,
 					tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-					cost: 0,
+					cost: this.#advisorCosts.get(slug) ?? 0,
 					messages: { user: 0, assistant: 0, total: 0 },
 				});
 			}
 		}
 		const active = liveAdvisors.length > 0;
+		const cost = this.getAdvisorCost();
 		if (liveAdvisors.length === 0) {
 			return {
 				configured,
@@ -1479,14 +1558,13 @@ export class SessionAdvisors {
 				contextWindow: 0,
 				contextTokens: 0,
 				tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				cost: 0,
+				cost,
 				messages: { user: 0, assistant: 0, total: 0 },
 				advisors: roster,
 			};
 		}
 		const tokens = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
 		const messages = { user: 0, assistant: 0, total: 0 };
-		let cost = 0;
 		let contextTokens = 0;
 		for (const a of liveAdvisors) {
 			tokens.input += a.tokens.input;
@@ -1498,7 +1576,6 @@ export class SessionAdvisors {
 			messages.user += a.messages.user;
 			messages.assistant += a.messages.assistant;
 			messages.total += a.messages.total;
-			cost += a.cost;
 			contextTokens += a.contextTokens;
 		}
 		// Single-advisor displays read the top-level model/window directly; surface the
@@ -1527,7 +1604,6 @@ export class SessionAdvisors {
 		let cacheRead = 0;
 		let cacheWrite = 0;
 		let totalTokens = 0;
-		let cost = 0;
 		let user = 0;
 		let assistant = 0;
 		for (const message of messages) {
@@ -1541,7 +1617,6 @@ export class SessionAdvisors {
 				cacheRead += assistantMsg.usage.cacheRead;
 				cacheWrite += assistantMsg.usage.cacheWrite;
 				totalTokens += assistantMsg.usage.totalTokens;
-				cost += assistantMsg.usage.cost.total;
 			}
 		}
 		return {
@@ -1555,7 +1630,7 @@ export class SessionAdvisors {
 			contextWindow: model.contextWindow ?? 0,
 			contextTokens,
 			tokens: { input, output, reasoning, cacheRead, cacheWrite, total: totalTokens },
-			cost,
+			cost: this.#advisorCosts.get(advisor.slug) ?? 0,
 			messages: { user, assistant, total: messages.length },
 			sessionId: advisor.agent.sessionId,
 		};
@@ -1585,7 +1660,7 @@ export class SessionAdvisors {
 			const spendParts = [`${s.tokens.input.toLocaleString()} input`, `${s.tokens.output.toLocaleString()} output`];
 			if (s.tokens.cacheRead > 0) spendParts.push(`${s.tokens.cacheRead.toLocaleString()} cache read`);
 			if (s.tokens.cacheWrite > 0) spendParts.push(`${s.tokens.cacheWrite.toLocaleString()} cache write`);
-			const spendLine = `Spend: ${spendParts.join(", ")}, $${s.cost.toFixed(4)}`;
+			const spendLine = `Spend: ${spendParts.join(", ")}, $${stats.cost.toFixed(4)}`;
 			if (!s.model || s.status !== "running") return `Advisor "${s.name}" is ${s.status.replace("_", " ")}.`;
 			return `Advisor is enabled (${s.model.provider}/${s.model.id}). ${contextLine}. ${spendLine}.`;
 		}

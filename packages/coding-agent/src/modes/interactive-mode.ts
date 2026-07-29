@@ -78,7 +78,6 @@ import type {
 import type { CompactOptions } from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
 import { loadSlashCommands } from "../extensibility/slash-commands";
-import { type GuidedGoalMessage, newGuidedGoalSessionId, runGuidedGoalTurn } from "../goals/guided-setup";
 import type { Goal, GoalModeState } from "../goals/state";
 import { resolveLocalUrlToPath } from "../internal-urls";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
@@ -91,6 +90,7 @@ import {
 } from "../mcp/startup-events";
 import { humanizePlanTitle, type PlanApprovalDetails, resolvePlanTitle } from "../plan-mode/approved-plan";
 import { resolvePlanModelTransition } from "../plan-mode/model-transition";
+import guidedGoalInterviewPrompt from "../prompts/goals/guided-goal-interview.md" with { type: "text" };
 import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" with { type: "text" };
 import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with {
 	type: "text",
@@ -1392,6 +1392,11 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#deferLoopAutoSubmit(() => {
 				void this.#runLoopIteration(action, prompt);
 			});
+			return;
+		}
+
+		if (action === "reset" && this.vibeModeEnabled) {
+			this.disableLoopMode("Exit vibe mode before using reset loops. Loop mode disabled.");
 			return;
 		}
 
@@ -3272,9 +3277,10 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	/**
 	 * `/vibe` toggle. Entering installs the ephemeral vibe tools, strips the
-	 * active toolset down to `read` plus those tools, and injects the director
-	 * context. Exiting unregisters them, restores the previous toolset, and kills
-	 * every worker session so workers cannot outlive the mode that directs them.
+	 * active toolset down to `read`, optional parent-owned `todo`, plus those
+	 * tools, and injects the director context. Exiting unregisters them, restores
+	 * the previous toolset, and kills every worker session so workers cannot
+	 * outlive the mode that directs them.
 	 */
 	async handleVibeModeCommand(initialPrompt?: string): Promise<void> {
 		if (this.vibeModeEnabled) {
@@ -3312,7 +3318,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		const ownerScope = vibeRegistry.ownerScope(this.#vibeParentSession());
 		vibeRegistry.activateScope(ownerScope);
 		const previousTools = this.session.getEnabledToolNames();
-		await this.session.activateVibeTools(["read"]);
+		const vibeBaseTools = ["read"];
+		if (this.session.hasBuiltInTool("todo")) vibeBaseTools.push("todo");
+		await this.session.activateVibeTools(vibeBaseTools);
 		this.#vibeModePreviousTools = previousTools;
 		this.#vibeModeOwnerScope = ownerScope;
 		this.vibeModeEnabled = true;
@@ -3325,7 +3333,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		this.#updateVibeModeStatus();
 		if (options?.persistModeChange !== false) this.sessionManager.appendModeChange("vibe");
-		this.showStatus("Vibe mode enabled. You direct fast/good worker sessions; toolset is read + vibe tools.");
+		this.showStatus(
+			"Vibe mode enabled. You direct fast/good worker sessions; toolset is read + optional parent Todo + vibe tools.",
+		);
 	}
 
 	async #exitVibeMode(): Promise<void> {
@@ -3429,6 +3439,10 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.showWarning("Exit plan mode first.");
 				return;
 			}
+			if (this.vibeModeEnabled) {
+				this.showWarning("Exit vibe mode first.");
+				return;
+			}
 			if (!this.session.settings.get("goal.enabled")) {
 				this.showWarning("Goal mode is disabled. Enable it in settings (goal.enabled).");
 				return;
@@ -3442,51 +3456,31 @@ export class InteractiveMode implements InteractiveModeContext {
 				return;
 			}
 
-			const initial = rest?.trim()
-				? rest.trim()
-				: (await this.showHookEditor("Guided goal", undefined, undefined, { promptStyle: true }))?.trim();
-			if (!initial) return;
-
-			const messages: GuidedGoalMessage[] = [{ role: "user", content: initial }];
-			let latestDraftObjective: string | undefined;
-			// One Codex side session for the whole interview: every follow-up turn
-			// reuses it so a multi-question interview shares a single websocket-only
-			// Codex socket instead of leaking one per turn (#5471 review).
-			const guidedGoalSessionId = newGuidedGoalSessionId(this.session);
-			for (let turn = 0; turn < 6; turn++) {
-				const result = await runGuidedGoalTurn(this.session, { messages, sideSessionId: guidedGoalSessionId });
-				if (result.objective?.trim()) latestDraftObjective = result.objective.trim();
-				if (result.kind === "question") {
-					messages.push({ role: "assistant", content: result.question });
-					const answer = (
-						await this.showHookEditor(result.question, undefined, undefined, { promptStyle: true })
-					)?.trim();
-					if (!answer) return;
-					messages.push({ role: "user", content: answer });
-					continue;
-				}
-
-				const finalObjective = (
-					await this.showHookEditor("Review guided goal", result.objective, undefined, { promptStyle: true })
-				)?.trim();
-				if (!finalObjective) return;
-				await this.#startGoalFromObjective(finalObjective);
-				return;
+			// Expose the goal tool for the interview so the agent can finish by
+			// calling `goal create`. Record the pre-interview toolset first: the
+			// tool-driven create flips goalModeEnabled via `goal_updated`, and the
+			// eventual goal exit restores this set (dropping the goal tool again).
+			const enabledTools = this.session.getEnabledToolNames();
+			this.#goalModePreviousTools = enabledTools.filter(name => name !== "goal");
+			if (!enabledTools.includes("goal")) {
+				await this.session.setActiveToolsByName([...enabledTools, "goal"]);
 			}
 
-			// Hit the turn cap without an explicit `ready`. Rather than discard the whole interview,
-			// salvage the latest non-empty model objective draft seen on any earlier turn. A final
-			// question turn may omit `objective`; that must not erase a usable draft.
-			if (latestDraftObjective) {
-				const finalObjective = (
-					await this.showHookEditor("Review guided goal", latestDraftObjective, undefined, { promptStyle: true })
-				)?.trim();
-				if (finalObjective) {
-					await this.#startGoalFromObjective(finalObjective);
-					return;
+			// The interview is a normal conversation: the kickoff rides in as a
+			// hidden developer message, the agent asks its questions as regular
+			// assistant turns, and the user answers in the ordinary editor. Queue
+			// behind an in-flight run instead of aborting it.
+			const kickoff = prompt.render(guidedGoalInterviewPrompt, { initial: rest?.trim() || undefined });
+			if (this.session.isStreaming) {
+				await this.session.followUp(kickoff, undefined, { synthetic: true });
+			} else {
+				try {
+					await this.session.prompt(kickoff, { synthetic: true });
+				} catch (error) {
+					if (!(error instanceof AgentBusyError)) throw error;
+					await this.session.followUp(kickoff, undefined, { synthetic: true });
 				}
 			}
-			this.showWarning("Guided goal setup needs more detail. Run /guided-goal again with a narrower objective.");
 		} catch (error) {
 			this.showError(error instanceof Error ? error.message : String(error));
 		}
@@ -3706,6 +3700,17 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (!planContent) {
 			this.showError(`Plan file not found at ${planFilePath}`);
 			return;
+		}
+
+		// resolveApprovedPlan may return a newer draft than the path recorded in
+		// plan-mode state. `AgentSession.#buildPlanModeMessage()` reads that state,
+		// so if the operator refines (or dismisses and keeps planning) the next
+		// planning turn must target the plan just reviewed — promote the reviewed
+		// path into plan-mode state now, mirroring the print-mode approval handler.
+		const planState = this.session.getPlanModeState();
+		if (planState?.enabled && planState.planFilePath !== planFilePath) {
+			this.session.setPlanModeState({ ...planState, planFilePath });
+			this.sessionManager.appendModeChange("plan", { planFilePath });
 		}
 
 		const contextUsage = this.#getPlanApprovalContextUsage();
@@ -4432,6 +4437,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#commandController.handleContextCommand();
 	}
 
+	#vibeSessionTransitionBlocked(): boolean {
+		if (!this.vibeModeEnabled) return false;
+		this.showWarning("Exit vibe mode first.");
+		return true;
+	}
+
 	#prepareSessionSwitch(): void {
 		this.#btwController.dispose();
 		this.#omfgController.dispose();
@@ -4440,28 +4451,32 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#hidePlanReview();
 	}
 
-	handleClearCommand(): Promise<void> {
+	async handleClearCommand(): Promise<void> {
+		if (this.#vibeSessionTransitionBlocked()) return;
 		this.#prepareSessionSwitch();
-		return this.#commandController.handleClearCommand();
+		await this.#commandController.handleClearCommand();
 	}
 
 	handleFreshCommand(): Promise<void> {
 		return this.#commandController.handleFreshCommand();
 	}
 
-	handleDropCommand(): Promise<void> {
+	async handleDropCommand(): Promise<void> {
+		if (this.#vibeSessionTransitionBlocked()) return;
 		this.#prepareSessionSwitch();
-		return this.#commandController.handleDropCommand();
+		await this.#commandController.handleDropCommand();
 	}
 
-	handleForkCommand(): Promise<void> {
+	async handleForkCommand(): Promise<void> {
+		if (this.#vibeSessionTransitionBlocked()) return;
 		this.#btwController.dispose();
 		this.#omfgController.dispose();
-		return this.#commandController.handleForkCommand();
+		await this.#commandController.handleForkCommand();
 	}
 
-	handleMoveCommand(targetPath?: string): Promise<void> {
-		return this.#commandController.handleMoveCommand(targetPath);
+	async handleMoveCommand(targetPath?: string): Promise<void> {
+		if (this.#vibeSessionTransitionBlocked()) return;
+		await this.#commandController.handleMoveCommand(targetPath);
 	}
 
 	handleRenameCommand(title: string): Promise<void> {

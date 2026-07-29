@@ -169,6 +169,8 @@ bash:
 
 Valid rule approvals are `allow`, `prompt`, and `deny`. Critical bash commands still require confirmation unless a matching rule explicitly denies them; broad allow rules such as `match: "*"` do not bypass the critical-command guard.
 
+Matching is asymmetric so that rules mean what they appear to: `deny` and `prompt` rules fire when the glob matches the whole command **or any single segment** of a compound line (split on `&&`, `||`, `;`, `|`, a single `&`, subshells, and newlines), so `match: "rm -rf *"` still denies `cd /tmp && rm -rf build` and `sleep 1 & rm -rf build`. `allow` rules must match the **entire** command and never apply to a compound line, so a narrow allow such as `match: "git *"` cannot vouch for `git status && rm -rf /`.
+
 ### Worked example: global vs. project
 
 ```yaml
@@ -476,7 +478,7 @@ tools:
 | `tools.artifactTailBytes` | number | `20` | KB of tail kept inline on spill. |
 | `tools.artifactTailLines` | number | `500` | Max tail lines kept inline on spill. |
 
-Individual built-in tools are toggled by their own keys, e.g. `bash.enabled`, `launch.enabled`, `eval.py`, `eval.js`, `glob.enabled`, `grep.enabled`, `fetch.enabled`, `browser.enabled`, `computer.enabled`, `astEdit.enabled`, `astGrep.enabled`, `web_search.enabled`, and `inspect_image.enabled`.
+Individual built-in tools are toggled by their own keys, e.g. `bash.enabled`, `launch.enabled`, `eval.py`, `eval.js`, `glob.enabled`, `grep.enabled`, `fetch.enabled`, `browser.enabled`, `computer.enabled`, `astEdit.enabled`, `astGrep.enabled`, and `web_search.enabled`. The `inspect_image` tool is controlled by the tri-state `inspect_image.mode` (`auto`|`on`|`off`, default `auto`): `auto` exposes it only when the active model lacks native image input, and the `/vision` slash command overrides the mode per session.
 
 ### Native computer use
 
@@ -496,10 +498,10 @@ computer:
 | `computer.enabled` | boolean | `false` | Enable the native computer tool. Natively capable OpenAI GA models use the `{ "type": "computer" }` wire form; every other function-calling model gets `computer` as a regular function tool. The `/computer` slash command toggles this for the current session only. |
 | `computer.backend` | enum | `auto` | `auto` or `native`; both require native capture/input and never fall back to browser automation. |
 | `computer.display` | string | `all` | Composite all active displays, or use a numeric display ID reported by a successful computer result. |
-| `computer.maxWidth` | number | `1920` | Maximum composite screenshot width in pixels; must be greater than zero. |
-| `computer.maxHeight` | number | `1200` | Maximum composite screenshot height in pixels; must be greater than zero. |
+| `computer.maxWidth` | number | `1920` | Maximum composite screenshot width in pixels. Image transports that cannot preserve original detail, including GitHub Copilot Responses and xAI OAuth, cap the effective width at `1280`; Claude-family models use the same cap as a compatibility fallback. |
+| `computer.maxHeight` | number | `1200` | Maximum composite screenshot height in pixels. Those coordinate-safe transports cap the effective height at `896`; other models retain the configured limit. |
 
-Computer settings are captured when the session tool is constructed; start a new session after changing them. Before enabling input, configure `tools.approvalMode` or `tools.approval.computer` and grant platform permissions. See [Native computer use](./computer-use.md) for supported providers, actions, coordinate mapping, displays, platform setup, safety, Files behavior, troubleshooting, and verified limitations.
+Computer settings are captured when the desktop controller is created. A model switch that crosses the coordinate-safe sizing boundary recreates the controller and resnapshots those settings; changing config alone does not, so start a new session after a settings change. The recreated controller has no prior coordinate frame, so capture a fresh screenshot before the next pointer action. Before enabling input, configure `tools.approvalMode` or `tools.approval.computer` and grant platform permissions. See [Native computer use](computer-use.md).
 
 ### Shell, eval, and LSP
 
@@ -742,6 +744,7 @@ Applied whenever raw settings are loaded (global, project, overlays, and runtime
 
 | Old | New |
 |---|---|
+| `inspect_image.enabled` boolean | `inspect_image.mode` (`true` → `on`, `false` → `off`) |
 | `queueMode` | `steeringMode` |
 | `ask.timeout` in milliseconds (value `> 1000`) | seconds (divided by 1000) |
 | flat `theme: "<name>"` string | `theme.dark` / `theme.light` (slot chosen by luminance; built-in `light`/`dark` are dropped to use defaults) |

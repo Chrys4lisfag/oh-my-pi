@@ -37,6 +37,7 @@ import { invalidateGithubCacheForBashCommand } from "./gh-cache-invalidation";
 import {
 	formatStyledTruncationWarning,
 	type OutputMeta,
+	resolveInlineByteCapBudget,
 	stripOutputNotice,
 	stripRawOutputArtifactNotice,
 } from "./output-meta";
@@ -48,6 +49,7 @@ import {
 	previewWindowRows,
 	replaceTabs,
 } from "./render-utils";
+import { tokenizeShellSegments } from "./shell-tokenize";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout, TOOL_TIMEOUTS } from "./tool-timeouts";
@@ -71,12 +73,13 @@ const BASH_PATTERN_APPROVAL_VALUES = new Set(["allow", "deny", "prompt"]);
  * containing a space, pipe, `&&`, redirect, or `$(...)`.
  *
  * The wrap reuses the same shell binary + args the local `bash-executor` would
- * pick via `settings.getShellConfig()` — Git Bash / `bash.exe` on Windows,
+ * pick via `settings.getShellConfig()` — Git Bash / `bash.exe` on Windows
+ * (`cmd.exe /c` as the last-resort fallback when no bash exists on the host),
  * `$SHELL` (bash/zsh) with the `sh` fallback on POSIX — so the ACP path
  * preserves `bash` tool semantics (`$VAR`, `$(...)`, `source`, POSIX quoting,
- * `-l`) instead of dropping to `cmd.exe` on Windows. The agent host's shell
- * path is used as a proxy for the client's, matching the near-universal
- * ACP deployment shape of an editor spawning omp as a co-hosted subprocess.
+ * `-l`) wherever a POSIX shell is available. The agent host's shell path is
+ * used as a proxy for the client's, matching the near-universal ACP
+ * deployment shape of an editor spawning omp as a co-hosted subprocess.
  */
 export function wrapShellLineForClientTerminal(
 	line: string,
@@ -189,16 +192,43 @@ function commandMatchesBashApprovalPattern(command: string, pattern: string): bo
 	return bashApprovalPatternToRegExp(pattern).test(normalizedCommand);
 }
 
+// `deny`/`prompt` rules are matched per segment so a dangerous command buried in
+// a compound line (`cd x && rm -rf /`, `sleep 1 & rm -rf /`) is still caught.
+// Reuse the shared shell tokenizer so segmentation stays in one place and honors
+// every command boundary (`;`, `&&`, `||`, `|`, `&`, subshells, newlines).
+function bashCommandSegments(command: string): string[] {
+	return tokenizeShellSegments(command)
+		.map(segment => segment.join(" "))
+		.filter(segment => segment.length > 0);
+}
+
+// `deny`/`prompt` matching: the rule fires when its glob matches the whole
+// command or any single segment of a compound command.
+function commandSegmentMatchesBashApprovalPattern(command: string, pattern: string): boolean {
+	const regex = bashApprovalPatternToRegExp(pattern);
+	const normalizedCommand = normalizeBashApprovalPattern(command);
+	if (normalizedCommand.length === 0) return false;
+	if (regex.test(normalizedCommand)) return true;
+	return bashCommandSegments(command).some(segment => regex.test(segment));
+}
+
+// A rule "applies" to a command under approval-specific semantics: `allow` must
+// vouch for the ENTIRE command and never rides a compound line (shell control
+// syntax could smuggle an unsafe segment past a narrow allow), while `deny` and
+// `prompt` fire on any matching segment so they mean what they appear to.
+function bashApprovalRuleMatches(command: string, rule: BashApprovalPatternRule): boolean {
+	if (rule.approval === "allow") {
+		if (BASH_APPROVAL_SHELL_CONTROL_RE.test(command)) return false;
+		return commandMatchesBashApprovalPattern(command, rule.match);
+	}
+	return commandSegmentMatchesBashApprovalPattern(command, rule.match);
+}
+
 function findBashApprovalPatternRule(
 	command: string,
 	rules: readonly BashApprovalPatternRule[],
 ): BashApprovalPatternRule | undefined {
-	return rules.find(rule => {
-		if (rule.approval === "allow" && BASH_APPROVAL_SHELL_CONTROL_RE.test(command)) {
-			return false;
-		}
-		return commandMatchesBashApprovalPattern(command, rule.match);
-	});
+	return rules.find(rule => bashApprovalRuleMatches(command, rule));
 }
 
 async function saveBashOriginalArtifact(session: ToolSession, originalText: string): Promise<string | undefined> {
@@ -459,7 +489,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		const rawCommand = (args as Partial<BashToolInput>).command;
 		const command = typeof rawCommand === "string" ? rawCommand : "";
 		const patternRules = getBashApprovalPatternRules(this.session.settings.get("bash.patterns"));
-		const patternRule = patternRules.find(rule => commandMatchesBashApprovalPattern(command, rule.match));
+		const patternRule = findBashApprovalPatternRule(command, patternRules);
 		if (patternRule?.approval === "deny") {
 			return {
 				tier: "exec",
@@ -471,14 +501,13 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		if (command !== "" && CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(command))) {
 			return { tier: "exec", override: true, reason: "Critical pattern detected" };
 		}
-		const safePatternRule = findBashApprovalPatternRule(command, patternRules);
-		if (safePatternRule?.approval === "allow") return { tier: "write", policy: "allow" };
-		if (safePatternRule?.approval === "prompt") {
+		if (patternRule?.approval === "allow") return { tier: "write", policy: "allow" };
+		if (patternRule?.approval === "prompt") {
 			return {
 				tier: "exec",
 				override: true,
 				policy: "prompt",
-				reason: `Prompt required by bash pattern: ${safePatternRule.match}`,
+				reason: `Prompt required by bash pattern: ${patternRule.match}`,
 			};
 		}
 		return "exec";
@@ -627,6 +656,18 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			details.exitCode = exitCode;
 		}
 
+		// Final-defense inline cap config, shared by the timeout and normal
+		// completion paths. The sink already bounds inline bodies to the spill
+		// threshold, so with the notice slack this only fires on paths that
+		// bypass the sink (client-bridge terminals, minimizer misses). When the
+		// sink spilled, its artifact already holds the full raw stream — reuse
+		// that id instead of saving a second (already-truncated) copy, so the
+		// `[raw output: artifact://N]` footer and the truncation notice agree.
+		const inlineCap = {
+			maxBytes: resolveInlineByteCapBudget(this.session.settings),
+			saveArtifact: (full: string) => result.artifactId ?? saveBashOriginalArtifact(this.session, full),
+		};
+
 		if (isTimeout) {
 			details.timedOut = true;
 			const message =
@@ -636,9 +677,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			if (!normalizeResultOutput(result).startsWith(`[${message}]\n`)) {
 				outputLines.push("", `[${message}]`);
 			}
-			const timeoutOutputText = await enforceInlineByteCap(outputLines.join("\n"), {
-				saveArtifact: full => saveBashOriginalArtifact(this.session, full),
-			});
+			const timeoutOutputText = await enforceInlineByteCap(outputLines.join("\n"), inlineCap);
 			return toolResult(details)
 				.text(timeoutOutputText)
 				.truncationFromSummary(result, { direction: "tail" })
@@ -649,12 +688,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		// Non-timeout cancellations and missing exit status still propagate as thrown errors.
 		this.#throwIfUnfinished(result, timeoutSec, outputText);
 
-		// Final defense at the tool-result boundary: no bash path (client bridge,
-		// head-retention spill, minimizer miss) may emit more than
-		// ~DEFAULT_MAX_BYTES inline. No-op for already-bounded output.
-		const cappedOutputText = await enforceInlineByteCap(outputText, {
-			saveArtifact: full => saveBashOriginalArtifact(this.session, full),
-		});
+		// No-op for already-bounded output; see `inlineCap` above.
+		const cappedOutputText = await enforceInlineByteCap(outputText, inlineCap);
 
 		const resultBuilder = toolResult(details)
 			.text(cappedOutputText)

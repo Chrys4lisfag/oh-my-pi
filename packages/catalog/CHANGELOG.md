@@ -6,6 +6,59 @@
 
 - Fixed Qwen models on the Venice provider (`api.venice.ai`) failing every request with `400 Unrecognized key(s) in object: 'enable_thinking'`. `buildOpenAICompat` picked `thinkingFormat: "qwen"` from the `qwen*` id for any non-NVIDIA/Fireworks host, emitting a top-level `enable_thinking` field that Venice's strict (`additionalProperties: false`) chat-completions schema rejects — the same failure class as NVIDIA NIM (#2299). Venice is now a registered host and its Qwen models route to the standard `"openai"` reasoning_effort dialect (mirroring the Fireworks Qwen carve-out), so the wire body no longer carries `enable_thinking`.
 - Fixed Venice models that don't support function calling (the `e2ee-*` end-to-end-encrypted variants, several `-uncensored` models, `hermes-3-llama-3.1-405b`, `grok-4-20-multi-agent`) failing every request with `400 tools is not supported by this model`. Venice reports per-model support under `model_spec.capabilities.supportsFunctionCalling`, but discovery ignored it and always sent a native `tools` array. Discovery now maps `supportsFunctionCalling: false` → `supportsTools: false`, so the agent routes those models through a prompted (in-band) tool dialect instead of the native tools API.
+## [17.1.8] - 2026-07-28
+
+### Added
+
+- Added `resolveVertexEndpointHost(location)` utility to resolve the correct Vertex AI API endpoint hostnames for global, multi-region, and regional locations.
+
+### Fixed
+
+- Fixed an issue where `calculateCost` under-reported Anthropic cache-write costs by honoring the `usage.cttl` breakdown to correctly price 1-hour retention writes at 2x the base input rate.
+
+## [17.1.7] - 2026-07-27
+
+### Added
+
+- Added support for moonshotai/Kimi-K3 and kimi-k3-fast models
+- Added umans-kimi-k3 prerelease model configuration
+
+### Changed
+
+- Updated pricing and token limits for selected models
+
+## [17.1.6] - 2026-07-27
+
+### Added
+
+- Added SiliconFlow providers (`siliconflow`, `siliconflow-cn`) with dynamic-only OpenAI-compatible model discovery: no bundled catalog — the model list is fetched live from each region's `/v1/models` endpoint, with non-chat entries (embedding, reranker, image, audio, video) filtered out. Discovery hydrates pricing, context/output limits, and reasoning metadata from the provider's models.dev catalog at runtime (with bundled upstream references as a reasoning-only fallback for ids models.dev has not indexed), so reasoning models keep thinking enabled and sessions compact against real context windows. `SILICONFLOW_API_KEY` / `SILICONFLOW_CN_API_KEY` environment variables are wired into `getEnvApiKey`.
+
+## [17.1.5] - 2026-07-27
+
+### Fixed
+
+- Fixed Kimi Code (`kimi-code`) reporting `maxTokens: 32000` for every model — its `/coding/v1/models` discovery mapper and the bundled catalog applied a blanket constant, truncating `k3`/`k3-256k` output at ~4x below their real 131072 ceiling and `kimi-for-coding`/`kimi-for-coding-highspeed` below their 32768 ceiling. Output caps are now derived per family, and the model cache is invalidated so upgrades drop the stale `maxTokens: 32000` rows (including the discovery-only `k3-256k`) instead of serving them until the next network refresh ([#6711](https://github.com/can1357/oh-my-pi/issues/6711)).
+- Fixed Anthropic model discovery 404ing when the registry derived the provider base URL from a bundled model without the `/v1` suffix (`https://api.anthropic.com/models` instead of `/v1/models`), which let a stale text-only cache row shadow fresh models.dev vision metadata — surfacing as snapcompact refusing to run on `claude-opus-5`. Discovery now always targets `/v1/models` while model rows keep the provider base URL ([#6563](https://github.com/can1357/oh-my-pi/issues/6563)).
+
+## [17.1.4] - 2026-07-26
+
+### Added
+
+- Added Claude Opus 5 model entries for Amazon Bedrock: `anthropic.claude-opus-5` plus its `us.`, `eu.`, `au.`, and `global.` regional/geo IDs.
+
+### Fixed
+
+- Fixed `alibaba-token-plan` locking out China (Beijing) 百炼 Token Plan subscribers: the provider hardcoded the international Singapore endpoint, so Beijing-issued `sk-sp-` keys got `401 invalid_api_key`. The wire credential now carries an optional region base URL, and model discovery targets the credential's region ([#6682](https://github.com/can1357/oh-my-pi/issues/6682)).
+- Fixed forced `tool_choice` 400s (`tool_choice 'specified' is incompatible with thinking enabled`) on Kimi Code's Anthropic-compatible endpoint for the `kimi-for-coding`, `kimi-for-coding-highspeed`, and `k3` aliases: the Anthropic-surface compat matcher only recognised Moonshot's native `kimi-k2.7-code*` ids, so thinking-locked kimi-code models kept `supportsForcedToolChoice: true` and the forced selector was sent to a host that always thinks. These models now resolve `requiresThinkingEnabled`, keeping thinking on and downgrading forced choices to `auto`.
+- Retried empty successful provider discovery responses after the short non-authoritative interval instead of caching them for the full catalog TTL ([#6620](https://github.com/can1357/oh-my-pi/issues/6620)).
+- Fixed GitHub Copilot Claude models with no bundled catalog reference (e.g. a freshly served `claude-opus-5`) discovering with `reasoning: false`/`thinking: null` and no effort dial, and disappearing along with their synthesized `-1m` sibling on offline reads: reference-less Copilot models on the anthropic-messages proxy now derive the adaptive reasoning ladder from the model id, and the cache restores their compile-time `COPILOT_API_HEADERS` by value instead of dropping them as unrestorable ([#6664](https://github.com/can1357/oh-my-pi/issues/6664)).
+
+## [17.1.3] - 2026-07-24
+
+### Fixed
+
+- Disabled the first-event watchdog for local OpenAI-compatible backends while retaining the 300-second inter-event watchdog, so long llama.cpp prompt prefill is not canceled and retried ([#6524](https://github.com/can1357/oh-my-pi/issues/6524)).
+
 ## [17.1.1] - 2026-07-24
 
 ### Added
