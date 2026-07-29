@@ -262,6 +262,38 @@ export interface SessionMaintenanceHost {
 	abortHandoff(): void;
 }
 
+function supportsProviderNativeAutoCompaction(model: Model): boolean {
+	const api = model.remoteCompaction?.api ?? model.api;
+	return (
+		shouldUseOpenAiRemoteCompaction(model) &&
+		(api === "openai-responses" || api === "azure-openai-responses" || api === "openai-codex-responses")
+	);
+}
+
+export function resolveAutoCompactionAction(options: {
+	settings: CompactionSettings;
+	compactionModel: Model | null | undefined;
+	strategyConfigured: boolean;
+	reason: "overflow" | "threshold" | "idle" | "incomplete";
+	suppressHandoff: boolean;
+}): "context-full" | "handoff" | "snapcompact" {
+	const { settings, compactionModel, strategyConfigured, reason, suppressHandoff } = options;
+	// The schema default remains snapcompact for providers without native
+	// compaction. A remote-capable first compaction candidate gets the stronger
+	// provider path only while the strategy is unset; explicit choices stay put.
+	if (
+		!strategyConfigured &&
+		settings.remoteEnabled !== false &&
+		compactionModel &&
+		supportsProviderNativeAutoCompaction(compactionModel)
+	) {
+		return "context-full";
+	}
+	if (settings.strategy === "snapcompact") return "snapcompact";
+	if (settings.strategy === "handoff" && reason !== "overflow" && !suppressHandoff) return "handoff";
+	return "context-full";
+}
+
 /** Owns compaction, pruning, shake, promotion, and automatic context maintenance. */
 export class SessionMaintenance {
 	#compactionAbortController: AbortController | undefined;
@@ -2101,12 +2133,24 @@ export class SessionMaintenance {
 		// "overflow" forces context-full because the input itself is broken — a handoff
 		// LLM call would hit the same overflow. "incomplete" is an output-side problem,
 		// so a handoff request on the existing context is still viable.
-		let action: "context-full" | "handoff" | "snapcompact" =
-			compactionSettings.strategy === "snapcompact"
-				? "snapcompact"
-				: compactionSettings.strategy === "handoff" && reason !== "overflow" && !suppressHandoff
-					? "handoff"
-					: "context-full";
+		const strategyConfigured = this.#host.settings.isConfigured("compaction.strategy");
+		let defaultCompactionModel: Model | undefined;
+		if (!strategyConfigured) {
+			const candidates = this.#getCompactionModelCandidates(this.#host.modelRegistry.getAvailable());
+			for (const candidate of candidates) {
+				const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
+				if (!apiKey) continue;
+				defaultCompactionModel = candidate;
+				break;
+			}
+		}
+		let action = resolveAutoCompactionAction({
+			settings: compactionSettings,
+			compactionModel: defaultCompactionModel,
+			strategyConfigured,
+			reason,
+			suppressHandoff,
+		});
 		if (action === "snapcompact" && this.#model && !this.#model.input.includes("image")) {
 			this.#host.emitNotice(
 				"warning",
