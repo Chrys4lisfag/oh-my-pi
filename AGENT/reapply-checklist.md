@@ -88,6 +88,9 @@ Never edit generated catalog JSON for Venice.
    `navigator.webdriver`.
 9. Preserve advisor config provenance, per-tool successful/attempted status, and
    process-startup reconstruction from named advisor transcripts.
+10. Preserve the fork's remote-first automatic default only for unconfigured,
+    provider-native-capable GPT/Codex candidates; upstream owns `/compact remote`,
+    transport, fallback, and lifecycle semantics.
 
 ### 6. Generated and optional files
 
@@ -143,6 +146,15 @@ Preserve upstream browser discovery and backend architecture. In
 `stealthIgnoreDefaultArgs`, suppress `--enable-automation` only outside Windows and
 for non-Edge executables. Explicit `app.path` uses the spawned backend and can hide
 this default-headless failure, so verify both paths separately.
+
+### `packages/coding-agent/src/session/session-maintenance.ts`
+
+Take upstream's full maintenance lifecycle first, including retries, native-failure
+boundaries, dead-end recovery, and continuation logic. Reapply
+`resolveAutoCompactionAction` as a narrow policy seam: only an unconfigured strategy
+with an authenticated native-capable OpenAI candidate and remote enabled may override
+the schema's local `snapcompact` default. Never replace the maintenance method with
+the older fork body.
 
 ### Generated-file delete/modify conflicts
 
@@ -200,6 +212,7 @@ expand a file argument into a large test bucket.
   test/write-xdev-dispatch.test.ts \
   test/tools/browser-launch.test.ts \
   test/tools/browser-tab-evaluate.test.ts \
+  test/session-maintenance-compaction-action.test.ts \
   test/advisor/config.test.ts \
   test/advisor/transcript-recorder.test.ts \
   test/advisor-toggle.test.ts \

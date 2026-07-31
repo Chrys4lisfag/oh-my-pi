@@ -218,7 +218,48 @@ The verified repair passes six tests on Windows, including four real-browser
 evaluation cases. Do not replace this with a hard-coded user Chrome path; preserve
 normal system discovery and cached Chromium fallback.
 
-## 9. Advisor provenance and durable tool telemetry
+## 9. GPT provider-native auto-compaction default
+
+### Upstream capability versus fork policy
+
+Canonical OMP already supports remote compaction. Upstream commit `71144825ec`
+(2026-06-19) added `/compact remote`, which applies one-shot
+`strategy: context-full` and `remoteEnabled: true`. The shared compaction engine
+also tries OpenAI/OpenAI Codex provider-native `/responses/compact` when remote
+compaction is enabled, then falls back to local LLM summarization on failure.
+
+That upstream feature does **not** make remote compaction the zero-config automatic
+default. Upstream settings still default to:
+
+- `compaction.strategy: snapcompact`
+- `compaction.remoteEnabled: true`
+
+`snapcompact` is local image archival and bypasses the context-full summarization
+path, so `remoteEnabled: true` alone does not select provider-native compaction.
+
+Fork commit `5708cb1cc8` changes only automatic default selection. When
+`compaction.strategy` is not explicitly configured, the first available compaction
+candidate supports OpenAI provider-native compaction, and remote compaction is not
+disabled, `resolveAutoCompactionAction` selects `context-full` instead of the schema's
+local `snapcompact` default. Explicit `snapcompact`, `context-full`, `handoff`, and
+remote-disable choices remain authoritative.
+
+The maintainer's current `~/.omp/agent/config.yml` already explicitly sets
+`strategy: context-full`, `remoteEnabled: true`, and
+`remoteStreamingV2Enabled: true`. Therefore current personal behavior would remain
+remote-first without the fork override; the fork delta matters for fresh/unconfigured
+GPT/Codex sessions.
+
+Implementation and tests:
+
+- `packages/coding-agent/src/session/session-maintenance.ts`
+- `packages/coding-agent/test/session-maintenance-compaction-action.test.ts`
+
+Merge rule: preserve upstream compaction lifecycle, retries, dead-end recovery, and
+provider-native semantics. Reapply only the small automatic action-resolution policy;
+never replace the upstream maintenance method wholesale.
+
+## 10. Advisor provenance and durable tool telemetry
 
 ### Status contract
 
@@ -285,7 +326,7 @@ risk requires immediate intervention.
 
 Back up or reapply that user file separately; this repository commit cannot carry it.
 
-## 10. Confirmed non-features and stale history
+## 11. Confirmed non-features and stale history
 
 Do not recreate these from old branches unless a new requirement exists:
 

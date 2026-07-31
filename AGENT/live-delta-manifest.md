@@ -23,6 +23,7 @@ commit count alone proves behavior survived.
 | `121cbbe40` | active             | Configurable Hindsight reflect timeout; pin recall/reflect top-level                                                       |
 | `32b11c08c` | active             | Venice Qwen thinking and per-model tool support                                                                            |
 | `68f30cc56` | active             | Merge profile items per key across concurrent processes                                                                    |
+| `5708cb1cc` | active, policy     | Default unconfigured native-capable GPT/Codex auto-maintenance to remote-first context-full compaction                     |
 | `696bd711d` | active             | Advisor source provenance and restart-safe per-tool successful/attempted telemetry                                         |
 
 `PI_MCP_TIMING` is a live fork delta carried through merge commit history (reference
@@ -98,6 +99,8 @@ subagent inheritance. Preserve all domains when resolving its conflicts.
 - `packages/coding-agent/src/hindsight/client.ts`
 - `packages/coding-agent/src/hindsight/config.ts`
 - `packages/coding-agent/src/mcp/manager.ts`
+- `packages/coding-agent/src/session/session-maintenance.ts`
+  - fork-only automatic action selection; upstream owns remote transport and lifecycle
 - `packages/coding-agent/src/tools/memory-reflect.ts`
 - `packages/coding-agent/src/tools/xdev.ts`
 - `packages/coding-agent/src/utils/external-editor.ts`
@@ -125,6 +128,7 @@ subagent inheritance. Preserve all domains when resolving its conflicts.
 - `packages/coding-agent/test/profiles-multi-instance.test.ts`
 - `packages/coding-agent/test/profiles.test.ts`
 - `packages/coding-agent/test/hindsight-bank.test.ts`
+- `packages/coding-agent/test/session-maintenance-compaction-action.test.ts`
 - `packages/coding-agent/test/memory-tools.test.ts`
 - `packages/coding-agent/test/tools/browser-launch.test.ts`
 - `packages/coding-agent/test/tools/browser-tab-evaluate.test.ts`

@@ -53,6 +53,9 @@ be adopted without silently losing fork features.
 12. `/advisor status` identifies each advisor's winning config source and reports
     per-tool successful/attempted calls; persisted advisor transcripts restore those
     counts after process restart.
+13. Zero-config OpenAI GPT/Codex auto-maintenance selects provider-native
+    context-full compaction when available; explicit strategies and remote-disable
+    settings still win.
 
 ## Important memory corrections
 
