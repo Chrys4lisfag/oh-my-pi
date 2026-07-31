@@ -12,7 +12,7 @@
 ### Changed
 
 - Pinned the Hindsight `recall` and `reflect` tools top-level (added to `XDEV_KEEP_TOP_LEVEL`) so the long-term-memory read path is a first-class native tool the model reaches for by default, instead of being mounted behind the `xd://` device (`write xd://reflect`). They still only exist when `memory.backend` is `hindsight`/`mnemopi`, so there is no clutter when memory is off; `retain` and other discoverable tools stay xd://-mounted.
-- OpenAI GPT and Codex sessions now default automatic compaction to provider-native remote compaction when available, while explicit compaction strategies, remote-disabled models, and non-native providers keep their configured/local behavior. Native remote failures still fall back through the existing local summarization path.
+- OpenAI GPT and Codex sessions now default automatic compaction to provider-native remote compaction when available, while explicit compaction strategies, remote-disabled models, and non-native providers keep their configured/local behavior. Provider-native protocol/endpoint fallback follows upstream semantics; terminal native failures remain terminal rather than silently switching to generic local summarization.
 
 ### Fixed
 
