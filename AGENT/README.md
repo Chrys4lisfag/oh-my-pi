@@ -6,10 +6,10 @@ from a fresh `can1357/oh-my-pi` checkout.
 
 ## Audit baseline
 
-- Audited fork merge: `69a80d946`
-- Audited upstream parent: `ef44bb5707fc359d4b01a15b8a810760923bf874`
+- Audited fork merge: `f8e5be5688`
+- Audited upstream parent: `80627462b4e91f46795ba87f3678174bd3c0b907`
 - Audit date: 2026-07-31
-- Live delta refresh: advisor provenance/tool telemetry and upstream integration
+- Live delta refresh: GPT remote-compaction policy and upstream v17.2.2
 
 Hashes are checkpoints, not permanent patch targets. Current code is authoritative;
 these documents describe behavior and reapplication intent so upstream refactors can
