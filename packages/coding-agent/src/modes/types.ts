@@ -403,6 +403,8 @@ export interface InteractiveModeContext {
 	handleCtrlC(): void;
 	handleCtrlD(): void;
 	handleCtrlZ(): void;
+	/** Re-query terminal appearance for an explicit display reset, then immediately replay the display. */
+	resetDisplayAfterAppearanceRefresh(): void;
 	handleDequeue(): void;
 	handleImagePaste(): Promise<boolean>;
 	/** Queue a message for delivery only after the active agent turn would stop. */

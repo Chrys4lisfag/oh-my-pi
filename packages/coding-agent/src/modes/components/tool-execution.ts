@@ -27,6 +27,7 @@ import { type FirstResultViewportRepaint, toolRenderers } from "../../tools/rend
 import { TODO_STRIKE_TOTAL_FRAMES, type TodoToolDetails } from "../../tools/todo";
 import type { XdevState } from "../../tools/xdev";
 import { isFramedBlockComponent, markFramedBlockComponent, renderStatusLine, WidthAwareText } from "../../tui";
+import { convertImageToPng } from "../../utils/image-loading";
 import { sanitizeWithOptionalSixelPassthrough } from "../../utils/sixel";
 import { renderDiff } from "./diff";
 
@@ -651,11 +652,9 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 
 			// Convert async - catch errors from processing
 			const index = i;
-			new Bun.Image(Buffer.from(img.data, "base64"))
-				.png()
-				.toBase64()
-				.then(data => {
-					this.#convertedImages.set(index, { data, mimeType: "image/png" });
+			convertImageToPng({ type: "image", data: img.data, mimeType: img.mimeType })
+				.then(converted => {
+					this.#convertedImages.set(index, converted);
 					this.#displayInputVersion++;
 					this.#updateDisplay();
 					this.#ui.requestRender();

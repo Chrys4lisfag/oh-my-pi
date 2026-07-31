@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [17.2.2] - 2026-07-31
+
 ### Added
 
 - Added `hindsight.reflectTimeoutMs` setting (default 60000; env `HINDSIGHT_REFLECT_TIMEOUT_MS`): a client-side timeout applied **only** to Hindsight `reflect` synthesis calls, which are far slower than `recall`/`retain` (server-side LLM synthesis over the whole bank — observed ~14–20s). Threaded via a new per-request `timeoutMs` override in `HindsightApi.#request`, so raising reflect's budget no longer requires bumping the shared 30s constant for every Hindsight call; other requests keep the 30s default, and the timeout-error message now reports the actual budget instead of a hardcoded "30s".
@@ -16,11 +18,48 @@
 
 - Fixed profiles being lost when multiple omp instances run against one `config.yml`. `Settings.#saveNow` re-read the config under a cross-process file lock but re-applied whole modified *paths*, and `profiles.items` is a single path holding the entire profile map — so a second instance's save overwrote the map with its stale copy, dropping a profile the first instance had just added (the lock prevented file corruption, not the logical lost update). Profile writes now go through per-key `Settings.setProfileItem` / `deleteProfileItem`, which track only the touched profile names and merge them into the freshest on-disk `profiles.items` at save time, leaving a concurrent instance's independently added/edited/deleted profiles intact. `profiles.active` and live `modelRoles` stay last-writer-wins (per-session runtime state).
 - Added an `app.live.toggle` keybinding (default `Ctrl+L`) that starts or stops live voice mode, same as `/live`.
+- Added an app.live.toggle keybinding (default Ctrl+L) to start or stop live voice mode.
+- Added ctx.invokeTool(params, options?) to extension contexts, allowing wrappers to run native tools while inheriting context, abort signals, and progress updates.
 
 ### Changed
 
-- Moved the display-reset default chord (`app.display.reset`) from `Ctrl+L` to `Alt+L` to make room for the live-mode toggle.
-- Updated the hashline edit tool, streaming preview, and plan-mode guidance for the unified `PUT`/`CUT` grammar, `.=` ranges, and named registers.
+- Moved the display-reset default keybinding (app.display.reset) from Ctrl+L to Alt+L to accommodate the new live-mode toggle.
+- Updated the hashline edit tool, streaming preview, and plan-mode guidance to support the unified PUT/CUT grammar, .= ranges, and named registers.
+- Improved startup performance by moving subagent model-registry refresh and session-file opening off the launch critical path.
+- Optimized session file writing performance by batching same-turn file-session appends.
+- Rewrote the Codex saved-reset auto-redeem algorithm to be pool-wide, window-exact, and expiry-aware, ensuring banked resets are automatically and reliably redeemed across multi-account setups before they expire.
+
+### Fixed
+
+- Fixed a crash in Kitty terminals when rendering non-PNG tool-result images if PNG conversion fails.
+- Fixed subagent evaluation resets (reset: true) wiping the shared kernel inherited from the parent session; resets from non-exclusive owners now fork into a private per-owner kernel.
+- Fixed the copy selector and ask dialog rendering raw key IDs instead of human-readable keybinding labels.
+- Fixed CLI positional initial messages bypassing automatic session-title generation.
+- Fixed the environment-variable reference omitting Kitty Unicode placeholder controls and tmux placement caveats.
+- Fixed extension validation failures during omp plugin install for extensions importing compact from @earendil-works/pi-coding-agent by adding the missing re-export.
+- Fixed Bash interceptor rules to inspect unquoted/unescaped compound command fragments (e.g., &&, ||, ;, |, &, and newlines) instead of only matching the complete command input.
+- Fixed ExtensionContext.cwd staying pinned to the initial session directory; it now dynamically tracks the active session's current working directory.
+- Fixed the web-search provider picker description for xAI/Grok to clarify that it supports SuperGrok/X Premium+ OAuth sign-ins.
+- Fixed /reload-plugins failing to reconnect MCP servers or refresh MCP tool and prompt-command registries.
+- Enforced the centralized artifact spill threshold on oversized read results, persisting them as recoverable session artifacts.
+- Fixed DuckDuckGo web search under-returning results above the first-page limit by automatically submitting continuation forms.
+- Fixed DuckDuckGo web search ignoring after: and before: date bounds by correctly parsing and filtering result timestamps.
+- Fixed env-driven OTLP trace export ignoring OTEL_RESOURCE_ATTRIBUTES.
+- Fixed a fresh session with deferred MCP discovery injecting the newly mounted xd:// tool catalog twice into the first model request.
+- Fixed the bash tool failing with EACCES permission errors on multi-user machines by scoping the snapshot directory per user ID.
+- Fixed LSP write batching replaying stale whole-file snapshots over newer external changes made before the batch flushed.
+- Fixed ctx.ui.editor() in ACP mode always resolving to undefined by routing it through the elicitation bridge.
+- Fixed omp commit failing to resolve extension-provided models in both agentic and legacy pipelines.
+- Fixed RPC hosts receiving no subagent lifecycle or progress frames when an IRC message revives an idle or parked keep-alive subagent.
+- Fixed copied fenced-code body rows in assistant messages retaining component and container margins.
+- Fixed mid-turn auto-compaction repeating dead-end rescue work and warnings at every tool boundary within a single oversized turn.
+- Fixed automatic terminal appearance changes clearing native scrollback and snapping readers away from their current scroll position.
+- Fixed exact-match edits failing on files containing credential-shaped tokens when secrets.enabled is active by using reversible placeholders instead of irreversible redactions.
+- Fixed context usage collapsing to the latest response size for Cursor models that omit prompt-token usage.
+- Fixed the browser tool crashing with EBUSY errors on Windows when a headless Chromium profile is locked during cleanup.
+- Fixed the Python RPC client dropping context, compaction, OAuth URL, and terminal-settlement fields.
+- Fixed the browser tool ignoring the url parameter when opening a new tab on an attached browser.
+- Fixed browser automation disrupting attached browsers by adopting the active foreground tab and avoiding raising new tabs during screenshots.
 
 ## [17.2.1] - 2026-07-30
 

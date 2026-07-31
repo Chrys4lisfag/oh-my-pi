@@ -225,8 +225,10 @@ normal system discovery and cached Chromium fallback.
 Canonical OMP already supports remote compaction. Upstream commit `71144825ec`
 (2026-06-19) added `/compact remote`, which applies one-shot
 `strategy: context-full` and `remoteEnabled: true`. The shared compaction engine
-also tries OpenAI/OpenAI Codex provider-native `/responses/compact` when remote
-compaction is enabled, then falls back to local LLM summarization on failure.
+also tries OpenAI/OpenAI Codex provider-native `/responses/compact` when eligible.
+Current upstream may fall from streaming V2 to V1 or a configured remote endpoint,
+but preserves terminal native failures instead of silently using generic local
+summarization.
 
 That upstream feature does **not** make remote compaction the zero-config automatic
 default. Upstream settings still default to:

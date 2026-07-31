@@ -72,7 +72,10 @@ interface SessionToolsOptions {
 	builtInToolNames?: Iterable<string>;
 	presentationPinnedToolNames?: ReadonlySet<string>;
 	ensureWriteRegistered?: () => Promise<boolean>;
-	rebuildSystemPrompt?: (toolNames: string[], tools: Map<string, AgentTool>) => Promise<{ systemPrompt: string[] }>;
+	rebuildSystemPrompt?: (
+		toolNames: string[],
+		tools: Map<string, AgentTool>,
+	) => Promise<{ systemPrompt: string[]; xdevCatalogNames?: readonly string[] }>;
 	getLocalCalendarDate?: () => string;
 	getMcpServerInstructions?: () => Map<string, string> | undefined;
 	xdev?: XdevState;
@@ -196,6 +199,14 @@ export class SessionTools {
 	#runtimeSelectedToolNames: ReadonlySet<string> | undefined;
 	#baseSystemPrompt: string[];
 	#lastAppliedToolSignature: string | undefined;
+	/**
+	 * `xd://` device names the current base system prompt renders in its catalog
+	 * (the last rebuild's {@link BuildSystemPromptResult.xdevCatalogNames}). Consulted
+	 * when a pending mount notice is delivered: a device the outgoing prompt already
+	 * lists is recorded as announced without a redundant notice line. Empty when the
+	 * prompt carries no catalog (no mounts, or a custom prompt that omits the section).
+	 */
+	#basePromptXdevNames: ReadonlySet<string> = new Set();
 	#mcpRefreshTail: Promise<void> = Promise.resolve();
 	#promptModelKey: string | undefined;
 	#rebuildSystemPrompt: SessionToolsOptions["rebuildSystemPrompt"];
@@ -619,6 +630,7 @@ export class SessionTools {
 
 		let rebuiltSystemPrompt: string[] | undefined;
 		let rebuiltSignature: string | undefined;
+		let rebuiltXdevCatalogNames: readonly string[] | undefined;
 		try {
 			if (this.#rebuildSystemPrompt) {
 				const signature = this.#computeAppliedToolSignature(validToolNames, tools);
@@ -626,6 +638,7 @@ export class SessionTools {
 					const built = await this.#rebuildSystemPrompt(validToolNames, this.#toolRegistry);
 					rebuiltSystemPrompt = built.systemPrompt;
 					rebuiltSignature = signature;
+					rebuiltXdevCatalogNames = built.xdevCatalogNames;
 				}
 			}
 		} catch (error) {
@@ -649,6 +662,7 @@ export class SessionTools {
 			this.#host.agent.setSystemPrompt(this.#baseSystemPrompt);
 			this.#lastAppliedToolSignature = rebuiltSignature;
 			this.#promptModelKey = this.#currentPromptModelKey();
+			this.#basePromptXdevNames = new Set(rebuiltXdevCatalogNames);
 		}
 	}
 
@@ -765,11 +779,24 @@ export class SessionTools {
 	}
 
 	/** Consumes the hidden notice for unannounced `xd://` mount changes. */
-	takePendingXdevMountNotice(): CustomMessage<XdevMountNoticeDetails> | undefined {
+	takePendingXdevMountNotice(baseCatalogDelivered: boolean): CustomMessage<XdevMountNoticeDetails> | undefined {
 		const pending = this.#pendingXdevMountDelta;
 		if (!pending) return undefined;
 		this.#pendingXdevMountDelta = undefined;
 		this.#ensureAnnouncedMountsSeeded();
+		// A pending add for a device the outgoing base prompt already lists in its
+		// catalog needs no notice line — but only when the final provider prompt
+		// still carries that base catalog. A `before_agent_start` replacement drops
+		// it, so its additions must remain in the notice. Record prompt-carried
+		// devices announced here, after the final prompt is known and immediately
+		// before delivery. The pending delta remains untouched by rebuilds, letting
+		// {@link #notifyXdevMountDelta} cancel a mount followed by an unmount before
+		// any request is sent (issue #7139 reviews).
+		if (baseCatalogDelivered) {
+			for (const name of pending.added) {
+				if (this.#basePromptXdevNames.has(name)) this.#announcedMounts.add(name);
+			}
+		}
 		// Only announce a net change relative to what the model already knows (from
 		// this session and persisted history): a re-mount of an already-announced
 		// device — the common resume/reconnect case — and an unmount for a device
@@ -1066,6 +1093,7 @@ export class SessionTools {
 		const built = await this.#rebuildSystemPrompt(activeToolNames, this.#toolRegistry);
 		if (this.#host.isDisposed()) return;
 		this.#baseSystemPrompt = built.systemPrompt;
+		this.#basePromptXdevNames = new Set(built.xdevCatalogNames);
 		this.#host.clearMemoryPromotionSnapshot();
 		if (
 			previousBaseSystemPrompt.length !== this.#baseSystemPrompt.length ||

@@ -111,7 +111,7 @@ const BLOCK_OP_LABELS: Record<BlockResolution["op"], string> = {
 };
 
 function formatBlockResolution(resolution: BlockResolution): string {
-	const op = BLOCK_OP_LABELS[resolution.op];
+	const op = BLOCK_OP_LABELS[resolution.op].replace("N", String(resolution.anchorLine));
 	const lines = resolution.end - resolution.start + 1;
 	const span =
 		resolution.start === resolution.end ? `line ${resolution.start}` : `lines ${resolution.start}-${resolution.end}`;
@@ -121,7 +121,7 @@ function formatBlockResolution(resolution: BlockResolution): string {
 			: resolution.op === "paste_after"
 				? `; clipboard lands after line ${resolution.end}`
 				: "";
-	return `${op} ${resolution.anchorLine} → resolved ${span} (${lines} line${lines === 1 ? "" : "s"})${suffix}`;
+	return `${op} → resolved ${span} (${lines} line${lines === 1 ? "" : "s"})${suffix}`;
 }
 
 function renderSection(

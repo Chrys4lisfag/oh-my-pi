@@ -122,7 +122,7 @@ describe("PUT N*: — native tree-sitter resolution end-to-end", () => {
 					"",
 				].join("\n"),
 			);
-			expect(text).toContain("PUT >N*: 1 → resolved lines 1-3 (3 lines); body lands after line 3");
+			expect(text).toContain("PUT >1*: → resolved lines 1-3 (3 lines); body lands after line 3");
 		});
 	});
 	it("inserts after an extensionless .emacs top-level form", async () => {
@@ -162,7 +162,7 @@ describe("PUT N*: — native tree-sitter resolution end-to-end", () => {
 			const text = result.content.map(part => (part.type === "text" ? part.text : "")).join("\n");
 
 			// `function x() {` opens on line 1; tree-sitter resolves the whole body (lines 1-4).
-			expect(text).toContain("PUT N*: 1 → resolved lines 1-4 (4 lines)");
+			expect(text).toContain("PUT 1*: → resolved lines 1-4 (4 lines)");
 		});
 	});
 
@@ -189,7 +189,7 @@ describe("PUT N*: — native tree-sitter resolution end-to-end", () => {
 
 			// Steers to the concrete form and previews the file around the anchor (`*`-marked).
 			await expect(executeHashlineSingle(executeOptions(tempDir, input, session))).rejects.toThrow(
-				/could not resolve a syntactic block beginning on line 3.*SWAP 3\.=M:.*^ 1:function x\(\) \{$.*^\*3: {2}\}$/ms,
+				/could not resolve a syntactic block beginning on line 3.*PUT 3\.=M:.*^ 1:function x\(\) \{$.*^\*3: {2}\}$/ms,
 			);
 			// Disk untouched — refusal never leaves a partial write.
 			expect(await Bun.file(filePath).text()).toBe(TS_SOURCE);
@@ -218,7 +218,7 @@ describe("PUT N*: — native tree-sitter resolution end-to-end", () => {
 			const input = `${header}\nPUT 2*:\n+  stop();`;
 
 			await expect(executeHashlineSingle(executeOptions(tempDir, input, session))).rejects.toThrow(
-				"For only this statement use `PUT 2-2:`. The nearest enclosing multi-line block begins at line 1 and ends at line 3; use `PUT 1*:` to target it.",
+				"For only this statement use `PUT 2:`. The nearest enclosing multi-line block begins at line 1 and ends at line 3; use `PUT 1*:` to target it.",
 			);
 			expect(await Bun.file(filePath).text()).toBe(source);
 		});
@@ -305,7 +305,7 @@ describe("block ops on markdown headings — whole-section resolution end-to-end
 					"",
 				].join("\n"),
 			);
-			expect(text).toContain("PUT >N*: 4 → resolved lines 4-10 (7 lines); body lands after line 10");
+			expect(text).toContain("PUT >4*: → resolved lines 4-10 (7 lines); body lands after line 10");
 		});
 	});
 });

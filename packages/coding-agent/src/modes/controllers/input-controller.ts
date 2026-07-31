@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { type AutocompleteProvider, matchesKey, type SlashCommand } from "@oh-my-pi/pi-tui";
-import { $env, isEnoent, logger, sanitizeText } from "@oh-my-pi/pi-utils";
+import { isEnoent, logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import { cycleProfile } from "../../config/profiles";
 import { isSettingsInitialized, settings } from "../../config/settings";
 import { resolveLocalRoot } from "../../internal-urls";
@@ -22,7 +22,6 @@ import manualContinuePrompt from "../../prompts/system/manual-continue.md" with 
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
 import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
 import { isTinyTitleLocalModelKey } from "../../tiny/models";
-import { isLowSignalTitleInput } from "../../tiny/text";
 import { tinyTitleClient } from "../../tiny/title-client";
 import type { TinyTitleProgressEvent } from "../../tiny/title-protocol";
 import { shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../../tools/render-utils";
@@ -412,8 +411,7 @@ export class InputController {
 			// path (#5352). The appearance callback re-evaluates the auto theme; the
 			// repaint below then renders the resolved palette. Bounded to one OSC 11
 			// probe per gesture — no timers, no periodic polling.
-			this.ctx.ui.terminal.refreshAppearance?.();
-			this.ctx.ui.resetDisplay();
+			this.ctx.resetDisplayAfterAppearanceRefresh();
 		};
 		this.ctx.editor.onExit = () => this.handleCtrlD();
 		this.ctx.editor.setActionKeys("app.suspend", this.ctx.keybindings.getKeys("app.suspend"));
@@ -909,12 +907,9 @@ export class InputController {
 	}
 
 	/**
-	 * Kick off session-title generation while the session is still unnamed.
-	 * Invoked AFTER the optimistic user row is painted so the local tiny-title
-	 * worker's subprocess spawn never lands ahead of the first frame (issue #6462).
-	 * Skips slash extension commands (consumed locally by AgentSession.prompt()),
-	 * already-named sessions, PI_NO_TITLE, and low-signal greetings — no model or
-	 * download UI for those.
+	 * Kick off session-title generation after the optimistic user row paints.
+	 * Local extension commands are consumed before reaching the shared session
+	 * title gate and must not name the conversation.
 	 */
 	#maybeStartTitleGeneration(text: string): void {
 		const runner = this.ctx.session.extensionRunner;
@@ -923,32 +918,12 @@ export class InputController {
 			text.startsWith("/") &&
 			runner?.getCommand(extensionCommandSpace === -1 ? text.slice(1) : text.slice(1, extensionCommandSpace)) !==
 				undefined;
-		if (
-			isLocalExtensionCommand ||
-			this.ctx.sessionManager.getSessionName() ||
-			$env.PI_NO_TITLE ||
-			isLowSignalTitleInput(text)
-		) {
+		if (isLocalExtensionCommand) {
 			return;
 		}
-		this.#showTinyTitleDownloadProgress(this.ctx.settings.get("providers.tinyModel"));
-		this.ctx.session
-			.generateTitle(text)
-			.then(async title => {
-				// Re-check: a concurrent attempt for an earlier message may have
-				// already named the session. Don't clobber it. Terminal title and
-				// accent updates fire from the onSessionNameChanged listener.
-				if (title && !this.ctx.sessionManager.getSessionName()) {
-					await this.ctx.sessionManager.setSessionName(title, "auto");
-				}
-			})
-			.catch(err => {
-				logger.warn("title-generator: uncaught auto-title error", {
-					sessionId: this.ctx.session.sessionId,
-					reason: "uncaught-auto-title-error",
-					error: err instanceof Error ? err.message : String(err),
-				});
-			});
+		this.ctx.session.maybeStartTitleGeneration(text, () => {
+			this.#showTinyTitleDownloadProgress(this.ctx.settings.get("providers.tinyModel"));
+		});
 	}
 
 	/** Submit editor text to the focused subagent session (chat-only focus policy). */

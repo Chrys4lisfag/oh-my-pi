@@ -48,7 +48,7 @@ function header(filePath: string, tag: string): string {
 }
 
 function sameLineRange(anchor: string): string {
-	return `SWAP ${anchor}..${anchor}:`;
+	return `PUT ${anchor}.=${anchor}:`;
 }
 
 async function withTempDir(fn: (tempDir: string) => Promise<void>): Promise<void> {
@@ -256,7 +256,7 @@ describe("hashline executor", () => {
 				repl("L2h"),
 				repl("L2i"),
 				header("a.ts", originalTag),
-				`PUT > ${tag(8, "L8")}:`,
+				`PUT >${tag(8, "L8")}:`,
 				repl("INSERTED"),
 			].join("\n");
 

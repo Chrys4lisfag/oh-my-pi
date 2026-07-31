@@ -187,6 +187,18 @@ export interface CompactionSettings {
 /** Reserve applied when {@link CompactionSettings.reserveTokens} is unset. */
 export const DEFAULT_RESERVE_TOKENS = 16384;
 
+/**
+ * Hard ceiling on a generated compaction summary.
+ *
+ * The summary budget is `floor(0.8 * reserveTokens)`, and the effective reserve is
+ * at least 15% of the declared context window, so a 1M-token window authorizes a
+ * ~120k-token summary. At that size the model copies rather than compresses, and
+ * output is the slowest and most expensive token class. Capping absolutely keeps
+ * the compression ratio improving with window size instead of degrading. The value
+ * mirrors {@link DEFAULT_RESERVE_TOKENS} so this adds no new tuning constant.
+ */
+export const MAX_SUMMARY_TOKENS = DEFAULT_RESERVE_TOKENS;
+
 // reserveTokens is deliberately absent: an unset reserve is what marks it as
 // defaulted, which resolveBudgetReserveTokens needs to distinguish "user never
 // chose a reserve" from "user explicitly configured the default value".
@@ -221,12 +233,15 @@ export function shouldUseProviderNativeCompaction(
 
 /**
  * Calculate total context tokens from usage.
- * Uses the native totalTokens field when available, falls back to computing from components.
- * Provider-side orchestration tokens are billable but never replay into the
- * conversation prefix, so they are excluded from context sizing to keep
- * auto-compaction and context-promotion thresholds honest.
+ * Prefers an explicit provider-reported context occupancy when available.
+ * Otherwise uses totalTokens and falls back to computing from billable
+ * components. Provider-side orchestration tokens are billable but never replay
+ * into the conversation prefix, so they are excluded from context sizing.
  */
 export function calculateContextTokens(usage: Usage): number {
+	if (usage.contextTokens !== undefined) {
+		return Math.max(0, usage.contextTokens);
+	}
 	const orchestration = usage.orchestration;
 	const orchestrationTotal = orchestration
 		? (orchestration.input ?? 0) + (orchestration.output ?? 0) + (orchestration.cacheRead ?? 0)
@@ -236,11 +251,22 @@ export function calculateContextTokens(usage: Usage): number {
 }
 
 export function calculatePromptTokens(usage: Usage): number {
+	if (usage.contextTokens !== undefined) {
+		return Math.max(0, usage.contextTokens);
+	}
 	const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
 	if (promptTokens > 0) {
 		return promptTokens;
 	}
 	return calculateContextTokens(usage);
+}
+
+export function hasContextTokenUsage(usage: Usage): boolean {
+	return (
+		(usage.contextTokens ?? 0) > 0 ||
+		usage.input + usage.cacheRead + usage.cacheWrite > 0 ||
+		calculateContextTokens(usage) > usage.output
+	);
 }
 
 /**
@@ -842,7 +868,7 @@ export async function generateSummary(
 	previousSummary?: string,
 	options?: SummaryOptions,
 ): Promise<string> {
-	const maxTokens = Math.floor(0.8 * reserveTokens);
+	const maxTokens = Math.min(Math.floor(0.8 * reserveTokens), MAX_SUMMARY_TOKENS);
 
 	// Use update prompt if we have a previous summary, otherwise initial prompt
 	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
@@ -881,7 +907,7 @@ export async function generateSummary(
 			key =>
 				requestRemoteCompaction(
 					endpoint,
-					{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, prompt: promptText },
+					{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, prompt: promptText, maxTokens },
 					signal,
 					{ fetch: options.fetch, model, apiKey: key },
 				),
@@ -1086,7 +1112,7 @@ async function generateShortSummary(
 			key =>
 				requestRemoteCompaction(
 					endpoint,
-					{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, prompt: promptText },
+					{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, prompt: promptText, maxTokens },
 					signal,
 					{ fetch: options?.fetch, model, apiKey: key },
 				),
@@ -1657,7 +1683,7 @@ async function generateTurnPrefixSummary(
 	signal?: AbortSignal,
 	options?: SummaryOptions,
 ): Promise<string> {
-	const maxTokens = Math.floor(0.5 * reserveTokens); // Smaller budget for turn prefix
+	const maxTokens = Math.min(Math.floor(0.5 * reserveTokens), MAX_SUMMARY_TOKENS); // Smaller budget for turn prefix
 
 	const llmMessages = (options?.convertToLlm ?? defaultConvertToLlm)(messages);
 	const conversationText = serializeConversationForSummary(llmMessages, preferredDialect(model.id));

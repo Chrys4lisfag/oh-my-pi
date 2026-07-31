@@ -554,6 +554,14 @@ export interface BuildSystemPromptOptions {
 export interface BuildSystemPromptResult {
 	/** Ordered system prompt blocks. Providers should preserve entries as distinct messages/blocks. */
 	systemPrompt: string[];
+	/**
+	 * Names of `xd://` devices whose catalog/protocol section this prompt renders.
+	 * Empty/undefined when no catalog was emitted (no mounted devices, or a custom
+	 * prompt template that omits the section). Lets the session fold these devices
+	 * into its announced-mount baseline so a same-turn mount notice does not re-list
+	 * a catalog the prompt already carries (issue #7139).
+	 */
+	xdevCatalogNames?: readonly string[];
 }
 
 /** Build the system prompt with tools, guidelines, and context */
@@ -895,5 +903,9 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		systemPrompt.push(activeRepoContextPrompt);
 	}
 
-	return { systemPrompt };
+	// The xd:// protocol section (with its device catalog) is only rendered by the
+	// default template; a resolved custom prompt uses a template that omits it.
+	const xdevCatalogNames =
+		!resolvedCustomPrompt && xdevTools.length > 0 ? xdevTools.map(mounted => mounted.name) : undefined;
+	return { systemPrompt, xdevCatalogNames };
 }

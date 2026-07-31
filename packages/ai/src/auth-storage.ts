@@ -62,6 +62,7 @@ import {
 	type CodexResetCredit,
 	consumeCodexResetCredit,
 	listCodexResetCredits,
+	pickSoonestExpiringCredit,
 } from "./usage/openai-codex-reset";
 import { opencodeGoUsageProvider } from "./usage/opencode-go";
 import { syntheticUsageProvider } from "./usage/synthetic";
@@ -952,7 +953,9 @@ export interface ResetCreditRedeemOutcome {
 	 * Result code. Backend codes: `reset` (success), `already_redeemed`,
 	 * `no_credit`, `nothing_to_reset`. Locally-synthesized: `no_account`
 	 * (target not found), `account_unavailable` (token refresh failed),
-	 * `http_<status>` (unexpected HTTP).
+	 * `credit_list_failed` (transport/auth failure while listing credits —
+	 * retryable, unlike a genuine `no_credit`), `http_<status>` (unexpected
+	 * HTTP).
 	 */
 	code: CodexResetConsumeCode;
 	accountId?: string;
@@ -2407,10 +2410,19 @@ export class AuthStorage {
 			if (!current) {
 				return { credential: undefined, refreshed: false, removed: false };
 			}
-			if (options.observedCredential && !authCredentialEquals(current, options.observedCredential)) {
+			const currentIsFresh = Date.now() + refreshSkewMs < current.expires;
+			// A peer rotated the credential out from under the caller's observation.
+			// Adopt the stored copy only when it is still usable; a stored copy that
+			// is itself expired must fall through to a refresh rather than be handed
+			// back and fail the downstream `getOAuthApiKey` expiry precondition.
+			if (
+				options.observedCredential &&
+				!authCredentialEquals(current, options.observedCredential) &&
+				currentIsFresh
+			) {
 				return { credential: current, refreshed: false, removed: false };
 			}
-			if (!options.forceRefresh && Date.now() + refreshSkewMs < current.expires) {
+			if (!options.forceRefresh && currentIsFresh) {
 				return { credential: current, refreshed: false, removed: false };
 			}
 			if (options.canRefresh && !options.canRefresh(current)) {
@@ -2450,10 +2462,17 @@ export class AuthStorage {
 			if (!current) {
 				return { credential: undefined, refreshed: false, removed: false };
 			}
-			if (options.observedCredential && !authCredentialEquals(current, options.observedCredential)) {
+			const currentIsFresh = Date.now() + refreshSkewMs < current.expires;
+			// Re-check after acquiring the lease: only adopt the stored copy on an
+			// observed mismatch when it is still usable, mirroring the pre-lease guard.
+			if (
+				options.observedCredential &&
+				!authCredentialEquals(current, options.observedCredential) &&
+				currentIsFresh
+			) {
 				return { credential: current, refreshed: false, removed: false };
 			}
-			if (!options.forceRefresh && Date.now() + refreshSkewMs < current.expires) {
+			if (!options.forceRefresh && currentIsFresh) {
 				return { credential: current, refreshed: false, removed: false };
 			}
 			if (options.canRefresh && !options.canRefresh(current)) {
@@ -5685,7 +5704,13 @@ export class AuthStorage {
 				fetch: this.#usageFetch,
 				signal: options.signal,
 			});
-			const credit = list?.credits.find(entry => (entry.status ?? "available") === "available") ?? list?.credits[0];
+			// Transport/auth failure is NOT "no credits": callers treat `no_credit`
+			// as terminal for the episode, so conflating them would bury a live
+			// credit behind one flaky request.
+			if (!list) {
+				return { ok: false, code: "credit_list_failed", accountId: match.accountId, email: match.email };
+			}
+			const credit = pickSoonestExpiringCredit(list.credits);
 			if (!credit) return { ok: false, code: "no_credit", accountId: match.accountId, email: match.email };
 			creditId = credit.id;
 		}

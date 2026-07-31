@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [17.2.2] - 2026-07-31
+
+### Added
+
+- Added request tokens to explicit OSC 11 appearance refreshes to allow consumers to correlate responses across queued and coalesced terminal probes.
+
+### Fixed
+
+- Fixed the event-loop watchdog incorrectly reporting system sleep or suspension as a synchronous ui.loop-blocked stall.
+- Fixed terminal copies of fenced-code blocks retaining margins from components, lists, or blockquotes in assistant messages (#7055 by @GratefulDave).
+
 ## [17.2.0] - 2026-07-30
 
 ### Added

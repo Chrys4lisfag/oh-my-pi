@@ -1340,7 +1340,7 @@ describe("requestRemoteCompaction wire formats", () => {
 
 		const result = await requestRemoteCompaction(
 			"http://127.0.0.1:8001/v1/chat/completions",
-			{ systemPrompt: "summarize", prompt: "<conversation>hello</conversation>" },
+			{ systemPrompt: "summarize", prompt: "<conversation>hello</conversation>", maxTokens: 16_384 },
 			undefined,
 			{ fetch: fetchMock, model, apiKey: "local-key" },
 		);
@@ -1353,6 +1353,7 @@ describe("requestRemoteCompaction wire formats", () => {
 				{ role: "user", content: "<conversation>hello</conversation>" },
 			],
 			stream: false,
+			max_tokens: 16_384,
 		});
 	});
 
@@ -1369,13 +1370,17 @@ describe("requestRemoteCompaction wire formats", () => {
 
 		const result = await requestRemoteCompaction(
 			"https://compaction.example.test/summarize",
-			{ systemPrompt: "summarize", prompt: "<conversation>hello</conversation>" },
+			{ systemPrompt: "summarize", prompt: "<conversation>hello</conversation>", maxTokens: 16_384 },
 			undefined,
 			{ fetch: fetchMock, apiKey: "unused-for-generic" },
 		);
 
 		expect(result).toEqual({ summary: "generic summary", shortSummary: "generic" });
-		expect(sentBody).toEqual({ systemPrompt: "summarize", prompt: "<conversation>hello</conversation>" });
+		expect(sentBody).toEqual({
+			systemPrompt: "summarize",
+			prompt: "<conversation>hello</conversation>",
+			maxTokens: 16_384,
+		});
 	});
 });
 

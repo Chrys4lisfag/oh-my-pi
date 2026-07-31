@@ -870,9 +870,9 @@ export class SessionManager {
 			return;
 		}
 
-		// Hot path: append synchronously so the entry is durable the instant this
-		// returns (file/memory writers perform the write in-body). Never routed
-		// through the async disk chain — durability must hold without a flush().
+		// Hot path: queue the entry directly on the writer, outside the async disk
+		// chain. File writers batch same-turn appends until their microtask
+		// boundary; flush(), flushSync(), and close() drain that batch explicitly.
 		// A mid-close writer leaves `#writer` undefined, so `#appendWriter` simply
 		// opens a fresh append handle and the entry still lands.
 		try {
@@ -1555,6 +1555,7 @@ export class SessionManager {
 		if (this.#atomicEntryBatch) throw new Error("Cannot synchronously flush during an atomic session batch.");
 		if (this.#diskFailure) throw this.#diskFailure;
 		if (this.#fileIsCurrent && !this.#rewriteRequired) {
+			this.#writer?.flushSync?.();
 			const writerError = this.#writer?.getError();
 			if (writerError) throw writerError;
 			return;

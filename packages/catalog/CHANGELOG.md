@@ -6,9 +6,20 @@
 
 - Fixed Qwen models on the Venice provider (`api.venice.ai`) failing every request with `400 Unrecognized key(s) in object: 'enable_thinking'`. `buildOpenAICompat` picked `thinkingFormat: "qwen"` from the `qwen*` id for any non-NVIDIA/Fireworks host, emitting a top-level `enable_thinking` field that Venice's strict (`additionalProperties: false`) chat-completions schema rejects — the same failure class as NVIDIA NIM (#2299). Venice is now a registered host and its Qwen models route to the standard `"openai"` reasoning_effort dialect (mirroring the Fireworks Qwen carve-out), so the wire body no longer carries `enable_thinking`.
 - Fixed Venice models that don't support function calling (the `e2ee-*` end-to-end-encrypted variants, several `-uncensored` models, `hermes-3-llama-3.1-405b`, `grok-4-20-multi-agent`) failing every request with `400 tools is not supported by this model`. Venice reports per-model support under `model_spec.capabilities.supportsFunctionCalling`, but discovery ignored it and always sent a native `tools` array. Discovery now maps `supportsFunctionCalling: false` → `supportsTools: false`, so the agent routes those models through a prompted (in-band) tool dialect instead of the native tools API.
+## [17.2.2] - 2026-07-31
+
 ### Added
 
-- Added the GMI Cloud provider (`gmi-cloud`), an OpenAI-compatible inference gateway at `https://api.gmi-serving.com/v1` with dynamic model discovery via `/v1/models` and an API-key paste login. Authenticates with the `GMI_API_KEY` environment variable. The default model (`deepseek-ai/DeepSeek-V4-Flash`) is seeded into the bundled catalog so a fresh install resolves it before the first discovery pass.
+- Added support for the GMI Cloud provider (`gmi-cloud`), an OpenAI-compatible inference gateway with dynamic model discovery and API-key authentication via the `GMI_API_KEY` environment variable.
+- Added optional authoritative context occupancy to usage records for providers with separate checkpoint telemetry and billable token buckets.
+
+### Fixed
+
+- Fixed classification of dynamically discovered Cursor Kimi K3 effort variants as non-reasoning models when `thinkingDetails` is omitted.
+- Fixed Google AI Studio OpenAI-compatible requests failing with HTTP 400 by omitting the unsupported `store` field.
+- Fixed Synthetic models losing capabilities (such as reasoning/thinking selectors, vision input, output limits, and pricing) by correcting how the discovery mapper parses Synthetic's advertised features, effort vocabularies, and pricing structures.
+- Fixed Cursor model discovery to correctly expose the 1M-token context window for supported models (including Claude, GPT, Kimi K3, and GLM 5.2+ families) instead of defaulting to 200k.
+- Fixed GitHub Copilot routing for `grok-4.5` to use the correct Responses endpoint instead of the unsupported Chat Completions endpoint.
 
 ## [17.2.1] - 2026-07-30
 

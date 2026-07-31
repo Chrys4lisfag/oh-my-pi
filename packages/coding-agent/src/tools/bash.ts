@@ -920,7 +920,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			const rules = this.session.settings.getBashInterceptorRules();
 			const commandsToCheck = rawCommand === command ? [command] : [rawCommand, command];
 			for (const commandToCheck of commandsToCheck) {
-				const interception = checkBashInterception(commandToCheck, ctx?.toolNames ?? [], rules);
+				const interception = checkBashInterception(commandToCheck, ctx?.toolNames ?? [], rules, rawCommand);
 				if (interception.block) {
 					throw new ToolError(interception.message ?? "Command blocked");
 				}

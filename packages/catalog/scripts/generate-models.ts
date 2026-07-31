@@ -35,6 +35,7 @@ import {
 	buildXaiOAuthStaticSeed,
 	clampFireworksKimiMaxTokens,
 	clampKimiK27CodeMaxTokens,
+	fetchWellKnownModels,
 	GMI_CLOUD_STATIC_MODELS,
 	isFireworksKimiK2ModelId,
 	isKimiK27CodeModelId,
@@ -154,15 +155,14 @@ async function fetchProviderModelsFromCatalog(
 
 async function loadModelsDevData(): Promise<ModelSpec[]> {
 	try {
-		console.log("Fetching models from models.dev API...");
-		const response = await fetch("https://models.dev/api.json");
-		const data = await response.json();
+		console.log("Fetching stencil.so catalog from catalog.stencil.so...");
+		const data = await fetchWellKnownModels();
 		const models = mapModelsDevToModels(data as Record<string, unknown>, MODELS_DEV_PROVIDER_DESCRIPTORS);
 		models.sort((a, b) => a.id.localeCompare(b.id));
-		console.log(`Loaded ${models.length} tool-capable models from models.dev`);
+		console.log(`Loaded ${models.length} tool-capable models from stencil.so`);
 		return models;
 	} catch (error) {
-		console.error("Failed to load models.dev data:", error);
+		console.error("Failed to load stencil.so data:", error);
 		return [];
 	}
 }
@@ -212,7 +212,7 @@ function applyGlobalModelsDevFallback(
 			name: reference.name,
 			reasoning: reference.reasoning,
 			input: reference.input,
-			// Fill unknown endpoint limits from same-id models.dev references, but keep
+			// Fill unknown endpoint limits from same-id stencil.so references, but keep
 			// provider-specific values when discovery returned them explicitly.
 			contextWindow: model.contextWindow ?? reference.contextWindow,
 			maxTokens: model.maxTokens ?? reference.maxTokens,
@@ -248,7 +248,7 @@ function applyUmansPricingFallback(models: readonly ModelSpec[], modelsDevModels
 	}
 
 	// The public endpoint exposes this technical alias for Umans Flash, but
-	// models.dev publishes pricing only for the recommended `umans-flash` id.
+	// stencil.so publishes pricing only for the recommended `umans-flash` id.
 	const flashCost = paygCosts.get("umans-flash");
 	if (flashCost) {
 		paygCosts.set("umans-qwen3.6-35b-a3b", flashCost);
@@ -502,7 +502,7 @@ async function generateModels() {
 		})),
 	);
 	// A provider is authoritative once its endpoint snapshot can replace the
-	// models.dev / previous-snapshot rows. Requiring fetched models keeps a
+	// stencil.so / previous-snapshot rows. Requiring fetched models keeps a
 	// flaky empty-but-200 discovery from silently wiping another provider's
 	// bundled catalog; only alibaba-token-plan treats an empty success as
 	// authoritative, because its `/models` allowlist reflects the subscribed
@@ -520,8 +520,8 @@ async function generateModels() {
 	const bundledModelsDevModels = modelsDevModels.filter(model => !authoritativeCatalogProviders.has(model.provider));
 	// getGitLabDuoModels returns built models; project back to spec stage for the bundle.
 	const gitLabDuoModels = getGitLabDuoModels().map(model => toModelSpec(model));
-	// Combine models. models.dev has priority unless a provider's successful endpoint
-	// discovery is authoritative; those endpoint snapshots replace models.dev rows.
+	// Combine models. stencil.so has priority unless a provider's successful endpoint
+	// discovery is authoritative; those endpoint snapshots replace stencil.so rows.
 	let allModels = applyGlobalModelsDevFallback(
 		[...bundledModelsDevModels, ...catalogProviderModels, ...gitLabDuoModels],
 		modelsDevModels,
@@ -531,7 +531,7 @@ async function generateModels() {
 		allModels.push(CLOUDFLARE_FALLBACK_MODEL as ModelSpec<"anthropic-messages">);
 	}
 
-	// xai-oauth is not in models.dev; its descriptor's catalogDiscovery fetch
+	// xai-oauth is not in stencil.so; its descriptor's catalogDiscovery fetch
 	// only succeeds with live SuperGrok OAuth credentials (and on success the
 	// dynamic entries — already overlaid by applyXAIOAuthCuration — win dedup
 	// below). Always push the curated seed so a regen without credentials, or
@@ -547,7 +547,7 @@ async function generateModels() {
 		allModels.push(...ALIBABA_TOKEN_PLAN_STATIC_MODELS);
 	}
 	// Seed Anthropic models that are live on the first-party API or in limited
-	// release but that models.dev has not catalogued yet (e.g. Claude Fable 5 /
+	// release but that stencil.so has not catalogued yet (e.g. Claude Fable 5 /
 	// Mythos 5). Deduped behind upstream entries; metadata is pinned in
 	// applyAnthropicCatalogPolicy.
 	allModels.push(...ANTHROPIC_CURATED_FALLBACK_MODELS);
@@ -617,7 +617,7 @@ async function generateModels() {
 	}
 	// Merge previous models.json entries as fallback for provider/model pairs not
 	// fetched dynamically. Providers covered by authoritative endpoint discovery
-	// or authoritative models.dev sources keep that upstream list exactly, so
+	// or authoritative stencil.so sources keep that upstream list exactly, so
 	// retired entries from the previous snapshot do not reappear during regeneration.
 	// Discovery-only providers (local inference servers) — never bundle static models.
 	const fetchedKeys = new Set(allModels.map(model => `${model.provider}/${model.id}`));
