@@ -1295,6 +1295,7 @@ export class AgentSession {
 			sharedInstructions: config.advisorSharedInstructions,
 			contextPrompt: config.advisorContextPrompt,
 			configs: config.advisorConfigs,
+			initialToolStats: config.advisorToolStats,
 			streamFn: config.advisorStreamFn,
 			transformProviderContext: config.transformProviderContext,
 		});

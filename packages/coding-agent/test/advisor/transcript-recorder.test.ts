@@ -19,6 +19,8 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import {
 	ADVISOR_TRANSCRIPT_FILENAME,
 	AdvisorTranscriptRecorder,
+	advisorTranscriptFilename,
+	loadAdvisorTranscriptToolStats,
 } from "@oh-my-pi/pi-coding-agent/advisor/transcript-recorder";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
@@ -73,6 +75,24 @@ function assistantMessage(text: string, inputTokens: number): AgentMessage {
 		timestamp: 1,
 	};
 	return message as unknown as AgentMessage;
+}
+function assistantToolMessage(calls: Array<{ id: string; name: string }>): AgentMessage {
+	const message = assistantMessage("tool calls", 1) as AgentMessage & {
+		content: Array<{ type: "toolCall"; id: string; name: string; arguments: Record<string, never> }>;
+	};
+	message.content = calls.map(call => ({ type: "toolCall", ...call, arguments: {} }));
+	return message;
+}
+
+function toolResultMessage(toolCallId: string, toolName: string, isError: boolean): AgentMessage {
+	return {
+		role: "toolResult",
+		toolCallId,
+		toolName,
+		content: [{ type: "text", text: isError ? "failed" : "ok" }],
+		isError,
+		timestamp: 1,
+	} as AgentMessage;
 }
 
 function userMessage(text: string): AgentMessage {
@@ -159,6 +179,42 @@ describe("AdvisorTranscriptRecorder", () => {
 			expect(first[0].message?.usage?.input).toBe(1);
 			expect(second).toHaveLength(1);
 			expect(second[0].message?.usage?.input).toBe(2);
+		});
+	});
+	it("restores named advisor tool stats from persisted messages", async () => {
+		await withTempDir(async dir => {
+			const sessionFile = path.join(dir, "sess.jsonl");
+			const recorder = new AdvisorTranscriptRecorder(
+				() => sessionFile,
+				() => dir,
+				advisorTranscriptFilename("memory-advisor"),
+			);
+			const calls = assistantToolMessage([
+				{ id: "shared-1", name: "edit" },
+				{ id: "shared-1", name: "learn" },
+			]);
+			recorder.record(calls);
+			recorder.record(calls);
+			recorder.record(toolResultMessage("shared-1", "edit", false));
+			recorder.record(toolResultMessage("shared-1", "edit", false));
+			recorder.record(toolResultMessage("shared-1", "learn", true));
+			// A later runtime may reuse a provider correlation ID; a new call after
+			// completion is distinct and must survive the next restart.
+			recorder.record(assistantToolMessage([{ id: "shared-1", name: "edit" }]));
+			recorder.record(toolResultMessage("shared-1", "edit", false));
+			// A finalized result without its assistant call still counts as one attempt.
+			recorder.record(toolResultMessage("server-side-1", "read", false));
+			await recorder.close();
+
+			const transcript = path.join(dir, "sess", advisorTranscriptFilename("memory-advisor"));
+			await fs.appendFile(transcript, "{malformed trailing record}\n");
+			const restored = await loadAdvisorTranscriptToolStats(sessionFile);
+
+			expect(restored.get("memory-advisor")).toEqual([
+				{ name: "edit", successful: 2, attempts: 2 },
+				{ name: "learn", successful: 0, attempts: 1 },
+				{ name: "read", successful: 1, attempts: 1 },
+			]);
 		});
 	});
 });

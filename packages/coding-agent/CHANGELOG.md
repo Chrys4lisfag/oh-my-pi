@@ -5,6 +5,7 @@
 ### Added
 
 - Added `hindsight.reflectTimeoutMs` setting (default 60000; env `HINDSIGHT_REFLECT_TIMEOUT_MS`): a client-side timeout applied **only** to Hindsight `reflect` synthesis calls, which are far slower than `recall`/`retain` (server-side LLM synthesis over the whole bank — observed ~14–20s). Threaded via a new per-request `timeoutMs` override in `HindsightApi.#request`, so raising reflect's budget no longer requires bumping the shared 30s constant for every Hindsight call; other requests keep the 30s default, and the timeout-error message now reports the actual budget instead of a hardcoded "30s".
+- Added advisor config provenance and per-tool successful/attempted call counts to `/advisor status`, including named user/project `WATCHDOG` sources and restoration from persisted advisor transcripts after process restart.
 
 ### Changed
 

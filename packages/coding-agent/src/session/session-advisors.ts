@@ -39,6 +39,7 @@ import {
 	AdviseTool,
 	type AdvisorAgent,
 	type AdvisorConfig,
+	type AdvisorConfigSource,
 	AdvisorEmissionGuard,
 	type AdvisorMessageDetails,
 	type AdvisorNote,
@@ -47,6 +48,7 @@ import {
 	type AdvisorRuntimeStatus,
 	type AdvisorSeverity,
 	AdvisorTranscriptRecorder,
+	type AdvisorTranscriptToolStat,
 	advisorTranscriptFilename,
 	buildAdvisorQuarantineSourceText,
 	formatAdvisorBatchContent,
@@ -96,6 +98,13 @@ import { buildSessionMetadata } from "./session-metadata";
 import type { YieldQueue } from "./yield-queue";
 
 const ADVISOR_CODEX_SSE_MAX_ATTEMPTS = 1;
+/** Successful executions and total attempts for one advisor tool. */
+export interface AdvisorToolStat {
+	name: string;
+	successful: number;
+	attempts: number;
+}
+
 /** Advisor statistics for the advisor status command. */
 export interface AdvisorStats {
 	configured: boolean;
@@ -117,6 +126,7 @@ export interface AdvisorStats {
 		assistant: number;
 		total: number;
 	};
+	tools: AdvisorToolStat[];
 	/** Per-advisor breakdown for every configured advisor. */
 	advisors: PerAdvisorStat[];
 }
@@ -131,7 +141,22 @@ export interface PerAdvisorStat {
 	tokens: AdvisorStats["tokens"];
 	cost: number;
 	messages: AdvisorStats["messages"];
+	tools: AdvisorToolStat[];
+	source?: AdvisorConfigSource;
 	sessionId?: string;
+}
+
+function aggregateAdvisorToolStats(advisors: readonly PerAdvisorStat[]): AdvisorToolStat[] {
+	const totals = new Map<string, AdvisorToolStat>();
+	for (const advisor of advisors) {
+		for (const tool of advisor.tools) {
+			const total = totals.get(tool.name) ?? { name: tool.name, attempts: 0, successful: 0 };
+			total.attempts += tool.attempts;
+			total.successful += tool.successful;
+			totals.set(tool.name, total);
+		}
+	}
+	return [...totals.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
 interface AdvisorRetryFallbackState {
@@ -157,6 +182,7 @@ interface ActiveAdvisor {
 	retryFallback?: AdvisorRetryFallbackState;
 	retryFallbackPendingSuccess: boolean;
 	signature: string;
+	source?: AdvisorConfigSource;
 }
 
 interface AdvisorCompactionSummaryMessage extends CompactionSummaryMessage {
@@ -181,6 +207,7 @@ export interface SessionAdvisorsOptions {
 	sharedInstructions?: string;
 	contextPrompt?: string;
 	configs?: AdvisorConfig[];
+	initialToolStats?: ReadonlyMap<string, readonly AdvisorTranscriptToolStat[]>;
 	streamFn?: StreamFn;
 	transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;
 }
@@ -251,9 +278,12 @@ export class SessionAdvisors {
 	#transformProviderContext: ((context: Context, model: Model) => Context | Promise<Context>) | undefined;
 	#advisors: ActiveAdvisor[] = [];
 	#advisorConfigs: AdvisorConfig[] | undefined;
-	#advisorStatuses = new Map<string, { name: string; status: AdvisorRuntimeStatus }>();
+	#advisorStatuses = new Map<string, { name: string; status: AdvisorRuntimeStatus; source?: AdvisorConfigSource }>();
 	#advisorProviderSessionIds = new Map<string, string>();
 	#advisorCosts = new Map<string, number>();
+	#advisorToolStats = new Map<string, Map<string, AdvisorToolStat>>();
+	#advisorToolCallNames = new Map<string, Map<string, string>>();
+	#advisorCompletedToolCalls = new Map<string, Set<string>>();
 	#advisorRecorderClosed: Promise<void> = Promise.resolve();
 	#advisorAutoResumeSuppressed = false;
 	#preserveAdvisorAdvice = false;
@@ -272,6 +302,9 @@ export class SessionAdvisors {
 		this.#advisorConfigs = options.configs;
 		this.#advisorStreamFn = options.streamFn;
 		this.#transformProviderContext = options.transformProviderContext;
+		for (const [slug, stats] of options.initialToolStats ?? []) {
+			this.#advisorToolStats.set(slug, new Map(stats.map(stat => [stat.name, { ...stat }])));
+		}
 		if (this.#advisorEnabled) this.#buildAdvisorRuntime();
 	}
 
@@ -330,9 +363,12 @@ export class SessionAdvisors {
 		this.#resetAdvisorSessionState(options.preserveCost === true);
 	}
 
-	/** Drop the recorded spend once a conversation boundary has committed. */
+	/** Drop cumulative advisor usage once a conversation boundary has committed. */
 	clearCost(): void {
 		this.#advisorCosts.clear();
+		this.#advisorToolStats.clear();
+		this.#advisorToolCallNames.clear();
+		this.#advisorCompletedToolCalls.clear();
 	}
 
 	/**
@@ -457,7 +493,12 @@ export class SessionAdvisors {
 	 * so none of them inject into the new conversation.
 	 */
 	#resetAdvisorSessionState(preserveCost: boolean): void {
-		if (!preserveCost) this.#advisorCosts.clear();
+		if (!preserveCost) {
+			this.#advisorCosts.clear();
+			this.#advisorToolStats.clear();
+		}
+		this.#advisorToolCallNames.clear();
+		this.#advisorCompletedToolCalls.clear();
 		// Mute the recorder across the re-prime: AdvisorRuntime.reset() aborts the advisor
 		// loop, and that abort can emit an `aborted` message_end we must not attribute to
 		// either session's transcript. Detach, reset, then re-attach the live agent's feed.
@@ -479,7 +520,11 @@ export class SessionAdvisors {
 
 	#resolveAdvisorRuntimeDescriptors(emitWarnings: boolean): AdvisorRuntimeDescriptor[] {
 		const legacy = !this.#advisorConfigs?.length;
-		const roster: AdvisorConfig[] = legacy ? [{ name: "default" }] : this.#advisorConfigs!;
+		const provenance = this.#host.settings.getModelRoleProvenance("advisor");
+		const legacySource: AdvisorConfigSource = {
+			scope: provenance === "global" ? "user" : provenance,
+		};
+		const roster: AdvisorConfig[] = legacy ? [{ name: "default", source: legacySource }] : this.#advisorConfigs!;
 		const descriptors: AdvisorRuntimeDescriptor[] = [];
 		const usedSlugs = new Set<string>();
 		for (const config of roster) {
@@ -494,7 +539,7 @@ export class SessionAdvisors {
 			// Per-advisor toggle: skip disabled advisors but keep them in the
 			// status map so they show `○` rather than disappearing.
 			if (config.enabled === false) {
-				this.#advisorStatuses.set(slug, { name: config.name, status: "paused" });
+				this.#advisorStatuses.set(slug, { name: config.name, status: "paused", source: config.source });
 				continue;
 			}
 
@@ -507,7 +552,7 @@ export class SessionAdvisors {
 				model = resolved.model;
 				thinkingLevel = concreteThinkingLevel(resolved.thinkingLevel);
 				if (!model) {
-					this.#advisorStatuses.set(slug, { name: config.name, status: "no_model" });
+					this.#advisorStatuses.set(slug, { name: config.name, status: "no_model", source: config.source });
 					if (emitWarnings) {
 						this.#host.emitNotice(
 							"warning",
@@ -520,7 +565,7 @@ export class SessionAdvisors {
 			} else {
 				const sel = resolveAdvisorRoleSelection(this.#host.settings, this.#host.modelRegistry.getAvailable());
 				if (!sel) {
-					this.#advisorStatuses.set(slug, { name: config.name, status: "no_model" });
+					this.#advisorStatuses.set(slug, { name: config.name, status: "no_model", source: config.source });
 					if (emitWarnings) {
 						logger.debug("advisor enabled but no model assigned to the 'advisor' role; advisor inactive", {
 							advisor: config.name,
@@ -548,7 +593,7 @@ export class SessionAdvisors {
 			// order matches the configured roster even when earlier advisors were
 			// skipped as paused/no_model. The build loop overwrites this to "running"
 			// without changing insertion order.
-			this.#advisorStatuses.set(slug, { name: config.name, status: "running" });
+			this.#advisorStatuses.set(slug, { name: config.name, status: "running", source: config.source });
 			descriptors.push({
 				config,
 				name: config.name,
@@ -564,7 +609,8 @@ export class SessionAdvisors {
 	#advisorRuntimeSignature(config: AdvisorConfig, slug: string, model: Model, thinkingLevel: ThinkingLevel): string {
 		const tools = config.tools?.length ? config.tools.join("\u001e") : "";
 		const instructions = config.instructions?.trim() ?? "";
-		return [config.name, slug, formatModelStringWithRouting(model), thinkingLevel, tools, instructions].join(
+		const source = config.source ? `${config.source.scope}\u001e${config.source.path ?? ""}` : "";
+		return [config.name, slug, formatModelStringWithRouting(model), thinkingLevel, tools, instructions, source].join(
 			"\u001f",
 		);
 	}
@@ -799,7 +845,7 @@ export class SessionAdvisors {
 					});
 				},
 				notifyFailure: error => {
-					this.#advisorStatuses.set(slug, { name: advisorName, status: "error" });
+					this.#advisorStatuses.set(slug, { name: advisorName, status: "error", source: config.source });
 					const message = error instanceof Error ? error.message : String(error);
 					this.#host.emitNotice(
 						"warning",
@@ -808,7 +854,11 @@ export class SessionAdvisors {
 					);
 				},
 				notifyQuotaExhausted: () => {
-					this.#advisorStatuses.set(slug, { name: advisorName, status: "quota_exhausted" });
+					this.#advisorStatuses.set(slug, {
+						name: advisorName,
+						status: "quota_exhausted",
+						source: config.source,
+					});
 					this.#host.emitNotice(
 						"warning",
 						`Advisor "${advisorName}" quota exhausted — pausing until reset.`,
@@ -831,11 +881,12 @@ export class SessionAdvisors {
 				providerSessionId: advisorProviderSessionId,
 				retryFallbackPendingSuccess: false,
 				signature,
+				source: config.source,
 			};
 			this.#refreshAdvisorProviderIdentity(advisorRef);
 			this.#attachAdvisorRecorderFeed(advisorRef);
 			if (seedToCurrent) runtime.seedTo(this.#host.agent.state.messages.length);
-			this.#advisorStatuses.set(slug, { name: advisorName, status: "running" });
+			this.#advisorStatuses.set(slug, { name: advisorName, status: "running", source: config.source });
 			this.#advisors.push(advisorRef);
 		}
 
@@ -982,6 +1033,8 @@ export class SessionAdvisors {
 		}
 		this.#advisorRecorderClosed = Promise.all(closes).then(() => {});
 		this.#advisors = [];
+		this.#advisorToolCallNames.clear();
+		this.#advisorCompletedToolCalls.clear();
 		this.#advisorYieldQueueUnsubscribe?.();
 		this.#advisorYieldQueueUnsubscribe = undefined;
 	}
@@ -990,12 +1043,79 @@ export class SessionAdvisors {
 		this.#advisorCosts.set(advisor.slug, (this.#advisorCosts.get(advisor.slug) ?? 0) + message.usage.cost.total);
 	}
 
+	#recordAdvisorToolAttempt(slug: string, toolCallId: string, toolName: string): void {
+		if (!toolName) return;
+		let names = this.#advisorToolCallNames.get(slug);
+		if (!names) {
+			names = new Map();
+			this.#advisorToolCallNames.set(slug, names);
+		}
+		const callKey = `${toolName}\0${toolCallId}`;
+		if (names.has(callKey)) return;
+		names.set(callKey, toolName);
+
+		let tools = this.#advisorToolStats.get(slug);
+		if (!tools) {
+			tools = new Map();
+			this.#advisorToolStats.set(slug, tools);
+		}
+		const stat = tools.get(toolName) ?? { name: toolName, successful: 0, attempts: 0 };
+		stat.attempts++;
+		tools.set(toolName, stat);
+	}
+
+	#recordAdvisorToolResult(slug: string, toolCallId: string, toolName: string, isError: boolean): void {
+		this.#recordAdvisorToolAttempt(slug, toolCallId, toolName);
+		let completed = this.#advisorCompletedToolCalls.get(slug);
+		if (!completed) {
+			completed = new Set();
+			this.#advisorCompletedToolCalls.set(slug, completed);
+		}
+		const callKey = `${toolName}\0${toolCallId}`;
+		if (completed.has(callKey)) return;
+		completed.add(callKey);
+		if (isError) return;
+
+		const resolvedName = this.#advisorToolCallNames.get(slug)?.get(callKey) ?? toolName;
+		const stat = this.#advisorToolStats.get(slug)?.get(resolvedName);
+		if (stat) stat.successful++;
+	}
+
+	#recordAdvisorToolMessage(slug: string, message: AgentMessage): void {
+		if (message.role === "assistant") {
+			for (const block of message.content) {
+				if (block.type === "toolCall") {
+					this.#recordAdvisorToolAttempt(slug, block.id, block.name);
+				}
+			}
+			return;
+		}
+		if (message.role === "toolResult") {
+			this.#recordAdvisorToolResult(slug, message.toolCallId, message.toolName, message.isError);
+		}
+	}
+
+	#getAdvisorToolStats(slug: string): AdvisorToolStat[] {
+		return [...(this.#advisorToolStats.get(slug)?.values() ?? [])]
+			.map(stat => ({ ...stat }))
+			.sort((a, b) => a.name.localeCompare(b.name));
+	}
+
 	/** Subscribe the advisor agent's finalized messages into the transcript recorder.
 	 *  Idempotent-by-replacement: callers detach the prior feed first. Kept separate
 	 *  so the re-prime path can mute the feed across an abort-driven reset. */
 	#attachAdvisorRecorderFeed(advisor: ActiveAdvisor): void {
 		advisor.agentUnsubscribe = advisor.agent.subscribe(event => {
+			if (event.type === "tool_execution_start") {
+				this.#recordAdvisorToolAttempt(advisor.slug, event.toolCallId, event.toolName);
+				return;
+			}
+			if (event.type === "tool_execution_end") {
+				this.#recordAdvisorToolResult(advisor.slug, event.toolCallId, event.toolName, event.isError === true);
+				return;
+			}
 			if (event.type !== "message_end") return;
+			this.#recordAdvisorToolMessage(advisor.slug, event.message);
 			if (event.message.role === "assistant") this.#recordAdvisorCost(advisor, event.message);
 			advisor.recorder.record(event.message);
 		});
@@ -1546,6 +1666,8 @@ export class SessionAdvisors {
 					tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 					cost: this.#advisorCosts.get(slug) ?? 0,
 					messages: { user: 0, assistant: 0, total: 0 },
+					tools: this.#getAdvisorToolStats(slug),
+					source: entry.source,
 				});
 			}
 		}
@@ -1560,6 +1682,7 @@ export class SessionAdvisors {
 				tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 				cost,
 				messages: { user: 0, assistant: 0, total: 0 },
+				tools: aggregateAdvisorToolStats(roster),
 				advisors: roster,
 			};
 		}
@@ -1589,6 +1712,7 @@ export class SessionAdvisors {
 			tokens,
 			cost,
 			messages,
+			tools: aggregateAdvisorToolStats(roster),
 			advisors: roster,
 		};
 	}
@@ -1632,6 +1756,8 @@ export class SessionAdvisors {
 			tokens: { input, output, reasoning, cacheRead, cacheWrite, total: totalTokens },
 			cost: this.#advisorCosts.get(advisor.slug) ?? 0,
 			messages: { user, assistant, total: messages.length },
+			tools: this.#getAdvisorToolStats(advisor.slug),
+			source: advisor.source,
 			sessionId: advisor.agent.sessionId,
 		};
 	}
@@ -1641,17 +1767,40 @@ export class SessionAdvisors {
 	 */
 	formatAdvisorStatus(): string {
 		const stats = this.getAdvisorStats();
+		if (!stats.configured) return "Advisor is disabled.";
 		if (!stats.active && stats.advisors.length === 0) {
-			return stats.configured
-				? "Advisor setting is enabled, but no model is assigned to the 'advisor' role."
-				: "Advisor is disabled.";
+			return "Advisor setting is enabled, but no model is assigned to the 'advisor' role.";
 		}
+		const sourceLabel = (source: AdvisorConfigSource | undefined): string | undefined => {
+			if (!source) return undefined;
+			return source.path ? `${source.scope} (${source.path})` : `${source.scope} settings (modelRoles.advisor)`;
+		};
+		const appendToolUsage = (lines: string[], tools: readonly AdvisorToolStat[], indent = ""): void => {
+			lines.push(`${indent}Tools usage (successful/attempts):`);
+			if (tools.length === 0) {
+				lines.push(`${indent}  No tools called.`);
+				return;
+			}
+			for (const tool of tools) {
+				lines.push(
+					`${indent}  ${tool.name}: ${tool.successful.toLocaleString()}/${tool.attempts.toLocaleString()}`,
+				);
+			}
+		};
+
 		if (stats.advisors.length <= 1) {
 			const s = stats.advisors[0];
-			if (s && s.status === "no_model") {
+			if (s && s.status === "no_model" && s.source?.scope === "default") {
 				return stats.configured
 					? "Advisor setting is enabled, but no model is assigned to the 'advisor' role."
 					: "Advisor is disabled.";
+			}
+			const source = sourceLabel(s.source);
+			if (!s.model || s.status !== "running") {
+				const lines = [`Advisor "${s.name}" is ${s.status.replace("_", " ")}.`];
+				if (source) lines.push(`Source: ${source}`);
+				appendToolUsage(lines, s.tools);
+				return lines.join("\n");
 			}
 			const contextLine =
 				s.contextWindow > 0
@@ -1660,19 +1809,28 @@ export class SessionAdvisors {
 			const spendParts = [`${s.tokens.input.toLocaleString()} input`, `${s.tokens.output.toLocaleString()} output`];
 			if (s.tokens.cacheRead > 0) spendParts.push(`${s.tokens.cacheRead.toLocaleString()} cache read`);
 			if (s.tokens.cacheWrite > 0) spendParts.push(`${s.tokens.cacheWrite.toLocaleString()} cache write`);
-			const spendLine = `Spend: ${spendParts.join(", ")}, $${stats.cost.toFixed(4)}`;
-			if (!s.model || s.status !== "running") return `Advisor "${s.name}" is ${s.status.replace("_", " ")}.`;
-			return `Advisor is enabled (${s.model.provider}/${s.model.id}). ${contextLine}. ${spendLine}.`;
+			const heading =
+				s.name === "default"
+					? `Advisor is enabled (${s.model.provider}/${s.model.id}).`
+					: `Advisor "${s.name}" is enabled (${s.model.provider}/${s.model.id}).`;
+			const lines = [heading];
+			if (source) lines.push(`Source: ${source}`);
+			lines.push(contextLine, `Spend: ${spendParts.join(", ")}, $${stats.cost.toFixed(4)}`);
+			appendToolUsage(lines, s.tools);
+			return lines.join("\n");
 		}
+
 		const lines = [`Advisors enabled (${stats.advisors.length}):`];
 		for (const s of stats.advisors) {
 			const ctx =
 				s.contextWindow > 0
 					? `${s.contextTokens.toLocaleString()} / ${s.contextWindow.toLocaleString()} (${Math.round((s.contextTokens / s.contextWindow) * 100)}%)`
 					: `${s.contextTokens.toLocaleString()}`;
+			const source = sourceLabel(s.source);
 			lines.push(
-				`  • ${s.name}${s.model && s.status === "running" ? ` (${s.model.provider}/${s.model.id})` : ` [${s.status}]`} — context ${ctx} tokens, $${s.cost.toFixed(4)}`,
+				`  • ${s.name}${s.model && s.status === "running" ? ` (${s.model.provider}/${s.model.id})` : ` [${s.status}]`} — context ${ctx} tokens, $${s.cost.toFixed(4)}${source ? ` — source ${source}` : ""}`,
 			);
+			appendToolUsage(lines, s.tools, "    ");
 		}
 		lines.push(
 			`Totals: ${stats.tokens.input.toLocaleString()} input, ${stats.tokens.output.toLocaleString()} output, $${stats.cost.toFixed(4)}.`,

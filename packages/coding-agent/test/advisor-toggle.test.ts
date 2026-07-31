@@ -261,7 +261,12 @@ describe("AgentSession advisor toggle", () => {
 		expect(session.isAdvisorActive()).toBe(false);
 		expect(session.isAdvisorEnabled()).toBe(true);
 		expect(session.formatAdvisorStatus()).toBe(
-			"Advisor setting is enabled, but no model is assigned to the 'advisor' role.",
+			[
+				'Advisor "default" is no model.',
+				"Source: user settings (modelRoles.advisor)",
+				"Tools usage (successful/attempts):",
+				"  No tools called.",
+			].join("\n"),
 		);
 	});
 
@@ -320,6 +325,183 @@ describe("AgentSession advisor toggle", () => {
 		expect(sid).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
 		expect(sid).not.toContain("-advisor");
 	});
+	it("reports advisor source and cumulative per-tool success/attempt counts", async () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		session.toggleAdvisorEnabled();
+		expect(
+			session.applyAdvisorConfigs(
+				[
+					{
+						name: "Memory Advisor",
+						source: { scope: "project", path: path.join(tempDir.path(), "WATCHDOG.yml") },
+					},
+				],
+				undefined,
+			),
+		).toBe(1);
+		const advisor = session.getAdvisorAgent();
+		if (!advisor) throw new Error("Expected advisor agent to exist");
+
+		advisor.emitExternalEvent({
+			type: "tool_execution_start",
+			toolCallId: "edit-1",
+			toolName: "edit",
+			args: {},
+		});
+		advisor.emitExternalEvent({
+			type: "tool_execution_end",
+			toolCallId: "edit-1",
+			toolName: "edit",
+			result: {},
+			isError: false,
+		});
+		advisor.emitExternalEvent({
+			type: "tool_execution_start",
+			toolCallId: "edit-2",
+			toolName: "edit",
+			args: {},
+		});
+		advisor.emitExternalEvent({
+			type: "tool_execution_end",
+			toolCallId: "edit-2",
+			toolName: "edit",
+			result: {},
+			isError: true,
+		});
+		advisor.emitExternalEvent({
+			type: "tool_execution_start",
+			toolCallId: "edit-1",
+			toolName: "learn",
+			args: {},
+		});
+		advisor.emitExternalEvent({
+			type: "tool_execution_end",
+			toolCallId: "edit-1",
+			toolName: "learn",
+			result: {},
+			isError: false,
+		});
+		// Duplicate completion events must not inflate successful counts.
+		advisor.emitExternalEvent({
+			type: "tool_execution_end",
+			toolCallId: "edit-1",
+			toolName: "learn",
+			result: {},
+			isError: false,
+		});
+		// Cursor/server-side tools may surface only as finalized tool-result messages.
+		advisor.emitExternalEvent({
+			type: "message_end",
+			message: {
+				role: "toolResult",
+				toolCallId: "read-1",
+				toolName: "read",
+				content: [{ type: "text", text: "ok" }],
+				isError: false,
+				timestamp: 1,
+			},
+		});
+
+		const stats = session.getAdvisorStats();
+		expect(stats.advisors[0].source).toEqual({
+			scope: "project",
+			path: path.join(tempDir.path(), "WATCHDOG.yml"),
+		});
+		expect(stats.advisors[0].tools).toEqual([
+			{ name: "edit", successful: 1, attempts: 2 },
+			{ name: "learn", successful: 1, attempts: 1 },
+			{ name: "read", successful: 1, attempts: 1 },
+		]);
+		expect(stats.tools).toEqual(stats.advisors[0].tools);
+		const text = session.formatAdvisorStatus();
+		expect(text).toContain('Advisor "Memory Advisor" is enabled');
+		expect(text).toContain(`Source: project (${path.join(tempDir.path(), "WATCHDOG.yml")})`);
+		expect(text).toContain("Tools usage (successful/attempts):");
+		expect(text).toContain("edit: 1/2");
+		expect(text).toContain("learn: 1/1");
+		expect(text).toContain("read: 1/1");
+
+		await session.reload();
+		const reloadedAdvisor = session.getAdvisorAgent();
+		if (!reloadedAdvisor) throw new Error("Expected advisor agent after reload");
+		// Correlation IDs may repeat after a conversation reset; totals persist, dedupe state does not.
+		reloadedAdvisor.emitExternalEvent({
+			type: "tool_execution_start",
+			toolCallId: "edit-1",
+			toolName: "edit",
+			args: {},
+		});
+		reloadedAdvisor.emitExternalEvent({
+			type: "tool_execution_end",
+			toolCallId: "edit-1",
+			toolName: "edit",
+			result: {},
+			isError: false,
+		});
+		expect(session.getAdvisorStats().advisors[0].tools).toContainEqual({
+			name: "edit",
+			successful: 2,
+			attempts: 3,
+		});
+		session.applyAdvisorConfigs(
+			[
+				{
+					name: "Memory Advisor",
+					enabled: false,
+					source: { scope: "project", path: path.join(tempDir.path(), "WATCHDOG.yml") },
+				},
+			],
+			undefined,
+		);
+		const pausedText = session.formatAdvisorStatus();
+		expect(pausedText).toContain('Advisor "Memory Advisor" is paused');
+		expect(pausedText).toContain("edit: 2/3");
+		expect(pausedText).toContain("learn: 1/1");
+		expect(pausedText).toContain("read: 1/1");
+	});
+	it("seeds per-advisor tool stats restored at session startup", async () => {
+		const restoredSettings = Settings.isolated({
+			"advisor.enabled": true,
+			"compaction.enabled": false,
+		});
+		restoredSettings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		const restoredSession = new AgentSession({
+			agent: new Agent({
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			}),
+			sessionManager: SessionManager.inMemory(),
+			settings: restoredSettings,
+			modelRegistry,
+			advisorTools: [],
+			advisorConfigs: [{ name: "Memory Advisor" }],
+			advisorToolStats: new Map([
+				[
+					"memory-advisor",
+					[
+						{ name: "learn", successful: 1, attempts: 2 },
+						{ name: "recall", successful: 8, attempts: 8 },
+					],
+				],
+			]),
+		});
+		try {
+			expect(restoredSession.getAdvisorStats().advisors[0].tools).toEqual([
+				{ name: "learn", successful: 1, attempts: 2 },
+				{ name: "recall", successful: 8, attempts: 8 },
+			]);
+			expect(restoredSession.formatAdvisorStatus()).toContain("recall: 8/8");
+			restoredSession.setAdvisorEnabled(false);
+			restoredSession.setAdvisorEnabled(true);
+			expect(restoredSession.getAdvisorStats().advisors[0].tools).toContainEqual({
+				name: "recall",
+				successful: 8,
+				attempts: 8,
+			});
+		} finally {
+			await restoredSession.dispose();
+		}
+	});
+
 	it("retains cumulative advisor cost after the advisor is disabled", () => {
 		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
 		session.toggleAdvisorEnabled();
@@ -332,6 +514,7 @@ describe("AgentSession advisor toggle", () => {
 		expect(session.getAdvisorCost()).toBeCloseTo(0.5, 8);
 		session.setAdvisorEnabled(false);
 		expect(session.getAdvisorCost()).toBeCloseTo(0.5, 8);
+		expect(session.formatAdvisorStatus()).toBe("Advisor is disabled.");
 	});
 	it("retains total advisor cost after the live roster changes", () => {
 		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);

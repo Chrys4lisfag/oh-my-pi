@@ -21,7 +21,7 @@ be adopted without silently losing fork features.
 | ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [provider-fixes.md](provider-fixes.md)               | Gemini request normalization, Venice compatibility, Codex safety handling/account attribution, K12 classification, rate-limit and Anthropic retry policy |
 | [profiles-and-accounts.md](profiles-and-accounts.md) | Model profiles, advisor synchronization, multi-instance persistence, `/accounts` routing controls                                                        |
-| [memory-and-runtime.md](memory-and-runtime.md)       | Hindsight reflect timeout, recall/reflect visibility, Windows EPIPE/browser launch, GUI editor wait, MCP timing, prompt helper                           |
+| [memory-and-runtime.md](memory-and-runtime.md)       | Hindsight memory behavior, advisor provenance/tool telemetry, Windows EPIPE/browser launch, GUI editor wait, MCP timing, prompt helper                   |
 | [live-delta-manifest.md](live-delta-manifest.md)     | Active commit/file map, generated or stale changes, coverage gaps                                                                                        |
 | [reapply-checklist.md](reapply-checklist.md)         | Ordered fresh-fork and recurring-merge procedure, survival checks, test matrix                                                                           |
 
@@ -50,6 +50,9 @@ be adopted without silently losing fork features.
 11. Windows headless Chrome keeps Puppeteer's `--enable-automation` launch default;
     removing it can make current Chrome exit before opening CDP, while
     `--disable-blink-features=AutomationControlled` still masks `navigator.webdriver`.
+12. `/advisor status` identifies each advisor's winning config source and reports
+    per-tool successful/attempted calls; persisted advisor transcripts restore those
+    counts after process restart.
 
 ## Important memory corrections
 

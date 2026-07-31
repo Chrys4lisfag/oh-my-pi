@@ -12,7 +12,7 @@ import type {
 	ToolChoice,
 } from "@oh-my-pi/pi-ai";
 import type { postmortem } from "@oh-my-pi/pi-utils";
-import type { AdvisorConfig } from "../advisor";
+import type { AdvisorConfig, AdvisorTranscriptToolStat } from "../advisor";
 import type { AsyncJob, AsyncJobDeliveryState, AsyncJobManager } from "../async";
 import type { ModelRegistry } from "../config/model-registry";
 import type { PromptTemplate } from "../config/prompt-templates";
@@ -207,6 +207,8 @@ export interface AgentSessionConfig {
 	providerPromptCacheKeySource?: "explicit" | "fork";
 	/** Full advisor toolset built against an advisor-scoped tool session. */
 	advisorTools?: AgentTool[];
+	/** Tool usage reconstructed from persisted advisor transcripts at startup. */
+	advisorToolStats?: ReadonlyMap<string, readonly AdvisorTranscriptToolStat[]>;
 	/** Preloaded watchdog prompt content for the advisor. */
 	advisorWatchdogPrompt?: string;
 	/** Shared advisor instructions loaded from WATCHDOG.yml. */

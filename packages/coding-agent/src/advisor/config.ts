@@ -17,6 +17,13 @@ import { collectConfigCandidates } from "./watchdog";
  * tools. `instructions` is the advisor's specialization, appended to the shared
  * baseline.
  */
+/** Runtime provenance for the winning advisor definition. */
+export interface AdvisorConfigSource {
+	scope: "project" | "user" | "runtime" | "overlay" | "default";
+	/** Present for WATCHDOG.yml/WATCHDOG.yaml sources; absent for settings layers. */
+	path?: string;
+}
+
 export interface AdvisorConfig {
 	name: string;
 	model?: string;
@@ -26,6 +33,9 @@ export interface AdvisorConfig {
 	 *  stays in the roster but its runtime is never built — it shows `○` in
 	 *  the status line and `/advisor status` rather than disappearing. */
 	enabled?: boolean;
+	/** Winning source after user/project advisor rosters are merged. Runtime-only;
+	 *  never serialized back into WATCHDOG.yml. */
+	source?: AdvisorConfigSource;
 }
 
 /**
@@ -173,6 +183,7 @@ export async function discoverAdvisorConfigs(cwd: string, agentDir?: string): Pr
 				tools: filterAdvisorTools(entry.tools, item.path),
 				instructions,
 				enabled: entry.enabled,
+				source: { scope: item.level, path: item.path },
 			});
 		}
 	}

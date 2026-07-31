@@ -58,16 +58,25 @@ at this baseline; it is not a separate fork behavior.
 
 ### Profiles/advisor
 
+- `packages/coding-agent/src/advisor/config.ts`
+  - runtime-only winning `WATCHDOG` source provenance
+- `packages/coding-agent/src/advisor/transcript-recorder.ts`
+  - append-only advisor transcript replay for restart-safe tool counters
 - `packages/coding-agent/src/config/keybindings.ts`
 - `packages/coding-agent/src/config/model-registry.ts`
 - `packages/coding-agent/src/config/profiles.ts`
 - `packages/coding-agent/src/config/settings-schema.ts`
 - `packages/coding-agent/src/config/settings.ts`
 - `packages/coding-agent/src/modes/controllers/command-controller.ts`
+- `packages/coding-agent/src/sdk.ts`
+  - restores persisted advisor tool totals before session construction
 - `packages/coding-agent/src/modes/controllers/input-controller.ts`
 - `packages/coding-agent/src/modes/interactive-mode.ts`
 - `packages/coding-agent/src/modes/types.ts`
 - `packages/coding-agent/src/session/agent-session.ts`
+- `packages/coding-agent/src/session/agent-session-types.ts`
+- `packages/coding-agent/src/session/session-advisors.ts`
+  - per-advisor successful/attempted accounting and status formatting
 - `packages/coding-agent/src/slash-commands/builtin-registry.ts`
 
 `agent-session.ts` is shared with Codex refusal/account attribution and advisor
@@ -106,6 +115,10 @@ subagent inheritance. Preserve all domains when resolving its conflicts.
 - `packages/catalog/test/venice-qwen-thinking.test.ts`
 - `packages/catalog/test/venice-tool-support.test.ts`
 - `packages/coding-agent/test/agent-session-advisor-model-sync.test.ts`
+- `packages/coding-agent/test/advisor/config.test.ts`
+- `packages/coding-agent/test/advisor/transcript-recorder.test.ts`
+- `packages/coding-agent/test/advisor-toggle.test.ts`
+- `packages/coding-agent/test/modes/controllers/advisor-status-command.test.ts`
 - `packages/coding-agent/test/build-named-tool-choice.test.ts`
 - `packages/coding-agent/test/model-registry-models-updated.test.ts`
 - `packages/coding-agent/test/profiles-multi-instance.test.ts`

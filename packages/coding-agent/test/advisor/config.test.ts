@@ -95,6 +95,28 @@ describe("discoverAdvisorConfigs", () => {
 		expect(result.advisors).toEqual([]);
 		expect(result.sharedInstructions).toBeUndefined();
 	});
+
+	it("tracks the source of each winning user/project advisor definition", async () => {
+		const userPath = path.join(agentDir, "WATCHDOG.yml");
+		const projectPath = path.join(tmp, "WATCHDOG.yml");
+		await Bun.write(userPath, ["advisors:", "  - name: Shared", "  - name: User Only"].join("\n"));
+		await Bun.write(projectPath, ["advisors:", "  - name: Shared", "  - name: Project Only"].join("\n"));
+
+		const { advisors } = await discoverAdvisorConfigs(tmp, agentDir);
+		expect(advisors.find(advisor => advisor.name === "Shared")?.source).toEqual({
+			scope: "project",
+			path: projectPath,
+		});
+		expect(advisors.find(advisor => advisor.name === "User Only")?.source).toEqual({
+			scope: "user",
+			path: userPath,
+		});
+		expect(advisors.find(advisor => advisor.name === "Project Only")?.source).toEqual({
+			scope: "project",
+			path: projectPath,
+		});
+		expect(serializeWatchdogConfig({ advisors })).not.toContain("source:");
+	});
 });
 
 describe("slugifyAdvisorName", () => {

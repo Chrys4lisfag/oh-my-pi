@@ -1,7 +1,9 @@
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { Message, UserMessage } from "@oh-my-pi/pi-ai";
-import { logger } from "@oh-my-pi/pi-utils";
+import { isEnoent, logger } from "@oh-my-pi/pi-utils";
+import { loadEntriesFromFile } from "../session/session-loader";
 import { SessionManager } from "../session/session-manager";
 
 /**
@@ -29,6 +31,85 @@ export function isAdvisorTranscriptName(name: string): boolean {
 		name === ADVISOR_TRANSCRIPT_FILENAME ||
 		(name.startsWith(`${ADVISOR_TRANSCRIPT_STEM}.`) && name.endsWith(JSONL_SUFFIX))
 	);
+}
+
+export interface AdvisorTranscriptToolStat {
+	name: string;
+	successful: number;
+	attempts: number;
+}
+
+/**
+ * Reconstruct per-advisor tool usage from the owning session's append-only
+ * advisor transcripts. Used once during process startup so advisor status
+ * survives restarts without putting counters on the render path.
+ */
+export async function loadAdvisorTranscriptToolStats(
+	sessionFile: string | undefined,
+): Promise<Map<string, AdvisorTranscriptToolStat[]>> {
+	const restored = new Map<string, AdvisorTranscriptToolStat[]>();
+	if (!sessionFile?.endsWith(JSONL_SUFFIX)) return restored;
+	const artifactsDir = sessionFile.slice(0, -JSONL_SUFFIX.length);
+	let names: string[];
+	try {
+		names = (await fs.readdir(artifactsDir, { withFileTypes: true }))
+			.filter(entry => entry.isFile() && isAdvisorTranscriptName(entry.name))
+			.map(entry => entry.name)
+			.sort();
+	} catch (err) {
+		if (!isEnoent(err)) logger.debug("advisor tool stats restore scan failed", { err: String(err) });
+		return restored;
+	}
+
+	for (const filename of names) {
+		const slug =
+			filename === ADVISOR_TRANSCRIPT_FILENAME
+				? ""
+				: filename.slice(`${ADVISOR_TRANSCRIPT_STEM}.`.length, -JSONL_SUFFIX.length);
+		const stats = new Map<string, AdvisorTranscriptToolStat>();
+		const callStates = new Map<string, "pending" | "completed">();
+		const recordAttempt = (toolCallId: string, toolName: string): void => {
+			if (!toolCallId || !toolName) return;
+			const key = `${toolName}\0${toolCallId}`;
+			if (callStates.get(key) === "pending") return;
+			const stat = stats.get(toolName) ?? { name: toolName, successful: 0, attempts: 0 };
+			stat.attempts++;
+			stats.set(toolName, stat);
+			callStates.set(key, "pending");
+		};
+		const recordResult = (toolCallId: string, toolName: string, isError: boolean): void => {
+			if (!toolCallId || !toolName) return;
+			const key = `${toolName}\0${toolCallId}`;
+			if (callStates.get(key) === "completed") return;
+			recordAttempt(toolCallId, toolName);
+			callStates.set(key, "completed");
+			if (isError) return;
+			const stat = stats.get(toolName);
+			if (stat) stat.successful++;
+		};
+
+		try {
+			for (const entry of await loadEntriesFromFile(path.join(artifactsDir, filename))) {
+				if (entry.type !== "message") continue;
+				const message = entry.message as AgentMessage;
+				if (message.role === "assistant" && Array.isArray(message.content)) {
+					for (const block of message.content) {
+						if (block.type === "toolCall") recordAttempt(block.id, block.name);
+					}
+				} else if (message.role === "toolResult") {
+					recordResult(message.toolCallId, message.toolName, message.isError);
+				}
+			}
+		} catch (err) {
+			logger.debug("advisor tool stats restore failed", { file: filename, err: String(err) });
+			continue;
+		}
+		restored.set(
+			slug,
+			[...stats.values()].map(stat => ({ ...stat })).sort((a, b) => a.name.localeCompare(b.name)),
+		);
+	}
+	return restored;
 }
 
 /**

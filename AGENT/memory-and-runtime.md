@@ -218,7 +218,74 @@ The verified repair passes six tests on Windows, including four real-browser
 evaluation cases. Do not replace this with a hard-coded user Chrome path; preserve
 normal system discovery and cached Chromium fallback.
 
-## 9. Confirmed non-features and stale history
+## 9. Advisor provenance and durable tool telemetry
+
+### Status contract
+
+`/advisor status` exposes merge-sensitive advisor configuration and tool activity:
+
+- every configured advisor shows its winning source scope and path;
+- the settings-backed default identifies `modelRoles.advisor` as its source;
+- each advisor has a `Tools usage (successful/attempts)` section;
+- advisors with no calls show `No tools called.`;
+- aggregate stats retain sorted successful/attempted counts.
+
+`AdvisorConfig.source` is runtime-only provenance. Discovery attaches it after
+choosing the winning user/project `WATCHDOG` candidate. YAML load/save must not
+serialize it back into configuration.
+
+### Counter and restart contract
+
+Live accounting consumes both tool execution events and finalized assistant/tool
+result messages. A tool call increments attempts once; a non-error result increments
+successful once. Correlation keys include tool name plus call ID so different tools
+may reuse one provider ID. Runtime rebuilds clear correlation state but preserve
+cumulative same-session totals, allowing a provider to reuse IDs.
+
+Advisor transcript files are append-only:
+
+- default advisor: `__advisor.jsonl`
+- named advisor: `__advisor.<slug>.jsonl`
+
+At process startup, the SDK reconstructs tool totals from these files before
+constructing `AgentSession`. Replay tolerates malformed trailing JSONL, result-only
+calls, duplicate events, and later calls reusing a completed provider ID. Keep this
+one-time load off the status render path.
+
+Current limit: an in-process switch to another session clears committed advisor
+usage but does not rehydrate that target session's historical tool totals. Process
+restart/resume is the durable path protected by this contract.
+
+Implementation:
+
+- `packages/coding-agent/src/advisor/config.ts`
+- `packages/coding-agent/src/advisor/transcript-recorder.ts`
+- `packages/coding-agent/src/modes/controllers/command-controller.ts`
+- `packages/coding-agent/src/sdk.ts`
+- `packages/coding-agent/src/session/agent-session-types.ts`
+- `packages/coding-agent/src/session/agent-session.ts`
+- `packages/coding-agent/src/session/session-advisors.ts`
+
+Tests:
+
+- `packages/coding-agent/test/advisor/config.test.ts`
+- `packages/coding-agent/test/advisor/transcript-recorder.test.ts`
+- `packages/coding-agent/test/advisor-toggle.test.ts`
+- `packages/coding-agent/test/modes/controllers/advisor-status-command.test.ts`
+
+### User-scoped Memory Advisor policy
+
+The maintainer's `~/.omp/agent/WATCHDOG.yml` is outside Git. Its Memory Advisor
+policy requires focused `recall` near substantive task start, uses `reflect` for
+multi-memory/cross-session synthesis, and evaluates verified durable work for
+`learn`. It also treats the main agent as a competent peer: after the first routine
+compile/test/lint/tool failure, it waits for one diagnosis or corrective update
+before advising unless verified security, data-loss, correctness, or major-waste
+risk requires immediate intervention.
+
+Back up or reapply that user file separately; this repository commit cannot carry it.
+
+## 10. Confirmed non-features and stale history
 
 Do not recreate these from old branches unless a new requirement exists:
 
@@ -243,6 +310,11 @@ Do not recreate these from old branches unless a new requirement exists:
 ```sh
 (cd packages/utils && bun test test/postmortem-epipe.test.ts)
 (cd packages/coding-agent && bun test test/memory-tools.test.ts test/write-xdev-dispatch.test.ts)
+(cd packages/coding-agent && bun test \
+  test/advisor/transcript-recorder.test.ts \
+  test/advisor/config.test.ts \
+  test/advisor-toggle.test.ts \
+  test/modes/controllers/advisor-status-command.test.ts)
 ```
 
 Manual checks remain required for reflect timeout wiring, GUI wait injection, MCP

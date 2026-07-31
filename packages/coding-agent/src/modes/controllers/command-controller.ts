@@ -380,6 +380,19 @@ export class CommandController {
 			this.ctx.presentCommandOutput([new Spacer(1), new Text("Advisor is disabled.", 1, 0)]);
 			return;
 		}
+		type AdvisorStatusEntry = (typeof stats.advisors)[number];
+		const formatSource = (source: AdvisorStatusEntry["source"]): string | undefined => {
+			if (!source) return undefined;
+			return source.path ? `${source.scope} · ${source.path}` : `${source.scope} settings · modelRoles.advisor`;
+		};
+		const formatToolUsage = (tools: AdvisorStatusEntry["tools"], indent = ""): string => {
+			let output = `${indent}${theme.bold("Tools usage")} ${theme.fg("dim", "(successful/attempts)")}\n`;
+			if (tools.length === 0) return `${output}${indent}${theme.fg("dim", "No tools called.")}\n`;
+			for (const tool of tools) {
+				output += `${indent}${tool.name}: ${tool.successful.toLocaleString()}/${tool.attempts.toLocaleString()}\n`;
+			}
+			return output;
+		};
 		// Fetch live quota data (cached 5 min by the auth-gateway) so we can show
 		// real usage windows/reset timers per advisor provider. Non-fatal when absent.
 		const usageProvider = this.ctx.session as { fetchUsageReports?: () => Promise<UsageReport[] | null> };
@@ -414,6 +427,8 @@ export class CommandController {
 							? "error"
 							: "dim";
 				info += `\n${theme.fg(color, glyph)} ${theme.bold(a.name)} ${theme.fg("dim", `[${label}]`)}\n`;
+				const source = formatSource(a.source);
+				if (source) info += `${theme.fg("dim", "Source:")} ${source}\n`;
 				if (a.model) {
 					info += `${theme.fg("dim", "Model:")} ${a.model.provider}/${a.model.id}\n`;
 				}
@@ -437,6 +452,7 @@ export class CommandController {
 					if (a.cost > 0) info += `, $${a.cost.toFixed(4)}`;
 					info += "\n";
 				}
+				info += `\n${formatToolUsage(a.tools)}`;
 			}
 			if (stats.active) {
 				info += `\n${theme.bold("Totals")}\n`;
@@ -454,6 +470,8 @@ export class CommandController {
 			const glyph = CommandController.#advisorStatusGlyph[a.status] ?? "?";
 			const label = CommandController.#advisorStatusLabel[a.status] ?? a.status;
 			info += `${theme.fg(a.status === "running" ? "success" : "error", glyph)} ${a.name} ${theme.fg("dim", `[${label}]`)}\n\n`;
+			const source = formatSource(a.source);
+			if (source) info += `${theme.fg("dim", "Source:")} ${source}\n\n`;
 		}
 		if (model) {
 			info += `${theme.bold("Provider")}\n`;
@@ -489,6 +507,7 @@ export class CommandController {
 			info += `${theme.fg("dim", "Cache Read:")} ${stats.tokens.cacheRead.toLocaleString()}\n`;
 		}
 		if (stats.cost > 0) info += `${theme.fg("dim", "Cost:")} $${stats.cost.toFixed(4)}\n`;
+		info += `\n${formatToolUsage(stats.tools)}`;
 		this.ctx.presentCommandOutput([new Spacer(1), new Text(info, 1, 0)]);
 	}
 

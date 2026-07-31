@@ -33,6 +33,7 @@ import {
 	discoverWatchdogFiles,
 	formatActiveRepoWatchdogPrompt,
 	formatAdvisorContextPrompt,
+	loadAdvisorTranscriptToolStats,
 } from "./advisor";
 import { AsyncJobManager } from "./async";
 import { AutoLearnController, buildAutoLearnInstructions } from "./autolearn/controller";
@@ -3113,6 +3114,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 		const built = await Promise.all(advisorToolBuilds);
 		const advisorTools: Tool[] = built.filter((tool): tool is Tool => tool != null).map(wrapToolWithMetaNotice);
+		const advisorToolStats = await logger.time("loadAdvisorToolStats", () =>
+			loadAdvisorTranscriptToolStats(sessionManager.getSessionFile()),
+		);
 
 		const advisorWatchdogPrompts = [...watchdogFiles];
 		if (activeRepoContext) {
@@ -3218,6 +3222,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			providerPromptCacheKeySource,
 			parentEvalSessionId: options.parentEvalSessionId,
 			advisorTools,
+			advisorToolStats,
 			titleSystemPrompt: options.titleSystemPrompt,
 		});
 		hasSession = true;
