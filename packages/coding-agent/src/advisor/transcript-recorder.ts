@@ -3,7 +3,7 @@ import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { Message, UserMessage } from "@oh-my-pi/pi-ai";
 import { isEnoent, logger } from "@oh-my-pi/pi-utils";
-import { loadEntriesFromFile } from "../session/session-loader";
+import { visitEntriesFromFileStream } from "../session/session-loader";
 import { SessionManager } from "../session/session-manager";
 
 /**
@@ -69,7 +69,7 @@ export async function loadAdvisorTranscriptToolStats(
 		const stats = new Map<string, AdvisorTranscriptToolStat>();
 		const callStates = new Map<string, "pending" | "completed">();
 		const recordAttempt = (toolCallId: string, toolName: string): void => {
-			if (!toolCallId || !toolName) return;
+			if (typeof toolCallId !== "string" || typeof toolName !== "string" || !toolCallId || !toolName) return;
 			const key = `${toolName}\0${toolCallId}`;
 			if (callStates.get(key) === "pending") return;
 			const stat = stats.get(toolName) ?? { name: toolName, successful: 0, attempts: 0 };
@@ -78,7 +78,7 @@ export async function loadAdvisorTranscriptToolStats(
 			callStates.set(key, "pending");
 		};
 		const recordResult = (toolCallId: string, toolName: string, isError: boolean): void => {
-			if (!toolCallId || !toolName) return;
+			if (typeof toolCallId !== "string" || typeof toolName !== "string" || !toolCallId || !toolName) return;
 			const key = `${toolName}\0${toolCallId}`;
 			if (callStates.get(key) === "completed") return;
 			recordAttempt(toolCallId, toolName);
@@ -88,18 +88,27 @@ export async function loadAdvisorTranscriptToolStats(
 			if (stat) stat.successful++;
 		};
 
+		let validHeader: boolean | undefined;
 		try {
-			for (const entry of await loadEntriesFromFile(path.join(artifactsDir, filename))) {
-				if (entry.type !== "message") continue;
-				const message = entry.message as AgentMessage;
+			await visitEntriesFromFileStream(path.join(artifactsDir, filename), entry => {
+				const isObject = typeof entry === "object" && entry !== null;
+				if (validHeader === undefined) {
+					validHeader = isObject && entry.type === "session" && typeof entry.id === "string";
+					return;
+				}
+				if (!validHeader || !isObject || entry.type !== "message") return;
+				const message = entry.message;
+				if (!message || typeof message !== "object") return;
 				if (message.role === "assistant" && Array.isArray(message.content)) {
 					for (const block of message.content) {
-						if (block.type === "toolCall") recordAttempt(block.id, block.name);
+						if (block && typeof block === "object" && block.type === "toolCall") {
+							recordAttempt(block.id, block.name);
+						}
 					}
 				} else if (message.role === "toolResult") {
 					recordResult(message.toolCallId, message.toolName, message.isError);
 				}
-			}
+			});
 		} catch (err) {
 			logger.debug("advisor tool stats restore failed", { file: filename, err: String(err) });
 			continue;
@@ -110,6 +119,60 @@ export async function loadAdvisorTranscriptToolStats(
 		);
 	}
 	return restored;
+}
+
+/**
+ * Sum the advisor spend already persisted next to a primary session transcript,
+ * keyed by advisor slug.
+ *
+ * The ledger a session keeps in memory only covers the current process, so a
+ * resumed session would report zero until the next advisor turn. The recorded
+ * transcripts are the durable copy of exactly the same finalized messages, so
+ * they are read back through the shared loader - no lock, no writer, and no
+ * second parser to keep in step with the session format.
+ *
+ * Only the session's own advisors count: subagent advisors write to
+ * `<session>/<SubId>/__advisor.jsonl`, and their spend belongs to the subagent,
+ * not to this roster. Hence the scan stays at the top level of the directory.
+ */
+export async function loadAdvisorTranscriptCosts(sessionFile: string | undefined): Promise<Map<string, number>> {
+	const costs = new Map<string, number>();
+	if (!sessionFile?.endsWith(JSONL_SUFFIX)) return costs;
+	const directory = sessionFile.slice(0, -JSONL_SUFFIX.length);
+	const dirents = await fs.readdir(directory, { withFileTypes: true }).catch(() => []);
+	for (const dirent of dirents) {
+		if (!dirent.isFile() || !isAdvisorTranscriptName(dirent.name)) continue;
+		const slug =
+			dirent.name === ADVISOR_TRANSCRIPT_FILENAME
+				? ""
+				: dirent.name.slice(`${ADVISOR_TRANSCRIPT_STEM}.`.length, -JSONL_SUFFIX.length);
+		let total = 0;
+		let validHeader: boolean | undefined;
+		try {
+			await visitEntriesFromFileStream(path.join(directory, dirent.name), entry => {
+				const isObject = typeof entry === "object" && entry !== null;
+				if (validHeader === undefined) {
+					validHeader = isObject && entry.type === "session" && typeof entry.id === "string";
+					return;
+				}
+				// A syntactically valid but non-object entry (e.g. a bare `null`
+				// line) must cost only itself, not crash entry.type access and
+				// discard everything accumulated for this transcript.
+				if (!validHeader || !isObject || entry.type !== "message") return;
+				const message = entry.message;
+				if (!message || typeof message !== "object" || message.role !== "assistant") return;
+				// One malformed usage block must cost that entry only, not the
+				// whole transcript's total.
+				const total_ = message.usage?.cost?.total;
+				if (typeof total_ === "number" && Number.isFinite(total_)) total += total_;
+			});
+		} catch (err) {
+			logger.debug("advisor transcript cost read failed", { file: dirent.name, err: String(err) });
+			continue;
+		}
+		if (total > 0) costs.set(slug, total);
+	}
+	return costs;
 }
 
 /**

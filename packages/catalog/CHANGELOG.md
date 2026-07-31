@@ -6,6 +6,26 @@
 
 - Fixed Qwen models on the Venice provider (`api.venice.ai`) failing every request with `400 Unrecognized key(s) in object: 'enable_thinking'`. `buildOpenAICompat` picked `thinkingFormat: "qwen"` from the `qwen*` id for any non-NVIDIA/Fireworks host, emitting a top-level `enable_thinking` field that Venice's strict (`additionalProperties: false`) chat-completions schema rejects — the same failure class as NVIDIA NIM (#2299). Venice is now a registered host and its Qwen models route to the standard `"openai"` reasoning_effort dialect (mirroring the Fireworks Qwen carve-out), so the wire body no longer carries `enable_thinking`.
 - Fixed Venice models that don't support function calling (the `e2ee-*` end-to-end-encrypted variants, several `-uncensored` models, `hermes-3-llama-3.1-405b`, `grok-4-20-multi-agent`) failing every request with `400 tools is not supported by this model`. Venice reports per-model support under `model_spec.capabilities.supportsFunctionCalling`, but discovery ignored it and always sent a native `tools` array. Discovery now maps `supportsFunctionCalling: false` → `supportsTools: false`, so the agent routes those models through a prompted (in-band) tool dialect instead of the native tools API.
+### Added
+
+- Added the GMI Cloud provider (`gmi-cloud`), an OpenAI-compatible inference gateway at `https://api.gmi-serving.com/v1` with dynamic model discovery via `/v1/models` and an API-key paste login. Authenticates with the `GMI_API_KEY` environment variable. The default model (`deepseek-ai/DeepSeek-V4-Flash`) is seeded into the bundled catalog so a fresh install resolves it before the first discovery pass.
+
+## [17.2.1] - 2026-07-30
+
+### Fixed
+
+- Fixed Ollama model-manager caches being reused after the configured base URL changed by scoping cache namespaces to the normalized native discovery endpoint, including reverse-proxy path prefixes ([#7087](https://github.com/can1357/oh-my-pi/issues/7087)).
+
+## [17.2.0] - 2026-07-30
+
+### Added
+
+- Regenerated the Cursor agent protobufs (`discovery/cursor-gen/agent_pb.ts`) against the modern `agent.proto`, adding the message and enum families current Cursor CLI builds emit: Pi tool exec frames, hook queries and responses, subagents, allowlist prechecks, MCP state, smart-mode classification, canvas diagnostics, conversation search, agent-store conflicts and git diff. Purely additive — no existing exported symbol changed shape.
+
+### Fixed
+
+- Fixed an issue where LM Studio first turns failed with a 400 Invalid tool_choice error when a named tool was forced, by using the supported tool_choice: "required" string selector.
+
 ## [17.1.8] - 2026-07-28
 
 ### Added

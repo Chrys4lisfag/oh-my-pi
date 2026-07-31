@@ -406,12 +406,12 @@ export class InputController {
 		this.ctx.editor.setActionKeys("app.exit", this.ctx.keybindings.getKeys("app.exit"));
 		this.ctx.editor.setActionKeys("app.display.reset", this.ctx.keybindings.getKeys("app.display.reset"));
 		this.ctx.editor.onDisplayReset = () => {
-			// Explicit user gesture (Ctrl+L): re-query the terminal background once
-			// so a mid-session light/dark switch is picked up even on terminals
-			// without an end-to-end Mode 2031 notification path (#5352). The
-			// appearance callback re-evaluates the auto theme; the repaint below
-			// then renders the resolved palette. Bounded to one OSC 11 probe per
-			// gesture — no timers, no periodic polling.
+			// Explicit user gesture (display reset, Alt+L by default): re-query the
+			// terminal background once so a mid-session light/dark switch is picked
+			// up even on terminals without an end-to-end Mode 2031 notification
+			// path (#5352). The appearance callback re-evaluates the auto theme; the
+			// repaint below then renders the resolved palette. Bounded to one OSC 11
+			// probe per gesture — no timers, no periodic polling.
 			this.ctx.ui.terminal.refreshAppearance?.();
 			this.ctx.ui.resetDisplay();
 		};
@@ -491,6 +491,9 @@ export class InputController {
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.stt.toggle")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => void this.ctx.handleSTTToggle());
+		}
+		for (const key of this.ctx.keybindings.getKeys("app.live.toggle")) {
+			this.ctx.editor.setCustomKeyHandler(key, () => void this.ctx.handleLiveCommand());
 		}
 		// Hold the space bar to push-to-talk: the editor recognizes the auto-repeat burst, tracks
 		// the spam back out, and toggles STT on hold start / release. Gated on `stt.enabled` so a

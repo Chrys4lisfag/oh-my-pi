@@ -86,6 +86,8 @@ Never edit generated catalog JSON for Venice.
    browser launch. Current Chrome can exit with code 0 before CDP opens when that
    flag is suppressed; retain `--disable-blink-features=AutomationControlled` for
    `navigator.webdriver`.
+9. Preserve advisor config provenance, per-tool successful/attempted status, and
+   process-startup reconstruction from named advisor transcripts.
 
 ### 6. Generated and optional files
 
@@ -174,6 +176,8 @@ git grep -n "isEpipe"
 git grep -n "PI_MCP_TIMING"
 git grep -n "jsonStringify"
 git grep -n 'process.platform !== "win32"' packages/coding-agent/src/tools/browser/launch.ts
+git grep -n "loadAdvisorTranscriptToolStats"
+git grep -n "Tools usage (successful/attempts)"
 ```
 
 Interpret the `resource.?exhausted` result carefully: the fork contract requires that
@@ -195,7 +199,11 @@ expand a file argument into a large test bucket.
   test/memory-tools.test.ts \
   test/write-xdev-dispatch.test.ts \
   test/tools/browser-launch.test.ts \
-  test/tools/browser-tab-evaluate.test.ts)
+  test/tools/browser-tab-evaluate.test.ts \
+  test/advisor/config.test.ts \
+  test/advisor/transcript-recorder.test.ts \
+  test/advisor-toggle.test.ts \
+  test/modes/controllers/advisor-status-command.test.ts)
 
 (cd packages/catalog && bun test \
   test/venice-qwen-thinking.test.ts \
@@ -226,6 +234,8 @@ from fork regressions; do not hide fork-specific errors among them.
 - MCP timing: unset has no output; set prints sorted connect/list table.
 - Agent frontmatter: names/descriptions containing quotes, backslashes, and newlines.
 - Advisor runtime toggle: newly spawned subagent inherits the live parent toggle.
+- Advisor session switch: historical target-session tool totals currently rehydrate
+  only after process restart/resume, not an in-process switch.
 
 ## G. Finish and update handbook
 

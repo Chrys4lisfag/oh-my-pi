@@ -888,6 +888,53 @@ export function projectOpenAIProReasoningAliases(models: readonly ModelSpec<Api>
 }
 
 // ---------------------------------------------------------------------------
+// 1b. GMI Cloud
+// ---------------------------------------------------------------------------
+
+const GMI_CLOUD_BASE_URL = "https://api.gmi-serving.com/v1";
+
+/**
+ * Bundled seed for GMI Cloud. Generation has no `GMI_API_KEY`, so a regen
+ * without credentials would leave the provider slice empty and the declared
+ * `defaultModel` unresolvable on a fresh install before the async runtime
+ * discovery fires. Live `/v1/models` discovery is authoritative for the model
+ * ID set and overrides context/max-token limits, but `mapWithBundledReference`
+ * keeps the reference's cost/reasoning/thinking — so these fields carry GMI's
+ * direct-tariff values: V4-Flash at $0.14/$0.28 per 1M with Think High/Max
+ * modes per GMI's launch post
+ * (https://www.gmicloud.ai/en/blog/deepseek-v4-is-here-we-tested-it), not
+ * discounted gateway-route pricing. GMI publishes no cache-read tariff, so
+ * cacheRead stays 0 until a direct source confirms cached-token billing.
+ */
+export const GMI_CLOUD_STATIC_MODELS: readonly ModelSpec<"openai-completions">[] = [
+	{
+		id: "deepseek-ai/DeepSeek-V4-Flash",
+		name: "DeepSeek V4 Flash",
+		api: "openai-completions",
+		provider: "gmi-cloud",
+		baseUrl: GMI_CLOUD_BASE_URL,
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0.14, output: 0.28, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1048576,
+		maxTokens: 384000,
+		thinking: { mode: "effort", efforts: [Effort.High, Effort.Max] },
+	},
+];
+
+export interface GmiCloudModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+	fetch?: FetchImpl;
+}
+
+export function gmiCloudModelManagerOptions(
+	config?: GmiCloudModelManagerConfig,
+): ModelManagerOptions<"openai-completions"> {
+	return createSimpleOpenAICompletionsOptions("gmi-cloud", GMI_CLOUD_BASE_URL, config);
+}
+
+// ---------------------------------------------------------------------------
 // 2. Groq
 // ---------------------------------------------------------------------------
 
@@ -2300,6 +2347,7 @@ export function ollamaModelManagerOptions(config?: OllamaModelManagerConfig): Mo
 	const resolveMetadata = createOllamaMetadataResolver(nativeBaseUrl, config?.fetch);
 	return {
 		providerId: "ollama",
+		cacheProviderId: resolveModelCacheProviderId("ollama", { baseUrl }),
 		fetchDynamicModels: async () => {
 			const openAiCompatible = await fetchOpenAICompatibleModels({
 				api: "openai-responses",

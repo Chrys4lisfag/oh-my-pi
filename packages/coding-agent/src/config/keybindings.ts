@@ -54,6 +54,7 @@ interface AppKeybindings {
 	"app.history.search": true;
 	"app.stt.toggle": true;
 	"app.profile.cycle": true;
+	"app.live.toggle": true;
 }
 
 export type AppKeybinding = keyof AppKeybindings;
@@ -93,7 +94,7 @@ export const KEYBINDINGS = {
 		description: "Suspend application",
 	},
 	"app.display.reset": {
-		defaultKeys: "ctrl+l",
+		defaultKeys: "alt+l",
 		description: "Reset terminal display",
 	},
 	"app.thinking.cycle": {
@@ -226,6 +227,10 @@ export const KEYBINDINGS = {
 	"app.profile.cycle": {
 		defaultKeys: "alt+c",
 		description: "Cycle model profile",
+	},
+	"app.live.toggle": {
+		defaultKeys: "ctrl+l",
+		description: "Start or stop live voice mode (/live)",
 	},
 } as const satisfies KeybindingDefinitions;
 

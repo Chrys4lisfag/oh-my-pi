@@ -35,6 +35,7 @@ import {
 	buildXaiOAuthStaticSeed,
 	clampFireworksKimiMaxTokens,
 	clampKimiK27CodeMaxTokens,
+	GMI_CLOUD_STATIC_MODELS,
 	isFireworksKimiK2ModelId,
 	isKimiK27CodeModelId,
 	kimiCodeMaxTokens,
@@ -558,6 +559,12 @@ async function generateModels() {
 	// Sakana is authoritative and stale seed IDs must stay out.
 	if (!authoritativeCatalogProviders.has("sakana")) {
 		allModels.push(...SAKANA_FUGU_STATIC_MODELS);
+	}
+	// Seed the GMI Cloud default model so a fresh install (and a regen without a
+	// `GMI_API_KEY`) still resolves the descriptor's `defaultModel` synchronously
+	// at boot. If live `/v1/models` discovery succeeds, it is authoritative.
+	if (!authoritativeCatalogProviders.has("gmi-cloud")) {
+		allModels.push(...GMI_CLOUD_STATIC_MODELS);
 	}
 	// Seed the GitLab Duo Agent fallback model so a fresh install (no credentialed
 	// dynamic discovery/cache yet) still surfaces the provider's default model in the
