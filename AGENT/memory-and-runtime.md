@@ -304,6 +304,7 @@ Do not recreate these from old branches unless a new requirement exists:
 - `f26026115` — EPIPE, editor wait, prompt helper, and surviving runtime ports
 - `121cbbe40` — Hindsight reflect timeout plus recall/reflect xdev pins
 - `9a8062a7f` — merge-carried `PI_MCP_TIMING` instrumentation
+- `696bd711d` — advisor provenance and restart-safe tool telemetry
 
 ## Focused verification
 

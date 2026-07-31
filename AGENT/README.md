@@ -6,10 +6,10 @@ from a fresh `can1357/oh-my-pi` checkout.
 
 ## Audit baseline
 
-- Audited fork merge: `d19936375c2b14ed32bf307f347dd1d0e7854012`
-- Audited upstream parent: `a38cd95d7d8c457a22f1b81c059b5491d78f79a3`
-- Audit date: 2026-07-24
-- Live delta refresh: Windows browser launch contract
+- Audited fork merge: `69a80d946`
+- Audited upstream parent: `ef44bb5707fc359d4b01a15b8a810760923bf874`
+- Audit date: 2026-07-31
+- Live delta refresh: advisor provenance/tool telemetry and upstream integration
 
 Hashes are checkpoints, not permanent patch targets. Current code is authoritative;
 these documents describe behavior and reapplication intent so upstream refactors can

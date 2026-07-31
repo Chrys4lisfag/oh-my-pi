@@ -1,7 +1,7 @@
 # Live fork delta manifest
 
-This manifest classifies the fork delta after merge commit `d19936375` against
-upstream parent `a38cd95d7`. Refresh it after every upstream merge; never assume
+This manifest classifies the fork delta after merge commit `69a80d946` against
+upstream parent `ef44bb570`. Refresh it after every upstream merge; never assume
 commit count alone proves behavior survived.
 
 ## Fork commit ledger
@@ -23,6 +23,7 @@ commit count alone proves behavior survived.
 | `121cbbe40` | active             | Configurable Hindsight reflect timeout; pin recall/reflect top-level                                                       |
 | `32b11c08c` | active             | Venice Qwen thinking and per-model tool support                                                                            |
 | `68f30cc56` | active             | Merge profile items per key across concurrent processes                                                                    |
+| `696bd711d` | active             | Advisor source provenance and restart-safe per-tool successful/attempted telemetry                                         |
 
 `PI_MCP_TIMING` is a live fork delta carried through merge commit history (reference
 `9a8062a7f`), so it does not appear in the non-merge ledger above.
