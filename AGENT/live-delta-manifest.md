@@ -1,7 +1,7 @@
 # Live fork delta manifest
 
-This manifest classifies the fork delta after merge commit `f8e5be5688` against
-upstream parent `80627462b`. Refresh it after every upstream merge; never assume
+This manifest classifies the fork delta after merge commit `048f62e34d` against
+upstream parent `3a8591a8af`. Refresh it after every upstream merge; never assume
 commit count alone proves behavior survived.
 
 ## Fork commit ledger
