@@ -9,11 +9,13 @@ import type { ModelManagerConfig, ProviderCatalogEntry, ProviderDescriptor } fro
 import { googleModelManagerOptions, googleVertexModelManagerOptions } from "./google";
 import { ollamaCloudModelManagerOptions } from "./ollama";
 import {
+	aiandModelManagerOptions,
 	aimlApiModelManagerOptions,
 	alibabaCodingPlanModelManagerOptions,
 	alibabaTokenPlanModelManagerOptions,
 	anthropicModelManagerOptions,
 	basetenModelManagerOptions,
+	bedrockMantleModelManagerOptions,
 	cerebrasModelManagerOptions,
 	cloudflareAiGatewayModelManagerOptions,
 	coreWeaveModelManagerOptions,
@@ -66,6 +68,14 @@ import {
 
 export const CATALOG_PROVIDERS = [
 	{
+		id: "aiand",
+		defaultModel: "moonshotai/kimi-k2.7-code",
+		envVars: ["AIAND_API_KEY"],
+		createModelManagerOptions: (config: ModelManagerConfig) => aiandModelManagerOptions(config),
+		dynamicModelsAuthoritative: true,
+		catalogDiscovery: { label: "ai&" },
+	},
+	{
 		id: "aimlapi",
 		defaultModel: "gpt-5.5-2026-04-23",
 		envVars: ["AIMLAPI_API_KEY"],
@@ -99,6 +109,13 @@ export const CATALOG_PROVIDERS = [
 	{
 		id: "amazon-bedrock",
 		defaultModel: "us.anthropic.claude-opus-4-8",
+	},
+	{
+		id: "bedrock-mantle",
+		defaultModel: "openai.gpt-5.6-terra",
+		envVars: ["AWS_BEARER_TOKEN_BEDROCK"],
+		createModelManagerOptions: (config: ModelManagerConfig) => bedrockMantleModelManagerOptions(config),
+		dynamicModelsAuthoritative: true,
 	},
 	{
 		id: "anthropic",

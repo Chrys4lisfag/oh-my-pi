@@ -64,11 +64,15 @@ export async function openInEditor(
 			lowerCmd.includes(gui),
 		);
 		const hasWaitFlag = lowerCmd.includes("--wait") || / -w(\s|$)/.test(lowerCmd);
-		if (isGuiEditor && !hasWaitFlag) {
-			editorArgs.unshift(lowerCmd.includes("subl") ? "-w" : "--wait");
-		}
+		const waitFlag = isGuiEditor && !hasWaitFlag ? (lowerCmd.includes("subl") ? "-w" : "--wait") : undefined;
+		if (waitFlag) editorArgs.unshift(waitFlag);
 
-		const child = spawn(editor, [...editorArgs, tmpFile], { stdio, shell: process.platform === "win32" });
+		const child =
+			process.platform === "win32"
+				? spawn(editor, [...editorArgs, tmpFile], { stdio, shell: true })
+				: spawn("/bin/sh", ["-c", `${editorCmd}${waitFlag ? ` ${waitFlag}` : ""} "$1"`, "sh", tmpFile], {
+						stdio,
+					});
 		const { promise, reject, resolve } = Promise.withResolvers<number>();
 		child.once("exit", (code, signal) => resolve(code ?? (signal ? -1 : 0)));
 		child.once("error", error => reject(error));

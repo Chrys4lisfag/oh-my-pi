@@ -82,17 +82,16 @@ const codingAgentBucketPlans: Record<CodingAgentBucket, { label: string; paralle
 // Smaller workspace packages stay separate from native/TUI/integration suites so
 // their short TS suites can run together. CI still downloads the Linux x64 native
 // addon before this bucket: shared utility barrels may load native-backed modules.
-// mnemopi is intentionally excluded — its embedding suites depend on a ~270MB
-// fastembed model absent from CI runners, so they flake/time out under the parallel
-// bucket; run `bun --cwd=packages/mnemopi test` locally instead.
 const fastWorkspacePackages = [
 	"packages/hashline",
 	"packages/wire",
+	"packages/omptype",
 	"packages/utils",
 	"packages/catalog",
 	"packages/ai",
 	"packages/snapcompact",
 	"packages/agent",
+	"packages/mnemopi",
 ];
 
 // These suites cover the native package, TUI/browser-ish behavior, local servers,
@@ -106,25 +105,8 @@ const nativeAndIntegrationPackages = [
 ];
 
 // Packages the CI buckets deliberately skip but a local full run should still
-// cover. mnemopi's embedding suites need a ~270MB fastembed model absent from CI
-// runners (so it flakes/times out there); robomp-web lives under python/robomp
-// and is outside every CI TS bucket.
-const localOnlyWorkspacePackages = ["packages/mnemopi", "python/robomp/web"];
-
-// Repo-level script tests. CI's `workspace` bucket only runs the merge gates:
-// the concurrency regression (the GHA-config guard) and the .d.ts extension
-// rewrite (guards published-type resolution; hermetic temp-dir suite). A local
-// full run also exercises the release-notes and link-omp tests. (A
-// `ci-test-ts.test.ts` entry used to sit here but the file never existed — bun
-// silently ignores unmatched filters when at least one other filter matches.)
-const repoScriptTests = [
-	"scripts/ci-concurrency.test.ts",
-	"scripts/bazel-natives.test.ts",
-	"scripts/ci-release-notes.test.ts",
-	"scripts/ci-release-publish.test.ts",
-	"scripts/fix-dts-extensions.test.ts",
-	"scripts/link-omp.test.ts",
-];
+// cover. robomp-web lives under python/robomp and is outside every CI TS bucket.
+const localOnlyWorkspacePackages = ["python/robomp/web"];
 
 const codingAgentNativePathPatterns = [
 	/(^|\/)[^/]*(bash|native|browser|cmux|mnemopi|hindsight|memory)[^/]*\.test\.ts$/i,
@@ -340,23 +322,7 @@ async function codingAgentTestCommands(bucket: CodingAgentBucket): Promise<TestC
 async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 	switch (mode) {
 		case "workspace":
-			return [
-				...fastWorkspacePackages.map(pkg => workspaceTestCommand(pkg, 8)),
-				{
-					label: "scripts",
-					cwd: ".",
-					command: [
-						"bun",
-						"test",
-						"--parallel=4",
-						...onlyFailuresArgs,
-						"scripts/ci-concurrency.test.ts",
-						"scripts/bazel-natives.test.ts",
-						"scripts/ci-release-publish.test.ts",
-						"scripts/fix-dts-extensions.test.ts",
-					],
-				},
-			];
+			return fastWorkspacePackages.map(pkg => workspaceTestCommand(pkg, 8));
 		case "native":
 			return nativeAndIntegrationPackages.map(pkg => workspaceTestCommand(pkg, 4, { smol: true }));
 		case "coding-agent-singleton":
@@ -382,20 +348,15 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 			];
 		// `local-ts` is the full local TypeScript run that root `bun run test:ts`
 		// drives: every package the old `--workspaces` fan-out covered (the CI
-		// `all` set PLUS mnemopi and robomp-web, which CI omits) and every repo
-		// script test, routed through this one quiet runner so the whole suite
-		// shares one progress stream and one failure report.
+		// `all` set plus robomp-web, which CI omits), routed through
+		// this one quiet runner so the whole suite shares one progress stream and
+		// one failure report. Repo script tests remain available via `test:scripts`.
 		case "local-ts":
 			return [
 				...fastWorkspacePackages.map(pkg => workspaceTestCommand(pkg, 8, { extraArgs: onlyFailuresArgs })),
 				...nativeAndIntegrationPackages.map(pkg => workspaceTestCommand(pkg, 4, { extraArgs: onlyFailuresArgs })),
 				...localOnlyWorkspacePackages.map(pkg => workspaceTestCommand(pkg, 4, { extraArgs: onlyFailuresArgs })),
 				...(await commandsForMode("coding-agent-heavy")),
-				{
-					label: "scripts",
-					cwd: ".",
-					command: ["bun", "test", "--parallel=4", ...onlyFailuresArgs, ...repoScriptTests],
-				},
 			];
 		// `local` is what root `bun run test` drives: the full TS suite plus the
 		// Rust task, so a single invocation reports TS and Rust together. The Rust
@@ -467,9 +428,9 @@ async function runTestCommand(testCommand: TestCommand): Promise<void> {
 	}
 }
 
-// Child env shared by every spawned test process: the parent env with all CI
-// credential / cloud-config variables scrubbed (see SCRUBBED_ENV_* above) and
-// GITHUB_ACTIONS cleared so suites resolve only against their own fixtures.
+// Child env shared by every spawned test process: the parent env with the
+// private test-runtime marker set, all CI credential / cloud-config variables
+// scrubbed (see SCRUBBED_ENV_* above), and GITHUB_ACTIONS cleared.
 //
 // GC knobs (both needed — they gate different JSC mechanisms):
 // - `BUN_JSC_useConcurrentGC=0` stops the collector from marking concurrently
@@ -493,6 +454,7 @@ function buildChildEnv(): Record<string, string | undefined> {
 	const env: Record<string, string | undefined> = {
 		...Bun.env,
 		GITHUB_ACTIONS: "",
+		PI_TEST_RUNTIME: "1",
 		BUN_JSC_useConcurrentGC: "0",
 		BUN_JSC_numberOfGCMarkers: "1",
 	};

@@ -8,6 +8,7 @@ packages/*/dist/
 packages/*/dist-chrome/
 packages/*/dist-firefox/
 target/
+.xwin-cache/
 *.tsbuildinfo
 *.node
 *.b64.js
@@ -75,6 +76,7 @@ nxs-manager
 /runs/
 scripts/session-stats/Cargo.lock
 scripts/session-stats/edit-analysis.csv
+python/omp-rpc/build/
 # parallel-agent worktrees
 .wt/
 CPU*.md

@@ -404,7 +404,7 @@ export interface Terminal {
 	// Whether Kitty keyboard protocol is active
 	get kittyProtocolActive(): boolean;
 
-	// The exact kitty keyboard push sequence in effect ("\x1b[>1u" or "\x1b[>7u"),
+	// The exact kitty keyboard push sequence in effect ("\x1b[>5u" or "\x1b[>7u"),
 	// or null when the protocol is not active. Kitty keyboard flags are per-screen,
 	// so the TUI re-pushes this after entering the alternate screen.
 	get kittyEnableSequence(): string | null;
@@ -717,10 +717,17 @@ export class ProcessTerminal implements Terminal {
 		// stderr-guard in pi-utils (mirrors openai/codex#24459).
 		suppressTerminalStderr();
 
-		// Save previous state and enable raw mode
+		// A multiplexer or SSH disconnect can leave isTTY true after its pty has
+		// been revoked. Raw mode is then impossible, so take the normal terminal
+		// disconnect path rather than letting Bun abort startup with EIO.
 		this.#wasRaw = process.stdin.isRaw || false;
 		if (process.stdin.setRawMode) {
-			process.stdin.setRawMode(true);
+			try {
+				process.stdin.setRawMode(true);
+			} catch (err) {
+				this.#markTerminalDisconnected("stdin raw mode setup failed", err);
+				return;
+			}
 		}
 		process.stdin.setEncoding("utf8");
 		process.stdin.on("end", this.#stdinEndHandler);
@@ -1100,15 +1107,21 @@ export class ProcessTerminal implements Terminal {
 				const reportedFlags = parseInt(match[1]!, 10);
 				this.#kittyProtocolActive = true;
 				setKittyProtocolActive(true);
-				if (reportedFlags >= 3) {
-					// Already enriched (Ghostty/foot may keep flags from a parent app).
-					// Push level-2 to lock in event reporting.
+				if (isConPTYHosted()) {
+					// ConPTY (native Windows and WSL) drops Shift+letter keypresses
+					// entirely when flag 4 (report alternate keys) is set. Use flag 1
+					// (disambiguate only), preserving flag 2 if already active.
+					this.#kittyEnableSeq = (reportedFlags & 2) !== 0 ? "\x1b[>3u" : "\x1b[>1u";
+					this.#safeWrite(this.#kittyEnableSeq);
+				} else if ((reportedFlags & 2) !== 0) {
+					// Preserve event-type reporting already enabled by a parent app.
+					// Push level-2 to keep its shortcuts reporting consistently.
 					this.#kittyEnableSeq = "\x1b[>7u";
 					this.#safeWrite(this.#kittyEnableSeq);
 				} else {
-					// Level 1 (disambiguate escape codes) — enough for Shift+Enter
-					// without the modifyOtherKeys fallback that caused regression #3259.
-					this.#kittyEnableSeq = "\x1b[>1u";
+					// Disambiguate escape codes and report base-layout keys for physical
+					// shortcut matching, without event reporting that caused regression #3259.
+					this.#kittyEnableSeq = "\x1b[>5u";
 					this.#safeWrite(this.#kittyEnableSeq);
 				}
 				return;
