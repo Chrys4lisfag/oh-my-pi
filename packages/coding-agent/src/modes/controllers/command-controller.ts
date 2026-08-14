@@ -15,10 +15,12 @@ import { formatDuration, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
 import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-mode";
 import {
 	addProfile,
+	captureProfileActivationState,
 	deleteProfile,
 	getActiveProfileName,
 	listProfiles,
 	renameProfile,
+	restoreProfileActivation,
 	saveActiveProfile,
 	switchProfile,
 } from "../../config/profiles";
@@ -1209,13 +1211,36 @@ export class CommandController {
 				this.ctx.showStatus("Usage: /profiles switch <name>");
 				return;
 			}
+			const previous = captureProfileActivationState();
+			let switched = false;
 			try {
 				switchProfile(name);
+				switched = true;
+				await this.ctx.settings.flush();
+				if (getActiveProfileName() !== name)
+					throw new Error(`Profile "${name}" was deleted by another omp instance`);
 				await this.#applyProfileModelToSession();
 				this.ctx.statusLine.invalidate();
 				this.ctx.updateEditorBorderColor();
 				this.ctx.showStatus(`Switched to profile "${name}".`);
 			} catch (err) {
+				if (switched) {
+					restoreProfileActivation(previous);
+					try {
+						await this.#applyProfileModelToSession();
+					} catch (rollbackError) {
+						this.ctx.statusLine.invalidate();
+						this.ctx.updateEditorBorderColor();
+						this.ctx.showError(
+							`${err instanceof Error ? err.message : String(err)} (rollback failed: ${
+								rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
+							})`,
+						);
+						return;
+					}
+					this.ctx.statusLine.invalidate();
+					this.ctx.updateEditorBorderColor();
+				}
 				this.ctx.showError(err instanceof Error ? err.message : String(err));
 			}
 			return;
@@ -1227,11 +1252,46 @@ export class CommandController {
 				this.ctx.showStatus("Usage: /profiles delete <name>");
 				return;
 			}
+			const previous = captureProfileActivationState();
 			try {
-				deleteProfile(name);
+				const result = deleteProfile(name);
+				await this.ctx.settings.flush();
+				if (result.activated) {
+					try {
+						if (getActiveProfileName() !== result.activated.name) {
+							throw new Error(`Fallback profile "${result.activated.name}" was deleted by another omp instance`);
+						}
+						await this.#applyProfileModelToSession();
+					} catch (applyError) {
+						restoreProfileActivation({ snapshot: previous.snapshot });
+						try {
+							await this.#applyProfileModelToSession();
+						} catch (rollbackError) {
+							throw new Error(
+								`Profile "${name}" was deleted, but fallback "${result.activated.name}" failed: ${
+									applyError instanceof Error ? applyError.message : String(applyError)
+								}; session rollback failed: ${
+									rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
+								}`,
+							);
+						}
+						throw new Error(
+							`Profile "${name}" was deleted, but fallback "${result.activated.name}" was not activated: ${
+								applyError instanceof Error ? applyError.message : String(applyError)
+							}`,
+						);
+					}
+				}
 				this.ctx.statusLine.invalidate();
-				this.ctx.showStatus(`Profile "${name}" deleted.`);
+				this.ctx.updateEditorBorderColor();
+				this.ctx.showStatus(
+					result.activated
+						? `Profile "${name}" deleted. Switched to "${result.activated.name}".`
+						: `Profile "${name}" deleted.`,
+				);
 			} catch (err) {
+				this.ctx.statusLine.invalidate();
+				this.ctx.updateEditorBorderColor();
 				this.ctx.showError(err instanceof Error ? err.message : String(err));
 			}
 			return;
@@ -1246,6 +1306,11 @@ export class CommandController {
 			}
 			try {
 				renameProfile(oldName, newName);
+				await this.ctx.settings.flush();
+				const names = new Set(listProfiles().map(profile => profile.name));
+				if (names.has(oldName) || !names.has(newName)) {
+					throw new Error(`Profile rename "${oldName}" to "${newName}" conflicted with another omp instance`);
+				}
 				this.ctx.statusLine.invalidate();
 				this.ctx.showStatus(`Profile renamed: "${oldName}" → "${newName}".`);
 			} catch (err) {

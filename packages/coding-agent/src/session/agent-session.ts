@@ -8969,18 +8969,52 @@ export class AgentSession {
 	 *   3. advisors       — rebuilt so they pick up the profile's `advisor`-role
 	 *      model instead of staying pinned to the previous profile's.
 	 *
-	 * A missing default-role model (e.g. providers still loading) is skipped
-	 * rather than throwing; the `onModelsUpdated` retry rebuilds advisors once
-	 * the catalog arrives. `setModel` still throws on a resolved-but-uncredentialed
-	 * model so the caller can surface it.
+	 * An unavailable configured default is an error: reporting a successful
+	 * profile switch while leaving the previous live model would make the profile
+	 * banner disagree with the status line. Callers can retry after dynamic model
+	 * discovery finishes; this method never partially applies another role first.
 	 */
 	async applyProfileToSession(): Promise<void> {
+		const configuredDefault = this.settings.getModelRole("default");
 		const model = this.resolveRoleModel("default");
-		if (model) {
-			await this.setModel(model);
+		if (!model) {
+			throw new Error(`Profile default model "${configuredDefault ?? "(unset)"}" is unavailable`);
 		}
-		this.setThinkingLevel(parseConfiguredThinkingLevel(this.settings.get("defaultThinkingLevel")));
-		this.refreshAdvisors();
+		const configuredAdvisor = this.settings.getModelRole("advisor");
+		if (this.isAdvisorEnabled() && configuredAdvisor && !this.resolveRoleModel("advisor")) {
+			throw new Error(`Profile advisor model "${configuredAdvisor}" is unavailable`);
+		}
+
+		const previousModel = this.model;
+		const previousThinking = this.configuredThinkingLevel();
+		try {
+			if (!modelsAreEqual(this.model, model)) await this.setModel(model);
+			if (!modelsAreEqual(this.model, model)) {
+				throw new Error(
+					`Profile default model "${configuredDefault ?? `${model.provider}/${model.id}`}" was not applied`,
+				);
+			}
+			this.setThinkingLevel(parseConfiguredThinkingLevel(this.settings.get("defaultThinkingLevel")));
+			if (this.isAdvisorEnabled()) {
+				if (this.isAdvisorActive()) this.refreshAdvisors();
+				else this.ensureAdvisorsBuilt();
+				if (configuredAdvisor && !this.isAdvisorActive()) {
+					throw new Error(`Profile advisor model "${configuredAdvisor}" was not applied`);
+				}
+			}
+		} catch (error) {
+			try {
+				if (previousModel && !modelsAreEqual(this.model, previousModel)) await this.setModel(previousModel);
+				this.setThinkingLevel(previousThinking);
+			} catch (rollbackError) {
+				throw new Error(
+					`${error instanceof Error ? error.message : String(error)} (live model rollback failed: ${
+						rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
+					})`,
+				);
+			}
+			throw error;
+		}
 	}
 
 	/**

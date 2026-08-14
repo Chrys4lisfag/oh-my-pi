@@ -3,12 +3,14 @@ import { Effort } from "@oh-my-pi/pi-ai";
 import {
 	addProfile,
 	captureCurrentSnapshot,
+	captureProfileActivationState,
 	cycleProfile,
 	deleteProfile,
 	ensureDefaultProfile,
 	getActiveProfileName,
 	listProfiles,
 	renameProfile,
+	restoreProfileActivation,
 	saveActiveProfile,
 	switchProfile,
 } from "@oh-my-pi/pi-coding-agent/config/profiles";
@@ -247,24 +249,109 @@ describe("profiles", () => {
 	});
 
 	describe("deleteProfile", () => {
-		it("removes a profile", () => {
-			addProfile("a");
-			addProfile("b");
-			deleteProfile("a");
+		it("removes an inactive profile without changing the selected profile or live model", () => {
+			const s = Settings.instance;
+			s.set("profiles.items", {
+				active: { modelRoles: { default: "provider/active" }, defaultThinkingLevel: "high" },
+				drop: { modelRoles: { default: "provider/drop" }, defaultThinkingLevel: "low" },
+			});
+			s.set("profiles.active", "active");
+			s.set("modelRoles", { default: "provider/active" });
 
-			const names = listProfiles().map(p => p.name);
-			expect(names).not.toContain("a");
+			const result = deleteProfile("drop");
+
+			expect(result.activated).toBeUndefined();
+			expect(getActiveProfileName()).toBe("active");
+			expect(s.get("modelRoles").default).toBe("provider/active");
+			expect(listProfiles().map(profile => profile.name)).toEqual(["active"]);
 		});
 
-		it("clears active if deleting the active profile", () => {
-			addProfile("only");
-			expect(getActiveProfileName()).toBe("only");
-			deleteProfile("only");
+		it("deleting the selected profile activates the first valid profile alphabetically", () => {
+			const s = Settings.instance;
+			s.set("profiles.items", {
+				selected: { modelRoles: { default: "provider/selected" }, defaultThinkingLevel: "high" },
+				zeta: { modelRoles: { default: "provider/zeta" }, defaultThinkingLevel: "low" },
+				alpha: { modelRoles: { default: "provider/alpha" }, defaultThinkingLevel: "medium" },
+			});
+			s.set("profiles.active", "selected");
+
+			const result = deleteProfile("selected");
+
+			expect(result.activated?.name).toBe("alpha");
+			expect(getActiveProfileName()).toBe("alpha");
+			expect(s.get("modelRoles")).toEqual({ default: "provider/alpha" });
+			expect(s.get("defaultThinkingLevel")).toBe(Effort.Medium);
+		});
+
+		it("deleting the selected profile skips malformed fallback entries", () => {
+			const s = Settings.instance;
+			s.set("profiles.items", {
+				selected: { modelRoles: { default: "provider/selected" }, defaultThinkingLevel: "high" },
+				aBroken: { modelRoles: { default: 42 }, defaultThinkingLevel: "low" },
+				valid: { modelRoles: { default: "provider/valid" }, defaultThinkingLevel: "low" },
+			});
+			s.set("profiles.active", "selected");
+
+			const result = deleteProfile("selected");
+
+			expect(result.activated?.name).toBe("valid");
+			expect(s.get("modelRoles").default).toBe("provider/valid");
+		});
+
+		it("deleting the only profile clears selection and retains unprofiled live settings", () => {
+			const s = Settings.instance;
+			s.set("profiles.items", {
+				only: { modelRoles: { default: "provider/saved" }, defaultThinkingLevel: "low" },
+			});
+			s.set("profiles.active", "only");
+			s.set("modelRoles", { default: "provider/live-edit" });
+			s.set("defaultThinkingLevel", Effort.High);
+
+			const result = deleteProfile("only");
+
+			expect(result.activated).toBeUndefined();
+			expect(getActiveProfileName()).toBeUndefined();
+			expect(s.get("modelRoles").default).toBe("provider/live-edit");
+			expect(s.get("defaultThinkingLevel")).toBe(Effort.High);
+		});
+
+		it("deleting a malformed selected profile recovers to a valid fallback", () => {
+			const s = Settings.instance;
+			s.set("profiles.items", {
+				broken: { garbage: true },
+				valid: { modelRoles: { default: "provider/valid" }, defaultThinkingLevel: "high" },
+			});
+			s.set("profiles.active", "broken");
+
+			const result = deleteProfile("broken");
+
+			expect(result.activated?.name).toBe("valid");
+			expect(getActiveProfileName()).toBe("valid");
+		});
+
+		it("clears a stale active marker while deleting another profile", () => {
+			const s = Settings.instance;
+			s.set("profiles.items", {
+				drop: { modelRoles: { default: "provider/drop" }, defaultThinkingLevel: "high" },
+				keep: { modelRoles: { default: "provider/keep" }, defaultThinkingLevel: "high" },
+			});
+			s.set("profiles.active", "missing");
+
+			deleteProfile("drop");
+
+			expect(s.get("profiles.active")).toBe("");
 			expect(getActiveProfileName()).toBeUndefined();
 		});
 
-		it("throws for nonexistent profile", () => {
+		it("throws for nonexistent profile without changing state", () => {
+			const s = Settings.instance;
+			s.set("profiles.items", {
+				keep: { modelRoles: { default: "provider/keep" }, defaultThinkingLevel: "high" },
+			});
+			s.set("profiles.active", "keep");
 			expect(() => deleteProfile("nope")).toThrow('Profile "nope" not found');
+			expect(getActiveProfileName()).toBe("keep");
+			expect(listProfiles()).toHaveLength(1);
 		});
 	});
 
@@ -451,6 +538,66 @@ describe("profiles", () => {
 			const profiles = listProfiles();
 			expect(profiles).toHaveLength(1);
 			expect(profiles[0].name).toBe("valid");
+		});
+	});
+
+	describe("profile state invariants", () => {
+		it("treats an active marker pointing to a missing profile as inactive", () => {
+			const s = Settings.instance;
+			s.set("profiles.active", "ghost");
+			expect(getActiveProfileName()).toBeUndefined();
+			expect(listProfiles().some(profile => profile.isActive)).toBe(false);
+		});
+
+		it("treats an active marker pointing to a malformed profile as inactive", () => {
+			const s = Settings.instance;
+			s.set("profiles.items", { broken: { modelRoles: { default: 7 }, defaultThinkingLevel: "high" } });
+			s.set("profiles.active", "broken");
+			expect(getActiveProfileName()).toBeUndefined();
+			expect(listProfiles()).toEqual([]);
+		});
+
+		it("cycles only across valid profiles and ignores malformed keys", () => {
+			const s = Settings.instance;
+			s.set("profiles.items", {
+				alpha: { modelRoles: { default: "provider/a" }, defaultThinkingLevel: "high" },
+				broken: { modelRoles: { default: false }, defaultThinkingLevel: "low" },
+				zeta: { modelRoles: { default: "provider/z" }, defaultThinkingLevel: "low" },
+			});
+			s.set("profiles.active", "alpha");
+			const result = cycleProfile();
+			expect(result?.name).toBe("zeta");
+			expect(s.get("modelRoles").default).toBe("provider/z");
+		});
+
+		it("returns undefined when only one valid profile remains beside malformed keys", () => {
+			const s = Settings.instance;
+			s.set("profiles.items", {
+				valid: { modelRoles: { default: "provider/valid" }, defaultThinkingLevel: "high" },
+				broken: "not-a-snapshot",
+			});
+			s.set("profiles.active", "valid");
+			expect(cycleProfile()).toBeUndefined();
+			expect(getActiveProfileName()).toBe("valid");
+		});
+
+		it("restores profile name, roles, and thinking after a failed runtime apply", () => {
+			const s = Settings.instance;
+			s.set("profiles.items", {
+				one: { modelRoles: { default: "provider/one" }, defaultThinkingLevel: "high" },
+				two: { modelRoles: { default: "provider/two" }, defaultThinkingLevel: "low" },
+			});
+			s.set("profiles.active", "one");
+			s.set("modelRoles", { default: "provider/live-one" });
+			s.set("defaultThinkingLevel", Effort.XHigh);
+			const before = captureProfileActivationState();
+
+			switchProfile("two");
+			restoreProfileActivation(before);
+
+			expect(getActiveProfileName()).toBe("one");
+			expect(s.get("modelRoles")).toEqual({ default: "provider/live-one" });
+			expect(s.get("defaultThinkingLevel")).toBe(Effort.XHigh);
 		});
 	});
 

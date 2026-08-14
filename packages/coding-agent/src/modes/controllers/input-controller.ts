@@ -4,7 +4,12 @@ import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { type AutocompleteProvider, matchesKey, type SlashCommand } from "@oh-my-pi/pi-tui";
 import { isEnoent, logger, sanitizeText } from "@oh-my-pi/pi-utils";
-import { cycleProfile } from "../../config/profiles";
+import {
+	captureProfileActivationState,
+	cycleProfile,
+	getActiveProfileName,
+	restoreProfileActivation,
+} from "../../config/profiles";
 import { isSettingsInitialized, settings } from "../../config/settings";
 import { resolveLocalRoot } from "../../internal-urls";
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";
@@ -1845,23 +1850,42 @@ export class InputController {
 	}
 
 	async cycleModelProfile(): Promise<void> {
+		const previous = captureProfileActivationState();
 		const result = cycleProfile();
 		if (!result) {
 			this.ctx.showStatus("No profiles to cycle (create with /profiles add <name>)");
 			return;
 		}
 		try {
-			// Apply the cycled profile (primary model, thinking level, advisors) via
-			// the centralized session method so the advisor model tracks the profile.
+			await settings.flush();
+			if (getActiveProfileName() !== result.name) {
+				throw new Error(`Profile "${result.name}" was deleted by another omp instance`);
+			}
 			await this.ctx.session.applyProfileToSession();
 		} catch (err) {
+			restoreProfileActivation(previous);
+			try {
+				await this.ctx.session.applyProfileToSession();
+			} catch (rollbackError) {
+				this.ctx.statusLine.invalidate();
+				this.ctx.updateEditorBorderColor();
+				this.ctx.showError(
+					`${err instanceof Error ? err.message : String(err)} (rollback failed: ${
+						rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
+					})`,
+				);
+				return;
+			}
+			this.ctx.statusLine.invalidate();
+			this.ctx.updateEditorBorderColor();
 			this.ctx.showError(err instanceof Error ? err.message : String(err));
 			return;
 		}
 		this.ctx.statusLine.invalidate();
 		this.ctx.updateEditorBorderColor();
 		const profileName = theme.bold(theme.fg("accent", result.name));
-		const rolesSummary = Object.entries(result.snapshot.modelRoles)
+		const liveRoles = settings.get("modelRoles");
+		const rolesSummary = Object.entries(liveRoles)
 			.map(([role, model]) => `${theme.fg("muted", role)}: ${model.split("/").pop()}`)
 			.join(theme.fg("dim", ", "));
 		this.ctx.showStatus(`Profile: ${profileName} (${rolesSummary})`, { dim: false });

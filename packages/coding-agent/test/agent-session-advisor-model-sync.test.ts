@@ -18,20 +18,21 @@
  *   #5 `applyProfileToSession()` — apply the active profile's model roles +
  *                                 thinking level to a live session (primary
  *                                 model via `default` role, `defaultThinkingLevel`,
- *                                 advisor rebuild). Unresolvable `default`
- *                                 role is skipped without throwing while
- *                                 thinking + advisor still apply.
+ *                                 advisor rebuild). An unresolvable `default`
+ *                                 role rejects before any partial runtime apply,
+ *                                 preventing profile/header model divergence.
  *
  * The reference harness (real ModelRegistry(authStorage) + new AgentSession)
  * mirrors `advisor-toggle.test.ts` and `model-registry-models-updated.test.ts`.
  */
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { Effort, type Model } from "@oh-my-pi/pi-ai";
 import { type GeneratedProvider, getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { deleteProfile, getActiveProfileName, switchProfile } from "@oh-my-pi/pi-coding-agent/config/profiles";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -59,6 +60,7 @@ function getModelOrThrow(provider: GeneratedProvider, id: string): Model {
 interface HarnessOptions {
 	settingsOverrides: Partial<Record<string, unknown>>;
 	credentialedProviders: readonly string[];
+	settings?: Settings;
 }
 
 interface Harness {
@@ -84,10 +86,12 @@ describe("AgentSession advisor + profile model sync", () => {
 		}
 		const modelRegistry = new ModelRegistry(authStorage);
 		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
-		const settings = Settings.isolated({
-			"compaction.enabled": false,
-			...opts.settingsOverrides,
-		});
+		const settings =
+			opts.settings ??
+			Settings.isolated({
+				"compaction.enabled": false,
+				...opts.settingsOverrides,
+			});
 		const primaryModel = getModelOrThrow(PRIMARY_PROVIDER, PRIMARY_MODEL_ID);
 		const agent = new Agent({
 			initialState: {
@@ -352,11 +356,7 @@ describe("AgentSession advisor + profile model sync", () => {
 			expect(advisorAgent?.state.model?.provider).toBe(LATE_PROVIDER);
 		});
 
-		it("skips an unresolvable default-role model without throwing while thinking + advisor still apply", async () => {
-			// Advisor active on model A; primary is model A. Simulate a profile
-			// whose `default` role points at a model that isn't in the registry —
-			// applyProfileToSession() must NOT throw, must leave the primary alone,
-			// and must still propagate the thinking level + advisor rebuild.
+		it("rejects an unresolvable default-role model before changing the primary model or thinking", async () => {
 			const { session } = await createHarness({
 				settingsOverrides: {
 					"advisor.enabled": true,
@@ -367,22 +367,123 @@ describe("AgentSession advisor + profile model sync", () => {
 				},
 				credentialedProviders: [PRIMARY_PROVIDER],
 			});
-			expect(session.model?.id).toBe(PRIMARY_MODEL_ID);
-			expect(session.getAdvisorAgent()?.state.model?.id).toBe(PRIMARY_MODEL_ID);
+			const previousThinking = session.thinkingLevel;
 
 			session.settings.setModelRole("default", "bogus-provider/nonexistent-model");
 			session.settings.set("defaultThinkingLevel", Effort.Low);
 			session.settings.setModelRole("advisor", `${PRIMARY_PROVIDER}/${SWAP_MODEL_ID}`);
 
-			await expect(session.applyProfileToSession()).resolves.toBeUndefined();
-
-			// Primary unchanged (unresolvable → skipped).
+			await expect(session.applyProfileToSession()).rejects.toThrow(
+				'Profile default model "bogus-provider/nonexistent-model" is unavailable',
+			);
 			expect(session.model?.id).toBe(PRIMARY_MODEL_ID);
-			// Thinking + advisor still applied.
-			expect(session.thinkingLevel).toBe(Effort.Low);
-			const advisorAgent = session.getAdvisorAgent();
-			expect(advisorAgent?.state.model?.id).toBe(SWAP_MODEL_ID);
-			expect(advisorAgent?.state.model?.provider).toBe(PRIMARY_PROVIDER);
+			expect(session.thinkingLevel).toBe(previousThinking);
+		});
+
+		it("preflights an unavailable advisor before changing the live primary model or thinking", async () => {
+			const { session } = await createHarness({
+				settingsOverrides: {
+					"advisor.enabled": true,
+					modelRoles: {
+						default: `${PRIMARY_PROVIDER}/${PRIMARY_MODEL_ID}`,
+						advisor: `${PRIMARY_PROVIDER}/${PRIMARY_MODEL_ID}`,
+					},
+				},
+				credentialedProviders: [PRIMARY_PROVIDER],
+			});
+			const previousThinking = session.thinkingLevel;
+			session.settings.setModelRole("default", `${PRIMARY_PROVIDER}/${SWAP_MODEL_ID}`);
+			session.settings.set("defaultThinkingLevel", Effort.High);
+			session.settings.setModelRole("advisor", `${LATE_PROVIDER}/${LATE_MODEL_ID}`);
+
+			await expect(session.applyProfileToSession()).rejects.toThrow(
+				`Profile advisor model "${LATE_PROVIDER}/${LATE_MODEL_ID}" is unavailable`,
+			);
+			expect(session.model?.id).toBe(PRIMARY_MODEL_ID);
+			expect(session.thinkingLevel).toBe(previousThinking);
+		});
+
+		it("restores the previous live model when setModel throws after mutating agent state", async () => {
+			const { session } = await createHarness({
+				settingsOverrides: {
+					modelRoles: { default: `${PRIMARY_PROVIDER}/${PRIMARY_MODEL_ID}` },
+				},
+				credentialedProviders: [PRIMARY_PROVIDER],
+			});
+			vi.spyOn(session, "setModel").mockImplementationOnce(async model => {
+				session.agent.setModel(model);
+				throw new Error("injected model apply failure");
+			});
+			session.settings.setModelRole("default", `${PRIMARY_PROVIDER}/${SWAP_MODEL_ID}`);
+
+			await expect(session.applyProfileToSession()).rejects.toThrow("injected model apply failure");
+			expect(session.model?.id).toBe(PRIMARY_MODEL_ID);
+		});
+
+		describe("profile CRUD to live-session integration", () => {
+			it("switches the live primary model to the selected profile model", async () => {
+				resetSettingsForTest();
+				await Settings.init({ inMemory: true });
+				const settings = Settings.instance;
+				settings.set("profiles.items", {
+					first: {
+						modelRoles: { default: `${PRIMARY_PROVIDER}/${PRIMARY_MODEL_ID}` },
+						defaultThinkingLevel: "medium",
+					},
+					second: {
+						modelRoles: { default: `${PRIMARY_PROVIDER}/${SWAP_MODEL_ID}` },
+						defaultThinkingLevel: "high",
+					},
+				});
+				settings.set("profiles.active", "first");
+				settings.set("modelRoles", { default: `${PRIMARY_PROVIDER}/${PRIMARY_MODEL_ID}` });
+				const { session } = await createHarness({
+					settingsOverrides: {},
+					credentialedProviders: [PRIMARY_PROVIDER],
+					settings,
+				});
+
+				switchProfile("second");
+				await session.applyProfileToSession();
+
+				expect(getActiveProfileName()).toBe("second");
+				expect(settings.get("modelRoles").default).toBe(`${PRIMARY_PROVIDER}/${SWAP_MODEL_ID}`);
+				expect(session.model?.provider).toBe(PRIMARY_PROVIDER);
+				expect(session.model?.id).toBe(SWAP_MODEL_ID);
+				expect(session.thinkingLevel).toBe(Effort.High);
+			});
+
+			it("deleting the selected profile switches the live model to its deterministic fallback", async () => {
+				resetSettingsForTest();
+				await Settings.init({ inMemory: true });
+				const settings = Settings.instance;
+				settings.set("profiles.items", {
+					selected: {
+						modelRoles: { default: `${PRIMARY_PROVIDER}/${PRIMARY_MODEL_ID}` },
+						defaultThinkingLevel: "medium",
+					},
+					fallback: {
+						modelRoles: { default: `${PRIMARY_PROVIDER}/${SWAP_MODEL_ID}` },
+						defaultThinkingLevel: "high",
+					},
+				});
+				settings.set("profiles.active", "selected");
+				settings.set("modelRoles", { default: `${PRIMARY_PROVIDER}/${PRIMARY_MODEL_ID}` });
+				const { session } = await createHarness({
+					settingsOverrides: {},
+					credentialedProviders: [PRIMARY_PROVIDER],
+					settings,
+				});
+
+				const result = deleteProfile("selected");
+				expect(result.activated?.name).toBe("fallback");
+				await session.applyProfileToSession();
+
+				expect(getActiveProfileName()).toBe("fallback");
+				expect(session.model?.provider).toBe(PRIMARY_PROVIDER);
+				expect(session.model?.id).toBe(SWAP_MODEL_ID);
+				expect(session.thinkingLevel).toBe(Effort.High);
+			});
 		});
 	});
 });

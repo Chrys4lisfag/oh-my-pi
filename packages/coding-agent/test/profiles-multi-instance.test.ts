@@ -97,4 +97,134 @@ describe("profiles multi-instance persistence", () => {
 		const items = reader.get("profiles.items") as Record<string, unknown>;
 		expect(Object.keys(items).sort()).toEqual(["base", "external", "from-a"]);
 	});
+	it("does not resurrect a deleted profile when a stale instance updates that same name", async () => {
+		const seed = await load();
+		seed.setProfileItem("shared", SNAP);
+		await seed.flush();
+
+		const stale = await load();
+		const deleter = await load();
+		stale.setProfileItem("shared", {
+			modelRoles: { default: "xai-oauth/grok-4.5" },
+			defaultThinkingLevel: "auto",
+		});
+		deleter.deleteProfileItem("shared");
+		await deleter.flush();
+		await stale.flush();
+
+		const reader = await load();
+		expect(reader.get("profiles.items")).toEqual({});
+	});
+
+	it("deletion wins when the stale same-profile update saves first", async () => {
+		const seed = await load();
+		seed.setProfileItem("shared", SNAP);
+		await seed.flush();
+
+		const stale = await load();
+		const deleter = await load();
+		stale.setProfileItem("shared", {
+			modelRoles: { default: "xai-oauth/grok-4.5" },
+			defaultThinkingLevel: "auto",
+		});
+		deleter.deleteProfileItem("shared");
+		await stale.flush();
+		await deleter.flush();
+
+		const reader = await load();
+		expect(reader.get("profiles.items")).toEqual({});
+	});
+
+	it("allows a fresh instance to intentionally recreate a deleted profile name", async () => {
+		const seed = await load();
+		seed.setProfileItem("shared", SNAP);
+		await seed.flush();
+		const deleter = await load();
+		deleter.deleteProfileItem("shared");
+		await deleter.flush();
+
+		const fresh = await load();
+		const replacement = {
+			modelRoles: { default: "openai-codex/gpt-5.6" },
+			defaultThinkingLevel: "medium",
+		};
+		fresh.setProfileItem("shared", replacement);
+		await fresh.flush();
+
+		const reader = await load();
+		expect(reader.get("profiles.items")).toEqual({ shared: replacement });
+	});
+
+	it("does not persist a stale active marker for a concurrently deleted profile", async () => {
+		const seed = await load();
+		seed.setProfileItem("shared", SNAP);
+		seed.set("profiles.active", "shared");
+		await seed.flush();
+
+		const stale = await load();
+		const deleter = await load();
+		deleter.deleteProfileItem("shared");
+		deleter.set("profiles.active", "");
+		await deleter.flush();
+
+		stale.setProfileItem("shared", {
+			modelRoles: { default: "xai-oauth/grok-4.5" },
+			defaultThinkingLevel: "auto",
+		});
+		stale.set("profiles.active", "shared");
+		await stale.flush();
+
+		const reader = await load();
+		expect(reader.get("profiles.items")).toEqual({});
+		expect(reader.get("profiles.active")).toBe("");
+	});
+
+	it("keeps create intent when a new profile is edited again before its first flush", async () => {
+		const writer = await load();
+		writer.setProfileItem("new", SNAP);
+		const edited = {
+			modelRoles: { default: "anthropic/claude-opus-4-6" },
+			defaultThinkingLevel: "xhigh",
+		};
+		writer.setProfileItem("new", edited);
+		await writer.flush();
+
+		const reader = await load();
+		expect(reader.get("profiles.items")).toEqual({ new: edited });
+	});
+	it("does not rename a stale source after another instance deletes it", async () => {
+		const seed = await load();
+		seed.setProfileItem("old", SNAP);
+		await seed.flush();
+
+		const stale = await load();
+		const deleter = await load();
+		deleter.deleteProfileItem("old");
+		await deleter.flush();
+		stale.renameProfileItem("old", "new", SNAP, false);
+		await stale.flush();
+
+		const reader = await load();
+		expect(reader.get("profiles.items")).toEqual({});
+	});
+
+	it("does not overwrite a rename destination concurrently created by another instance", async () => {
+		const seed = await load();
+		seed.setProfileItem("old", SNAP);
+		await seed.flush();
+
+		const stale = await load();
+		const creator = await load();
+		const concurrent = {
+			modelRoles: { default: "openai-codex/gpt-5.6" },
+			defaultThinkingLevel: "medium",
+		};
+		creator.setProfileItem("new", concurrent);
+		await creator.flush();
+		stale.renameProfileItem("old", "new", SNAP, false);
+		await stale.flush();
+
+		const reader = await load();
+		expect(reader.get("profiles.items")).toEqual({ old: SNAP, new: concurrent });
+	});
 });

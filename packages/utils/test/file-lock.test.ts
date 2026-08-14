@@ -6,7 +6,7 @@ import { __internalsForTesting, withFileLock } from "../src/file-lock";
 import { isEnoent } from "../src/fs-error";
 import { removeWithRetries } from "../src/temp";
 
-const { tryAcquireLock, getLockPath } = __internalsForTesting;
+const { createTryAcquire, tryAcquireCompatibilityLock, tryAcquireLock, getLockPath } = __internalsForTesting;
 
 const ROOTS: string[] = [];
 
@@ -22,7 +22,67 @@ afterAll(async () => {
 	}
 });
 
-describe("native file-lock ownership", () => {
+describe("file-lock ownership", () => {
+	test("falls back when the loaded native addon has no FileLock export", async () => {
+		const root = await mkRoot();
+		const lockPath = getLockPath(path.join(root, "missing-native.json"));
+		const acquire = createTryAcquire(undefined);
+		const owner = acquire(lockPath);
+		if (!owner) throw new Error("compatibility fallback failed to acquire");
+		expect(acquire(lockPath)).toBeNull();
+		owner.release();
+		const successor = acquire(lockPath);
+		if (!successor) throw new Error("compatibility fallback failed after release");
+		successor.release();
+	});
+
+	test("missing-native and native-present processes share the compatibility namespace", async () => {
+		const root = await mkRoot();
+		const lockPath = getLockPath(path.join(root, "mixed-native.json"));
+		let nativeHeld = false;
+		const nativeConstructor = {
+			tryAcquire: () => {
+				const acquired = !nativeHeld;
+				if (acquired) nativeHeld = true;
+				return {
+					acquired,
+					release: () => {
+						if (acquired) nativeHeld = false;
+					},
+				};
+			},
+		};
+		const fallbackAcquire = createTryAcquire(undefined);
+		const compositeAcquire = createTryAcquire(nativeConstructor);
+
+		const fallbackOwner = fallbackAcquire(lockPath);
+		if (!fallbackOwner) throw new Error("fallback owner failed to acquire");
+		expect(compositeAcquire(lockPath)).toBeNull();
+		expect(nativeHeld).toBe(false);
+		fallbackOwner.release();
+
+		const compositeOwner = compositeAcquire(lockPath);
+		if (!compositeOwner) throw new Error("composite owner failed to acquire");
+		expect(fallbackAcquire(lockPath)).toBeNull();
+		compositeOwner.release();
+		const finalOwner = fallbackAcquire(lockPath);
+		expect(finalOwner).not.toBeNull();
+		finalOwner?.release();
+	});
+
+	test("compatibility lock late release cannot unlock its successor", async () => {
+		const root = await mkRoot();
+		const lockPath = getLockPath(path.join(root, "compatibility-handoff.json"));
+		const formerOwner = tryAcquireCompatibilityLock(lockPath);
+		if (!formerOwner) throw new Error("former compatibility owner failed to acquire");
+		formerOwner.release();
+		const successor = tryAcquireCompatibilityLock(lockPath);
+		if (!successor) throw new Error("compatibility successor failed to acquire");
+		formerOwner.release();
+		expect(tryAcquireCompatibilityLock(lockPath)).toBeNull();
+		successor.release();
+	});
+
 	test("process death hands ownership to B while excluding C", async () => {
 		const root = await mkRoot();
 		const target = path.join(root, "abandoned.json");

@@ -349,8 +349,17 @@ export class Settings {
 
 	/** Paths modified during this session (for partial save) */
 	#modified = new Set<string>();
-	/** Profile names whose `profiles.items` entry changed this session; merged per-key on save so concurrent omp instances don't clobber each other's profiles. */
-	#modifiedProfileItems = new Map<string, "upsert" | "delete">();
+	/** Profile names changed locally. Creates may add an absent key; stale updates never resurrect a concurrently deleted profile. */
+	#modifiedProfileItems = new Map<string, "create" | "update" | "delete">();
+	/** Cross-key profile renames, committed only when the source still exists and destination is still absent on disk. */
+	#modifiedProfileRenames = new Map<
+		string,
+		{
+			newName: string;
+			snapshot: { modelRoles: Record<string, string>; defaultThinkingLevel: string };
+			wasActive: boolean;
+		}
+	>();
 	/** Individual project model roles modified during this session */
 	#modifiedProjectModelRoles = new Set<string>();
 	/** Individual global model roles modified during this session (for partial save) */
@@ -515,16 +524,17 @@ export class Settings {
 	}
 
 	/**
-	 * Upsert a single profile snapshot with per-key persistence. Unlike
-	 * `set("profiles.items", wholeMap)`, only the touched profile name is marked
-	 * dirty, so the background save merges it into the freshest on-disk
-	 * `profiles.items` under the file lock — a concurrent omp instance's
-	 * independently-added profiles survive instead of being clobbered by this
-	 * instance's stale full map.
+	 * Upsert one profile snapshot with per-key persistence. Existing local keys
+	 * are tracked as updates, so a stale omp process cannot recreate that key
+	 * after another process deletes it. Brand-new local keys are creates and may
+	 * intentionally add (or re-add) an absent profile.
 	 */
 	setProfileItem(name: string, snapshot: { modelRoles: Record<string, string>; defaultThinkingLevel: string }): void {
+		const items = getByPath(this.#global, ["profiles", "items"]);
+		const existed = isRecord(items) && Object.hasOwn(items, name);
+		const pending = this.#modifiedProfileItems.get(name);
 		setByPath(this.#global, ["profiles", "items", name], snapshot);
-		this.#modifiedProfileItems.set(name, "upsert");
+		this.#modifiedProfileItems.set(name, pending === "create" || !existed ? "create" : "update");
 		this.#rebuildMerged();
 		this.#queueSave();
 	}
@@ -540,6 +550,24 @@ export class Settings {
 			delete (items as Record<string, unknown>)[name];
 		}
 		this.#modifiedProfileItems.set(name, "delete");
+		this.#rebuildMerged();
+		this.#queueSave();
+	}
+
+	/** Rename one profile atomically against the freshest on-disk profile map. */
+	renameProfileItem(
+		oldName: string,
+		newName: string,
+		snapshot: { modelRoles: Record<string, string>; defaultThinkingLevel: string },
+		wasActive: boolean,
+	): void {
+		const items = getByPath(this.#global, ["profiles", "items"]);
+		if (isRecord(items)) {
+			items[newName] = snapshot;
+			delete items[oldName];
+		}
+		if (wasActive) setByPath(this.#global, ["profiles", "active"], newName);
+		this.#modifiedProfileRenames.set(oldName, { newName, snapshot, wasActive });
 		this.#rebuildMerged();
 		this.#queueSave();
 	}
@@ -624,7 +652,12 @@ export class Settings {
 		if (this.#projectSavePromise) {
 			await this.#projectSavePromise;
 		}
-		if (this.#modified.size > 0 || this.#modifiedProfileItems.size > 0 || this.#modifiedGlobalModelRoles.size > 0) {
+		if (
+			this.#modified.size > 0 ||
+			this.#modifiedProfileItems.size > 0 ||
+			this.#modifiedProfileRenames.size > 0 ||
+			this.#modifiedGlobalModelRoles.size > 0
+		) {
 			await this.#saveNow();
 		}
 		if (this.#modifiedProjectModelRoles.size > 0) {
@@ -2013,6 +2046,7 @@ export class Settings {
 		if (
 			this.#modified.size === 0 &&
 			this.#modifiedProfileItems.size === 0 &&
+			this.#modifiedProfileRenames.size === 0 &&
 			this.#modifiedGlobalModelRoles.size === 0
 		)
 			return;
@@ -2024,6 +2058,8 @@ export class Settings {
 		this.#modified.clear();
 		const modifiedProfileItems = new Map(this.#modifiedProfileItems);
 		this.#modifiedProfileItems.clear();
+		const modifiedProfileRenames = new Map(this.#modifiedProfileRenames);
+		this.#modifiedProfileRenames.clear();
 		this.#modifiedGlobalModelRoles.clear();
 
 		try {
@@ -2042,22 +2078,52 @@ export class Settings {
 					setByPath(current, segments, value);
 				}
 
-				// Merge touched profile keys individually so a concurrent omp
-				// instance's independently added/edited profiles survive: never
-				// overwrite the whole `profiles.items` map from this stale copy.
+				for (const [oldName, rename] of modifiedProfileRenames) {
+					const items = getByPath(current, ["profiles", "items"]);
+					const canRename =
+						isRecord(items) && Object.hasOwn(items, oldName) && !Object.hasOwn(items, rename.newName);
+					if (canRename) {
+						items[rename.newName] = rename.snapshot;
+						delete items[oldName];
+						if (rename.wasActive) setByPath(current, ["profiles", "active"], rename.newName);
+					} else if (rename.wasActive) {
+						setByPath(
+							current,
+							["profiles", "active"],
+							isRecord(items) && Object.hasOwn(items, oldName) ? oldName : "",
+						);
+					}
+				}
+
+				// Merge touched profile keys individually. Updates only land when
+				// the key still exists on disk: absence is the durable tombstone
+				// that prevents a stale, still-open omp process from resurrecting
+				// a profile deleted by another process. Creates intentionally add
+				// absent keys, supporting explicit re-creation with the same name.
 				for (const [profileName, op] of modifiedProfileItems) {
 					if (op === "delete") {
 						const items = getByPath(current, ["profiles", "items"]);
-						if (items && typeof items === "object") {
-							delete (items as Record<string, unknown>)[profileName];
-						}
-					} else {
-						setByPath(
-							current,
-							["profiles", "items", profileName],
-							getByPath(this.#global, ["profiles", "items", profileName]),
-						);
+						if (isRecord(items)) delete items[profileName];
+						continue;
 					}
+					if (op === "update") {
+						const items = getByPath(current, ["profiles", "items"]);
+						if (!isRecord(items) || !Object.hasOwn(items, profileName)) continue;
+					}
+					setByPath(
+						current,
+						["profiles", "items", profileName],
+						getByPath(this.#global, ["profiles", "items", profileName]),
+					);
+				}
+				const activeProfile = getByPath(current, ["profiles", "active"]);
+				const currentProfileItems = getByPath(current, ["profiles", "items"]);
+				if (
+					typeof activeProfile === "string" &&
+					activeProfile.length > 0 &&
+					(!isRecord(currentProfileItems) || !Object.hasOwn(currentProfileItems, activeProfile))
+				) {
+					setByPath(current, ["profiles", "active"], "");
 				}
 				// Merge only the model roles captured by this save. Then retain
 				// any role changed while the async read/lock was pending before
@@ -2117,6 +2183,9 @@ export class Settings {
 				if (!this.#modifiedProfileItems.has(profileName)) {
 					this.#modifiedProfileItems.set(profileName, op);
 				}
+			}
+			for (const [oldName, rename] of modifiedProfileRenames) {
+				if (!this.#modifiedProfileRenames.has(oldName)) this.#modifiedProfileRenames.set(oldName, rename);
 			}
 			for (const role of modifiedModelRoles) {
 				this.#modifiedGlobalModelRoles.add(role);
