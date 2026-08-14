@@ -315,6 +315,7 @@ Tests:
 - `packages/coding-agent/test/advisor/transcript-recorder.test.ts`
 - `packages/coding-agent/test/advisor-toggle.test.ts`
 - `packages/coding-agent/test/modes/controllers/advisor-status-command.test.ts`
+- `packages/coding-agent/test/modes/controllers/selector-controller-settings.test.ts`
 
 ### User-scoped Memory Advisor policy
 
@@ -327,6 +328,46 @@ before advising unless verified security, data-loss, correctness, or major-waste
 risk requires immediate intervention.
 
 Back up or reapply that user file separately; this repository commit cannot carry it.
+
+### Memory Advisor retrieval enforcement and injection telemetry
+
+Memory-related advisors are classified from their own custom instructions and granted
+`recall` access. Shared advisor instructions do not opt every advisor into enforcement.
+`advisor.memoryReminderInterval` controls cadence and defaults to 8; injection occurs on
+every Nth consecutive advisor context read. The counter measures advisor reads, not
+primary turns. A `recall` or `reflect`
+attempt resets the no-retrieval streak even when the backend fails; `learn` does not.
+
+On each due read, OMP stores the advisor's exact custom instructions once as an
+`artifact://` document and prepends `<advisor-memory-reminder>` to the prompt. An
+injection is counted only when that reminder is actually prepended; failed artifact
+creation does not increment it. `/advisor status` exposes `Memory reminder injections`
+for each classified advisor and an aggregate total. Counts survive same-session advisor
+runtime rebuilds, reset at conversation boundaries with the other session-level advisor
+statistics, and are not reconstructed from transcript files after process restart.
+Compaction/history rewrites reset runtime context without erasing this session counter.
+
+Implementation:
+
+- `packages/coding-agent/src/advisor/memory-reminder.ts`
+- `packages/coding-agent/src/config/settings-schema.ts`
+- `packages/coding-agent/src/main.ts`
+- `packages/coding-agent/src/session/session-advisors.ts`
+- `packages/coding-agent/src/modes/controllers/command-controller.ts`
+- `packages/coding-agent/src/modes/controllers/selector-controller.ts`
+
+Tests:
+
+- `packages/coding-agent/test/advisor/memory-reminder.test.ts`
+- `packages/coding-agent/test/advisor-memory-reminder-integration.test.ts`
+- `packages/coding-agent/test/modes/controllers/advisor-status-command.test.ts`
+- `packages/coding-agent/test/modes/controllers/selector-controller-settings.test.ts`
+
+Merge rule: preserve the upstream advisor prompt/input shape and tool-event lifecycle;
+reapply classification, artifact injection, the per-slug cumulative map, runtime
+signature/settings-selector rebuild wiring, structured stats, and both text/TUI
+status rendering. Do not conflate reminder injections with
+`recall` attempts or durable tool transcript telemetry.
 
 ## 11. Confirmed non-features and stale history
 

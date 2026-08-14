@@ -56,6 +56,9 @@ be adopted without silently losing fork features.
 13. Zero-config OpenAI GPT/Codex auto-maintenance selects provider-native
     context-full compaction when available; explicit strategies and remote-disable
     settings still win.
+14. Memory-related advisors receive a retrieval reminder after the configured number
+    of advisor context reads without `recall`/`reflect`; `/advisor status` reports
+    actual reminder injections per advisor and in aggregate.
 
 ## Important memory corrections
 

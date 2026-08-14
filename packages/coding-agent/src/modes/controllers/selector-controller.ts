@@ -449,6 +449,9 @@ export class SelectorController {
 				this.ctx.statusLine.invalidate();
 				this.ctx.ui.requestRender();
 				break;
+			case "advisor.memoryReminderInterval":
+				this.ctx.session.refreshAdvisors();
+				break;
 			case "steeringMode":
 				this.ctx.session.setSteeringMode(value as "all" | "one-at-a-time");
 				break;

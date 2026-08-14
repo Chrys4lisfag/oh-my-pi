@@ -501,6 +501,24 @@ export const SETTINGS_SCHEMA = {
 			condition: "advisorEnabled",
 		},
 	},
+	"advisor.memoryReminderInterval": {
+		type: "number",
+		default: 8,
+		ui: {
+			tab: "model",
+			group: "Advisor",
+			label: "Memory Advisor Reminder Interval",
+			description: "Remind memory-related advisors on every Nth consecutive context read without recall or reflect.",
+			options: [
+				{ value: "4", label: "4 reads" },
+				{ value: "6", label: "6 reads" },
+				{ value: "8", label: "8 reads", description: "Default." },
+				{ value: "12", label: "12 reads" },
+				{ value: "16", label: "16 reads" },
+			],
+			condition: "advisorEnabled",
+		},
+	},
 	shellPath: { type: "string", default: undefined },
 	"git.enabled": {
 		type: "boolean",

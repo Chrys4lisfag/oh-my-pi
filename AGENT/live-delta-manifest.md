@@ -62,6 +62,8 @@ at this baseline; it is not a separate fork behavior.
 
 - `packages/coding-agent/src/advisor/config.ts`
   - runtime-only winning `WATCHDOG` source provenance
+- `packages/coding-agent/src/advisor/memory-reminder.ts`
+  - memory-advisor classification, retrieval cadence, injection counter, and reminder formatting
 - `packages/coding-agent/src/advisor/transcript-recorder.ts`
   - append-only advisor transcript replay for restart-safe tool counters
 - `packages/coding-agent/src/config/keybindings.ts`
@@ -70,6 +72,10 @@ at this baseline; it is not a separate fork behavior.
 - `packages/coding-agent/src/config/settings-schema.ts`
 - `packages/coding-agent/src/config/settings.ts`
 - `packages/coding-agent/src/modes/controllers/command-controller.ts`
+- `packages/coding-agent/src/modes/controllers/selector-controller.ts`
+  - applies live Memory Advisor reminder-interval changes by rebuilding advisors
+- `packages/coding-agent/src/main.ts`
+  - keeps protocol-host advisor reminder cadence at the neutral schema default
 - `packages/coding-agent/src/sdk.ts`
   - restores persisted advisor tool totals before session construction
 - `packages/coding-agent/src/modes/controllers/input-controller.ts`
@@ -78,7 +84,8 @@ at this baseline; it is not a separate fork behavior.
 - `packages/coding-agent/src/session/agent-session.ts`
 - `packages/coding-agent/src/session/agent-session-types.ts`
 - `packages/coding-agent/src/session/session-advisors.ts`
-  - per-advisor successful/attempted accounting and status formatting
+  - per-advisor successful/attempted accounting, memory-reminder injection telemetry,
+    and status formatting
 - `packages/coding-agent/src/slash-commands/builtin-registry.ts`
 
 `agent-session.ts` is shared with Codex refusal/account attribution and advisor

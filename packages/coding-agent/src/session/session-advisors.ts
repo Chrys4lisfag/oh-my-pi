@@ -62,6 +62,16 @@ import {
 	resolveAdvisorDeliveryChannel,
 	slugifyAdvisorName,
 } from "../advisor";
+import {
+	type AdvisorMemoryReminderState,
+	beginAdvisorMemoryTurn,
+	createAdvisorMemoryReminderState,
+	endAdvisorMemoryTurn,
+	formatAdvisorMemoryReminder,
+	recordAdvisorMemoryReminderInjection,
+	recordAdvisorMemoryToolAttempt,
+	resetAdvisorMemoryReminderState,
+} from "../advisor/memory-reminder";
 import type { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelString,
@@ -131,6 +141,8 @@ export interface AdvisorStats {
 		total: number;
 	};
 	tools: AdvisorToolStat[];
+	/** Total injected memory reminders across configured memory advisors. */
+	memoryReminderInjections?: number;
 	/** Per-advisor breakdown for every configured advisor. */
 	advisors: PerAdvisorStat[];
 }
@@ -146,6 +158,8 @@ export interface PerAdvisorStat {
 	cost: number;
 	messages: AdvisorStats["messages"];
 	tools: AdvisorToolStat[];
+	/** Present only for advisors classified as memory-related. */
+	memoryReminderInjections?: number;
 	source?: AdvisorConfigSource;
 	sessionId?: string;
 }
@@ -161,6 +175,17 @@ function aggregateAdvisorToolStats(advisors: readonly PerAdvisorStat[]): Advisor
 		}
 	}
 	return [...totals.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function aggregateAdvisorMemoryReminderInjections(advisors: readonly PerAdvisorStat[]): number | undefined {
+	let configured = false;
+	let total = 0;
+	for (const advisor of advisors) {
+		if (advisor.memoryReminderInjections === undefined) continue;
+		configured = true;
+		total += advisor.memoryReminderInjections;
+	}
+	return configured ? total : undefined;
 }
 
 interface AdvisorRetryFallbackState {
@@ -187,6 +212,7 @@ interface ActiveAdvisor {
 	retryFallbackPendingSuccess: boolean;
 	signature: string;
 	source?: AdvisorConfigSource;
+	memoryReminder?: AdvisorMemoryReminderState;
 }
 
 interface AdvisorCompactionSummaryMessage extends CompactionSummaryMessage {
@@ -329,6 +355,7 @@ export class SessionAdvisors {
 	#advisorProviderSessionIds = new Map<string, string>();
 	#advisorCosts = new Map<string, number>();
 	#advisorToolStats = new Map<string, Map<string, AdvisorToolStat>>();
+	#advisorMemoryReminderInjections = new Map<string, number>();
 	#advisorToolCallNames = new Map<string, Map<string, string>>();
 	#advisorCompletedToolCalls = new Map<string, Set<string>>();
 	#advisorRecorderClosed: Promise<void> = Promise.resolve();
@@ -435,6 +462,10 @@ export class SessionAdvisors {
 	/** Drop cumulative advisor usage once a conversation boundary has committed. */
 	clearCost(): void {
 		this.#advisorCosts.clear();
+		this.#advisorMemoryReminderInjections.clear();
+		for (const advisor of this.#advisors) {
+			if (advisor.memoryReminder) advisor.memoryReminder.reminderInjections = 0;
+		}
 		this.#advisorToolStats.clear();
 		this.#advisorToolCallNames.clear();
 		this.#advisorCompletedToolCalls.clear();
@@ -568,6 +599,7 @@ export class SessionAdvisors {
 	 */
 	#resetAdvisorSessionState(preserveCost: boolean): void {
 		if (!preserveCost) {
+			this.#advisorMemoryReminderInjections.clear();
 			this.#advisorCosts.clear();
 			this.#advisorToolStats.clear();
 		}
@@ -577,6 +609,9 @@ export class SessionAdvisors {
 		// loop, and that abort can emit an `aborted` message_end we must not attribute to
 		// either session's transcript. Detach, reset, then re-attach the live agent's feed.
 		for (const a of this.#advisors) {
+			if (a.memoryReminder) {
+				resetAdvisorMemoryReminderState(a.memoryReminder, { preserveInjectionCount: preserveCost });
+			}
 			a.agentUnsubscribe?.();
 			a.agentUnsubscribe = undefined;
 			a.runtime.reset("conversation-boundary");
@@ -684,9 +719,17 @@ export class SessionAdvisors {
 		const tools = config.tools?.length ? config.tools.join("\u001e") : "";
 		const instructions = config.instructions?.trim() ?? "";
 		const source = config.source ? `${config.source.scope}\u001e${config.source.path ?? ""}` : "";
-		return [config.name, slug, formatModelStringWithRouting(model), thinkingLevel, tools, instructions, source].join(
-			"\u001f",
-		);
+		const memoryReminderInterval = this.#host.settings.get("advisor.memoryReminderInterval");
+		return [
+			config.name,
+			slug,
+			formatModelStringWithRouting(model),
+			thinkingLevel,
+			tools,
+			instructions,
+			source,
+			memoryReminderInterval,
+		].join("\u001f");
 	}
 
 	#advisorRuntimeMatchesCurrentConfig(): boolean {
@@ -758,6 +801,19 @@ export class SessionAdvisors {
 					availableAdvisorToolNames.add(tool.customWireName);
 					advisorToolMap.set(tool.customWireName, tool);
 				}
+			}
+			const memoryReminder = createAdvisorMemoryReminderState(
+				config.instructions,
+				availableAdvisorToolNames,
+				this.#host.settings.get("advisor.memoryReminderInterval"),
+				this.#advisorMemoryReminderInjections.get(slug) ?? 0,
+			);
+			if (memoryReminder) {
+				if (!this.#advisorMemoryReminderInjections.has(slug)) {
+					this.#advisorMemoryReminderInjections.set(slug, memoryReminder.reminderInjections);
+				}
+			} else {
+				this.#advisorMemoryReminderInjections.delete(slug);
 			}
 			let quarantinedAdvisorOutput: string | undefined;
 			let currentAdvisorInput = "";
@@ -885,22 +941,39 @@ export class SessionAdvisors {
 
 			const advisorAgentFacade: AdvisorAgent = {
 				prompt: async input => {
+					let effectiveInput = input;
+					if (memoryReminder && beginAdvisorMemoryTurn(memoryReminder)) {
+						if (!memoryReminder.artifactUri) {
+							const artifactId = await this.#host.sessionManager.saveArtifact(
+								`# ${advisorName} custom instructions\n\n${memoryReminder.instructions}\n`,
+								`advisor-memory-instructions-${slug || "default"}`,
+							);
+							if (artifactId) memoryReminder.artifactUri = `artifact://${artifactId}`;
+						}
+						if (memoryReminder.artifactUri) {
+							const renderedInput = Array.isArray(input)
+								? formatSessionHistoryMarkdown(input, { watchedRoles: true })
+								: input;
+							recordAdvisorMemoryReminderInjection(memoryReminder);
+							this.#advisorMemoryReminderInjections.set(slug, memoryReminder.reminderInjections);
+							effectiveInput = `${formatAdvisorMemoryReminder(memoryReminder.artifactUri)}\n\n${renderedInput}`;
+						}
+					}
+
 					let quarantined: string | undefined;
 					try {
 						quarantinedAdvisorOutput = undefined;
-						// Multi-message input (candidate 4) must serialize deterministically
-						// for quarantine source text; reuse the session history formatter
-						// rather than ad-hoc joins so all message kinds (text/tool/
-						// custom/structured) are preserved exactly as rendered.
-						currentAdvisorInput = Array.isArray(input)
-							? formatSessionHistoryMarkdown(input, { watchedRoles: true })
-							: input;
-						// Agent.prompt's overloads accept string OR AgentMessage[] but not
-						// the union, so narrow first; both branches intentionally identical.
-						if (Array.isArray(input)) await advisorAgent.prompt(input);
-						else await advisorAgent.prompt(input);
+						// Multi-message input must serialize deterministically for quarantine
+						// source text. Memory reminders may already have converted it to a string.
+						currentAdvisorInput = Array.isArray(effectiveInput)
+							? formatSessionHistoryMarkdown(effectiveInput, { watchedRoles: true })
+							: effectiveInput;
+						// Agent.prompt overloads accept string OR AgentMessage[] but not the union.
+						if (Array.isArray(effectiveInput)) await advisorAgent.prompt(effectiveInput);
+						else await advisorAgent.prompt(effectiveInput);
 						quarantined = quarantinedAdvisorOutput;
 					} finally {
+						if (memoryReminder) endAdvisorMemoryTurn(memoryReminder);
 						quarantinedAdvisorOutput = undefined;
 						currentAdvisorInput = "";
 					}
@@ -996,6 +1069,7 @@ export class SessionAdvisors {
 				retryFallbackPendingSuccess: false,
 				signature,
 				source: config.source,
+				memoryReminder,
 			};
 			this.#refreshAdvisorProviderIdentity(advisorRef);
 			this.#attachAdvisorRecorderFeed(advisorRef);
@@ -1222,6 +1296,7 @@ export class SessionAdvisors {
 		advisor.agentUnsubscribe = advisor.agent.subscribe(event => {
 			if (event.type === "tool_execution_start") {
 				this.#recordAdvisorToolAttempt(advisor.slug, event.toolCallId, event.toolName);
+				if (advisor.memoryReminder) recordAdvisorMemoryToolAttempt(advisor.memoryReminder, event.toolName);
 				return;
 			}
 			if (event.type === "tool_execution_end") {
@@ -1828,6 +1903,9 @@ export class SessionAdvisors {
 					cost: this.#advisorCosts.get(slug) ?? 0,
 					messages: { user: 0, assistant: 0, total: 0 },
 					tools: this.#getAdvisorToolStats(slug),
+					memoryReminderInjections: this.#advisorMemoryReminderInjections.has(slug)
+						? (this.#advisorMemoryReminderInjections.get(slug) ?? 0)
+						: undefined,
 					source: entry.source,
 				});
 			}
@@ -1844,6 +1922,7 @@ export class SessionAdvisors {
 				cost,
 				messages: { user: 0, assistant: 0, total: 0 },
 				tools: aggregateAdvisorToolStats(roster),
+				memoryReminderInjections: aggregateAdvisorMemoryReminderInjections(roster),
 				advisors: roster,
 			};
 		}
@@ -1874,6 +1953,7 @@ export class SessionAdvisors {
 			cost,
 			messages,
 			tools: aggregateAdvisorToolStats(roster),
+			memoryReminderInjections: aggregateAdvisorMemoryReminderInjections(roster),
 			advisors: roster,
 		};
 	}
@@ -1918,6 +1998,7 @@ export class SessionAdvisors {
 			cost: this.#advisorCosts.get(advisor.slug) ?? 0,
 			messages: { user, assistant, total: messages.length },
 			tools: this.#getAdvisorToolStats(advisor.slug),
+			memoryReminderInjections: advisor.memoryReminder?.reminderInjections,
 			source: advisor.source,
 			sessionId: advisor.agent.sessionId,
 		};
@@ -1960,6 +2041,9 @@ export class SessionAdvisors {
 			if (!s.model || s.status !== "running") {
 				const lines = [`Advisor "${s.name}" is ${s.status.replace("_", " ")}.`];
 				if (source) lines.push(`Source: ${source}`);
+				if (s.memoryReminderInjections !== undefined) {
+					lines.push(`Memory reminder injections: ${s.memoryReminderInjections.toLocaleString()}`);
+				}
 				appendToolUsage(lines, s.tools);
 				return lines.join("\n");
 			}
@@ -1977,6 +2061,9 @@ export class SessionAdvisors {
 			const lines = [heading];
 			if (source) lines.push(`Source: ${source}`);
 			lines.push(contextLine, `Spend: ${spendParts.join(", ")}, $${stats.cost.toFixed(4)}`);
+			if (s.memoryReminderInjections !== undefined) {
+				lines.push(`Memory reminder injections: ${s.memoryReminderInjections.toLocaleString()}`);
+			}
 			appendToolUsage(lines, s.tools);
 			return lines.join("\n");
 		}
@@ -1991,11 +2078,17 @@ export class SessionAdvisors {
 			lines.push(
 				`  • ${s.name}${s.model && s.status === "running" ? ` (${s.model.provider}/${s.model.id})` : ` [${s.status}]`} — context ${ctx} tokens, $${s.cost.toFixed(4)}${source ? ` — source ${source}` : ""}`,
 			);
+			if (s.memoryReminderInjections !== undefined) {
+				lines.push(`    Memory reminder injections: ${s.memoryReminderInjections.toLocaleString()}`);
+			}
 			appendToolUsage(lines, s.tools, "    ");
 		}
 		lines.push(
 			`Totals: ${stats.tokens.input.toLocaleString()} input, ${stats.tokens.output.toLocaleString()} output, $${stats.cost.toFixed(4)}.`,
 		);
+		if (stats.memoryReminderInjections !== undefined) {
+			lines.push(`Memory reminder injections: ${stats.memoryReminderInjections.toLocaleString()}.`);
+		}
 		return lines.join("\n");
 	}
 

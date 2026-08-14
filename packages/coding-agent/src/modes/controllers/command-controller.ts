@@ -454,12 +454,18 @@ export class CommandController {
 					if (a.cost > 0) info += `, $${a.cost.toFixed(4)}`;
 					info += "\n";
 				}
+				if (a.memoryReminderInjections !== undefined) {
+					info += `${theme.fg("dim", "Memory reminder injections:")} ${a.memoryReminderInjections.toLocaleString()}\n`;
+				}
 				info += `\n${formatToolUsage(a.tools)}`;
 			}
 			if (stats.active) {
 				info += `\n${theme.bold("Totals")}\n`;
 				info += `${theme.fg("dim", "Tokens:")} ${stats.tokens.total.toLocaleString()}\n`;
 				if (stats.cost > 0) info += `${theme.fg("dim", "Cost:")} $${stats.cost.toFixed(4)}\n`;
+				if (stats.memoryReminderInjections !== undefined) {
+					info += `${theme.fg("dim", "Memory reminder injections:")} ${stats.memoryReminderInjections.toLocaleString()}\n`;
+				}
 			}
 			this.ctx.presentCommandOutput([new Spacer(1), new Text(info, 1, 0)]);
 			return;
@@ -509,6 +515,10 @@ export class CommandController {
 			info += `${theme.fg("dim", "Cache Read:")} ${stats.tokens.cacheRead.toLocaleString()}\n`;
 		}
 		if (stats.cost > 0) info += `${theme.fg("dim", "Cost:")} $${stats.cost.toFixed(4)}\n`;
+		if (stats.memoryReminderInjections !== undefined) {
+			info += `\n${theme.bold("Memory reminder")}\n`;
+			info += `${theme.fg("dim", "Injections:")} ${stats.memoryReminderInjections.toLocaleString()}\n`;
+		}
 		info += `\n${formatToolUsage(stats.tools)}`;
 		this.ctx.presentCommandOutput([new Spacer(1), new Text(info, 1, 0)]);
 	}

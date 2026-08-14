@@ -3,6 +3,18 @@ import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 
 describe("SelectorController prompt-affecting settings", () => {
+	it("rebuilds active advisors when the memory reminder interval changes", () => {
+		const refreshAdvisors = vi.fn(() => 1);
+		const ctx = {
+			session: { refreshAdvisors },
+		} as unknown as InteractiveModeContext;
+		const controller = new SelectorController(ctx);
+
+		controller.handleSettingChange("advisor.memoryReminderInterval", 4);
+
+		expect(refreshAdvisors).toHaveBeenCalledTimes(1);
+	});
+
 	it("refreshes the active prompt when xdev docs mode changes", async () => {
 		const refreshBaseSystemPrompt = vi.fn(async () => {});
 		const ctx = {

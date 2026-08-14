@@ -88,7 +88,11 @@ Never edit generated catalog JSON for Venice.
    `navigator.webdriver`.
 9. Preserve advisor config provenance, per-tool successful/attempted status, and
    process-startup reconstruction from named advisor transcripts.
-10. Preserve the fork's remote-first automatic default only for unconfigured,
+10. Reapply Memory Advisor retrieval enforcement: the interval setting, per-advisor
+    classifier/state, instruction artifact injection, per-slug injection counter,
+    runtime signature/settings-selector rebuild wiring, and structured/text/TUI
+    `/advisor status` telemetry.
+11. Preserve the fork's remote-first automatic default only for unconfigured,
     provider-native-capable GPT/Codex candidates; upstream owns `/compact remote`,
     transport, fallback, and lifecycle semantics.
 
@@ -190,6 +194,8 @@ git grep -n "jsonStringify"
 git grep -n 'process.platform !== "win32"' packages/coding-agent/src/tools/browser/launch.ts
 git grep -n "loadAdvisorTranscriptToolStats"
 git grep -n "Tools usage (successful/attempts)"
+git grep -n "advisor.memoryReminderInterval"
+git grep -n "Memory reminder injections"
 ```
 
 Interpret the `resource.?exhausted` result carefully: the fork contract requires that
@@ -215,8 +221,11 @@ expand a file argument into a large test bucket.
   test/session-maintenance-compaction-action.test.ts \
   test/advisor/config.test.ts \
   test/advisor/transcript-recorder.test.ts \
+  test/advisor/memory-reminder.test.ts \
+  test/advisor-memory-reminder-integration.test.ts \
   test/advisor-toggle.test.ts \
-  test/modes/controllers/advisor-status-command.test.ts)
+  test/modes/controllers/advisor-status-command.test.ts \
+  test/modes/controllers/selector-controller-settings.test.ts)
 
 (cd packages/catalog && bun test \
   test/venice-qwen-thinking.test.ts \

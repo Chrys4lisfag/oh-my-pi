@@ -43,6 +43,7 @@ describe("CommandController /advisor status", () => {
 				{ name: "edit", successful: 1, attempts: 2 },
 				{ name: "learn", successful: 2, attempts: 3 },
 			],
+			memoryReminderInjections: 3,
 			advisors: [
 				{
 					name: "default",
@@ -65,6 +66,7 @@ describe("CommandController /advisor status", () => {
 					cost: 0,
 					messages: zeroMessages,
 					tools: [{ name: "learn", successful: 2, attempts: 3 }],
+					memoryReminderInjections: 3,
 					source: { scope: "user", path: "C:\\agent\\WATCHDOG.yml" },
 				},
 				{
@@ -90,13 +92,62 @@ describe("CommandController /advisor status", () => {
 
 		await controller.handleAdvisorStatusCommand();
 
-		const output = renderPresentedBlocks(present.mock.calls[0]?.[0]);
+		const output = Bun.stripANSI(renderPresentedBlocks(present.mock.calls[0]?.[0]));
 		expect(output.split("Tools usage")).toHaveLength(4);
 		const memoryStart = output.indexOf("Memory Advisor");
 		const securityStart = output.indexOf("Security Advisor");
 		expect(output.indexOf("No tools called.")).toBeLessThan(memoryStart);
 		expect(output.indexOf("learn: 2/3")).toBeGreaterThan(memoryStart);
 		expect(output.indexOf("learn: 2/3")).toBeLessThan(securityStart);
+		const reminderLine = output.indexOf("Memory reminder injections: 3");
+		expect(reminderLine).toBeGreaterThan(memoryStart);
+		expect(reminderLine).toBeLessThan(securityStart);
+		const totalsStart = output.lastIndexOf("Totals");
+		const totalReminderLine = output.lastIndexOf("Memory reminder injections: 3");
+		expect(totalsStart).toBeGreaterThan(securityStart);
+		expect(totalReminderLine).toBeGreaterThan(totalsStart);
 		expect(output.indexOf("edit: 1/2")).toBeGreaterThan(securityStart);
+	});
+
+	it("renders memory reminder injections in the single-advisor detailed view", async () => {
+		const present = vi.fn();
+		const stats = {
+			configured: true,
+			active: true,
+			model: { provider: "openai-codex", id: "gpt-5.6" },
+			contextWindow: 272_000,
+			contextTokens: 10,
+			tokens: zeroTokens,
+			cost: 0,
+			messages: zeroMessages,
+			tools: [],
+			memoryReminderInjections: 12,
+			advisors: [
+				{
+					name: "Memory Advisor",
+					status: "running",
+					model: { provider: "openai-codex", id: "gpt-5.6" },
+					contextWindow: 272_000,
+					contextTokens: 10,
+					tokens: zeroTokens,
+					cost: 0,
+					messages: zeroMessages,
+					tools: [],
+					memoryReminderInjections: 12,
+				},
+			],
+		};
+		const ctx = {
+			session: { getAdvisorStats: () => stats },
+			ui: { terminal: { columns: 100 } },
+			presentCommandOutput: present,
+		} as unknown as InteractiveModeContext;
+		const controller = new CommandController(ctx);
+
+		await controller.handleAdvisorStatusCommand();
+
+		const output = Bun.stripANSI(renderPresentedBlocks(present.mock.calls[0]?.[0]));
+		expect(output).toContain("Memory reminder");
+		expect(output).toContain("Injections: 12");
 	});
 });
