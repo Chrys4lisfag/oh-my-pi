@@ -2,9 +2,45 @@
 
 ## [Unreleased]
 
+## [17.3.2] - 2026-08-13
+
 ### Fixed
 
-- Fixed the in-house `marked` list tokenizer still consuming a trailing blank run into the list token at end of input (17.2.10 fixed only the mid-document case). `- item\n\n` now lexes as a tight list plus a `space` token, matching real marked, instead of a loose list whose raw includes the blank.
+- Fixed `fetchWithRetry()` aborts during retry backoff to preserve the documented `"Request was aborted"` error contract ([#8450](https://github.com/can1357/oh-my-pi/issues/8450)).
+
+## [17.3.0] - 2026-08-13
+
+### Fixed
+
+- Optimized performance of partial JSON parsing for long streaming tool-call arguments.
+- Fixed Mermaid ASCII multi-word edge labels where routed lines would show through spaces.
+
+## [17.2.15] - 2026-08-12
+
+### Changed
+
+- Extended parsed Server-Sent Events (SSE) to include optional id and retry fields, enabling reconnecting transports to retain stream cursors and respect server-requested retry intervals.
+
+## [17.2.13] - 2026-08-11
+
+### Changed
+
+- Changed stale process-log retention from the newest five files globally to one newest file per completed process and day within the current and previous four local calendar days. This preserves bounded daily diagnostic coverage while continuing to remove one-use audit files.
+- Changed outbound User-Agent consumers to share the versioned `USER_AGENT` constant (`omp/<version>`).
+
+### Fixed
+
+- Fixed Mermaid ASCII state pseudostates rendering empty boxes, miscoloring final-state borders, and inverting rounded corners in bottom-to-top diagrams.
+
+## [17.2.11] - 2026-08-07
+
+### Added
+
+- Added `repair` and `rawKeys` options to `parseFrontmatter` to support spec-conformant loading (disabling lenient recovery and preserving keys verbatim), and exported `normalizeFrontmatterKeys` for manual key normalization.
+
+### Fixed
+
+- Fixed the in-house `marked` list tokenizer incorrectly consuming trailing blank lines at the end of input, ensuring correct list tightness and token generation matching standard `marked` behavior.
 
 ## [17.2.10] - 2026-08-06
 

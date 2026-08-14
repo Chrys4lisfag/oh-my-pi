@@ -27,7 +27,7 @@ import { AnthropicApiError, AnthropicConnectionError, AnthropicConnectionTimeout
 export { AnthropicApiError, AnthropicConnectionError, AnthropicConnectionTimeoutError };
 
 import type { FetchImpl } from "../types";
-import type { MessageCreateParamsStreaming } from "./anthropic-wire";
+import type { MessageCreateParams } from "./anthropic-wire";
 
 /** Default pre-response timeout, matching the SDK's 10-minute default. */
 const DEFAULT_TIMEOUT_MS = 600_000;
@@ -181,7 +181,7 @@ export class AnthropicMessages {
 		this.#path = path;
 	}
 
-	create(params: MessageCreateParamsStreaming, options?: AnthropicRequestOptions): AnthropicApiRequest {
+	create(params: MessageCreateParams, options?: AnthropicRequestOptions): AnthropicApiRequest {
 		return this.#client.request(this.#path, params, options);
 	}
 }
@@ -192,8 +192,8 @@ export class AnthropicMessages {
  * alternative Messages-API client via `AnthropicOptions.client`.
  */
 export interface AnthropicMessagesClientLike {
-	messages: { create(params: MessageCreateParamsStreaming, options?: AnthropicRequestOptions): unknown };
-	beta?: { messages: { create(params: MessageCreateParamsStreaming, options?: AnthropicRequestOptions): unknown } };
+	messages: { create(params: MessageCreateParams, options?: AnthropicRequestOptions): unknown };
+	beta?: { messages: { create(params: MessageCreateParams, options?: AnthropicRequestOptions): unknown } };
 }
 
 export class AnthropicMessagesClient implements AnthropicMessagesClientLike {
@@ -207,7 +207,7 @@ export class AnthropicMessagesClient implements AnthropicMessagesClientLike {
 		this.beta = { messages: new AnthropicMessages(this, "/v1/messages?beta=true") };
 	}
 
-	request(path: string, params: MessageCreateParamsStreaming, options?: AnthropicRequestOptions): AnthropicApiRequest {
+	request(path: string, params: MessageCreateParams, options?: AnthropicRequestOptions): AnthropicApiRequest {
 		return new AnthropicApiRequest(() => this.#send(path, params, options));
 	}
 
@@ -226,11 +226,7 @@ export class AnthropicMessagesClient implements AnthropicMessagesClientLike {
 		return headers;
 	}
 
-	async #send(
-		path: string,
-		params: MessageCreateParamsStreaming,
-		options?: AnthropicRequestOptions,
-	): Promise<Response> {
+	async #send(path: string, params: MessageCreateParams, options?: AnthropicRequestOptions): Promise<Response> {
 		const opts = this.#options;
 		const fetchFn: FetchImpl = opts.fetch ?? fetch;
 		const callerSignal = options?.signal;

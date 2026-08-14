@@ -695,7 +695,7 @@ describe("anthropic provider retry delays", () => {
 
 		expect(attempt).toBe(11);
 		expect(providerRetryWait.mock.calls.map(call => call[0])).toEqual([
-			500, 1000, 2000, 4000, 8000, 8000, 8000, 8000, 8000, 8000,
+			500, 1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000, 30000,
 		]);
 		expect(result.stopReason).toBe("stop");
 		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "recovered from 502" }]);

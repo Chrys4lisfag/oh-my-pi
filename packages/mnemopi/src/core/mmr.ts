@@ -1,4 +1,6 @@
-import { mmrRerankIndices } from "@oh-my-pi/pi-natives";
+import { mmrRerankIndices as nativeMmrRerankIndices } from "@oh-my-pi/pi-natives";
+
+const mmrRerankIndices = nativeMmrRerankIndices as typeof nativeMmrRerankIndices | undefined;
 
 export interface MmrResult {
 	readonly content?: string;
@@ -42,6 +44,7 @@ export function mmrRerank<T extends MmrResult>(
 	// pre-native contract (loop guard is false, first result still returned)
 	// is preserved.
 	if (
+		mmrRerankIndices &&
 		similarityFn === jaccardSimilarity &&
 		!Number.isNaN(limit) &&
 		sortedResults.every(result => (result.content ?? "").isWellFormed())

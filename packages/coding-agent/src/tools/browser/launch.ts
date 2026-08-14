@@ -206,6 +206,15 @@ function isExecutableFile(p: string): boolean {
 
 async function isChromiumExecutable(p: string): Promise<boolean> {
 	if (!isExecutableFile(p)) return false;
+	// The version probe below launches the candidate. It exists to reject
+	// non-Chromium `chrome`/`chromium` wrapper scripts that appear on a Linux
+	// PATH (ecb22957, "validate Linux browser executables"). On Windows and
+	// macOS the candidates are fixed GUI application paths, not PATH wrappers,
+	// and executing them is harmful: a GUI `chrome.exe --version` does not print
+	// to a detached stdout and can hand off to the user's running instance,
+	// opening/activating a normal browser window (#8445). Confine the probe to
+	// Linux and trust the executable-file check elsewhere.
+	if (process.platform !== "linux") return true;
 	try {
 		const probeTimeoutMs = 3000;
 		const proc = Bun.spawn([p, "--version"], {
@@ -235,16 +244,17 @@ function systemChromiumCandidates(
 	which: (name: string) => string | null | undefined = $which,
 ): string[] {
 	const candidates: string[] = [];
+	const targetPath = platform === "win32" ? path.win32 : path.posix;
 	switch (platform) {
 		case "darwin": {
-			for (const root of ["/Applications", path.join(home, "Applications")]) {
+			for (const root of ["/Applications", targetPath.join(home, "Applications")]) {
 				candidates.push(
-					path.join(root, "Google Chrome.app/Contents/MacOS/Google Chrome"),
-					path.join(root, "Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta"),
-					path.join(root, "Google Chrome Dev.app/Contents/MacOS/Google Chrome Dev"),
-					path.join(root, "Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary"),
-					path.join(root, "Chromium.app/Contents/MacOS/Chromium"),
-					path.join(root, "Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+					targetPath.join(root, "Google Chrome.app/Contents/MacOS/Google Chrome"),
+					targetPath.join(root, "Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta"),
+					targetPath.join(root, "Google Chrome Dev.app/Contents/MacOS/Google Chrome Dev"),
+					targetPath.join(root, "Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary"),
+					targetPath.join(root, "Chromium.app/Contents/MacOS/Chromium"),
+					targetPath.join(root, "Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
 				);
 			}
 			break;
@@ -269,7 +279,7 @@ function systemChromiumCandidates(
 				onNixos = fs.existsSync("/etc/NIXOS");
 			} catch {}
 			if (onNixos) {
-				candidates.push(path.join(home, ".nix-profile/bin/chromium"), "/run/current-system/sw/bin/chromium");
+				candidates.push(targetPath.join(home, ".nix-profile/bin/chromium"), "/run/current-system/sw/bin/chromium");
 			}
 			for (const name of ["ungoogled-chromium", "ungoogled-chromium-browser"]) {
 				const found = which(name);
@@ -282,22 +292,22 @@ function systemChromiumCandidates(
 				"/usr/bin/ungoogled-chromium",
 				"/usr/bin/ungoogled-chromium-browser",
 				`/var/lib/flatpak/exports/bin/${UNGOOGLED_CHROMIUM_FLATPAK_ID}`,
-				path.join(home, ".local/share/flatpak/exports/bin", UNGOOGLED_CHROMIUM_FLATPAK_ID),
+				targetPath.join(home, ".local/share/flatpak/exports/bin", UNGOOGLED_CHROMIUM_FLATPAK_ID),
 			);
 			break;
 		}
 		case "win32": {
 			const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
 			const programFilesX86 = process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
-			const localAppData = process.env.LOCALAPPDATA ?? path.join(home, "AppData\\Local");
+			const localAppData = process.env.LOCALAPPDATA ?? targetPath.join(home, "AppData\\Local");
 			candidates.push(
-				path.join(programFiles, "Google\\Chrome\\Application\\chrome.exe"),
-				path.join(programFilesX86, "Google\\Chrome\\Application\\chrome.exe"),
-				path.join(localAppData, "Google\\Chrome\\Application\\chrome.exe"),
-				path.join(programFiles, "Chromium\\Application\\chrome.exe"),
-				path.join(localAppData, "Chromium\\Application\\chrome.exe"),
-				path.join(programFiles, "Microsoft\\Edge\\Application\\msedge.exe"),
-				path.join(programFilesX86, "Microsoft\\Edge\\Application\\msedge.exe"),
+				targetPath.join(programFiles, "Google\\Chrome\\Application\\chrome.exe"),
+				targetPath.join(programFilesX86, "Google\\Chrome\\Application\\chrome.exe"),
+				targetPath.join(localAppData, "Google\\Chrome\\Application\\chrome.exe"),
+				targetPath.join(programFiles, "Chromium\\Application\\chrome.exe"),
+				targetPath.join(localAppData, "Chromium\\Application\\chrome.exe"),
+				targetPath.join(programFiles, "Microsoft\\Edge\\Application\\msedge.exe"),
+				targetPath.join(programFilesX86, "Microsoft\\Edge\\Application\\msedge.exe"),
 			);
 			break;
 		}

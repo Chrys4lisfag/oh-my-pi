@@ -2386,7 +2386,8 @@ describe("AuthStorage codex oauth ranking", () => {
 			};
 		});
 
-		const refreshDelayMs = 75;
+		const allRefreshesStarted = Promise.withResolvers<void>();
+		const releaseRefreshes = Promise.withResolvers<void>();
 		let inFlight = 0;
 		let maxConcurrent = 0;
 		const refreshStarts: number[] = [];
@@ -2394,7 +2395,8 @@ describe("AuthStorage codex oauth ranking", () => {
 			refreshStarts.push(Date.now());
 			inFlight += 1;
 			maxConcurrent = Math.max(maxConcurrent, inFlight);
-			await Bun.sleep(refreshDelayMs);
+			if (inFlight === 3) allRefreshesStarted.resolve();
+			await releaseRefreshes.promise;
 			inFlight -= 1;
 			return {
 				...credential,
@@ -2410,7 +2412,10 @@ describe("AuthStorage codex oauth ranking", () => {
 			{ type: "oauth", ...createCredential("acct-third", "third@example.com"), expires: expiredAt },
 		]);
 
-		const apiKey = await authStorage.getApiKey("openai-codex");
+		const apiKeyPromise = authStorage.getApiKey("openai-codex");
+		await allRefreshesStarted.promise;
+		releaseRefreshes.resolve();
+		const apiKey = await apiKeyPromise;
 
 		expect(apiKey).toBe("refreshed-acct-third");
 		expect(refreshStarts).toHaveLength(3);
