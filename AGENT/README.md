@@ -59,6 +59,10 @@ be adopted without silently losing fork features.
 14. Memory-related advisors receive a retrieval reminder after the configured number
     of advisor context reads without `recall`/`reflect`; `/advisor status` reports
     actual reminder injections per advisor and in aggregate.
+15. `/tryshake on` enables a session-scoped surgical shake preflight per automatic
+    compaction trigger; sufficient recovery skips full compaction, while no-op,
+    failed, or low-savings attempts fall through once to the configured strategy.
+    New, switched, and cleared sessions reset the toggle; settings files never store it.
 
 ## Important memory corrections
 

@@ -500,6 +500,8 @@ export class AgentSession {
 	#planModeState: PlanModeState | undefined;
 	/** Session-scoped `/vision` override; undefined = follow persisted `inspect_image.mode`. */
 	#inspectImageModeOverride: InspectImageMode | undefined;
+	/** Whether automatic compaction should first attempt surgical shake cleanup in this logical session. */
+	#tryShakeEnabled = false;
 	#vibeModeState: VibeModeState | undefined;
 	#goalModeState: GoalModeState | undefined;
 	#goalRuntime: GoalRuntime;
@@ -1517,6 +1519,7 @@ export class AgentSession {
 			messages: () => this.messages,
 			baseSystemPrompt: () => this.#tools.baseSystemPrompt,
 			goalModeState: () => this.#goalModeState,
+			tryShakeEnabled: () => this.#tryShakeEnabled,
 			planReferencePath: () => this.#planReferencePath,
 			nonMessageTokenSource: () => this,
 			memoryBackendSession: () => this,
@@ -4621,6 +4624,16 @@ export class AgentSession {
 		return this.#maintenance.autoCompactionEnabled;
 	}
 
+	/** Toggle shake-before-compaction for the current logical session. */
+	setTryShakeEnabled(enabled: boolean): void {
+		this.#tryShakeEnabled = enabled;
+	}
+
+	/** Whether shake-before-compaction is enabled for the current logical session. */
+	isTryShakeEnabled(): boolean {
+		return this.#tryShakeEnabled;
+	}
+
 	/**
 	 * Whether idle-flush tasks, auto-continuations, or other short-lived
 	 * post-prompt work are pending.  True in the brief window after
@@ -4816,6 +4829,7 @@ export class AgentSession {
 
 	/** Drop mutable tool decisions and directives owned by the previous logical session. */
 	#clearSessionScopedToolState(): void {
+		this.#tryShakeEnabled = false;
 		this.agent.clearDeferredToolDirectives();
 		this.#toolChoiceQueue.clear();
 		this.#tools.clearAcpPermissionDecisions();

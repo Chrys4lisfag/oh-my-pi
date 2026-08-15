@@ -110,6 +110,15 @@ describe("AgentSession shake", () => {
 			.map(e => (e as { message: ToolResultMessage }).message);
 	}
 
+	it("resets try-shake at a logical session boundary", async () => {
+		session.setTryShakeEnabled(true);
+		expect(session.isTryShakeEnabled()).toBe(true);
+
+		expect(await session.newSession()).toBe(true);
+
+		expect(session.isTryShakeEnabled()).toBe(false);
+	});
+
 	describe("elide", () => {
 		it("drops the tool result, offloads to an artifact, and embeds the recovery link", async () => {
 			seedHeavyToolResult("X".repeat(4000));
@@ -343,6 +352,16 @@ describe("AgentSession shake", () => {
 	});
 
 	describe("auto-shake strategy", () => {
+		function waitForAgentEnd(): Promise<void> {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			let unsubscribe = () => {};
+			unsubscribe = session.subscribe(event => {
+				if (event.type !== "agent_end" || event.isTerminal !== true) return;
+				unsubscribe();
+				resolve();
+			});
+			return promise;
+		}
 		it("dispatches the elide path and emits a shake action for threshold maintenance", async () => {
 			session.settings.set("compaction.strategy", "shake");
 			session.settings.set("compaction.thresholdPercent", 1);
@@ -381,6 +400,130 @@ describe("AgentSession shake", () => {
 			const end = events.filter(e => e.type === "auto_compaction_end");
 			expect(end).toHaveLength(1);
 			expect(end[0]).toMatchObject({ type: "auto_compaction_end", action: "shake" });
+		});
+
+		it("try-shake skips configured compaction when it recovers enough headroom", async () => {
+			session.settings.set("compaction.strategy", "context-full");
+			session.setTryShakeEnabled(true);
+			session.settings.set("compaction.thresholdPercent", 1);
+			session.settings.set("contextPromotion.enabled", false);
+
+			const shakeSpy = vi
+				.spyOn(session, "shake")
+				.mockResolvedValue({ mode: "elide", toolResultsDropped: 1, blocksDropped: 0, tokensFreed: 10_000 });
+			const compactSpy = vi.spyOn(compactionModule, "compact");
+			const assistantMessage: AssistantMessage = {
+				role: "assistant",
+				content: [{ type: "text", text: "trigger" }],
+				...apiInfo,
+				stopReason: "stop",
+				usage: {
+					input: 10_000,
+					output: 1_000,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 11_000,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				timestamp: Date.now(),
+			};
+			const settled = waitForAgentEnd();
+
+			session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
+			session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
+			await settled;
+
+			expect(shakeSpy).toHaveBeenCalledTimes(1);
+			expect(compactSpy).not.toHaveBeenCalled();
+			expect(events.some(event => event.type === "auto_compaction_start" && event.action === "context-full")).toBe(
+				false,
+			);
+		});
+
+		it("try-shake falls through once when reclaimed tokens leave insufficient headroom", async () => {
+			session.settings.set("compaction.strategy", "context-full");
+			session.setTryShakeEnabled(true);
+			session.settings.set("compaction.thresholdPercent", 1);
+			session.settings.set("contextPromotion.enabled", false);
+			session.agent.replaceMessages([
+				{
+					role: "user",
+					content: [{ type: "text", text: "x".repeat(40_000) }],
+					timestamp: Date.now(),
+				} as never,
+			]);
+
+			const shakeSpy = vi
+				.spyOn(session, "shake")
+				.mockResolvedValue({ mode: "elide", toolResultsDropped: 1, blocksDropped: 0, tokensFreed: 10 });
+			const assistantMessage: AssistantMessage = {
+				role: "assistant",
+				content: [{ type: "text", text: "trigger" }],
+				...apiInfo,
+				stopReason: "stop",
+				usage: {
+					input: 10_000,
+					output: 1_000,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 11_000,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				timestamp: Date.now(),
+			};
+			const settled = waitForAgentEnd();
+
+			session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
+			session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
+			await settled;
+
+			expect(shakeSpy).toHaveBeenCalledTimes(1);
+			const shakeEnd = events.find(event => event.type === "auto_compaction_end" && event.action === "shake");
+			expect(shakeEnd).toMatchObject({
+				errorMessage: expect.stringMatching(/falling back to configured compaction/i),
+			});
+			expect(events.some(event => event.type === "auto_compaction_start" && event.action === "context-full")).toBe(
+				true,
+			);
+		});
+
+		it("try-shake attempts only once across deferred handoff fallback", async () => {
+			session.settings.set("compaction.strategy", "handoff");
+			session.setTryShakeEnabled(true);
+			session.settings.set("compaction.thresholdPercent", 1);
+			session.settings.set("contextPromotion.enabled", false);
+
+			const shakeSpy = vi
+				.spyOn(session, "shake")
+				.mockResolvedValue({ mode: "elide", toolResultsDropped: 0, blocksDropped: 0, tokensFreed: 0 });
+			const { promise: handoffDone, resolve: onHandoff } = Promise.withResolvers<void>();
+			const handoffSpy = vi.spyOn(session, "handoff").mockImplementation(async () => {
+				onHandoff();
+				return { document: "handoff document" };
+			});
+			const assistantMessage: AssistantMessage = {
+				role: "assistant",
+				content: [{ type: "text", text: "trigger" }],
+				...apiInfo,
+				stopReason: "stop",
+				usage: {
+					input: 10_000,
+					output: 1_000,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 11_000,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				timestamp: Date.now(),
+			};
+			const settled = waitForAgentEnd();
+
+			session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
+			session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
+			await Promise.all([handoffDone, settled]);
+
+			expect(shakeSpy).toHaveBeenCalledTimes(1);
+			expect(handoffSpy).toHaveBeenCalledTimes(1);
 		});
 
 		it("keeps a successful overflow shake recovery committed before retrying", async () => {

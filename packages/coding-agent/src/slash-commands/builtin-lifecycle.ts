@@ -194,6 +194,25 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		},
 	},
 	{
+		name: "tryshake",
+		description: "Try surgical cleanup before automatic compaction",
+		acpDescription: "Toggle shake-before-compaction",
+		subcommands: [
+			{ name: "on", description: "Try shake before automatic compaction" },
+			{ name: "off", description: "Use the configured compaction strategy directly" },
+		],
+		acpInputHint: "[on|off]",
+		allowArgs: true,
+		handle: async (command, runtime) => {
+			const arg = command.args.trim().toLowerCase();
+			if (arg !== "on" && arg !== "off") return usage("Usage: /tryshake [on|off]", runtime);
+			const enabled = arg === "on";
+			runtime.session.setTryShakeEnabled(enabled);
+			await runtime.output(`Try-shake ${enabled ? "enabled" : "disabled"} for this session.`);
+			return commandConsumed();
+		},
+	},
+	{
 		name: "handoff",
 		description: "Hand off session context to a new session",
 		inlineHint: "[focus instructions]",

@@ -369,7 +369,40 @@ signature/settings-selector rebuild wiring, structured stats, and both text/TUI
 status rendering. Do not conflate reminder injections with
 `recall` attempts or durable tool transcript telemetry.
 
-## 11. Confirmed non-features and stale history
+## 11. Try-shake compaction preflight
+
+`/tryshake on` sets in-memory state on the current `AgentSession`. New, switched,
+and cleared logical sessions reset it, and no settings file stores it. On each
+automatic compaction trigger, OMP runs one conservative `DEFAULT_SHAKE_CONFIG`
+elide pass before the configured `context-full`, `handoff`, or `snapcompact`
+strategy. Explicit `compaction.strategy: shake` already owns this flow and does not
+run a duplicate preflight. Disabled/off auto-compaction still wins.
+
+The preflight skips the configured strategy only after recovering the existing
+headroom/recovery target. No eligible regions, a shake failure, or residual pressure
+falls through immediately to the configured strategy. Per-trigger
+`shakePreflightAttempted` state survives deferred handoff recursion, while
+`skipElideRescue` prevents the fallback path from running another elide shake. If the
+configured compaction also cannot create headroom, existing dead-end continuation
+blocking stops repeated low-token shake/compact cycles.
+
+Implementation:
+
+- `packages/coding-agent/src/session/agent-session.ts`
+- `packages/coding-agent/src/session/session-maintenance.ts`
+- `packages/coding-agent/src/slash-commands/builtin-lifecycle.ts`
+
+Tests:
+
+- `packages/coding-agent/test/shake.test.ts`
+- `packages/coding-agent/test/slash-commands/tryshake.test.ts`
+
+Merge rule: preserve upstream shake eligibility, recovery-band math, compaction
+actions, retries, aborts, and dead-end rescue. Reapply only the session-scoped state
+and reset, single-attempt preflight guard, configured-strategy fallthrough, and slash
+command.
+
+## 12. Confirmed non-features and stale history
 
 Do not recreate these from old branches unless a new requirement exists:
 

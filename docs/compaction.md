@@ -407,6 +407,9 @@ Post-navigation event exposing new/old leaf and optional summary entry.
 - Auto compaction emits start/end session events for UI/state updates.
 - Auto compaction can try multiple model candidates and retry transient failures; long retry delays prefer the next candidate when one is available.
 - Overflow errors are excluded from generic retry path because they are handled by context promotion/compaction.
+- `/tryshake on` enables one surgical shake preflight per automatic compaction trigger in the current logical session. This in-memory toggle resets on new, switched, or cleared sessions and is never written to global settings. If the shake recovers the required headroom, OMP skips the configured compaction strategy for that trigger.
+- A no-op, error, or low-savings preflight falls through immediately to the configured strategy. The per-trigger attempt marker survives deferred handoff scheduling, and fallback skips duplicate elide rescue, preventing repeated small shakes from cycling before full compaction.
+- `/tryshake off` disables only the preflight. Explicit `compaction.strategy: "shake"` behavior is unchanged.
 - If auto-compaction fails:
   - overflow path emits `Context overflow recovery failed: ...`
   - incomplete-output path emits `Incomplete response recovery failed: ...`

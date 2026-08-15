@@ -106,8 +106,12 @@ subagent inheritance. Preserve all domains when resolving its conflicts.
 - `packages/coding-agent/src/hindsight/client.ts`
 - `packages/coding-agent/src/hindsight/config.ts`
 - `packages/coding-agent/src/mcp/manager.ts`
+- `packages/coding-agent/src/session/agent-session.ts`
+  - logical-session try-shake state and boundary reset
 - `packages/coding-agent/src/session/session-maintenance.ts`
-  - fork-only automatic action selection; upstream owns remote transport and lifecycle
+  - fork-only automatic action selection plus one-shot try-shake preflight; upstream owns remote transport and lifecycle
+- `packages/coding-agent/src/slash-commands/builtin-lifecycle.ts`
+  - session-scoped `/tryshake on|off` command
 - `packages/coding-agent/src/tools/memory-reflect.ts`
 - `packages/coding-agent/src/tools/xdev.ts`
 - `packages/coding-agent/src/utils/external-editor.ts`
@@ -136,6 +140,8 @@ subagent inheritance. Preserve all domains when resolving its conflicts.
 - `packages/coding-agent/test/profiles.test.ts`
 - `packages/coding-agent/test/hindsight-bank.test.ts`
 - `packages/coding-agent/test/session-maintenance-compaction-action.test.ts`
+- `packages/coding-agent/test/shake.test.ts`
+- `packages/coding-agent/test/slash-commands/tryshake.test.ts`
 - `packages/coding-agent/test/memory-tools.test.ts`
 - `packages/coding-agent/test/tools/browser-launch.test.ts`
 - `packages/coding-agent/test/tools/browser-tab-evaluate.test.ts`

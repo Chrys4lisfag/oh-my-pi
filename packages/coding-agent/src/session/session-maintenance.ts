@@ -193,6 +193,7 @@ export interface SessionMaintenanceHost {
 	messages(): AgentMessage[];
 	baseSystemPrompt(): string[];
 	goalModeState(): GoalModeState | undefined;
+	tryShakeEnabled(): boolean;
 	planReferencePath(): string;
 	nonMessageTokenSource(): NonMessageTokenSource;
 	memoryBackendSession(): MemoryBackendOperationContext["session"];
@@ -2198,6 +2199,10 @@ export class SessionMaintenance {
 			suppressHandoff?: boolean;
 			phase?: CodexCompactionContext["phase"];
 			terminalTextAnswer?: boolean;
+			/** Internal per-trigger guard carried through deferred handoff recursion. */
+			shakePreflightAttempted?: boolean;
+			/** Internal rescue guard: the current trigger already ran an elide shake. */
+			skipElideRescue?: boolean;
 		} = {},
 	): Promise<CompactionCheckResult> {
 		const compactionSettings = this.#host.settings.getGroup("compaction");
@@ -2210,7 +2215,8 @@ export class SessionMaintenance {
 		const shouldAutoContinue =
 			!suppressContinuation && options.autoContinue !== false && compactionSettings.autoContinue !== false;
 		const suppressHandoff = options.suppressHandoff === true;
-		let fallbackFromShake = false;
+		let skipElideRescue = options.skipElideRescue === true;
+		let shakePreflightAttempted = options.shakePreflightAttempted === true;
 		// Shake runs inline (cheap, no remote LLM). On overflow recovery, if shake
 		// reclaims nothing we fall through to the summary-compaction body below so
 		// the oversized input still gets resolved.
@@ -2225,7 +2231,25 @@ export class SessionMaintenance {
 				suppressContinuation,
 			);
 			if (outcome !== "fallback") return outcome;
-			fallbackFromShake = true;
+			skipElideRescue = true;
+		}
+		// Optional preflight is independent of the configured strategy. It gets one
+		// attempt per trigger, including across deferred handoff recursion. A weak or
+		// failed shake falls through immediately to the configured compaction path.
+		if (this.#host.tryShakeEnabled() && compactionSettings.strategy !== "shake" && !shakePreflightAttempted) {
+			shakePreflightAttempted = true;
+			const outcome = await this.#runAutoShake(
+				reason,
+				willRetry,
+				generation,
+				shouldAutoContinue,
+				terminalTextAnswer,
+				options.triggerContextTokens,
+				suppressContinuation,
+				"preflight",
+			);
+			if (outcome !== "fallback") return outcome;
+			skipElideRescue = true;
 		}
 		// "overflow" and "incomplete" force inline execution because they are recovery
 		// paths the caller wants resolved before scheduling the next turn. "idle" is
@@ -2246,6 +2270,8 @@ export class SessionMaintenance {
 					await this.runAutoCompaction(reason, willRetry, true, true, {
 						...options,
 						terminalTextAnswer,
+						shakePreflightAttempted,
+						skipElideRescue,
 					});
 				},
 				{ generation },
@@ -2419,7 +2445,7 @@ export class SessionMaintenance {
 					}
 					if (!frameRescueCreatedHeadroom) {
 						await this.#rescueCompactionDeadEnd(autoCompactionSignal, {
-							skipElide: fallbackFromShake,
+							skipElide: skipElideRescue,
 							hasProgress: () => {
 								// Only reached when a tier actually freed something, so the
 								// branch has been rewritten either way.
@@ -2912,7 +2938,7 @@ export class SessionMaintenance {
 				retryFits = this.#compactionCreatedRetryFit();
 				if (!retryFits) {
 					retryFits = await this.#rescueCompactionDeadEnd(autoCompactionSignal, {
-						skipElide: fallbackFromShake,
+						skipElide: skipElideRescue,
 						hasProgress: () => this.#compactionCreatedRetryFit(),
 					});
 				}
@@ -2930,7 +2956,7 @@ export class SessionMaintenance {
 				hasHeadroom = this.#compactionCreatedHeadroom();
 				if (!hasHeadroom) {
 					hasHeadroom = await this.#rescueCompactionDeadEnd(autoCompactionSignal, {
-						skipElide: fallbackFromShake,
+						skipElide: skipElideRescue,
 						hasProgress: () => this.#compactionCreatedHeadroom(),
 					});
 				}
@@ -3007,14 +3033,12 @@ export class SessionMaintenance {
 	}
 
 	/**
-	 * Run a shake-strategy auto-maintenance pass. Emits the
-	 * `auto_compaction_start`/`auto_compaction_end` pair with a shake `action`,
-	 * runs {@link shake} inline against the protect-window config, and schedules
-	 * continuation exactly like the context-full tail.
+	 * Run an automatic shake pass and emit the standard compaction lifecycle.
 	 *
-	 * Returns `"fallback"` only for an overflow recovery where shake reclaimed
-	 * nothing (or threw) — the caller then runs the summary-compaction body so
-	 * the oversized input still gets resolved. Returns `"handled"` otherwise.
+	 * Configured strategy mode preserves shake's existing recovery behavior.
+	 * Preflight mode is stricter: no-op, insufficient headroom, or non-abort
+	 * failure returns `"fallback"` so the caller immediately runs its configured
+	 * compaction strategy instead of entering another low-savings shake cycle.
 	 */
 	async #runAutoShake(
 		reason: "overflow" | "threshold" | "idle" | "incomplete",
@@ -3024,8 +3048,10 @@ export class SessionMaintenance {
 		terminalTextAnswer: boolean,
 		triggerContextTokens?: number,
 		suppressContinuation = false,
+		mode: "strategy" | "preflight" = "strategy",
 	): Promise<CompactionCheckResult | "fallback"> {
 		const action = "shake";
+		const preflight = mode === "preflight";
 		this.#autoCompactionAbortController?.abort();
 		const controller = new AbortController();
 		this.#autoCompactionAbortController = controller;
@@ -3078,11 +3104,14 @@ export class SessionMaintenance {
 					stillOverThreshold = shouldCompact(postShakeTokens, contextWindow, compactionSettings);
 				}
 			}
-			const shouldFallBack = reason !== "idle" && ((reason === "overflow" && !reclaimed) || stillOverThreshold);
+			const shouldFallBack = preflight
+				? !reclaimed || stillOverThreshold
+				: reason !== "idle" && ((reason === "overflow" && !reclaimed) || stillOverThreshold);
 			if (shouldFallBack) {
+				const fallbackTarget = preflight ? "configured compaction" : "context-full compaction";
 				const errorMessage = reclaimed
-					? `Auto-shake reclaimed ~${result.tokensFreed} tokens but context is still above the threshold; falling back to context-full compaction.`
-					: "Auto-shake found nothing eligible to drop; falling back to context-full compaction.";
+					? `Auto-shake reclaimed ~${result.tokensFreed} tokens but context is still above the threshold; falling back to ${fallbackTarget}.`
+					: `Auto-shake found nothing eligible to drop; falling back to ${fallbackTarget}.`;
 				await this.#host.emitSessionEvent({
 					type: "auto_compaction_end",
 					action,
@@ -3160,7 +3189,7 @@ export class SessionMaintenance {
 				skipped: false,
 			});
 			// Overflow still needs recovery even if shake threw.
-			return reason === "overflow" ? "fallback" : COMPACTION_CHECK_NONE;
+			return preflight || reason === "overflow" ? "fallback" : COMPACTION_CHECK_NONE;
 		} finally {
 			if (this.#autoCompactionAbortController === controller) {
 				this.#autoCompactionAbortController = undefined;

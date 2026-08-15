@@ -95,6 +95,9 @@ Never edit generated catalog JSON for Venice.
 11. Preserve the fork's remote-first automatic default only for unconfigured,
     provider-native-capable GPT/Codex candidates; upstream owns `/compact remote`,
     transport, fallback, and lifecycle semantics.
+12. Reapply session-scoped `/tryshake on|off` state and boundary reset as a
+    one-attempt preflight: enough headroom skips configured compaction; no-op, error,
+    or low savings falls through once, including across deferred handoff recursion.
 
 ### 6. Generated and optional files
 
@@ -196,6 +199,8 @@ git grep -n "loadAdvisorTranscriptToolStats"
 git grep -n "Tools usage (successful/attempts)"
 git grep -n "advisor.memoryReminderInterval"
 git grep -n "Memory reminder injections"
+git grep -n "setTryShakeEnabled"
+git grep -n 'name: "tryshake"'
 ```
 
 Interpret the `resource.?exhausted` result carefully: the fork contract requires that
@@ -219,6 +224,8 @@ expand a file argument into a large test bucket.
   test/tools/browser-launch.test.ts \
   test/tools/browser-tab-evaluate.test.ts \
   test/session-maintenance-compaction-action.test.ts \
+  test/shake.test.ts \
+  test/slash-commands/tryshake.test.ts \
   test/advisor/config.test.ts \
   test/advisor/transcript-recorder.test.ts \
   test/advisor/memory-reminder.test.ts \
