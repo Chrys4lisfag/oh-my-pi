@@ -6,6 +6,17 @@
 
 - Fixed Qwen models on the Venice provider (`api.venice.ai`) failing every request with `400 Unrecognized key(s) in object: 'enable_thinking'`. `buildOpenAICompat` picked `thinkingFormat: "qwen"` from the `qwen*` id for any non-NVIDIA/Fireworks host, emitting a top-level `enable_thinking` field that Venice's strict (`additionalProperties: false`) chat-completions schema rejects — the same failure class as NVIDIA NIM (#2299). Venice is now a registered host and its Qwen models route to the standard `"openai"` reasoning_effort dialect (mirroring the Fireworks Qwen carve-out), so the wire body no longer carries `enable_thinking`.
 - Fixed Venice models that don't support function calling (the `e2ee-*` end-to-end-encrypted variants, several `-uncensored` models, `hermes-3-llama-3.1-405b`, `grok-4-20-multi-agent`) failing every request with `400 tools is not supported by this model`. Venice reports per-model support under `model_spec.capabilities.supportsFunctionCalling`, but discovery ignored it and always sent a native `tools` array. Discovery now maps `supportsFunctionCalling: false` → `supportsTools: false`, so the agent routes those models through a prompted (in-band) tool dialect instead of the native tools API.
+## [17.3.4] - 2026-08-14
+
+### Added
+
+- Added wire constants for Codex V2 remote-compaction feature negotiation.
+
+### Fixed
+
+- Fixed raw `COPILOT_GITHUB_TOKEN` credentials skipping plan-specific endpoint discovery, which routed GitHub Copilot Business model requests to the personal endpoint and returned HTTP 403. The GitHub Copilot model cache is now scoped per credential, so switching the token no longer serves another account's stale endpoint for the cache TTL ([#8507](https://github.com/can1357/oh-my-pi/issues/8507)).
+- Fixed the OpenRouter `deepseek/deepseek-v4-pro-0813` route silently clamping the reasoning effort to `high`: the dated SKU advertises (and accepts) the wire-exact `low`/`high`/`max` ladder, so its effort override no longer collapses to `high`-only. The undated `deepseek/deepseek-v4-pro` OpenRouter route stays `high`-only. ([#8517](https://github.com/can1357/oh-my-pi/issues/8517))
+
 ## [17.3.2] - 2026-08-13
 
 ### Added

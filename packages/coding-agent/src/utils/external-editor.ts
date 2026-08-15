@@ -33,6 +33,27 @@ export interface OpenInEditorOptions {
 	trimTrailingNewline?: boolean;
 }
 
+/** Subprocess argv and Windows quoting mode used to launch an external editor. */
+export interface EditorSpawnCommand {
+	cmd: string[];
+	windowsVerbatimArguments: boolean;
+}
+
+/** Resolves shell argv without letting the host runtime re-quote the editor command. */
+export function resolveEditorSpawnCommand(
+	editorCmd: string,
+	tmpFile: string,
+	platform: NodeJS.Platform = process.platform,
+): EditorSpawnCommand {
+	const windows = platform === "win32";
+	// cmd.exe strips the outer /s /c quote pair; Bun must pass the embedded
+	// editor/path quotes verbatim instead of applying argv escaping to them.
+	const cmd = windows
+		? ["cmd.exe", "/d", "/s", "/c", `"${editorCmd} "${tmpFile}""`]
+		: [$which("sh") ?? "sh", "-c", `${editorCmd} "$1"`, "sh", tmpFile];
+	return { cmd, windowsVerbatimArguments: windows };
+}
+
 /**
  * Opens `content` in the user's external editor and returns the edited text.
  * Returns `null` if the editor exits with a non-zero code.
@@ -61,14 +82,12 @@ export async function openInEditor(
 		const hasWaitFlag = lowerCmd.includes("--wait") || / -w(\s|$)/.test(lowerCmd);
 		const waitFlag = isGuiEditor && !hasWaitFlag ? (lowerCmd.includes("subl") ? "-w" : "--wait") : undefined;
 		const editorWithWait = `${editorCmd}${waitFlag ? ` ${waitFlag}` : ""}`;
-		const cmd =
-			process.platform === "win32"
-				? ["cmd", "/c", `${editorWithWait} "${tmpFile}"`]
-				: [$which("sh") ?? "sh", "-c", `${editorWithWait} "$1"`, "sh", tmpFile];
-		const child = Bun.spawn(cmd, {
+		const spawnCommandWithWait = resolveEditorSpawnCommand(editorWithWait, tmpFile);
+		const child = Bun.spawn(spawnCommandWithWait.cmd, {
 			stdin,
 			stdout,
 			stderr,
+			windowsVerbatimArguments: spawnCommandWithWait.windowsVerbatimArguments,
 		});
 		const exitCode = await child.exited;
 		if (exitCode === 0) {

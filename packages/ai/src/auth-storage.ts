@@ -3363,9 +3363,10 @@ export class AuthStorage {
 
 	async #fetchUsageCached(
 		request: UsageRequestDescriptor,
-		timeoutMs?: number,
-		forceRefresh = false,
+		options: { timeoutMs?: number; forceRefresh?: boolean } = {},
 	): Promise<UsageReport | null> {
+		const timeoutMs = options.timeoutMs;
+		const forceRefresh = options.forceRefresh ?? false;
 		const cacheKey = this.#buildUsageReportCacheKey(request);
 		const now = Date.now();
 		const cached = forceRefresh ? undefined : this.#usageCache.get<UsageReport | null>(cacheKey);
@@ -3886,10 +3887,9 @@ export class AuthStorage {
 			if (!resolvedApiKey) return null;
 			usageCredential.apiKey = resolvedApiKey;
 		}
-		return this.#fetchUsageCached(
-			this.#buildUsageRequest(provider, usageCredential, options?.baseUrl),
-			options?.timeoutMs ?? this.#usageRequestTimeoutMs,
-		);
+		return this.#fetchUsageCached(this.#buildUsageRequest(provider, usageCredential, options?.baseUrl), {
+			timeoutMs: options?.timeoutMs ?? this.#usageRequestTimeoutMs,
+		});
 	}
 
 	/**
@@ -4096,10 +4096,12 @@ export class AuthStorage {
 			requests.map(request => {
 				const forceRefresh = serializedProviders.has(request.provider);
 				if (!forceRefresh) {
-					return this.#fetchUsageCached(request, this.#usageRequestTimeoutMs);
+					return this.#fetchUsageCached(request, { timeoutMs: this.#usageRequestTimeoutMs });
 				}
 				const tail = tails.get(request.provider) ?? Promise.resolve();
-				const current = tail.then(() => this.#fetchUsageCached(request, this.#usageRequestTimeoutMs, true));
+				const current = tail.then(() =>
+					this.#fetchUsageCached(request, { timeoutMs: this.#usageRequestTimeoutMs, forceRefresh: true }),
+				);
 				tails.set(
 					request.provider,
 					current.then(
