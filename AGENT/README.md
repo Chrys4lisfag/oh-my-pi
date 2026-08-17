@@ -62,7 +62,8 @@ be adopted without silently losing fork features.
 15. `/tryshake on` enables a session-scoped surgical shake preflight per automatic
     compaction trigger; sufficient recovery skips full compaction, while no-op,
     failed, or low-savings attempts fall through once to the configured strategy.
-    New, switched, and cleared sessions reset the toggle; settings files never store it.
+    `/tryshake status` reports the current value. New, switched, and cleared sessions
+    reset the toggle; settings files never store it.
 
 ## Important memory corrections
 

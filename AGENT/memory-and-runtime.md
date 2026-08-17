@@ -371,8 +371,9 @@ status rendering. Do not conflate reminder injections with
 
 ## 11. Try-shake compaction preflight
 
-`/tryshake on` sets in-memory state on the current `AgentSession`. New, switched,
-and cleared logical sessions reset it, and no settings file stores it. On each
+`/tryshake on` sets in-memory state on the current `AgentSession`, while
+`/tryshake status` reports that state without mutating it. New, switched, and cleared
+logical sessions reset it, and no settings file stores it. On each
 automatic compaction trigger, OMP runs one conservative `DEFAULT_SHAKE_CONFIG`
 elide pass before the configured `context-full`, `handoff`, or `snapcompact`
 strategy. Explicit `compaction.strategy: shake` already owns this flow and does not

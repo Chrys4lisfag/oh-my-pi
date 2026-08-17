@@ -13,7 +13,11 @@ function createRuntime() {
 	const setTryShakeEnabled = vi.fn((value: boolean) => {
 		enabled = value;
 	});
-	const runtime = { settings, output, session: { setTryShakeEnabled } } as unknown as SlashCommandRuntime;
+	const runtime = {
+		settings,
+		output,
+		session: { setTryShakeEnabled, isTryShakeEnabled: () => enabled },
+	} as unknown as SlashCommandRuntime;
 	return { output, runtime, setTryShakeEnabled, isEnabled: () => enabled };
 }
 
@@ -37,6 +41,19 @@ describe("/tryshake slash command", () => {
 		expect(h.output).toHaveBeenLastCalledWith("Try-shake disabled for this session.");
 	});
 
+	it("reports current session status without changing it", async () => {
+		const h = createRuntime();
+
+		await executeAcpBuiltinSlashCommand("/tryshake status", h.runtime);
+		expect(h.output).toHaveBeenLastCalledWith("Try-shake is disabled for this session.");
+		expect(h.setTryShakeEnabled).not.toHaveBeenCalled();
+
+		await executeAcpBuiltinSlashCommand("/tryshake on", h.runtime);
+		await executeAcpBuiltinSlashCommand("/tryshake status", h.runtime);
+		expect(h.output).toHaveBeenLastCalledWith("Try-shake is enabled for this session.");
+		expect(h.setTryShakeEnabled).toHaveBeenCalledTimes(1);
+	});
+
 	it("normalizes command argument case", async () => {
 		const h = createRuntime();
 		await executeAcpBuiltinSlashCommand("/tryshake ON", h.runtime);
@@ -49,13 +66,13 @@ describe("/tryshake slash command", () => {
 			await executeAcpBuiltinSlashCommand(command, h.runtime);
 			expect(h.isEnabled()).toBe(false);
 			expect(h.setTryShakeEnabled).not.toHaveBeenCalled();
-			expect(h.output).toHaveBeenCalledWith("Usage: /tryshake [on|off]");
+			expect(h.output).toHaveBeenCalledWith("Usage: /tryshake [on|off|status]");
 		}
 	});
 
-	it("is advertised to ACP clients with on and off subcommands", () => {
+	it("is advertised to ACP clients with on, off, and status subcommands", () => {
 		const advertised = ACP_BUILTIN_SLASH_COMMANDS.find(command => command.name === "tryshake");
 		expect(advertised).toBeDefined();
-		expect(advertised?.input?.hint).toBe("[on|off]");
+		expect(advertised?.input?.hint).toBe("[on|off|status]");
 	});
 });

@@ -111,7 +111,7 @@ subagent inheritance. Preserve all domains when resolving its conflicts.
 - `packages/coding-agent/src/session/session-maintenance.ts`
   - fork-only automatic action selection plus one-shot try-shake preflight; upstream owns remote transport and lifecycle
 - `packages/coding-agent/src/slash-commands/builtin-lifecycle.ts`
-  - session-scoped `/tryshake on|off` command
+  - session-scoped `/tryshake on|off|status` command
 - `packages/coding-agent/src/tools/memory-reflect.ts`
 - `packages/coding-agent/src/tools/xdev.ts`
 - `packages/coding-agent/src/utils/external-editor.ts`

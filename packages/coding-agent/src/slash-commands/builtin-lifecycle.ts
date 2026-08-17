@@ -200,12 +200,18 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		subcommands: [
 			{ name: "on", description: "Try shake before automatic compaction" },
 			{ name: "off", description: "Use the configured compaction strategy directly" },
+			{ name: "status", description: "Show current session try-shake status" },
 		],
-		acpInputHint: "[on|off]",
+		acpInputHint: "[on|off|status]",
 		allowArgs: true,
 		handle: async (command, runtime) => {
 			const arg = command.args.trim().toLowerCase();
-			if (arg !== "on" && arg !== "off") return usage("Usage: /tryshake [on|off]", runtime);
+			if (arg === "status") {
+				const enabled = runtime.session.isTryShakeEnabled();
+				await runtime.output(`Try-shake is ${enabled ? "enabled" : "disabled"} for this session.`);
+				return commandConsumed();
+			}
+			if (arg !== "on" && arg !== "off") return usage("Usage: /tryshake [on|off|status]", runtime);
 			const enabled = arg === "on";
 			runtime.session.setTryShakeEnabled(enabled);
 			await runtime.output(`Try-shake ${enabled ? "enabled" : "disabled"} for this session.`);

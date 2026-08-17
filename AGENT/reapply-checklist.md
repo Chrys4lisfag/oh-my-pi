@@ -95,7 +95,7 @@ Never edit generated catalog JSON for Venice.
 11. Preserve the fork's remote-first automatic default only for unconfigured,
     provider-native-capable GPT/Codex candidates; upstream owns `/compact remote`,
     transport, fallback, and lifecycle semantics.
-12. Reapply session-scoped `/tryshake on|off` state and boundary reset as a
+12. Reapply session-scoped `/tryshake on|off|status` state and boundary reset as a
     one-attempt preflight: enough headroom skips configured compaction; no-op, error,
     or low savings falls through once, including across deferred handoff recursion.
 
