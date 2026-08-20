@@ -11,11 +11,20 @@
  * concurrent instance's independently added/edited/deleted profiles intact.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { Effort } from "@oh-my-pi/pi-ai";
+import {
+	onSettingsSynchronized,
+	resetSettingsForTest,
+	resetSettingsForTestAsync,
+	Settings,
+} from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { YAML } from "bun";
 
 const SNAP = { modelRoles: { default: "anthropic/claude-sonnet-4" }, defaultThinkingLevel: "high" };
 
@@ -23,22 +32,34 @@ describe("profiles multi-instance persistence", () => {
 	let dir: string;
 
 	beforeEach(async () => {
+		resetSettingsForTest();
 		dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-profiles-"));
 	});
 
 	afterEach(async () => {
-		// Close all agent.db handles so Windows can delete the temp dir.
 		AgentStorage.resetInstance();
-		try {
-			await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
-		} catch {
-			// Windows can hold the sqlite handle past close(); the temp dir is OS-reclaimed.
-		}
+		await resetSettingsForTestAsync();
+		await removeWithRetries(dir);
 	});
 
-	async function load() {
-		const s = await Settings.loadIsolated({ agentDir: dir, cwd: dir });
+	async function load(overrides: Record<string, unknown> = {}) {
+		const s = await Settings.loadIsolated({ agentDir: dir, cwd: dir, overrides });
 		return s;
+	}
+
+	function rewriteConfig(mutator: (config: Record<string, any>) => void): void {
+		const configPath = path.join(dir, "config.yml");
+		const config = YAML.parse(fsSync.readFileSync(configPath, "utf8")) as Record<string, any>;
+		mutator(config);
+		fsSync.writeFileSync(configPath, YAML.stringify(config, null, 2));
+	}
+
+	async function waitFor(predicate: () => boolean, timeoutMs = 3_000): Promise<void> {
+		const deadline = Date.now() + timeoutMs;
+		while (!predicate()) {
+			if (Date.now() >= deadline) throw new Error("Timed out waiting for settings synchronization");
+			await Bun.sleep(25);
+		}
 	}
 
 	it("keeps both profiles when two stale instances each add one and save", async () => {
@@ -226,5 +247,276 @@ describe("profiles multi-instance persistence", () => {
 
 		const reader = await load();
 		expect(reader.get("profiles.items")).toEqual({ old: SNAP, new: concurrent });
+	});
+	it("activates the freshest target snapshot without writing a stale copy", async () => {
+		const old = { modelRoles: { default: "anthropic/old" }, defaultThinkingLevel: "low" };
+		const staleTarget = { modelRoles: { default: "anthropic/stale" }, defaultThinkingLevel: "medium" };
+		const freshTarget = { modelRoles: { default: "openai/fresh" }, defaultThinkingLevel: "high" };
+		const seed = await load();
+		seed.setProfileItem("old", old);
+		seed.setProfileItem("target", staleTarget);
+		seed.set("profiles.active", "old");
+		seed.set("modelRoles", old.modelRoles);
+		await seed.flush();
+
+		const stale = await load();
+		rewriteConfig(config => {
+			config.profiles.items.target = freshTarget;
+		});
+		stale.activateProfile("target", staleTarget);
+		await stale.flush();
+
+		const reader = await load();
+		expect(reader.get("profiles.items").target).toEqual(freshTarget);
+		expect(reader.get("profiles.active")).toBe("target");
+		expect(reader.get("modelRoles")).toEqual(freshTarget.modelRoles);
+		expect(reader.get("defaultThinkingLevel")).toBe(Effort.High);
+	});
+
+	it("renames the freshest source without overwriting a concurrently changed active marker", async () => {
+		const other = { modelRoles: { default: "openai/other" }, defaultThinkingLevel: "high" };
+		const fresh = { modelRoles: { default: "openai/fresh-source" }, defaultThinkingLevel: "medium" };
+		const seed = await load();
+		seed.setProfileItem("old", SNAP);
+		seed.setProfileItem("other", other);
+		seed.set("profiles.active", "old");
+		seed.set("modelRoles", SNAP.modelRoles);
+		await seed.flush();
+
+		const stale = await load();
+		rewriteConfig(config => {
+			config.profiles.items.old = fresh;
+			config.profiles.active = "other";
+			config.modelRoles = other.modelRoles;
+			config.defaultThinkingLevel = other.defaultThinkingLevel;
+		});
+		stale.renameProfileItem("old", "new", SNAP, true);
+		await stale.flush();
+
+		const reader = await load();
+		expect(reader.get("profiles.items")).toEqual({ new: fresh, other });
+		expect(reader.get("profiles.active")).toBe("other");
+		expect(reader.get("modelRoles")).toEqual(other.modelRoles);
+	});
+
+	it("does not overwrite a concurrently changed active marker when deleting stale active state", async () => {
+		const other = { modelRoles: { default: "openai/other" }, defaultThinkingLevel: "high" };
+		const seed = await load();
+		seed.setProfileItem("selected", SNAP);
+		seed.setProfileItem("other", other);
+		seed.set("profiles.active", "selected");
+		seed.set("modelRoles", SNAP.modelRoles);
+		await seed.flush();
+
+		const stale = await load();
+		rewriteConfig(config => {
+			config.profiles.active = "other";
+			config.modelRoles = other.modelRoles;
+			config.defaultThinkingLevel = other.defaultThinkingLevel;
+		});
+		stale.deleteProfileItem("selected");
+		await stale.flush();
+
+		const reader = await load();
+		expect(reader.get("profiles.items")).toEqual({ other });
+		expect(reader.get("profiles.active")).toBe("other");
+		expect(reader.get("modelRoles")).toEqual(other.modelRoles);
+	});
+
+	it("preserves unrelated explicit overrides and retires profile-owned slots after final deletion", async () => {
+		const seed = await load();
+		seed.setProfileItem("only", SNAP);
+		seed.set("profiles.active", "only");
+		seed.set("modelRoles", SNAP.modelRoles);
+		seed.set("defaultThinkingLevel", Effort.High);
+		await seed.flush();
+		await fs.mkdir(path.join(dir, ".omp"), { recursive: true });
+		await fs.writeFile(
+			path.join(dir, ".omp", "config.yml"),
+			YAML.stringify({ modelRoles: { smol: "project/smol" } }, null, 2),
+		);
+
+		const peer = await load({
+			modelRoles: { default: "runtime/default", advisor: "runtime/advisor" },
+			defaultThinkingLevel: "xhigh",
+		});
+		expect(peer.getModelRole("default")).toBe(SNAP.modelRoles.default);
+		expect(peer.getModelRole("advisor")).toBe("runtime/advisor");
+		expect(peer.getModelRole("smol")).toBe("project/smol");
+		rewriteConfig(config => {
+			config.theme = { dark: "anthracite" };
+		});
+		await peer.syncFromDisk();
+		expect(peer.getModelRole("advisor")).toBe("runtime/advisor");
+		expect(peer.getModelRole("smol")).toBe("project/smol");
+
+		rewriteConfig(config => {
+			config.profiles = { active: "", items: {} };
+			config.modelRoles = { default: "global/default" };
+			config.defaultThinkingLevel = "low";
+		});
+		await peer.syncFromDisk();
+		expect(peer.getModelRole("default")).toBe("runtime/default");
+		expect(peer.getModelRole("advisor")).toBe("runtime/advisor");
+		expect(peer.getModelRole("smol")).toBe("project/smol");
+		expect(peer.get("defaultThinkingLevel")).toBe(Effort.XHigh);
+	});
+
+	it("does not switch other instances when one instance switches active profile", async () => {
+		const seed = await load();
+		seed.setProfileItem("work", {
+			modelRoles: { default: "anthropic/initial" },
+			defaultThinkingLevel: "high",
+		});
+		seed.setProfileItem("other", {
+			modelRoles: { default: "openai/other" },
+			defaultThinkingLevel: "low",
+		});
+		seed.set("profiles.active", "work");
+		seed.set("modelRoles", { default: "anthropic/initial" });
+		await seed.flush();
+
+		const writer = await load();
+		const peer = await seed.cloneForCwd(dir);
+
+		writer.activateProfile("other", {
+			modelRoles: { default: "openai/other" },
+			defaultThinkingLevel: "low",
+		});
+		await writer.flush();
+		await Bun.sleep(400);
+
+		expect(peer.get("profiles.active")).toBe("work");
+		expect(peer.getModelRole("default")).toBe("anthropic/initial");
+	});
+
+	it("does not emit an external synchronization event for local activation", async () => {
+		const settings = await load();
+		settings.setProfileItem("old", {
+			modelRoles: { default: "anthropic/old" },
+			defaultThinkingLevel: "medium",
+		});
+		const target = {
+			modelRoles: { default: "openai/target" },
+			defaultThinkingLevel: "high",
+		};
+		settings.setProfileItem("target", target);
+		settings.set("profiles.active", "old");
+		await settings.flush();
+
+		let synchronizations = 0;
+		const unsubscribe = onSettingsSynchronized(source => {
+			if (source === settings) synchronizations++;
+		});
+		try {
+			settings.activateProfile("target", target);
+			await settings.flush();
+			expect(synchronizations).toBe(0);
+		} finally {
+			unsubscribe();
+		}
+	});
+
+	it("keeps concurrent local activations isolated while last flush sets startup default", async () => {
+		const seed = await load();
+		const old = { modelRoles: { default: "anthropic/old" }, defaultThinkingLevel: "medium" };
+		const target = { modelRoles: { default: "openai/target" }, defaultThinkingLevel: "high" };
+		const winner = { modelRoles: { default: "anthropic/winner" }, defaultThinkingLevel: "low" };
+		seed.setProfileItem("old", old);
+		seed.setProfileItem("target", target);
+		seed.setProfileItem("winner", winner);
+		seed.set("profiles.active", "old");
+		await seed.flush();
+
+		const stale = await load();
+		const concurrent = await load();
+		stale.activateProfile("target", target);
+		concurrent.activateProfile("winner", winner);
+		await concurrent.flush();
+
+		let synchronizations = 0;
+		const unsubscribe = onSettingsSynchronized(source => {
+			if (source === stale) synchronizations++;
+		});
+		try {
+			await stale.flush();
+			expect(stale.get("profiles.active")).toBe("target");
+			expect(stale.getModelRole("default")).toBe("openai/target");
+			expect(synchronizations).toBe(0);
+
+			await concurrent.syncFromDisk();
+			expect(concurrent.get("profiles.active")).toBe("winner");
+			expect(concurrent.getModelRole("default")).toBe("anthropic/winner");
+
+			const reader = await load();
+			expect(reader.get("profiles.active")).toBe("target");
+		} finally {
+			unsubscribe();
+		}
+	});
+
+	it("autoswitches every live peer when its selected profile is deleted", async () => {
+		const seed = await load();
+		seed.setProfileItem("selected", {
+			modelRoles: { default: "anthropic/selected" },
+			defaultThinkingLevel: "low",
+		});
+		seed.setProfileItem("zeta", {
+			modelRoles: { default: "anthropic/zeta" },
+			defaultThinkingLevel: "medium",
+		});
+		seed.setProfileItem("alpha", {
+			modelRoles: { default: "openai/alpha" },
+			defaultThinkingLevel: "high",
+		});
+		seed.set("profiles.active", "selected");
+		seed.set("modelRoles", { default: "anthropic/selected" });
+		seed.set("defaultThinkingLevel", Effort.Low);
+		await seed.flush();
+
+		const deleter = await load();
+		const peer = await load();
+		peer.overrideModelRoles({ default: "google/gemini-stale" });
+
+		deleter.deleteProfileItem("selected");
+		await deleter.flush();
+		await waitFor(
+			() =>
+				peer.get("profiles.active") === "alpha" &&
+				peer.getModelRole("default") === "openai/alpha" &&
+				!("selected" in peer.get("profiles.items")),
+		);
+
+		peer.setModelRole("advisor", "anthropic/advisor-after-delete");
+		await peer.flush();
+		const reader = await load();
+		expect(reader.get("profiles.active")).toBe("alpha");
+		expect(reader.get("profiles.items")).not.toHaveProperty("selected");
+		expect(reader.get("modelRoles")).toEqual({
+			default: "openai/alpha",
+			advisor: "anthropic/advisor-after-delete",
+		});
+		expect(reader.get("defaultThinkingLevel")).toBe(Effort.High);
+	});
+
+	it("synchronizes inactive-profile deletion without changing the active profile", async () => {
+		const seed = await load();
+		seed.setProfileItem("active", SNAP);
+		seed.setProfileItem("inactive", {
+			modelRoles: { default: "openai/inactive" },
+			defaultThinkingLevel: "low",
+		});
+		seed.set("profiles.active", "active");
+		seed.set("modelRoles", { ...SNAP.modelRoles });
+		await seed.flush();
+
+		const deleter = await load();
+		const peer = await load();
+		deleter.deleteProfileItem("inactive");
+		await deleter.flush();
+
+		await waitFor(() => !("inactive" in peer.get("profiles.items")));
+		expect(peer.get("profiles.active")).toBe("active");
+		expect(peer.get("modelRoles")).toEqual(SNAP.modelRoles);
 	});
 });

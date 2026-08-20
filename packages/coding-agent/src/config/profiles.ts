@@ -1,5 +1,4 @@
 import { settings } from "./settings";
-import type { SettingValue } from "./settings-schema";
 
 export interface ProfileSnapshot {
 	modelRoles: Record<string, string>;
@@ -79,8 +78,7 @@ export function captureProfileActivationState(): ProfileActivationState {
 
 /** Restore live profile settings after a failed session-level apply. */
 export function restoreProfileActivation(state: ProfileActivationState): void {
-	settings.set("modelRoles", { ...state.snapshot.modelRoles });
-	settings.set("defaultThinkingLevel", state.snapshot.defaultThinkingLevel as SettingValue<"defaultThinkingLevel">);
+	settings.applyProfileSnapshot(state.snapshot);
 	const items = settings.get("profiles.items");
 	settings.set("profiles.active", state.name && asSnapshot(items[state.name]) ? state.name : "");
 }
@@ -133,10 +131,7 @@ export function switchProfile(name: string): void {
 	if (active && active in items) {
 		settings.setProfileItem(active, captureCurrentSnapshot());
 	}
-	settings.setProfileItem(name, snapshot); // keep the validated copy
-	settings.set("modelRoles", { ...snapshot.modelRoles });
-	settings.set("defaultThinkingLevel", snapshot.defaultThinkingLevel as SettingValue<"defaultThinkingLevel">);
-	settings.set("profiles.active", name);
+	settings.activateProfile(name, snapshot);
 }
 
 /**
@@ -154,24 +149,15 @@ export function deleteProfile(name: string): ProfileDeleteResult {
 	settings.deleteProfileItem(name);
 
 	if (rawActive !== name) {
-		if (rawActive && !asSnapshot(items[rawActive])) settings.set("profiles.active", "");
 		return { deletedName: name };
 	}
 
-	const fallback = Object.entries(items)
-		.filter(([candidate]) => candidate !== name)
-		.map(([candidate, raw]) => ({ name: candidate, snapshot: asSnapshot(raw) }))
-		.filter((entry): entry is ProfileCycleResult => entry.snapshot !== undefined)
-		.sort((a, b) => a.name.localeCompare(b.name))[0];
-	if (!fallback) {
-		settings.set("profiles.active", "");
+	const active = getActiveProfileName();
+	const fallback = active ? asSnapshot(settings.get("profiles.items")[active]) : undefined;
+	if (!active || !fallback) {
 		return { deletedName: name };
 	}
-
-	settings.set("modelRoles", { ...fallback.snapshot.modelRoles });
-	settings.set("defaultThinkingLevel", fallback.snapshot.defaultThinkingLevel as SettingValue<"defaultThinkingLevel">);
-	settings.set("profiles.active", fallback.name);
-	return { deletedName: name, activated: fallback };
+	return { deletedName: name, activated: { name: active, snapshot: fallback } };
 }
 
 /** Rename a profile. Throws if old not found or new already exists. */

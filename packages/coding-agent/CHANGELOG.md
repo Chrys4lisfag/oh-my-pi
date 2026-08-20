@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed multi-process profile persistence and runtime isolation: profile switches now stay local to each running terminal, active-profile deletion propagates a deterministic fallback, stale clients preserve untouched sibling profiles and cannot resurrect deleted profiles, activation resolves the freshest target snapshot, and unavailable profile models no longer block switching while prompt submission remains safely blocked.
+
 ## [17.3.4] - 2026-08-14
 
 ### Changed

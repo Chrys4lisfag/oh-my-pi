@@ -387,6 +387,124 @@ describe("Settings", () => {
 				process.removeListener("unhandledRejection", onUnhandled);
 			}
 		});
+		describe("background persistence lifecycle", () => {
+			it("continues a queued save after its predecessor rejects", async () => {
+				vi.useFakeTimers();
+				try {
+					await writeSettings({ setupVersion: 0 });
+					const settings = await Settings.init({ cwd: projectDir, agentDir });
+					const configPath = await fs.promises.realpath(getConfigPath());
+					const withFileLock = fileLock.withFileLock;
+					const firstFailure = Promise.withResolvers<never>();
+					const blocked = Promise.withResolvers<void>();
+					let intercepted = false;
+					vi.spyOn(fileLock, "withFileLock").mockImplementation(async (filePath, fn, options) => {
+						if (!intercepted && filePath === configPath) {
+							intercepted = true;
+							blocked.resolve();
+							await firstFailure.promise;
+						}
+						return await withFileLock(filePath, fn, options);
+					});
+
+					settings.set("setupVersion", 1);
+					vi.advanceTimersByTime(100);
+					await blocked.promise;
+					settings.set("setupVersion", 2);
+					vi.advanceTimersByTime(100);
+					await Promise.resolve();
+					firstFailure.reject(new Error("injected predecessor failure"));
+					await settings.flush();
+
+					expect(await readSettings()).toEqual({ setupVersion: 2 });
+				} finally {
+					vi.useRealTimers();
+				}
+			});
+
+			it("contains polling stat exceptions and remains reloadable", async () => {
+				vi.useFakeTimers();
+				try {
+					await writeSettings({ setupVersion: 1 });
+					const settings = await Settings.init({ cwd: projectDir, agentDir });
+					const statSync = fs.statSync;
+					let injected = false;
+					vi.spyOn(fs, "statSync").mockImplementation(((filePath: fs.PathLike, options?: fs.StatOptions) => {
+						if (!injected && String(filePath) === getConfigPath()) {
+							injected = true;
+							throw new FsCodeError("EACCES", "injected polling failure");
+						}
+						return statSync(filePath, options as never);
+					}) as never);
+
+					expect(() => vi.advanceTimersByTime(250)).not.toThrow();
+					expect(injected).toBe(true);
+					fs.writeFileSync(getConfigPath(), YAML.stringify({ setupVersion: 2 }, null, 2));
+					await settings.syncFromDisk();
+					expect(settings.get("setupVersion")).toBe(2);
+					await settings.dispose();
+				} finally {
+					vi.useRealTimers();
+				}
+			});
+
+			it("retries an unchanged watcher fingerprint after a transient reload failure", async () => {
+				await writeSettings({ setupVersion: 1 });
+				const settings = await Settings.init({ cwd: projectDir, agentDir });
+				const readFile = fs.promises.readFile.bind(fs.promises);
+				let attempts = 0;
+				vi.spyOn(fs.promises, "readFile").mockImplementation((async (
+					filePath: fs.PathLike | fs.promises.FileHandle,
+					options?: unknown,
+				) => {
+					if (String(filePath) === getConfigPath() && attempts++ === 0) {
+						throw new FsCodeError("EACCES", "injected transient reload failure");
+					}
+					return await readFile(filePath, options as never);
+				}) as never);
+
+				fs.writeFileSync(getConfigPath(), YAML.stringify({ setupVersion: 2 }, null, 2));
+				await Bun.sleep(700);
+
+				expect(attempts).toBeGreaterThanOrEqual(2);
+				expect(settings.get("setupVersion")).toBe(2);
+				await settings.dispose();
+			});
+
+			it("cancels and drains an in-flight external reload before teardown", async () => {
+				vi.useFakeTimers();
+				try {
+					await writeSettings({ setupVersion: 1 });
+					const settings = await Settings.init({ cwd: projectDir, agentDir });
+					const readFile = fs.promises.readFile.bind(fs.promises);
+					const gate = Promise.withResolvers<void>();
+					const blocked = Promise.withResolvers<void>();
+					let intercepted = false;
+					vi.spyOn(fs.promises, "readFile").mockImplementation((async (
+						filePath: fs.PathLike | fs.promises.FileHandle,
+						options?: unknown,
+					) => {
+						if (!intercepted && String(filePath) === getConfigPath()) {
+							intercepted = true;
+							blocked.resolve();
+							await gate.promise;
+						}
+						return await readFile(filePath, options as never);
+					}) as never);
+
+					fs.writeFileSync(getConfigPath(), YAML.stringify({ setupVersion: 2 }, null, 2));
+					vi.advanceTimersByTime(250);
+					await blocked.promise;
+					const disposal = settings.dispose();
+					gate.resolve();
+					await disposal;
+
+					expect(settings.get("setupVersion")).toBe(1);
+				} finally {
+					vi.useRealTimers();
+				}
+			});
+		});
 	});
 
 	describe("get()", () => {

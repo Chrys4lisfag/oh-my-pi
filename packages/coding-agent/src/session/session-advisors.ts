@@ -196,6 +196,7 @@ interface AdvisorRetryFallbackState {
 }
 
 interface ActiveAdvisor {
+	config: AdvisorConfig;
 	name: string;
 	slug: string;
 	agent: Agent;
@@ -411,7 +412,14 @@ export class SessionAdvisors {
 	/** Rebuilds live advisors when role assignments alter their resolved runtime inputs. */
 	onModelRolesChanged(): void {
 		if (!this.#advisorEnabled || this.#host.isDisposed()) return;
-		if (this.#advisors.length > 0 && !this.#advisorRuntimeMatchesCurrentConfig()) this.#stopAdvisorRuntime();
+		if (this.#advisors.length > 0 && !this.#advisorRuntimeMatchesCurrentConfig()) {
+			try {
+				this.rebuildRuntime(true);
+			} catch (error) {
+				logger.warn("advisor role-change rebuild failed; prior runtime restored", { error: String(error) });
+			}
+			return;
+		}
 		this.#buildAdvisorRuntime(true);
 	}
 
@@ -423,6 +431,43 @@ export class SessionAdvisors {
 	/** Stops every advisor runtime and starts recorder shutdown. */
 	stopRuntime(): void {
 		this.#stopAdvisorRuntime();
+	}
+
+	/**
+	 * Rebuild runtimes from current settings, restoring prior descriptors if
+	 * construction fails after old runtimes were stopped.
+	 */
+	rebuildRuntime(seedToCurrent = false): boolean {
+		const previousDescriptors = this.#advisors.map(({ config, name, slug, model, thinkingLevel, signature }) => ({
+			config,
+			name,
+			slug,
+			model,
+			thinkingLevel,
+			signature,
+		}));
+		const previousStatuses = new Map(this.#advisorStatuses);
+		this.#stopAdvisorRuntime();
+		try {
+			const rebuilt = this.#buildAdvisorRuntime(seedToCurrent);
+			if (!rebuilt && previousDescriptors.length > 0) {
+				throw new Error("advisor runtime rebuild produced no active advisors");
+			}
+			return rebuilt;
+		} catch (error) {
+			this.#stopAdvisorRuntime();
+			try {
+				this.#buildAdvisorRuntime(seedToCurrent, previousDescriptors);
+				this.#advisorStatuses = previousStatuses;
+			} catch (rollbackError) {
+				throw new Error(
+					`${error instanceof Error ? error.message : String(error)} (advisor rollback failed: ${
+						rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
+					})`,
+				);
+			}
+			throw error;
+		}
 	}
 
 	/**
@@ -741,7 +786,7 @@ export class SessionAdvisors {
 		return true;
 	}
 
-	#buildAdvisorRuntime(seedToCurrent = false): boolean {
+	#buildAdvisorRuntime(seedToCurrent = false, resolvedDescriptors?: readonly AdvisorRuntimeDescriptor[]): boolean {
 		if (this.#host.isDisposed()) return false;
 		if (this.#advisors.length > 0) return true;
 		if (!this.#advisorEnabled) return false;
@@ -751,7 +796,7 @@ export class SessionAdvisors {
 		// entry (`paused`/`no_model`/`running`) in roster order; the build loop
 		// below confirms `running` for successfully built advisors.
 		this.#advisorStatuses.clear();
-		const descriptors = this.#resolveAdvisorRuntimeDescriptors(true);
+		const descriptors = resolvedDescriptors ?? this.#resolveAdvisorRuntimeDescriptors(true);
 
 		// Advisor service tier (`tier.advisor`): "none" (default) runs the advisor
 		// on standard processing; "inherit" tracks the session's live per-family
@@ -1055,6 +1100,7 @@ export class SessionAdvisors {
 			});
 
 			const advisorRef: ActiveAdvisor = {
+				config,
 				name: advisorName,
 				slug,
 				agent: advisorAgent,
@@ -1763,7 +1809,9 @@ export class SessionAdvisors {
 	setAdvisorEnabled(enabled: boolean): boolean {
 		this.#advisorEnabled = enabled;
 		if (enabled) {
-			if (this.#advisors.length > 0 && !this.#advisorRuntimeMatchesCurrentConfig()) this.#stopAdvisorRuntime();
+			if (this.#advisors.length > 0 && !this.#advisorRuntimeMatchesCurrentConfig()) {
+				return this.rebuildRuntime(true);
+			}
 			return this.#buildAdvisorRuntime(true);
 		}
 		this.#stopAdvisorRuntime();

@@ -40,36 +40,48 @@ Behavior that must survive:
    overwrite the saved snapshot from potentially dirty live settings.
 5. Cycling sorts names lexically, wraps, and requires at least two profiles. If the
    active name is absent, cycling starts with the first sorted profile.
-6. Deleting the active profile clears `profiles.active`.
+6. Deleting the active profile selects the first lexically sorted valid remaining
+   profile and applies its exact snapshot. If none remains, it clears
+   `profiles.active` and retires profile-owned runtime overrides.
 
-Known validation limits: `asSnapshot` checks that `modelRoles` is an object and
-`defaultThinkingLevel` is a string, but does not prove every role value is a string.
-Public add/rename functions also accept empty or whitespace names. Do not accidentally
-make validation weaker; tightening it should be a deliberate change with migration
-coverage.
+`asSnapshot` validates that `modelRoles` is an object,
+`defaultThinkingLevel` is a string, and every role value is a string. Public
+add/rename functions still accept empty or whitespace names. Tightening profile-name
+validation should be a deliberate change with migration coverage.
 
 ### Multi-instance persistence
 
-**Problem.** `profiles.items` is one settings path. Two processes loading the same
-stale map and writing different profile keys used to overwrite each other despite the
-file lock.
+**Problem.** Multiple processes cache `config.yml`. Config-file locking prevented
+file corruption but did not notify peers, stop stale snapshots from replacing fresh
+ones, or recover a running terminal whose selected profile was deleted. Naively
+applying `profiles.active` from disk also caused a switch in one terminal to
+force-switch every other terminal.
 
 **Contract.** Profile mutations persist per profile name, not by replacing the whole
-map.
-
+map. Persistent `Settings` instances poll `config.yml` without holding filesystem
+watch handles and merge fresh profile definitions. Each running terminal keeps its
+locally active profile, exact model roles, and thinking level while that profile still
+exists. A switch only changes that terminal; `profiles.active` on disk is a startup
+default for future sessions. If a terminal's local profile is deleted, only terminals
+using that profile switch to the first valid lexical fallback.
 Implementation in `packages/coding-agent/src/config/settings.ts`:
 
-- `#modifiedProfileItems: Map<string, "upsert" | "delete">`
+- per-profile mutation tracking for create, update, rename, and deletion tombstones
 - `setProfileItem`
 - `deleteProfileItem`
 - save path re-reads the latest on-disk config under the existing lock and applies
   only touched names
+- external synchronization preserves each running terminal's valid local profile and
+  snapshot, ignoring another terminal's `profiles.active`, `modelRoles`, and thinking
+  selection
+- deleting a locally active profile reconciles that terminal to the first valid
+  lexical fallback and applies its exact model roles and thinking level
+- stale clients preserve untouched fresh profile definitions and cannot resurrect
+  deleted profiles
 
-All profile-domain mutations must call these methods. Do not reintroduce
-`settings.set("profiles.items", wholeMap)`.
-
-`profiles.active` is still a normal whole-path setting and can race between processes;
-only profile item content has per-key merge semantics.
+All profile-domain mutations must use the per-key methods. Do not reintroduce
+`settings.set("profiles.items", wholeMap)` or write a locally cached target snapshot
+merely to activate it.
 
 ### Command and keybinding wiring
 
@@ -84,6 +96,8 @@ only profile item content has per-key merge semantics.
 
 Wiring spans:
 
+- `packages/coding-agent/src/slash-commands/builtin-fork.ts`
+  - `/profiles` command definition
 - `packages/coding-agent/src/slash-commands/builtin-registry.ts`
 - `packages/coding-agent/src/modes/types.ts`
 - `packages/coding-agent/src/modes/interactive-mode.ts`
@@ -100,15 +114,19 @@ A frequent merge failure is preserving the registry entry but losing the
 
 ### Live session and advisor synchronization
 
-A settings update alone does not update already-instantiated model/advisor agents.
-After switch or cycle, call `AgentSession.applyProfileToSession()`.
+Cross-process profile definition changes update cached profile lists, but do not apply
+another terminal's active selection to a live session. Settings synchronization queues
+`AgentSession.applyProfileToSession()` only when effective local profile-controlled
+settings change, such as deleted-profile fallback; command switch and cycle apply
+their own local selection directly.
 
 Implementation:
 
 - `packages/coding-agent/src/session/agent-session.ts`
   - `applyProfileToSession`: resolve `default`, set model when resolvable, set thinking
-    level, then `refreshAdvisors`
-  - `refreshAdvisors`: rebuild active advisor runtime from current settings
+    level, then `refreshAdvisors` (or stop advisors if advisor model is unavailable);
+    unavailable default models do not block profile selection, but prompt submission
+    is blocked until a working model is selected or discovered
   - `ensureAdvisorsBuilt`: idempotently build a missing advisor after late discovery
   - constructor subscription and dispose cleanup
   - `setAdvisorEnabled` writes a runtime settings override so spawned subagents inherit
@@ -119,14 +137,15 @@ Implementation:
   - `#emitModelsUpdated` after runtime discovery settles
 
 Late provider discovery is important: the session may exist before Ollama, LiteLLM,
-or extension models arrive. The registry event retries a previously skipped advisor
-build. If upstream moves discovery finalization, re-home `#emitModelsUpdated` after the
-canonical model list is finalized.
+or extension models arrive. A synchronized apply with an unresolved default model
+remains pending, and the registry event retries it after the canonical model list is
+finalized. Public `waitForIdle()` includes queued synchronized profile work.
 
 Tests:
 
 - `packages/coding-agent/test/profiles.test.ts`
 - `packages/coding-agent/test/profiles-multi-instance.test.ts`
+- `packages/coding-agent/test/profile-live-sync.test.ts`
 - `packages/coding-agent/test/agent-session-advisor-model-sync.test.ts`
 - `packages/coding-agent/test/model-registry-models-updated.test.ts`
 
@@ -224,13 +243,19 @@ tests. Add contract coverage when touching this feature:
   deleted upstream and must not be restored
 
 ## Focused verification
-
 ```sh
-(cd packages/coding-agent && bun test \
+cd packages/coding-agent
+bun test \
   test/profiles.test.ts \
   test/profiles-multi-instance.test.ts \
+  test/profile-live-sync.test.ts \
   test/agent-session-advisor-model-sync.test.ts \
-  test/model-registry-models-updated.test.ts)
+  test/model-registry-models-updated.test.ts
+bun test test/settings-manager.test.ts
 ```
+
+Run `settings-manager.test.ts` separately: both suites manipulate process-global
+Settings/AgentStorage test singletons, so Bun's cross-file parallel runner can make
+their teardown cancel another file's fixture.
 
 Also perform the `/accounts` manual checks above until dedicated tests exist.

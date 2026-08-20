@@ -356,7 +356,7 @@ describe("AgentSession advisor + profile model sync", () => {
 			expect(advisorAgent?.state.model?.provider).toBe(LATE_PROVIDER);
 		});
 
-		it("rejects an unresolvable default-role model before changing the primary model or thinking", async () => {
+		it("applies thinking level and blocks prompt submission when default-role model is unavailable", async () => {
 			const { session } = await createHarness({
 				settingsOverrides: {
 					"advisor.enabled": true,
@@ -367,20 +367,19 @@ describe("AgentSession advisor + profile model sync", () => {
 				},
 				credentialedProviders: [PRIMARY_PROVIDER],
 			});
-			const previousThinking = session.thinkingLevel;
 
 			session.settings.setModelRole("default", "bogus-provider/nonexistent-model");
 			session.settings.set("defaultThinkingLevel", Effort.Low);
 			session.settings.setModelRole("advisor", `${PRIMARY_PROVIDER}/${SWAP_MODEL_ID}`);
 
-			await expect(session.applyProfileToSession()).rejects.toThrow(
-				'Profile default model "bogus-provider/nonexistent-model" is unavailable',
+			await session.applyProfileToSession();
+			expect(session.thinkingLevel).toBe(Effort.Low);
+			await expect(session.prompt("hello")).rejects.toThrow(
+				'Default model "bogus-provider/nonexistent-model" is unavailable',
 			);
-			expect(session.model?.id).toBe(PRIMARY_MODEL_ID);
-			expect(session.thinkingLevel).toBe(previousThinking);
 		});
 
-		it("preflights an unavailable advisor before changing the live primary model or thinking", async () => {
+		it("stops advisor runtime when advisor model is unavailable while applying primary model and thinking", async () => {
 			const { session } = await createHarness({
 				settingsOverrides: {
 					"advisor.enabled": true,
@@ -391,16 +390,14 @@ describe("AgentSession advisor + profile model sync", () => {
 				},
 				credentialedProviders: [PRIMARY_PROVIDER],
 			});
-			const previousThinking = session.thinkingLevel;
 			session.settings.setModelRole("default", `${PRIMARY_PROVIDER}/${SWAP_MODEL_ID}`);
 			session.settings.set("defaultThinkingLevel", Effort.High);
 			session.settings.setModelRole("advisor", `${LATE_PROVIDER}/${LATE_MODEL_ID}`);
 
-			await expect(session.applyProfileToSession()).rejects.toThrow(
-				`Profile advisor model "${LATE_PROVIDER}/${LATE_MODEL_ID}" is unavailable`,
-			);
-			expect(session.model?.id).toBe(PRIMARY_MODEL_ID);
-			expect(session.thinkingLevel).toBe(previousThinking);
+			await session.applyProfileToSession();
+			expect(session.model?.id).toBe(SWAP_MODEL_ID);
+			expect(session.thinkingLevel).toBe(Effort.High);
+			expect(session.isAdvisorActive()).toBe(false);
 		});
 
 		it("restores the previous live model when setModel throws after mutating agent state", async () => {
@@ -418,6 +415,36 @@ describe("AgentSession advisor + profile model sync", () => {
 
 			await expect(session.applyProfileToSession()).rejects.toThrow("injected model apply failure");
 			expect(session.model?.id).toBe(PRIMARY_MODEL_ID);
+		});
+
+		it("rolls back advisor runtime state when advisor refresh fails after mutation", async () => {
+			const { session } = await createHarness({
+				settingsOverrides: {
+					"advisor.enabled": true,
+					modelRoles: {
+						default: `${PRIMARY_PROVIDER}/${PRIMARY_MODEL_ID}`,
+						advisor: `${PRIMARY_PROVIDER}/${PRIMARY_MODEL_ID}`,
+					},
+				},
+				credentialedProviders: [PRIMARY_PROVIDER],
+			});
+			const previousThinking = session.configuredThinkingLevel();
+			const previousAdvisor = session.getAdvisorAgent();
+			expect(previousAdvisor?.state.model?.id).toBe(PRIMARY_MODEL_ID);
+
+			vi.spyOn(session, "refreshAdvisors").mockImplementationOnce(() => {
+				previousAdvisor?.setModel(getModelOrThrow(PRIMARY_PROVIDER, SWAP_MODEL_ID));
+				throw new Error("injected advisor refresh failure");
+			});
+			session.settings.setModelRole("default", `${PRIMARY_PROVIDER}/${SWAP_MODEL_ID}`);
+			session.settings.set("defaultThinkingLevel", Effort.High);
+
+			await expect(session.applyProfileToSession()).rejects.toThrow("injected advisor refresh failure");
+			expect(session.model?.id).toBe(PRIMARY_MODEL_ID);
+			expect(session.configuredThinkingLevel()).toBe(previousThinking);
+			expect(session.isAdvisorActive()).toBe(true);
+			expect(session.getAdvisorAgent()).toBe(previousAdvisor);
+			expect(previousAdvisor?.state.model?.id).toBe(PRIMARY_MODEL_ID);
 		});
 
 		describe("profile CRUD to live-session integration", () => {

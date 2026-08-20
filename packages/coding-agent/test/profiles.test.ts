@@ -234,6 +234,22 @@ describe("profiles", () => {
 			expect(gp?.snapshot.modelRoles.default).toBe("gemini-proxy/gemini-2.5-flash:high");
 		});
 
+		it("replaces stale runtime overrides when switching profiles", () => {
+			const s = Settings.instance;
+			s.set("profiles.items", {
+				current: { modelRoles: { default: "provider/current" }, defaultThinkingLevel: "low" },
+				target: { modelRoles: { default: "openai/gpt-target" }, defaultThinkingLevel: "high" },
+			});
+			s.set("profiles.active", "current");
+			s.overrideModelRoles({ default: "google/gemini-stale" });
+			s.override("defaultThinkingLevel", Effort.Low);
+
+			switchProfile("target");
+
+			expect(s.get("modelRoles")).toEqual({ default: "openai/gpt-target" });
+			expect(s.get("defaultThinkingLevel")).toBe(Effort.High);
+		});
+
 		it("does not overwrite live edits when re-selecting the active profile", () => {
 			const s = Settings.instance;
 			s.set("modelRoles", { default: "anthropic/claude-opus-4-7:high" });
@@ -281,6 +297,22 @@ describe("profiles", () => {
 			expect(getActiveProfileName()).toBe("alpha");
 			expect(s.get("modelRoles")).toEqual({ default: "provider/alpha" });
 			expect(s.get("defaultThinkingLevel")).toBe(Effort.Medium);
+		});
+
+		it("replaces stale runtime overrides with the selected deletion fallback", () => {
+			const s = Settings.instance;
+			s.set("profiles.items", {
+				selected: { modelRoles: { default: "provider/selected" }, defaultThinkingLevel: "low" },
+				fallback: { modelRoles: { default: "openai/gpt-fallback" }, defaultThinkingLevel: "high" },
+			});
+			s.set("profiles.active", "selected");
+			s.overrideModelRoles({ default: "google/gemini-stale" });
+
+			const result = deleteProfile("selected");
+
+			expect(result.activated?.name).toBe("fallback");
+			expect(s.get("modelRoles")).toEqual({ default: "openai/gpt-fallback" });
+			expect(s.get("defaultThinkingLevel")).toBe(Effort.High);
 		});
 
 		it("deleting the selected profile skips malformed fallback entries", () => {

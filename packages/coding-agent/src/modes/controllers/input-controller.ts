@@ -4,12 +4,7 @@ import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { type AutocompleteProvider, matchesKey, type SlashCommand } from "@oh-my-pi/pi-tui";
 import { isEnoent, logger, sanitizeText } from "@oh-my-pi/pi-utils";
-import {
-	captureProfileActivationState,
-	cycleProfile,
-	getActiveProfileName,
-	restoreProfileActivation,
-} from "../../config/profiles";
+import { cycleProfile, getActiveProfileName } from "../../config/profiles";
 import { isSettingsInitialized, settings } from "../../config/settings";
 import { resolveLocalRoot } from "../../internal-urls";
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";
@@ -1886,7 +1881,6 @@ export class InputController {
 	}
 
 	async cycleModelProfile(): Promise<void> {
-		const previous = captureProfileActivationState();
 		const result = cycleProfile();
 		if (!result) {
 			this.ctx.showStatus("No profiles to cycle (create with /profiles add <name>)");
@@ -1899,19 +1893,6 @@ export class InputController {
 			}
 			await this.ctx.session.applyProfileToSession();
 		} catch (err) {
-			restoreProfileActivation(previous);
-			try {
-				await this.ctx.session.applyProfileToSession();
-			} catch (rollbackError) {
-				this.ctx.statusLine.invalidate();
-				this.ctx.updateEditorBorderColor();
-				this.ctx.showError(
-					`${err instanceof Error ? err.message : String(err)} (rollback failed: ${
-						rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
-					})`,
-				);
-				return;
-			}
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorBorderColor();
 			this.ctx.showError(err instanceof Error ? err.message : String(err));
@@ -1924,7 +1905,12 @@ export class InputController {
 		const rolesSummary = Object.entries(liveRoles)
 			.map(([role, model]) => `${theme.fg("muted", role)}: ${model.split("/").pop()}`)
 			.join(theme.fg("dim", ", "));
-		this.ctx.showStatus(`Profile: ${profileName} (${rolesSummary})`, { dim: false });
+		const configuredDefault = settings.getModelRole("default");
+		const unavailableNotice =
+			configuredDefault && !this.ctx.session.resolveRoleModel("default")
+				? ` ${theme.fg("warning", "[model unavailable]")}`
+				: "";
+		this.ctx.showStatus(`Profile: ${profileName} (${rolesSummary})${unavailableNotice}`, { dim: false });
 	}
 
 	async cycleRoleModel(direction: "forward" | "backward" = "forward"): Promise<void> {

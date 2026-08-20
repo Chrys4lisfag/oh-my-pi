@@ -106,7 +106,7 @@ import type { ResolvedModelRoleValue } from "../config/model-resolver";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import { buildServiceTierByFamily } from "../config/service-tier";
 import type { Settings, SkillsSettings } from "../config/settings";
-import { onAppendOnlyModeChanged, onModelRolesChanged } from "../config/settings";
+import { onAppendOnlyModeChanged, onModelRolesChanged, onSettingsSynchronized } from "../config/settings";
 import { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
 import { getFileSnapshotStore } from "../edit/file-snapshot-store";
 import type { PythonResult } from "../eval/py/executor";
@@ -486,6 +486,10 @@ export class AgentSession {
 	#unsubscribeAppendOnly?: () => void;
 	#unsubscribeModelsUpdated?: () => void;
 	#unsubscribeModelRoles?: () => void;
+	#unsubscribeSettingsSynchronized?: () => void;
+	#settingsSyncApplyPromise: Promise<void> = Promise.resolve();
+	#synchronizedProfileApplyPending = false;
+	#synchronizedProfileApplyGeneration = 0;
 	/** Last (enable, providerId) tuple resolved by `#syncAppendOnlyContext` — used to skip no-op invalidations. */
 	#lastAppendOnlyResolution?: { enable: boolean; providerId: string | undefined };
 	#eventListeners: AgentSessionEventListener[] = [];
@@ -1614,9 +1618,15 @@ export class AgentSession {
 		};
 		this.#handoff = new SessionHandoff(handoffHost);
 
-		// Dynamic provider catalogs may arrive after construction; retry advisor
-		// resolution then, while SessionAdvisors remains source of truth for runtime state.
-		this.#unsubscribeModelsUpdated = this.#modelRegistry.onModelsUpdated(() => this.ensureAdvisorsBuilt());
+		// Dynamic provider catalogs may arrive after construction. Besides the
+		// ordinary late advisor build, retry any synchronized profile snapshot
+		// whose model was unavailable during its first apply.
+		this.#unsubscribeModelsUpdated = this.#modelRegistry.onModelsUpdated(() => {
+			this.ensureAdvisorsBuilt();
+			if (this.#synchronizedProfileApplyPending && this.#agentKind === "main" && !this.#isDisposed) {
+				this.#queueSynchronizedProfileApply();
+			}
+		});
 
 		this.#rehydrateCheckpointRewindState();
 
@@ -1626,6 +1636,19 @@ export class AgentSession {
 		// Re-evaluate append-only context mode when the setting changes at runtime.
 		this.#unsubscribeAppendOnly = onAppendOnlyModeChanged(_value => this.#syncAppendOnlyContext(this.model));
 		this.#unsubscribeModelRoles = onModelRolesChanged(() => this.#advisors.onModelRolesChanged());
+		this.#unsubscribeSettingsSynchronized = onSettingsSynchronized((source, changedPaths) => {
+			if (source !== this.settings || this.#agentKind !== "main" || this.#isDisposed) return;
+			if (
+				!changedPaths.some(
+					settingPath =>
+						settingPath === "modelRoles" ||
+						settingPath === "defaultThinkingLevel" ||
+						settingPath === "profiles.active",
+				)
+			)
+				return;
+			this.#queueSynchronizedProfileApply();
+		});
 	}
 	/** Model registry for API key resolution and model discovery */
 	get modelRegistry(): ModelRegistry {
@@ -3796,6 +3819,9 @@ export class AgentSession {
 	 */
 	beginDispose(): void {
 		this.#isDisposed = true;
+		this.settings.cancelIfSessionOwned();
+		this.#synchronizedProfileApplyGeneration++;
+		this.#synchronizedProfileApplyPending = false;
 		this.#queuedMessageDrainBlocked = false;
 		this.#usagePreflightReadyForNextModelCall = false;
 		this.#detachUsageBeforeQueueDequeue?.();
@@ -3983,6 +4009,10 @@ export class AgentSession {
 			this.#unsubscribeModelRoles();
 			this.#unsubscribeModelRoles = undefined;
 		}
+		if (this.#unsubscribeSettingsSynchronized) {
+			this.#unsubscribeSettingsSynchronized();
+			this.#unsubscribeSettingsSynchronized = undefined;
+		}
 		this.#eventListeners = [];
 		this.#sessionChangeCallbacks.clear();
 
@@ -4048,6 +4078,7 @@ export class AgentSession {
 				this.#releaseRetainedSessionMemory();
 			})().catch(error => logger.warn("Deferred dispose finalization failed", { error: String(error) }));
 		}
+		await this.settings.disposeIfSessionOwned();
 	}
 
 	/** Drop the in-memory conversation state after the terminal dispose flush. */
@@ -4307,11 +4338,21 @@ export class AgentSession {
 		return this.agent.isAborting;
 	}
 
-	/** Wait until streaming, event persistence, and deferred recovery work are fully settled. */
-	async waitForIdle(): Promise<void> {
+	/** Wait for core runtime work without joining synchronized profile work. */
+	async #waitForRuntimeIdle(): Promise<void> {
 		await this.agent.waitForIdle();
 		await this.#advisors.waitForPendingCardEvents();
 		await this.#waitForPostPromptRecovery();
+	}
+
+	/** Wait until streaming, event persistence, deferred recovery, and profile synchronization are settled. */
+	async waitForIdle(): Promise<void> {
+		while (true) {
+			const synchronizedApply = this.#settingsSyncApplyPromise;
+			await this.#waitForRuntimeIdle();
+			await synchronizedApply;
+			if (synchronizedApply === this.#settingsSyncApplyPromise) return;
+		}
 	}
 	/**
 	 * Prevent advisor notes from starting hidden primary turns while a headless
@@ -5444,6 +5485,15 @@ export class AgentSession {
 			this.#todo.resetCycle();
 			this.#resetPromptMaintenanceState();
 			this.#recovery.setAcceptTerminalEmptyStop(options?.acceptTerminalEmptyStop === true);
+
+			// Validate configured default model
+			const configuredDefault = this.settings.getModelRole("default");
+			if (configuredDefault && !this.resolveRoleModel("default")) {
+				throw new Error(
+					`Default model "${configuredDefault}" is unavailable.\n\n` +
+						"Use /login, set API key environment variables, or use /model to select a working model.",
+				);
+			}
 
 			// Validate model
 			if (!this.model) {
@@ -9242,8 +9292,7 @@ export class AgentSession {
 	refreshAdvisors(): number {
 		if (!this.#advisors.isAdvisorEnabled()) return 0;
 		if (!this.#advisors.isAdvisorActive()) return 0;
-		this.#advisors.stopRuntime();
-		this.#advisors.buildRuntime(true);
+		this.#advisors.rebuildRuntime(true);
 		return this.#advisors.getAdvisorStats().advisors.filter(advisor => advisor.status === "running").length;
 	}
 
@@ -9278,46 +9327,85 @@ export class AgentSession {
 	 *   3. advisors       — rebuilt so they pick up the profile's `advisor`-role
 	 *      model instead of staying pinned to the previous profile's.
 	 *
-	 * An unavailable configured default is an error: reporting a successful
-	 * profile switch while leaving the previous live model would make the profile
-	 * banner disagree with the status line. Callers can retry after dynamic model
-	 * discovery finishes; this method never partially applies another role first.
+	 * An unavailable configured default leaves the previous runtime model in
+	 * place only for display and settings repair. Prompt submission validates
+	 * the configured role and rejects before dispatch, so requests can never be
+	 * sent through the previous profile's model.
 	 */
-	async applyProfileToSession(): Promise<void> {
-		const configuredDefault = this.settings.getModelRole("default");
-		const model = this.resolveRoleModel("default");
-		if (!model) {
-			throw new Error(`Profile default model "${configuredDefault ?? "(unset)"}" is unavailable`);
-		}
-		const configuredAdvisor = this.settings.getModelRole("advisor");
-		if (this.isAdvisorEnabled() && configuredAdvisor && !this.resolveRoleModel("advisor")) {
-			throw new Error(`Profile advisor model "${configuredAdvisor}" is unavailable`);
-		}
+	#queueSynchronizedProfileApply(): void {
+		const generation = ++this.#synchronizedProfileApplyGeneration;
+		this.#synchronizedProfileApplyPending = Boolean(
+			this.settings.getModelRole("default") && !this.resolveRoleModel("default"),
+		);
+		this.#settingsSyncApplyPromise = this.#settingsSyncApplyPromise
+			.catch(() => undefined)
+			.then(async () => {
+				if (this.#isDisposed) return;
+				// Do not call public waitForIdle() here: it joins this promise and
+				// would therefore wait on itself.
+				await this.applyProfileToSession();
+				if (generation === this.#synchronizedProfileApplyGeneration) {
+					this.#synchronizedProfileApplyPending = Boolean(
+						this.settings.getModelRole("default") && !this.resolveRoleModel("default"),
+					);
+				}
+			})
+			.catch(error => {
+				// Keep the snapshot pending. A later model-registry update retries
+				// dynamic providers that were unavailable during this attempt.
+				logger.warn("Failed to apply synchronized profile settings", {
+					sessionId: this.sessionId,
+					error: String(error),
+				});
+			});
+	}
 
+	async applyProfileToSession(): Promise<void> {
+		if (this.#isDisposed) return;
+		const model = this.resolveRoleModel("default");
 		const previousModel = this.model;
 		const previousThinking = this.configuredThinkingLevel();
+		const previousAdvisor = this.getAdvisorAgent();
+		const previousAdvisorState = previousAdvisor
+			? {
+					model: previousAdvisor.state.model,
+					thinkingLevel: previousAdvisor.state.thinkingLevel,
+				}
+			: undefined;
+
 		try {
-			if (!modelsAreEqual(this.model, model)) await this.setModel(model);
-			if (!modelsAreEqual(this.model, model)) {
-				throw new Error(
-					`Profile default model "${configuredDefault ?? `${model.provider}/${model.id}`}" was not applied`,
-				);
+			if (model && (!this.model || !modelsAreEqual(this.model, model))) {
+				await this.setModel(model);
 			}
 			this.setThinkingLevel(parseConfiguredThinkingLevel(this.settings.get("defaultThinkingLevel")));
 			if (this.isAdvisorEnabled()) {
-				if (this.isAdvisorActive()) this.refreshAdvisors();
-				else this.ensureAdvisorsBuilt();
-				if (configuredAdvisor && !this.isAdvisorActive()) {
-					throw new Error(`Profile advisor model "${configuredAdvisor}" was not applied`);
+				const configuredAdvisor = this.settings.getModelRole("advisor");
+				if (!configuredAdvisor || this.resolveRoleModel("advisor")) {
+					if (this.isAdvisorActive()) this.refreshAdvisors();
+					else this.ensureAdvisorsBuilt();
+				} else {
+					this.#advisors.stopRuntime();
 				}
 			}
 		} catch (error) {
 			try {
-				if (previousModel && !modelsAreEqual(this.model, previousModel)) await this.setModel(previousModel);
+				if (previousModel && (!this.model || !modelsAreEqual(this.model, previousModel))) {
+					await this.setModel(previousModel);
+				}
 				this.setThinkingLevel(previousThinking);
+
+				if (previousAdvisorState) {
+					if (!this.isAdvisorActive()) this.ensureAdvisorsBuilt();
+					const advisor = this.getAdvisorAgent();
+					if (advisor) {
+						advisor.setModel(previousAdvisorState.model);
+						advisor.setThinkingLevel(previousAdvisorState.thinkingLevel);
+						advisor.appendOnlyContext?.invalidateForModelChange();
+					}
+				}
 			} catch (rollbackError) {
 				throw new Error(
-					`${error instanceof Error ? error.message : String(error)} (live model rollback failed: ${
+					`${error instanceof Error ? error.message : String(error)} (live runtime rollback failed: ${
 						rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
 					})`,
 				);
@@ -9379,7 +9467,10 @@ export class AgentSession {
 	 * flag and per-advisor name/status without computing token/cost breakdowns.
 	 * Avoids re-tokenizing the advisor transcript on every render frame.
 	 */
-	getAdvisorStatusOverview(): { configured: boolean; advisors: { name: string; status: AdvisorRuntimeStatus }[] } {
+	getAdvisorStatusOverview(): {
+		configured: boolean;
+		advisors: { name: string; status: AdvisorRuntimeStatus }[];
+	} {
 		return this.#advisors.getAdvisorStatusOverview();
 	}
 

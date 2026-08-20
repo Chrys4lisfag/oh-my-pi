@@ -15,12 +15,10 @@ import { formatDuration, logger, Snowflake, sanitizeText } from "@oh-my-pi/pi-ut
 import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-mode";
 import {
 	addProfile,
-	captureProfileActivationState,
 	deleteProfile,
 	getActiveProfileName,
 	listProfiles,
 	renameProfile,
-	restoreProfileActivation,
 	saveActiveProfile,
 	switchProfile,
 } from "../../config/profiles";
@@ -1221,36 +1219,25 @@ export class CommandController {
 				this.ctx.showStatus("Usage: /profiles switch <name>");
 				return;
 			}
-			const previous = captureProfileActivationState();
-			let switched = false;
 			try {
 				switchProfile(name);
-				switched = true;
 				await this.ctx.settings.flush();
 				if (getActiveProfileName() !== name)
 					throw new Error(`Profile "${name}" was deleted by another omp instance`);
 				await this.#applyProfileModelToSession();
 				this.ctx.statusLine.invalidate();
 				this.ctx.updateEditorBorderColor();
-				this.ctx.showStatus(`Switched to profile "${name}".`);
-			} catch (err) {
-				if (switched) {
-					restoreProfileActivation(previous);
-					try {
-						await this.#applyProfileModelToSession();
-					} catch (rollbackError) {
-						this.ctx.statusLine.invalidate();
-						this.ctx.updateEditorBorderColor();
-						this.ctx.showError(
-							`${err instanceof Error ? err.message : String(err)} (rollback failed: ${
-								rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
-							})`,
-						);
-						return;
-					}
-					this.ctx.statusLine.invalidate();
-					this.ctx.updateEditorBorderColor();
+				const configuredDefault = this.ctx.settings.getModelRole("default");
+				if (configuredDefault && !this.ctx.session.resolveRoleModel("default")) {
+					this.ctx.showWarning(
+						`Switched to profile "${name}". Default model "${configuredDefault}" is currently unavailable. Select a model with /model or Ctrl+P.`,
+					);
+				} else {
+					this.ctx.showStatus(`Switched to profile "${name}".`);
 				}
+			} catch (err) {
+				this.ctx.statusLine.invalidate();
+				this.ctx.updateEditorBorderColor();
 				this.ctx.showError(err instanceof Error ? err.message : String(err));
 			}
 			return;
@@ -1262,41 +1249,25 @@ export class CommandController {
 				this.ctx.showStatus("Usage: /profiles delete <name>");
 				return;
 			}
-			const previous = captureProfileActivationState();
 			try {
 				const result = deleteProfile(name);
 				await this.ctx.settings.flush();
 				if (result.activated) {
-					try {
-						if (getActiveProfileName() !== result.activated.name) {
-							throw new Error(`Fallback profile "${result.activated.name}" was deleted by another omp instance`);
-						}
-						await this.#applyProfileModelToSession();
-					} catch (applyError) {
-						restoreProfileActivation({ snapshot: previous.snapshot });
-						try {
-							await this.#applyProfileModelToSession();
-						} catch (rollbackError) {
-							throw new Error(
-								`Profile "${name}" was deleted, but fallback "${result.activated.name}" failed: ${
-									applyError instanceof Error ? applyError.message : String(applyError)
-								}; session rollback failed: ${
-									rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
-								}`,
-							);
-						}
-						throw new Error(
-							`Profile "${name}" was deleted, but fallback "${result.activated.name}" was not activated: ${
-								applyError instanceof Error ? applyError.message : String(applyError)
-							}`,
-						);
+					if (getActiveProfileName() !== result.activated.name) {
+						throw new Error(`Fallback profile "${result.activated.name}" was deleted by another omp instance`);
 					}
+					await this.#applyProfileModelToSession();
 				}
 				this.ctx.statusLine.invalidate();
 				this.ctx.updateEditorBorderColor();
+				const configuredDefault = this.ctx.settings.getModelRole("default");
+				const modelWarning =
+					result.activated && configuredDefault && !this.ctx.session.resolveRoleModel("default")
+						? ` (default model "${configuredDefault}" is currently unavailable)`
+						: "";
 				this.ctx.showStatus(
 					result.activated
-						? `Profile "${name}" deleted. Switched to "${result.activated.name}".`
+						? `Profile "${name}" deleted. Switched to "${result.activated.name}"${modelWarning}.`
 						: `Profile "${name}" deleted.`,
 				);
 			} catch (err) {

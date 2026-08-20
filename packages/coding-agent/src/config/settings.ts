@@ -15,6 +15,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { configureCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { configureProviderMaxInFlightRequests } from "@oh-my-pi/pi-ai/stream";
 import {
@@ -372,6 +373,19 @@ export class Settings {
 	 * when the role had no runtime override).
 	 */
 	#savedRuntimeModelRoleOverrides = new Map<string, string | undefined>();
+	/**
+	 * Runtime override slots currently owned by active profile. Each entry
+	 * records value displaced by profile activation so removing final profile
+	 * restores explicit runtime state instead of inferring ownership from value.
+	 */
+	#profileOwnedModelRoleOverrides = new Map<
+		string,
+		{ profile: string; hadPrevious: boolean; previousValue?: unknown }
+	>();
+	#profileOwnedThinkingOverride?: { profile: string; hadPrevious: boolean; previousValue?: unknown };
+	#profileRuntimeOwner?: string;
+	/** Pending activation; target snapshot is resolved from freshest disk state under write lock. */
+	#modifiedProfileActivation?: { targetName: string };
 
 	/** Legacy `lastChangelogVersion` captured from config.yml during migration (now a marker file). */
 	#legacyLastChangelogVersion?: string;
@@ -381,6 +395,13 @@ export class Settings {
 	#savePromise?: Promise<void>;
 	#projectSaveTimer?: NodeJS.Timeout;
 	#projectSavePromise?: Promise<void>;
+	#globalWatchTimer?: NodeJS.Timeout;
+	#globalWatchFingerprint?: string;
+	#externalReloadPromise?: Promise<void>;
+	/** Incremented on cancellation so in-flight reloads cannot mutate discarded instances. */
+	#lifecycleEpoch = 0;
+	/** True for cwd clones whose creating session owns this instance's lifecycle. */
+	#sessionOwned = false;
 
 	/** Whether to persist changes */
 	#persist: boolean;
@@ -514,6 +535,14 @@ export class Settings {
 		const prev = this.get(path);
 		const segments = path.split(".");
 		setByPath(this.#global, segments, value);
+		if (this.#profileRuntimeOwner && path === "modelRoles") {
+			this.#replaceProfileOwnedModelRoles(this.#profileRuntimeOwner, value as SettingValue<"modelRoles">);
+		} else if (this.#profileRuntimeOwner && path === "defaultThinkingLevel") {
+			this.#setProfileOwnedThinkingOverride(
+				this.#profileRuntimeOwner,
+				value as SettingValue<"defaultThinkingLevel">,
+			);
+		}
 		this.#modified.add(path);
 		this.#rebuildMerged();
 		const next = this.get(path);
@@ -550,11 +579,40 @@ export class Settings {
 	 */
 	deleteProfileItem(name: string): void {
 		const items = getByPath(this.#global, ["profiles", "items"]);
+		const rawActive = getByPath(this.#global, ["profiles", "active"]);
 		if (items && typeof items === "object") {
 			delete (items as Record<string, unknown>)[name];
 		}
 		this.#modifiedProfileItems.set(name, "delete");
+		if (rawActive === name) {
+			this.#reconcileDeletedActiveProfile(this.#global);
+		} else if (typeof rawActive === "string" && rawActive.length > 0 && !this.#hasValidActiveProfile(this.#global)) {
+			setByPath(this.#global, ["profiles", "active"], "");
+		}
+		this.#reconcileProfileRuntimeOverrides(this.#global);
 		this.#rebuildMerged();
+		this.#queueSave();
+	}
+
+	/** Apply one profile snapshot to persisted live config and profile-owned runtime slots. */
+	applyProfileSnapshot(snapshot: { modelRoles: Record<string, string>; defaultThinkingLevel: string }): void {
+		this.set("modelRoles", { ...snapshot.modelRoles });
+		this.set("defaultThinkingLevel", snapshot.defaultThinkingLevel as SettingValue<"defaultThinkingLevel">);
+	}
+
+	/**
+	 * Activate a profile conditionally. Persistence resolves target snapshot
+	 * from disk while holding write lock; stale caller snapshot is live-only.
+	 */
+	activateProfile(name: string, snapshot: { modelRoles: Record<string, string>; defaultThinkingLevel: string }): void {
+		const previous = this.#captureEffectiveSettings();
+		setByPath(this.#global, ["profiles", "active"], name);
+		setByPath(this.#global, ["modelRoles"], { ...snapshot.modelRoles });
+		setByPath(this.#global, ["defaultThinkingLevel"], snapshot.defaultThinkingLevel);
+		this.#replaceProfileRuntimeOverrides(name, snapshot);
+		this.#modifiedProfileActivation = { targetName: name };
+		this.#rebuildMerged();
+		this.#notifySynchronizedSettings(previous, false);
 		this.#queueSave();
 	}
 
@@ -581,7 +639,10 @@ export class Settings {
 	 */
 	override<P extends SettingPath>(path: P, value: SettingValue<P>): void {
 		if (path === "modelRoles") {
+			this.#supersedeAllProfileOwnedModelRoles();
 			this.#savedRuntimeModelRoleOverrides.clear();
+		} else if (path === "defaultThinkingLevel") {
+			this.#supersedeProfileOwnedThinkingOverride();
 		}
 		const prev = this.get(path);
 		const segments = path.split(".");
@@ -595,7 +656,10 @@ export class Settings {
 	 */
 	clearOverride(path: SettingPath): void {
 		if (path === "modelRoles") {
+			this.#supersedeAllProfileOwnedModelRoles();
 			this.#savedRuntimeModelRoleOverrides.clear();
+		} else if (path === "defaultThinkingLevel") {
+			this.#supersedeProfileOwnedThinkingOverride();
 		}
 		const prev = this.get(path);
 		const segments = path.split(".");
@@ -631,10 +695,44 @@ export class Settings {
 	 */
 	cancelPendingSaves(): void {
 		this.#savesCancelled = true;
+		this.#lifecycleEpoch++;
 		clearTimeout(this.#saveTimer);
 		this.#saveTimer = undefined;
 		clearTimeout(this.#projectSaveTimer);
 		this.#projectSaveTimer = undefined;
+		clearInterval(this.#globalWatchTimer);
+		this.#globalWatchTimer = undefined;
+		this.#globalWatchFingerprint = undefined;
+	}
+
+	/** Cancel new work and wait until already-started saves/reloads release file handles. */
+	async dispose(): Promise<void> {
+		this.cancelPendingSaves();
+		await Promise.allSettled(
+			[this.#savePromise, this.#projectSavePromise, this.#externalReloadPromise].filter(
+				(promise): promise is Promise<void> => promise !== undefined,
+			),
+		);
+	}
+
+	/** Stop external synchronization promptly while preserving pending local saves. */
+	cancelIfSessionOwned(): void {
+		if (!this.#sessionOwned) return;
+		this.#lifecycleEpoch++;
+		clearInterval(this.#globalWatchTimer);
+		this.#globalWatchTimer = undefined;
+		this.#globalWatchFingerprint = undefined;
+	}
+
+	/** Persist pending local edits, then drain all owned background work. */
+	async disposeIfSessionOwned(): Promise<void> {
+		if (!this.#sessionOwned) return;
+		try {
+			await this.flush();
+		} catch (error) {
+			logger.warn("Settings: failed to flush session-owned settings during dispose", { error: String(error) });
+		}
+		await this.dispose();
 	}
 
 	/**
@@ -660,7 +758,8 @@ export class Settings {
 			this.#modified.size > 0 ||
 			this.#modifiedProfileItems.size > 0 ||
 			this.#modifiedProfileRenames.size > 0 ||
-			this.#modifiedGlobalModelRoles.size > 0
+			this.#modifiedGlobalModelRoles.size > 0 ||
+			this.#modifiedProfileActivation !== undefined
 		) {
 			await this.#saveNow();
 		}
@@ -677,6 +776,7 @@ export class Settings {
 		});
 		cloned.#storage = this.#storage;
 		cloned.#configPath = this.#configPath;
+		cloned.#sessionOwned = true;
 		cloned.#global = structuredClone(this.#global);
 		cloned.#project = this.#persist ? await cloned.#loadProjectSettings() : structuredClone(this.#project);
 		if (!this.#persist) cloned.#projectShellPathSource = this.#projectShellPathSource;
@@ -684,8 +784,10 @@ export class Settings {
 		cloned.#configOverlay = structuredClone(this.#configOverlay);
 		cloned.#overlayShellPathSource = this.#overlayShellPathSource;
 		cloned.#overrides = this.#buildOriginalOverrides();
+		cloned.#reconcileProfileRuntimeOverrides(cloned.#global);
 		cloned.#rebuildMerged();
 		cloned.#fireAllHooks();
+		cloned.#startGlobalSettingsWatch();
 		return cloned;
 	}
 
@@ -839,6 +941,161 @@ export class Settings {
 		if (!isRecord(value)) return false;
 		return Object.hasOwn(value, role);
 	}
+	#getRuntimeModelRoleOverrides(): Record<string, unknown> {
+		const raw = getByPath(this.#overrides, ["modelRoles"]);
+		if (isRecord(raw)) return raw;
+		const roles: Record<string, unknown> = {};
+		setByPath(this.#overrides, ["modelRoles"], roles);
+		return roles;
+	}
+
+	#setProfileOwnedModelRole(profile: string, role: string, modelId: string): void {
+		const runtimeRoles = this.#getRuntimeModelRoleOverrides();
+		if (!this.#profileOwnedModelRoleOverrides.has(role)) {
+			this.#profileOwnedModelRoleOverrides.set(role, {
+				profile,
+				hadPrevious: Object.hasOwn(runtimeRoles, role),
+				previousValue: structuredClone(runtimeRoles[role]),
+			});
+		}
+		runtimeRoles[role] = modelId;
+	}
+
+	#retireProfileOwnedModelRole(role: string): void {
+		const owned = this.#profileOwnedModelRoleOverrides.get(role);
+		if (!owned) return;
+		const runtimeRoles = this.#getRuntimeModelRoleOverrides();
+		if (owned.hadPrevious) runtimeRoles[role] = structuredClone(owned.previousValue);
+		else delete runtimeRoles[role];
+		this.#profileOwnedModelRoleOverrides.delete(role);
+	}
+
+	#retireAllProfileOwnedModelRoles(): void {
+		for (const role of [...this.#profileOwnedModelRoleOverrides.keys()]) {
+			this.#retireProfileOwnedModelRole(role);
+		}
+	}
+
+	#supersedeProfileOwnedModelRole(role: string, preserveForProject = false): void {
+		const owned = this.#profileOwnedModelRoleOverrides.get(role);
+		if (!owned) return;
+		if (preserveForProject && !this.#savedRuntimeModelRoleOverrides.has(role)) {
+			const previous = owned.hadPrevious ? modelRoleValueFromUnknown(owned.previousValue) : undefined;
+			this.#savedRuntimeModelRoleOverrides.set(role, previous);
+		}
+		this.#profileOwnedModelRoleOverrides.delete(role);
+	}
+
+	#supersedeAllProfileOwnedModelRoles(): void {
+		this.#profileOwnedModelRoleOverrides.clear();
+	}
+
+	#replaceProfileOwnedModelRoles(profile: string, roles: ReadOnlyDict<string>): void {
+		for (const role of [...this.#profileOwnedModelRoleOverrides.keys()]) {
+			if (!Object.hasOwn(roles, role)) this.#retireProfileOwnedModelRole(role);
+		}
+		for (const [role, modelId] of Object.entries(roles)) {
+			if (modelId) this.#setProfileOwnedModelRole(profile, role, modelId);
+		}
+	}
+
+	#setProfileOwnedThinkingOverride(profile: string, value: string): void {
+		if (!this.#profileOwnedThinkingOverride) {
+			this.#profileOwnedThinkingOverride = {
+				profile,
+				hadPrevious: Object.hasOwn(this.#overrides, "defaultThinkingLevel"),
+				previousValue: structuredClone(this.#overrides.defaultThinkingLevel),
+			};
+		}
+		this.#overrides.defaultThinkingLevel = value;
+	}
+
+	#retireProfileOwnedThinkingOverride(): void {
+		const owned = this.#profileOwnedThinkingOverride;
+		if (!owned) return;
+		if (owned.hadPrevious) this.#overrides.defaultThinkingLevel = structuredClone(owned.previousValue);
+		else delete this.#overrides.defaultThinkingLevel;
+		this.#profileOwnedThinkingOverride = undefined;
+	}
+
+	#supersedeProfileOwnedThinkingOverride(): void {
+		this.#profileOwnedThinkingOverride = undefined;
+	}
+
+	#retireProfileRuntimeOverrides(): void {
+		this.#retireAllProfileOwnedModelRoles();
+		this.#retireProfileOwnedThinkingOverride();
+		this.#profileRuntimeOwner = undefined;
+	}
+
+	#replaceProfileRuntimeOverrides(
+		profile: string,
+		snapshot: { modelRoles: Record<string, string>; defaultThinkingLevel: string },
+	): void {
+		this.#retireProfileRuntimeOverrides();
+		this.#profileRuntimeOwner = profile;
+		this.#replaceProfileOwnedModelRoles(profile, snapshot.modelRoles);
+		this.#setProfileOwnedThinkingOverride(profile, snapshot.defaultThinkingLevel);
+	}
+
+	/**
+	 * Reconcile only slots still carrying explicit profile provenance. Explicit
+	 * runtime mutations remove that provenance, so unrelated disk reloads cannot
+	 * infer ownership from equal values and overwrite them.
+	 */
+	#reconcileProfileRuntimeOverrides(nextGlobal: RawSettings, previousGlobal?: RawSettings): void {
+		const active = getByPath(nextGlobal, ["profiles", "active"]);
+		const items = getByPath(nextGlobal, ["profiles", "items"]);
+		const snapshot =
+			typeof active === "string" && active.length > 0 && isRecord(items)
+				? this.#profileSnapshotFromUnknown(items[active])
+				: undefined;
+		if (!snapshot || typeof active !== "string") {
+			this.#retireProfileRuntimeOverrides();
+			return;
+		}
+
+		const liveSnapshot = {
+			modelRoles: this.#modelRolesFromLayer(nextGlobal),
+			defaultThinkingLevel:
+				typeof getByPath(nextGlobal, ["defaultThinkingLevel"]) === "string"
+					? (getByPath(nextGlobal, ["defaultThinkingLevel"]) as string)
+					: snapshot.defaultThinkingLevel,
+		};
+		if (this.#profileRuntimeOwner !== active) {
+			this.#replaceProfileRuntimeOverrides(active, liveSnapshot);
+			return;
+		}
+
+		const previousActive = previousGlobal ? getByPath(previousGlobal, ["profiles", "active"]) : undefined;
+		const previousRoles = previousGlobal ? this.#modelRolesFromLayer(previousGlobal) : {};
+		const previousThinking = previousGlobal ? getByPath(previousGlobal, ["defaultThinkingLevel"]) : undefined;
+		if (previousGlobal && previousActive === active) {
+			for (const role of new Set([...Object.keys(previousRoles), ...Object.keys(liveSnapshot.modelRoles)])) {
+				if (previousRoles[role] === liveSnapshot.modelRoles[role]) continue;
+				if (liveSnapshot.modelRoles[role] === undefined) this.#retireProfileOwnedModelRole(role);
+				else this.#setProfileOwnedModelRole(active, role, liveSnapshot.modelRoles[role]);
+			}
+			if (previousThinking !== liveSnapshot.defaultThinkingLevel) {
+				this.#setProfileOwnedThinkingOverride(active, liveSnapshot.defaultThinkingLevel);
+			}
+		}
+
+		const runtimeRoles = this.#getRuntimeModelRoleOverrides();
+		for (const role of [...this.#profileOwnedModelRoleOverrides.keys()]) {
+			if (!Object.hasOwn(liveSnapshot.modelRoles, role)) this.#retireProfileOwnedModelRole(role);
+		}
+		for (const [role, modelId] of Object.entries(liveSnapshot.modelRoles)) {
+			if (this.#profileOwnedModelRoleOverrides.has(role)) {
+				runtimeRoles[role] = modelId;
+			} else if (!Object.hasOwn(runtimeRoles, role)) {
+				this.#setProfileOwnedModelRole(active, role, modelId);
+			}
+		}
+		if (this.#profileOwnedThinkingOverride) {
+			this.#overrides.defaultThinkingLevel = liveSnapshot.defaultThinkingLevel;
+		}
+	}
 
 	/**
 	 * Set the full `modelRoles` map on the runtime override layer without
@@ -912,18 +1169,22 @@ export class Settings {
 	 * Does not mutate the current instance's `#overrides`.
 	 */
 	#buildOriginalOverrides(): RawSettings {
-		if (this.#savedRuntimeModelRoleOverrides.size === 0) {
-			return structuredClone(this.#overrides);
-		}
 		const overrides = structuredClone(this.#overrides);
 		const runtimeRoles = getByPath(overrides, ["modelRoles"]);
-		if (!isRecord(runtimeRoles)) return overrides;
-		for (const [role, originalValue] of this.#savedRuntimeModelRoleOverrides) {
-			if (originalValue === undefined) {
-				delete runtimeRoles[role];
-			} else {
-				runtimeRoles[role] = originalValue;
+		if (isRecord(runtimeRoles)) {
+			for (const [role, originalValue] of this.#savedRuntimeModelRoleOverrides) {
+				if (originalValue === undefined) delete runtimeRoles[role];
+				else runtimeRoles[role] = originalValue;
 			}
+			for (const [role, owned] of this.#profileOwnedModelRoleOverrides) {
+				if (owned.hadPrevious) runtimeRoles[role] = structuredClone(owned.previousValue);
+				else delete runtimeRoles[role];
+			}
+		}
+		const thinking = this.#profileOwnedThinkingOverride;
+		if (thinking) {
+			if (thinking.hadPrevious) overrides.defaultThinkingLevel = structuredClone(thinking.previousValue);
+			else delete overrides.defaultThinkingLevel;
 		}
 		return overrides;
 	}
@@ -957,25 +1218,26 @@ export class Settings {
 	setModelRole(role: ModelRole | string, modelId: string | undefined): void {
 		const prev = this.get("modelRoles");
 		const current = this.#modelRolesFromLayer(this.#global);
-		if (modelId === undefined) {
-			delete current[role];
-		} else {
-			current[role] = modelId;
-		}
-		// Persist per-role rather than marking the whole `modelRoles` path
-		// modified: #saveNow merges only the changed role into the re-read
-		// file, so a concurrent external edit to a sibling role is not
-		// clobbered by this process's stale in-memory snapshot.
+		if (modelId === undefined) delete current[role];
+		else current[role] = modelId;
 		setByPath(this.#global, ["modelRoles"], current);
 		this.#modifiedGlobalModelRoles.add(role);
+
+		if (this.#profileRuntimeOwner) {
+			if (modelId === undefined) {
+				this.#supersedeProfileOwnedModelRole(role);
+				const runtimeRoles = this.#getRuntimeModelRoleOverrides();
+				delete runtimeRoles[role];
+			} else {
+				this.#setProfileOwnedModelRole(this.#profileRuntimeOwner, role, modelId);
+			}
+		} else if (!this.isProjectModelRoleRuntimeOverrideActive(role)) {
+			this.#savedRuntimeModelRoleOverrides.delete(role);
+			this.#updateRuntimeModelRoleOverride(role, modelId);
+		}
 		this.#rebuildMerged();
 		this.#queueSave();
 		this.#fireEffectiveSettingChanged("modelRoles", this.get("modelRoles"), prev);
-		if (this.isProjectModelRoleRuntimeOverrideActive(role)) {
-			return;
-		}
-		this.#savedRuntimeModelRoleOverrides.delete(role);
-		this.#updateRuntimeModelRoleOverride(role, modelId);
 	}
 
 	/**
@@ -994,6 +1256,7 @@ export class Settings {
 	 * Set a model role in the current project's settings layer.
 	 */
 	setProjectModelRole(role: ModelRole | string, modelId: string): void {
+		this.#supersedeProfileOwnedModelRole(role, true);
 		this.#setProjectModelRoleValue(role, modelId);
 		this.#captureRuntimeModelRoleOverride(role);
 		this.#updateRuntimeModelRoleOverride(role, modelId);
@@ -1002,6 +1265,7 @@ export class Settings {
 	 * Clear a model role from the current project's settings layer.
 	 */
 	clearProjectModelRole(role: ModelRole | string): void {
+		this.#supersedeProfileOwnedModelRole(role, true);
 		this.#setProjectModelRoleValue(role, null);
 		this.#captureRuntimeModelRoleOverride(role);
 		this.#updateRuntimeModelRoleOverride(role, undefined);
@@ -1085,6 +1349,7 @@ export class Settings {
 		for (const [role, modelId] of Object.entries(roles)) {
 			if (modelId) {
 				next[role] = modelId;
+				this.#supersedeProfileOwnedModelRole(role);
 				this.#savedRuntimeModelRoleOverrides.delete(role);
 			}
 		}
@@ -1116,10 +1381,12 @@ export class Settings {
 
 		this.#project = projectResult.value;
 		this.#configOverlay = await this.#loadConfigOverlays();
+		this.#reconcileProfileRuntimeOverrides(this.#global);
 
 		// Build merged view (global → project → overrides; project wins over global)
 		this.#rebuildMerged();
 		this.#fireAllHooks();
+		this.#startGlobalSettingsWatch();
 		return this;
 	}
 	async #loadGlobalSettings(): Promise<void> {
@@ -1147,6 +1414,7 @@ export class Settings {
 
 		this.#project = projectResult.value;
 		this.#configOverlay = await this.#loadConfigOverlays();
+		this.#reconcileProfileRuntimeOverrides(this.#global);
 		this.#rebuildMerged();
 		return this;
 	}
@@ -2089,6 +2357,172 @@ export class Settings {
 		}
 	}
 
+	#captureEffectiveSettings(): Map<SettingPath, unknown> {
+		const values = new Map<SettingPath, unknown>();
+		for (const settingPath of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
+			values.set(settingPath, structuredClone(this.get(settingPath)));
+		}
+		return values;
+	}
+
+	#notifySynchronizedSettings(previous: Map<SettingPath, unknown>, emitSynchronizationSignal = true): void {
+		const changedPaths: SettingPath[] = [];
+		for (const settingPath of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
+			const before = previous.get(settingPath);
+			const after = this.get(settingPath);
+			if (isDeepStrictEqual(after, before)) continue;
+			const hook = SETTING_HOOKS[settingPath];
+			if (hook) hook(after as never, before as never);
+			this.#fireEffectiveSettingChanged(settingPath, after, before);
+			changedPaths.push(settingPath);
+		}
+		if (emitSynchronizationSignal && changedPaths.length > 0) settingsSynchronizedSignal.fire(this, changedPaths);
+	}
+
+	#hasValidActiveProfile(target: RawSettings): boolean {
+		const active = getByPath(target, ["profiles", "active"]);
+		const items = getByPath(target, ["profiles", "items"]);
+		return (
+			typeof active === "string" &&
+			active.length > 0 &&
+			isRecord(items) &&
+			this.#profileSnapshotFromUnknown(items[active]) !== undefined
+		);
+	}
+
+	#profileSnapshotFromUnknown(
+		raw: unknown,
+	): { modelRoles: Record<string, string>; defaultThinkingLevel: string } | undefined {
+		if (!isRecord(raw) || typeof raw.defaultThinkingLevel !== "string" || !isRecord(raw.modelRoles)) {
+			return undefined;
+		}
+		const modelRoles: Record<string, string> = {};
+		for (const [role, value] of Object.entries(raw.modelRoles)) {
+			if (typeof value !== "string") return undefined;
+			modelRoles[role] = value;
+		}
+		return { modelRoles, defaultThinkingLevel: raw.defaultThinkingLevel };
+	}
+
+	#reconcileDeletedActiveProfile(target: RawSettings): void {
+		const active = getByPath(target, ["profiles", "active"]);
+		if (typeof active !== "string" || active.length === 0) return;
+		const items = getByPath(target, ["profiles", "items"]);
+		if (isRecord(items) && this.#profileSnapshotFromUnknown(items[active])) return;
+
+		const fallback = isRecord(items)
+			? Object.entries(items)
+					.map(([name, raw]) => ({ name, snapshot: this.#profileSnapshotFromUnknown(raw) }))
+					.filter(
+						(
+							entry,
+						): entry is {
+							name: string;
+							snapshot: { modelRoles: Record<string, string>; defaultThinkingLevel: string };
+						} => entry.snapshot !== undefined,
+					)
+					.sort((a, b) => a.name.localeCompare(b.name))[0]
+			: undefined;
+		if (!fallback) {
+			setByPath(target, ["profiles", "active"], "");
+			return;
+		}
+		setByPath(target, ["profiles", "active"], fallback.name);
+		setByPath(target, ["modelRoles"], { ...fallback.snapshot.modelRoles });
+		setByPath(target, ["defaultThinkingLevel"], fallback.snapshot.defaultThinkingLevel);
+	}
+
+	/** Reload global settings after another process atomically replaces config.yml. */
+	async syncFromDisk(): Promise<boolean> {
+		if (!this.#persist || !this.#configPath || this.#savesCancelled) return false;
+		const lifecycleEpoch = this.#lifecycleEpoch;
+		await this.flush();
+		if (this.#savesCancelled || lifecycleEpoch !== this.#lifecycleEpoch) return false;
+		const result = await this.#loadYamlIfPresent(this.#configPath);
+		if (this.#savesCancelled || lifecycleEpoch !== this.#lifecycleEpoch) return false;
+		if (result.kind !== "loaded") {
+			if (result.kind !== "missing") {
+				logger.warn("Settings: ignored invalid external config update", {
+					path: this.#configPath,
+					error: String(result.error),
+				});
+			}
+			return false;
+		}
+		const previous = this.#captureEffectiveSettings();
+		const previousGlobal = this.#global;
+		const localActive = this.#profileRuntimeOwner;
+		const localLiveRoles = this.#modelRolesFromLayer(previousGlobal);
+		const previousThinking = getByPath(previousGlobal, ["defaultThinkingLevel"]);
+		this.#global = result.settings;
+
+		const items = getByPath(this.#global, ["profiles", "items"]);
+		const localProfileExists =
+			typeof localActive === "string" &&
+			localActive.length > 0 &&
+			isRecord(items) &&
+			this.#profileSnapshotFromUnknown(items[localActive]) !== undefined;
+
+		if (localProfileExists) {
+			// Disk snapshots prove profile existence only. Another process may
+			// update that snapshot, but must not replace this terminal's dirty
+			// live role/thinking choices before an explicit save or switch.
+			setByPath(this.#global, ["profiles", "active"], localActive);
+			setByPath(this.#global, ["modelRoles"], localLiveRoles);
+			if (typeof previousThinking === "string") {
+				setByPath(this.#global, ["defaultThinkingLevel"], previousThinking);
+			}
+			this.#reconcileProfileRuntimeOverrides(this.#global, previousGlobal);
+		} else if (localActive) {
+			// Locally active profile was deleted by another instance: reconcile to
+			// the first valid remaining fallback profile and sync the change.
+			setByPath(this.#global, ["profiles", "active"], localActive);
+			this.#reconcileDeletedActiveProfile(this.#global);
+			this.#reconcileProfileRuntimeOverrides(this.#global, previousGlobal);
+		} else {
+			this.#reconcileDeletedActiveProfile(this.#global);
+		}
+
+		this.#rebuildMerged();
+		this.#notifySynchronizedSettings(previous);
+		return true;
+	}
+
+	#readGlobalWatchFingerprint(): string | undefined {
+		if (!this.#configPath) return "missing";
+		try {
+			const stat = fs.statSync(this.#configPath, { throwIfNoEntry: false });
+			return stat ? `${stat.mtimeMs}:${stat.ctimeMs}:${stat.ino}:${stat.size}` : "missing";
+		} catch (error) {
+			logger.warn("Settings: failed to poll global config", { path: this.#configPath, error: String(error) });
+			return undefined;
+		}
+	}
+
+	#startGlobalSettingsWatch(): void {
+		if (!this.#persist || !this.#configPath || this.#globalWatchTimer) return;
+		this.#globalWatchFingerprint = this.#readGlobalWatchFingerprint();
+		this.#globalWatchTimer = setInterval(() => {
+			const nextFingerprint = this.#readGlobalWatchFingerprint();
+			if (
+				nextFingerprint === undefined ||
+				nextFingerprint === this.#globalWatchFingerprint ||
+				this.#externalReloadPromise
+			)
+				return;
+			const reload = this.syncFromDisk()
+				.then(synchronized => {
+					if (synchronized) this.#globalWatchFingerprint = nextFingerprint;
+				})
+				.catch(error => logger.warn("Settings: external config synchronization failed", { error: String(error) }));
+			this.#externalReloadPromise = reload;
+			void reload.finally(() => {
+				if (this.#externalReloadPromise === reload) this.#externalReloadPromise = undefined;
+			});
+		}, 250);
+		this.#globalWatchTimer.unref();
+	}
+
 	#queueSave(): void {
 		if (!this.#persist || !this.#configPath) return;
 
@@ -2097,7 +2531,7 @@ export class Settings {
 		this.#saveTimer = setTimeout(() => {
 			this.#saveTimer = undefined;
 			const previousSave = this.#savePromise;
-			const savePromise = previousSave ? previousSave.then(() => this.#saveNow()) : this.#saveNow();
+			const savePromise = (previousSave ?? Promise.resolve()).catch(() => undefined).then(() => this.#saveNow());
 			this.#savePromise = savePromise;
 			savePromise
 				.catch(err => {
@@ -2117,10 +2551,12 @@ export class Settings {
 			this.#modified.size === 0 &&
 			this.#modifiedProfileItems.size === 0 &&
 			this.#modifiedProfileRenames.size === 0 &&
-			this.#modifiedGlobalModelRoles.size === 0
+			this.#modifiedGlobalModelRoles.size === 0 &&
+			this.#modifiedProfileActivation === undefined
 		)
 			return;
 
+		const effectiveBeforeSave = this.#captureEffectiveSettings();
 		const configPath = this.#configPath;
 		const modifiedPaths = [...this.#modified];
 		const modifiedModelRoles = [...this.#modifiedGlobalModelRoles];
@@ -2131,6 +2567,9 @@ export class Settings {
 		const modifiedProfileRenames = new Map(this.#modifiedProfileRenames);
 		this.#modifiedProfileRenames.clear();
 		this.#modifiedGlobalModelRoles.clear();
+		const modifiedProfileActivation = this.#modifiedProfileActivation;
+		this.#modifiedProfileActivation = undefined;
+		let localProfileActivationApplied = false;
 
 		try {
 			await this.#withYamlWriteLock(configPath, async writePath => {
@@ -2140,6 +2579,8 @@ export class Settings {
 				const loaded = await this.#loadYamlIfPresentForWriteLocked(configPath, writePath);
 				const current =
 					loaded ?? (this.#quarantinedYamlTargets.has(configPath) ? structuredClone(this.#global) : {});
+				const rawActiveAtRead = getByPath(current, ["profiles", "active"]);
+				const activeAtRead = typeof rawActiveAtRead === "string" ? rawActiveAtRead : "";
 
 				// Apply only our modified whole-value paths
 				for (const modPath of modifiedPaths) {
@@ -2153,15 +2594,9 @@ export class Settings {
 					const canRename =
 						isRecord(items) && Object.hasOwn(items, oldName) && !Object.hasOwn(items, rename.newName);
 					if (canRename) {
-						items[rename.newName] = rename.snapshot;
+						items[rename.newName] = structuredClone(items[oldName]);
 						delete items[oldName];
-						if (rename.wasActive) setByPath(current, ["profiles", "active"], rename.newName);
-					} else if (rename.wasActive) {
-						setByPath(
-							current,
-							["profiles", "active"],
-							isRecord(items) && Object.hasOwn(items, oldName) ? oldName : "",
-						);
+						if (activeAtRead === oldName) setByPath(current, ["profiles", "active"], rename.newName);
 					}
 				}
 
@@ -2185,15 +2620,6 @@ export class Settings {
 						["profiles", "items", profileName],
 						getByPath(this.#global, ["profiles", "items", profileName]),
 					);
-				}
-				const activeProfile = getByPath(current, ["profiles", "active"]);
-				const currentProfileItems = getByPath(current, ["profiles", "items"]);
-				if (
-					typeof activeProfile === "string" &&
-					activeProfile.length > 0 &&
-					(!isRecord(currentProfileItems) || !Object.hasOwn(currentProfileItems, activeProfile))
-				) {
-					setByPath(current, ["profiles", "active"], "");
 				}
 				// Merge only the model roles captured by this save. Then retain
 				// any role changed while the async read/lock was pending before
@@ -2229,10 +2655,28 @@ export class Settings {
 					}
 					setByPath(current, ["modelRoles"], mergedRoles);
 				}
+				if (modifiedProfileActivation) {
+					const items = getByPath(current, ["profiles", "items"]);
+					const targetSnapshot = isRecord(items)
+						? this.#profileSnapshotFromUnknown(items[modifiedProfileActivation.targetName])
+						: undefined;
+					if (targetSnapshot) {
+						setByPath(current, ["profiles", "active"], modifiedProfileActivation.targetName);
+						setByPath(current, ["modelRoles"], { ...targetSnapshot.modelRoles });
+						setByPath(current, ["defaultThinkingLevel"], targetSnapshot.defaultThinkingLevel);
+						localProfileActivationApplied = true;
+					}
+				}
+
+				// A profile deleted by another instance may still be selected in this
+				// writer's stale memory. Resolve the durable marker and live settings
+				// together so every watcher observes one deterministic fallback.
+				this.#reconcileDeletedActiveProfile(current);
 
 				// Update our global with any external changes we preserved
 				this.#global = current;
 				await this.#writeYamlAtomically(writePath, this.#global);
+				this.#globalWatchFingerprint = this.#readGlobalWatchFingerprint();
 				this.#quarantinedYamlTargets.delete(configPath);
 				// These pending roles were included in this write. Remove each
 				// only if no newer local change arrived while the write was in flight.
@@ -2261,10 +2705,15 @@ export class Settings {
 				this.#modifiedGlobalModelRoles.add(role);
 			}
 			this.#rebuildMerged();
+			if (!this.#modifiedProfileActivation && modifiedProfileActivation) {
+				this.#modifiedProfileActivation = modifiedProfileActivation;
+			}
 			throw error;
 		}
 
+		this.#reconcileProfileRuntimeOverrides(this.#global);
 		this.#rebuildMerged();
+		this.#notifySynchronizedSettings(effectiveBeforeSave, !localProfileActivationApplied);
 	}
 	#queueProjectSave(): void {
 		if (!this.#persist) return;
@@ -2272,7 +2721,10 @@ export class Settings {
 		clearTimeout(this.#projectSaveTimer);
 		this.#projectSaveTimer = setTimeout(() => {
 			this.#projectSaveTimer = undefined;
-			const savePromise = this.#saveProjectNow();
+			const previousSave = this.#projectSavePromise;
+			const savePromise = (previousSave ?? Promise.resolve())
+				.catch(() => undefined)
+				.then(() => this.#saveProjectNow());
 			this.#projectSavePromise = savePromise;
 			savePromise
 				.catch(err => {
@@ -2495,6 +2947,16 @@ const modelRolesSignal = new SettingSignal("modelRoles");
 /** Subscribe to model role changes. Returns an unsubscribe function. */
 export const onModelRolesChanged: (cb: () => void) => () => void = modelRolesSignal.on.bind(modelRolesSignal);
 
+/** Fires after this process adopts settings written by another process or merged during a locked save. */
+const settingsSynchronizedSignal = new SettingSignal<[source: Settings, changedPaths: readonly SettingPath[]]>(
+	"settings synchronization",
+);
+
+/** Subscribe to synchronized settings changes from a specific Settings instance. */
+export const onSettingsSynchronized = (
+	cb: (source: Settings, changedPaths: readonly SettingPath[]) => void,
+): (() => void) => settingsSynchronizedSignal.on(cb);
+
 /** Fires when `statusLine.sessionAccent` changes at runtime. */
 const statusLineSessionAccentSignal = new SettingSignal("statusLine.sessionAccent");
 
@@ -2562,6 +3024,19 @@ export function resetSettingsForTest(): void {
 	clearBoundSettingsMethods();
 	configureProviderMaxInFlightRequests(undefined);
 	configureCredentialRedaction(false);
+}
+
+/**
+ * Async test teardown variant. Synchronous reset remains immediate and safe;
+ * callers removing temp dirs can await this to drain already-open file work.
+ * @internal
+ */
+export async function resetSettingsForTestAsync(): Promise<void> {
+	const instances = [...liveSettingsInstances]
+		.map(ref => ref.deref())
+		.filter((instance): instance is Settings => instance !== undefined);
+	resetSettingsForTest();
+	await Promise.all(instances.map(instance => instance.dispose()));
 }
 
 /**
