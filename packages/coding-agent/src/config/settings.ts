@@ -39,6 +39,7 @@ import type { ModelRole } from "../config/model-roles";
 import { loadCapability } from "../discovery";
 import { isLightTheme, setAutoThemeMapping, setColorBlindMode, setSymbolPreset } from "../modes/theme/theme";
 import { AgentStorage } from "../session/agent-storage";
+import { type CompactionMethod, DEFAULT_COMPACTION_METHOD_ORDER } from "../session/compaction-methods";
 import { AUTO_IMAGE_PROVIDER_ORDER, isImageProviderId } from "../tools/image-providers";
 import { type EditMode, normalizeEditMode } from "../utils/edit-mode";
 import { INSPECT_IMAGE_MODES } from "../utils/inspect-image-mode";
@@ -71,6 +72,22 @@ type YamlLoadResult =
 	| { kind: "loaded"; settings: RawSettings }
 	| { kind: "invalid"; error: unknown; backupPath?: string }
 	| { kind: "unreadable"; error: unknown };
+
+type MainYamlReadResult = {
+	settings: RawSettings | null;
+	configPath: string | null;
+};
+
+type ProjectSettingsReadResult = {
+	settings: RawSettings;
+	fileSettings: RawSettings;
+	shellPathSource: string | undefined;
+};
+
+type ConfigOverlayReadResult = {
+	settings: RawSettings;
+	shellPathSource: string | undefined;
+};
 
 export interface SettingsOptions {
 	/** Current working directory for project settings discovery */
@@ -365,6 +382,8 @@ export class Settings {
 	#modifiedProjectModelRoles = new Set<string>();
 	/** Individual global model roles modified during this session (for partial save) */
 	#modifiedGlobalModelRoles = new Set<string>();
+	/** Changes whenever a live API mutates a persisted layer. */
+	#persistedMutationGeneration = 0;
 	/**
 	 * Original process-wide model-role overrides captured before a project edit
 	 * temporarily replaced them via `#updateRuntimeModelRoleOverride`. Restored
@@ -402,6 +421,8 @@ export class Settings {
 	#lifecycleEpoch = 0;
 	/** True for cwd clones whose creating session owns this instance's lifecycle. */
 	#sessionOwned = false;
+	/** Coalesces concurrent persisted-layer refreshes into one atomic reload. */
+	#reloadFromDiskPromise?: Promise<void>;
 
 	/** Whether to persist changes */
 	#persist: boolean;
@@ -535,6 +556,7 @@ export class Settings {
 		const prev = this.get(path);
 		const segments = path.split(".");
 		setByPath(this.#global, segments, value);
+		this.#persistedMutationGeneration++;
 		if (this.#profileRuntimeOwner && path === "modelRoles") {
 			this.#replaceProfileOwnedModelRoles(this.#profileRuntimeOwner, value as SettingValue<"modelRoles">);
 		} else if (this.#profileRuntimeOwner && path === "defaultThinkingLevel") {
@@ -568,6 +590,7 @@ export class Settings {
 		const pending = this.#modifiedProfileItems.get(name);
 		setByPath(this.#global, ["profiles", "items", name], snapshot);
 		this.#modifiedProfileItems.set(name, pending === "create" || !existed ? "create" : "update");
+		this.#persistedMutationGeneration++;
 		this.#rebuildMerged();
 		this.#queueSave();
 	}
@@ -584,6 +607,7 @@ export class Settings {
 			delete (items as Record<string, unknown>)[name];
 		}
 		this.#modifiedProfileItems.set(name, "delete");
+		this.#persistedMutationGeneration++;
 		if (rawActive === name) {
 			this.#reconcileDeletedActiveProfile(this.#global);
 		} else if (typeof rawActive === "string" && rawActive.length > 0 && !this.#hasValidActiveProfile(this.#global)) {
@@ -611,6 +635,7 @@ export class Settings {
 		setByPath(this.#global, ["defaultThinkingLevel"], snapshot.defaultThinkingLevel);
 		this.#replaceProfileRuntimeOverrides(name, snapshot);
 		this.#modifiedProfileActivation = { targetName: name };
+		this.#persistedMutationGeneration++;
 		this.#rebuildMerged();
 		this.#notifySynchronizedSettings(previous, false);
 		this.#queueSave();
@@ -630,6 +655,7 @@ export class Settings {
 		}
 		if (wasActive) setByPath(this.#global, ["profiles", "active"], newName);
 		this.#modifiedProfileRenames.set(oldName, { newName, snapshot, wasActive });
+		this.#persistedMutationGeneration++;
 		this.#rebuildMerged();
 		this.#queueSave();
 	}
@@ -789,6 +815,61 @@ export class Settings {
 		cloned.#fireAllHooks();
 		cloned.#startGlobalSettingsWatch();
 		return cloned;
+	}
+
+	/**
+	 * Re-read the current global, project, and explicit overlay layers from disk
+	 * without replacing this instance or discarding runtime overrides.
+	 *
+	 * All sources are loaded before any live layer is replaced, so readers never
+	 * observe a partially refreshed configuration. Concurrent callers share the
+	 * same reload.
+	 */
+	async reloadFromDisk(): Promise<void> {
+		if (!this.#persist) return;
+		if (this.#reloadFromDiskPromise) return this.#reloadFromDiskPromise;
+
+		const reload = this.#reloadPersistedLayers();
+		this.#reloadFromDiskPromise = reload;
+		try {
+			await reload;
+		} finally {
+			if (this.#reloadFromDiskPromise === reload) {
+				this.#reloadFromDiskPromise = undefined;
+			}
+		}
+	}
+
+	async #reloadPersistedLayers(): Promise<void> {
+		for (;;) {
+			await this.flush();
+			const mutationGeneration = this.#persistedMutationGeneration;
+			const previous = this.#captureEffectiveSettings();
+			const previousGlobal = this.#global;
+
+			const [globalResult, projectResult, overlayResult] = await Promise.allSettled([
+				this.#readExistingMainYaml(false),
+				this.#readProjectSettings(false),
+				this.#readConfigOverlays(false),
+			]);
+			if (mutationGeneration !== this.#persistedMutationGeneration) continue;
+			if (globalResult.status === "rejected") throw globalResult.reason;
+			if (projectResult.status === "rejected") throw projectResult.reason;
+			if (overlayResult.status === "rejected") throw overlayResult.reason;
+
+			this.#configPath = globalResult.value.configPath;
+			this.#global = globalResult.value.settings ?? {};
+			this.#project = projectResult.value.settings;
+			this.#projectFileSettings = projectResult.value.fileSettings;
+			this.#projectShellPathSource = projectResult.value.shellPathSource;
+			this.#configOverlay = overlayResult.value.settings;
+			this.#overlayShellPathSource = overlayResult.value.shellPathSource;
+			this.#reconcileDeletedActiveProfile(this.#global);
+			this.#reconcileProfileRuntimeOverrides(this.#global, previousGlobal);
+			this.#rebuildMerged();
+			this.#notifySynchronizedSettings(previous);
+			return;
+		}
 	}
 
 	/**
@@ -1196,6 +1277,7 @@ export class Settings {
 		current[role] = modelId;
 		setByPath(this.#project, ["modelRoles"], current);
 		this.#modifiedProjectModelRoles.add(role);
+		this.#persistedMutationGeneration++;
 		this.#rebuildMerged();
 		this.#fireEffectiveSettingChanged("modelRoles", this.get("modelRoles"), prev);
 		this.#queueProjectSave();
@@ -1222,6 +1304,7 @@ export class Settings {
 		else current[role] = modelId;
 		setByPath(this.#global, ["modelRoles"], current);
 		this.#modifiedGlobalModelRoles.add(role);
+		this.#persistedMutationGeneration++;
 
 		if (this.#profileRuntimeOwner) {
 			if (modelId === undefined) {
@@ -1424,7 +1507,7 @@ export class Settings {
 		return loaded ?? {};
 	}
 
-	async #loadYamlIfPresent(filePath: string): Promise<YamlLoadResult> {
+	async #loadYamlIfPresent(filePath: string, captureLegacyChangelogVersion = true): Promise<YamlLoadResult> {
 		let content: string;
 		try {
 			content = await fs.promises.readFile(filePath, "utf8");
@@ -1448,7 +1531,10 @@ export class Settings {
 				error: new Error("Settings YAML must contain a mapping at the document root"),
 			};
 		}
-		return { kind: "loaded", settings: this.#migrateRawSettings(parsed as RawSettings) };
+		return {
+			kind: "loaded",
+			settings: this.#migrateRawSettings(parsed as RawSettings, captureLegacyChangelogVersion),
+		};
 	}
 
 	async #resolveYamlWritePath(filePath: string): Promise<string> {
@@ -1548,55 +1634,81 @@ export class Settings {
 		}
 	}
 
-	async #loadExistingMainYaml(): Promise<RawSettings | null> {
-		if (!this.#configPath) return null;
+	async #readExistingMainYaml(quarantineInvalid: boolean): Promise<MainYamlReadResult> {
+		if (!this.#configPath) return { settings: null, configPath: null };
 		for (const filename of MAIN_CONFIG_FILENAMES) {
 			const configPath = path.join(this.#agentDir, filename);
-			const loaded = await this.#loadYamlIfPresentForStartup(configPath);
-			if (loaded) {
-				this.#configPath = configPath;
-				return loaded;
-			}
+			const loaded = quarantineInvalid
+				? await this.#loadYamlIfPresentForStartup(configPath)
+				: this.#unwrapYamlLoadResult(configPath, await this.#loadYamlIfPresent(configPath, false));
+			if (loaded) return { settings: loaded, configPath };
 		}
-		this.#configPath = path.join(this.#agentDir, MAIN_CONFIG_FILENAMES[0]);
-		return null;
+		return {
+			settings: null,
+			configPath: path.join(this.#agentDir, MAIN_CONFIG_FILENAMES[0]),
+		};
 	}
 
-	async #loadProjectSettings(): Promise<RawSettings> {
-		this.#projectShellPathSource = undefined;
+	async #loadExistingMainYaml(): Promise<RawSettings | null> {
+		const result = await this.#readExistingMainYaml(true);
+		this.#configPath = result.configPath;
+		return result.settings;
+	}
+
+	async #readProjectSettings(quarantineInvalid: boolean): Promise<ProjectSettingsReadResult> {
+		let shellPathSource: string | undefined;
 		let merged: RawSettings = {};
 		try {
 			const result = await loadCapability(settingsCapability.id, { cwd: this.#cwd });
 			for (const item of result.items as SettingsCapabilityItem[]) {
 				if (item.level === "project") {
 					merged = this.#deepMerge(merged, item.data as RawSettings);
-					if (Object.hasOwn(item.data, "shellPath")) this.#projectShellPathSource = item.path;
+					if (Object.hasOwn(item.data, "shellPath")) shellPathSource = item.path;
 				}
 			}
 		} catch {
-			this.#projectShellPathSource = undefined;
+			shellPathSource = undefined;
 			// Capability discovery is best-effort; the native project config below
 			// remains authoritative for its model-role layer and must not be hidden.
 		}
 		const projectConfigPath = path.join(this.#cwd, ".omp", "config.yml");
-		const nativeProject = await this.#loadYaml(projectConfigPath);
-		this.#projectFileSettings = structuredClone(nativeProject);
+		const nativeProject = quarantineInvalid
+			? await this.#loadYaml(projectConfigPath)
+			: (this.#unwrapYamlLoadResult(projectConfigPath, await this.#loadYamlIfPresent(projectConfigPath, false)) ??
+				{});
 		const nativeModelRoles = getByPath(nativeProject, ["modelRoles"]);
 		if (nativeModelRoles !== undefined) {
 			merged = this.#deepMerge(merged, { modelRoles: nativeModelRoles });
 		}
-		return this.#migrateRawSettings(merged);
+		return {
+			settings: this.#migrateRawSettings(merged, quarantineInvalid),
+			fileSettings: structuredClone(nativeProject),
+			shellPathSource,
+		};
+	}
+
+	async #loadProjectSettings(): Promise<RawSettings> {
+		const result = await this.#readProjectSettings(true);
+		this.#projectFileSettings = result.fileSettings;
+		this.#projectShellPathSource = result.shellPathSource;
+		return result.settings;
+	}
+
+	async #readConfigOverlays(captureLegacyChangelogVersion = true): Promise<ConfigOverlayReadResult> {
+		let shellPathSource: string | undefined;
+		let settings: RawSettings = {};
+		for (const filePath of this.#configFiles) {
+			const overlay = await this.#loadOverlayYaml(filePath, captureLegacyChangelogVersion);
+			settings = this.#deepMerge(settings, overlay);
+			if (Object.hasOwn(overlay, "shellPath")) shellPathSource = filePath;
+		}
+		return { settings, shellPathSource };
 	}
 
 	async #loadConfigOverlays(): Promise<RawSettings> {
-		this.#overlayShellPathSource = undefined;
-		let merged: RawSettings = {};
-		for (const filePath of this.#configFiles) {
-			const overlay = await this.#loadOverlayYaml(filePath);
-			merged = this.#deepMerge(merged, overlay);
-			if (Object.hasOwn(overlay, "shellPath")) this.#overlayShellPathSource = filePath;
-		}
-		return merged;
+		const result = await this.#readConfigOverlays();
+		this.#overlayShellPathSource = result.shellPathSource;
+		return result.settings;
 	}
 
 	/**
@@ -1604,7 +1716,7 @@ export class Settings {
 	 * missing or malformed files are hard errors so a typo'd path cannot
 	 * silently fall back to the persistent settings.
 	 */
-	async #loadOverlayYaml(filePath: string): Promise<RawSettings> {
+	async #loadOverlayYaml(filePath: string, captureLegacyChangelogVersion = true): Promise<RawSettings> {
 		let content: string;
 		try {
 			content = await Bun.file(filePath).text();
@@ -1625,7 +1737,7 @@ export class Settings {
 		if (typeof parsed !== "object" || Array.isArray(parsed)) {
 			throw new Error(`Config overlay must be a YAML mapping: ${filePath}`);
 		}
-		return this.#migrateRawSettings(parsed as RawSettings);
+		return this.#migrateRawSettings(parsed as RawSettings, captureLegacyChangelogVersion);
 	}
 
 	async #migrateFromLegacy(): Promise<void> {
@@ -1666,7 +1778,7 @@ export class Settings {
 	}
 
 	/** Apply schema migrations to raw settings */
-	#migrateRawSettings(raw: RawSettings): RawSettings {
+	#migrateRawSettings(raw: RawSettings, captureLegacyChangelogVersion = true): RawSettings {
 		// queueMode -> steeringMode
 		if ("queueMode" in raw && !("steeringMode" in raw)) {
 			raw.steeringMode = raw.queueMode;
@@ -1678,7 +1790,7 @@ export class Settings {
 		// longer dirty user-tracked configs. Capture for marker seeding (see
 		// #seedLastChangelogVersionMarker), then strip the key — the next
 		// config save drops it from disk.
-		if (typeof raw.lastChangelogVersion === "string") {
+		if (captureLegacyChangelogVersion && typeof raw.lastChangelogVersion === "string") {
 			this.#legacyLastChangelogVersion ??= raw.lastChangelogVersion;
 		}
 		delete raw.lastChangelogVersion;
@@ -1826,15 +1938,56 @@ export class Settings {
 			raw["edit.mode"] = "hashline";
 		}
 
-		// compaction.strategy: removed local-model shake-summary mode; plain shake
-		// keeps the same mechanical artifact-backed reduction without background CPU.
-		const compactionObj = raw.compaction as Record<string, unknown> | undefined;
-		if (compactionObj?.strategy === "shake-summary") {
-			compactionObj.strategy = "shake";
+		// compaction.strategy / compaction.remoteEnabled → compaction.methodOrder.
+		// The old single strategy could not express a capability-dependent fallback
+		// chain. Preserve explicit legacy intent while new installs use the
+		// server → snapcompact → handoff → shake → soft default.
+		const compactionObj = isRecord(raw.compaction) ? raw.compaction : undefined;
+		const configuredMethodOrder = compactionObj?.methodOrder ?? raw["compaction.methodOrder"];
+		const legacyStrategy = compactionObj?.strategy ?? raw["compaction.strategy"];
+		const legacyRemoteEnabled = compactionObj?.remoteEnabled ?? raw["compaction.remoteEnabled"];
+		if (!Array.isArray(configuredMethodOrder)) {
+			const remoteEnabled = legacyRemoteEnabled !== false;
+			const strategy = legacyStrategy === "shake-summary" ? "shake" : legacyStrategy;
+			let methodOrder: CompactionMethod[] | undefined;
+			switch (strategy) {
+				case "context-full":
+					methodOrder = remoteEnabled ? ["remote", "soft"] : ["soft"];
+					break;
+				case "handoff":
+					methodOrder = remoteEnabled ? ["handoff", "remote", "soft"] : ["handoff", "soft"];
+					break;
+				case "shake":
+					methodOrder = remoteEnabled ? ["shake", "remote", "soft"] : ["shake", "soft"];
+					break;
+				case "snapcompact":
+					methodOrder = remoteEnabled ? ["snapcompact", "remote", "soft"] : ["snapcompact", "soft"];
+					break;
+				case "off":
+					methodOrder = [];
+					break;
+				default:
+					if (legacyRemoteEnabled === false) {
+						methodOrder = DEFAULT_COMPACTION_METHOD_ORDER.filter(method => method !== "remote");
+					}
+			}
+			if (methodOrder) {
+				const root = compactionObj ?? {};
+				root.methodOrder = methodOrder;
+				raw.compaction = root;
+			}
+		} else if (!compactionObj || compactionObj.methodOrder === undefined) {
+			const root = compactionObj ?? {};
+			root.methodOrder = configuredMethodOrder;
+			raw.compaction = root;
 		}
-		if (raw["compaction.strategy"] === "shake-summary") {
-			raw["compaction.strategy"] = "shake";
+		if (compactionObj) {
+			delete compactionObj.strategy;
+			delete compactionObj.remoteEnabled;
 		}
+		delete raw["compaction.strategy"];
+		delete raw["compaction.remoteEnabled"];
+		delete raw["compaction.methodOrder"];
 
 		// snapcompact.systemPrompt: boolean -> scoped enum.
 		const snapcompactObj = raw.snapcompact as Record<string, unknown> | undefined;
@@ -2557,6 +2710,7 @@ export class Settings {
 			return;
 
 		const effectiveBeforeSave = this.#captureEffectiveSettings();
+		const previousGlobal = structuredClone(this.#global);
 		const configPath = this.#configPath;
 		const modifiedPaths = [...this.#modified];
 		const modifiedModelRoles = [...this.#modifiedGlobalModelRoles];
@@ -2571,6 +2725,9 @@ export class Settings {
 		this.#modifiedProfileActivation = undefined;
 		let localProfileActivationApplied = false;
 
+		let localActive: unknown;
+		let localLiveRoles: Record<string, string> = {};
+		let localThinking: unknown;
 		try {
 			await this.#withYamlWriteLock(configPath, async writePath => {
 				// Re-read to preserve external changes. If this instance moved a
@@ -2673,14 +2830,50 @@ export class Settings {
 				// together so every watcher observes one deterministic fallback.
 				this.#reconcileDeletedActiveProfile(current);
 
-				// Update our global with any external changes we preserved
-				this.#global = current;
-				await this.#writeYamlAtomically(writePath, this.#global);
+				// Keep this terminal's live state separate while the durable merged
+				// snapshot is written. Local mutations may arrive during the await.
+				await this.#writeYamlAtomically(writePath, current);
 				this.#globalWatchFingerprint = this.#readGlobalWatchFingerprint();
 				this.#quarantinedYamlTargets.delete(configPath);
+				const latestLocalGlobal = this.#global;
+				localActive = getByPath(latestLocalGlobal, ["profiles", "active"]);
+				localLiveRoles = this.#modelRolesFromLayer(latestLocalGlobal);
+				localThinking = getByPath(latestLocalGlobal, ["defaultThinkingLevel"]);
+				for (const modPath of this.#modified) {
+					const segments = modPath.split(".");
+					setByPath(current, segments, structuredClone(getByPath(latestLocalGlobal, segments)));
+				}
+				const pendingProfileNames = new Set(this.#modifiedProfileItems.keys());
+				for (const [oldName, rename] of this.#modifiedProfileRenames) {
+					pendingProfileNames.add(oldName);
+					pendingProfileNames.add(rename.newName);
+				}
+				const latestProfileItems = getByPath(latestLocalGlobal, ["profiles", "items"]);
+				for (const profileName of pendingProfileNames) {
+					const currentItems = getByPath(current, ["profiles", "items"]);
+					if (isRecord(latestProfileItems) && Object.hasOwn(latestProfileItems, profileName)) {
+						setByPath(
+							current,
+							["profiles", "items", profileName],
+							structuredClone(latestProfileItems[profileName]),
+						);
+					} else if (isRecord(currentItems)) {
+						delete currentItems[profileName];
+					}
+				}
+				if (this.#modifiedGlobalModelRoles.size > 0) {
+					const currentRoles = this.#modelRolesFromLayer(current);
+					const latestRoles = this.#modelRolesFromLayer(latestLocalGlobal);
+					for (const role of this.#modifiedGlobalModelRoles) {
+						if (Object.hasOwn(latestRoles, role)) currentRoles[role] = latestRoles[role];
+						else delete currentRoles[role];
+					}
+					setByPath(current, ["modelRoles"], currentRoles);
+				}
+				this.#global = current;
 				// These pending roles were included in this write. Remove each
 				// only if no newer local change arrived while the write was in flight.
-				const globalRolesAfterWrite = this.#modelRolesFromLayer(this.#global);
+				const globalRolesAfterWrite = this.#modelRolesFromLayer(current);
 				for (const role of rolesToPreserve) {
 					if (latestGlobalRoles[role] === globalRolesAfterWrite[role]) {
 						this.#modifiedGlobalModelRoles.delete(role);
@@ -2711,7 +2904,25 @@ export class Settings {
 			throw error;
 		}
 
-		this.#reconcileProfileRuntimeOverrides(this.#global);
+		const items = getByPath(this.#global, ["profiles", "items"]);
+		const localProfileExists =
+			typeof localActive === "string" &&
+			localActive.length > 0 &&
+			isRecord(items) &&
+			this.#profileSnapshotFromUnknown(items[localActive]) !== undefined;
+		if (localProfileExists) {
+			// Preserve this terminal's active profile while retaining unrelated
+			// values merged from disk. The durable active marker was already written.
+			setByPath(this.#global, ["profiles", "active"], localActive);
+			setByPath(this.#global, ["modelRoles"], localLiveRoles);
+			if (typeof localThinking === "string") {
+				setByPath(this.#global, ["defaultThinkingLevel"], localThinking);
+			}
+		} else if (typeof localActive === "string" && localActive.length > 0) {
+			setByPath(this.#global, ["profiles", "active"], localActive);
+			this.#reconcileDeletedActiveProfile(this.#global);
+		}
+		this.#reconcileProfileRuntimeOverrides(this.#global, previousGlobal);
 		this.#rebuildMerged();
 		this.#notifySynchronizedSettings(effectiveBeforeSave, !localProfileActivationApplied);
 	}
@@ -2919,6 +3130,7 @@ const SETTING_HOOKS: Partial<Record<SettingPath, SettingHook<any>>> = {
 	"hindsight.bankId": () => hindsightScopeSignal.fire(),
 	"hindsight.bankIdPrefix": () => hindsightScopeSignal.fire(),
 	"hindsight.scoping": () => hindsightScopeSignal.fire(),
+	extendedContext: () => extendedContextSignal.fire(),
 	"worktree.base": value => {
 		const dir = typeof value === "string" && value.trim() ? value : undefined;
 		// Always call so an unset/empty value clears a previously-applied override.
@@ -2956,6 +3168,17 @@ const settingsSynchronizedSignal = new SettingSignal<[source: Settings, changedP
 export const onSettingsSynchronized = (
 	cb: (source: Settings, changedPaths: readonly SettingPath[]) => void,
 ): (() => void) => settingsSynchronizedSignal.on(cb);
+
+/** Fires when `extendedContext` changes at runtime. */
+const extendedContextSignal = new SettingSignal("extendedContext");
+
+/**
+ * Subscribe to extended-context setting changes. Sessions re-derive their
+ * model's effective context window (the registry clamps premium long-context
+ * models to the standard-pricing threshold while the setting is off).
+ * Returns an unsubscribe function.
+ */
+export const onExtendedContextChanged = (cb: () => void) => extendedContextSignal.on(cb);
 
 /** Fires when `statusLine.sessionAccent` changes at runtime. */
 const statusLineSessionAccentSignal = new SettingSignal("statusLine.sessionAccent");

@@ -230,32 +230,21 @@ Current upstream may fall from streaming V2 to V1 or a configured remote endpoin
 but preserves terminal native failures instead of silently using generic local
 summarization.
 
-That upstream feature does **not** make remote compaction the zero-config automatic
-default. Upstream settings still default to:
+Upstream v17.4 replaced the single `compaction.strategy` /
+`compaction.remoteEnabled` policy with ordered `compaction.methodOrder`. Its default
+order starts with `remote`, then falls through to `snapcompact`, `handoff`, `shake`,
+and `soft` when a method is unavailable or fails.
 
-- `compaction.strategy: snapcompact`
-- `compaction.remoteEnabled: true`
+This upstream policy subsumes fork commit `5708cb1cc8`: supported OpenAI/Codex routes
+already try provider-native compaction first, while explicit method ordering remains
+authoritative. Do not restore the fork's historical `resolveAutoCompactionAction`
+shim or the removed `compaction.strategy` tests after future merges.
 
-`snapcompact` is local image archival and bypasses the context-full summarization
-path, so `remoteEnabled: true` alone does not select provider-native compaction.
+Implementation:
 
-Fork commit `5708cb1cc8` changes only automatic default selection. When
-`compaction.strategy` is not explicitly configured, the first available compaction
-candidate supports OpenAI provider-native compaction, and remote compaction is not
-disabled, `resolveAutoCompactionAction` selects `context-full` instead of the schema's
-local `snapcompact` default. Explicit `snapcompact`, `context-full`, `handoff`, and
-remote-disable choices remain authoritative.
-
-The maintainer's current `~/.omp/agent/config.yml` already explicitly sets
-`strategy: context-full`, `remoteEnabled: true`, and
-`remoteStreamingV2Enabled: true`. Therefore current personal behavior would remain
-remote-first without the fork override; the fork delta matters for fresh/unconfigured
-GPT/Codex sessions.
-
-Implementation and tests:
-
+- `packages/coding-agent/src/session/compaction-methods.ts`
 - `packages/coding-agent/src/session/session-maintenance.ts`
-- `packages/coding-agent/test/session-maintenance-compaction-action.test.ts`
+- `packages/coding-agent/src/config/settings-schema.ts`
 
 Merge rule: preserve upstream compaction lifecycle, retries, dead-end recovery, and
 provider-native semantics. Reapply only the small automatic action-resolution policy;
@@ -375,17 +364,17 @@ status rendering. Do not conflate reminder injections with
 `/tryshake status` reports that state without mutating it. New, switched, and cleared
 logical sessions reset it, and no settings file stores it. On each
 automatic compaction trigger, OMP runs one conservative `DEFAULT_SHAKE_CONFIG`
-elide pass before the configured `context-full`, `handoff`, or `snapcompact`
-strategy. Explicit `compaction.strategy: shake` already owns this flow and does not
-run a duplicate preflight. Disabled/off auto-compaction still wins.
+elide pass before the current non-`shake` method from `compaction.methodOrder`. When
+the ordered dispatcher reaches `shake` itself, it does not run a duplicate preflight.
+Disabled/off auto-compaction still wins.
 
-The preflight skips the configured strategy only after recovering the existing
+The preflight skips the current method only after recovering the existing
 headroom/recovery target. No eligible regions, a shake failure, or residual pressure
-falls through immediately to the configured strategy. Per-trigger
-`shakePreflightAttempted` state survives deferred handoff recursion, while
-`skipElideRescue` prevents the fallback path from running another elide shake. If the
-configured compaction also cannot create headroom, existing dead-end continuation
-blocking stops repeated low-token shake/compact cycles.
+falls through immediately to the ordered dispatcher. Per-trigger
+`shakePreflightAttempted` state survives deferred handoff and method-fallback
+recursion, while `skipElideRescue` prevents the fallback path from running another
+elide shake. If maintenance still cannot create headroom, existing dead-end
+continuation blocking stops repeated low-token shake/compact cycles.
 
 Implementation:
 
@@ -398,10 +387,10 @@ Tests:
 - `packages/coding-agent/test/shake.test.ts`
 - `packages/coding-agent/test/slash-commands/tryshake.test.ts`
 
-Merge rule: preserve upstream shake eligibility, recovery-band math, compaction
-actions, retries, aborts, and dead-end rescue. Reapply only the session-scoped state
-and reset, single-attempt preflight guard, configured-strategy fallthrough, and slash
-command.
+Merge rule: preserve upstream ordered method dispatch, shake eligibility,
+recovery-band math, retries, aborts, and dead-end rescue. Reapply only the
+session-scoped state and reset, single-attempt preflight guard, ordered-method
+fallthrough, and slash command.
 
 ## 12. Confirmed non-features and stale history
 

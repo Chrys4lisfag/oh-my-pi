@@ -156,12 +156,12 @@ this default-headless failure, so verify both paths separately.
 
 ### `packages/coding-agent/src/session/session-maintenance.ts`
 
-Take upstream's full maintenance lifecycle first, including retries, native-failure
-boundaries, dead-end recovery, and continuation logic. Reapply
-`resolveAutoCompactionAction` as a narrow policy seam: only an unconfigured strategy
-with an authenticated native-capable OpenAI candidate and remote enabled may override
-the schema's local `snapcompact` default. Never replace the maintenance method with
-the older fork body.
+Take upstream's full ordered maintenance dispatcher, including retries,
+native-failure boundaries, dead-end recovery, continuation logic, and
+`compaction.methodOrder`. Reapply fork try-shake as an optional preflight around that
+dispatcher. Do not restore the retired `compaction.strategy`,
+`compaction.remoteEnabled`, or `resolveAutoCompactionAction` compatibility layer;
+v17.4's remote-first default order supersedes it.
 
 ### Generated-file delete/modify conflicts
 

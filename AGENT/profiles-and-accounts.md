@@ -74,6 +74,12 @@ Implementation in `packages/coding-agent/src/config/settings.ts`:
 - external synchronization preserves each running terminal's valid local profile and
   snapshot, ignoring another terminal's `profiles.active`, `modelRoles`, and thinking
   selection
+- a later unrelated save writes against the freshest disk state, then restores that
+  terminal's valid local profile/model/thinking in memory instead of importing the
+  startup default it preserved on disk
+- explicit `reloadFromDisk()` adopts and reconciles the complete persisted profile
+  state and emits synchronized-setting notifications; watcher-driven `syncFromDisk()`
+  retains the local-profile isolation rule above
 - deleting a locally active profile reconciles that terminal to the first valid
   lexical fallback and applies its exact model roles and thinking level
 - stale clients preserve untouched fresh profile definitions and cannot resurrect
@@ -139,7 +145,9 @@ Implementation:
 Late provider discovery is important: the session may exist before Ollama, LiteLLM,
 or extension models arrive. A synchronized apply with an unresolved default model
 remains pending, and the registry event retries it after the canonical model list is
-finalized. Public `waitForIdle()` includes queued synchronized profile work.
+finalized. Prompt dispatch and public `waitForIdle()` drain queued synchronized profile
+work. Disposal also drains an in-flight apply, whose post-await thinking/advisor and
+rollback mutations stop once teardown begins.
 
 Tests:
 

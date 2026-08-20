@@ -10,7 +10,7 @@
  * and the save merges only those into the freshest on-disk map, leaving a
  * concurrent instance's independently added/edited/deleted profiles intact.
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -388,6 +388,137 @@ describe("profiles multi-instance persistence", () => {
 
 		expect(peer.get("profiles.active")).toBe("work");
 		expect(peer.getModelRole("default")).toBe("anthropic/initial");
+	});
+
+	it("keeps its active profile when an unrelated save merges another terminal's activation", async () => {
+		const work = { modelRoles: { default: "anthropic/work" }, defaultThinkingLevel: "medium" };
+		const other = { modelRoles: { default: "openai/other" }, defaultThinkingLevel: "low" };
+		const seed = await load();
+		seed.setProfileItem("work", work);
+		seed.setProfileItem("other", other);
+		seed.set("profiles.active", "work");
+		seed.set("modelRoles", work.modelRoles);
+		seed.set("defaultThinkingLevel", Effort.Medium);
+		await seed.flush();
+
+		const stale = await seed.cloneForCwd(dir);
+		stale.cancelIfSessionOwned();
+		const writer = await load();
+		writer.activateProfile("other", other);
+		await writer.flush();
+
+		stale.set("setupVersion", 2);
+		await stale.flush();
+
+		expect(stale.get("profiles.active")).toBe("work");
+		expect(stale.getModelRole("default")).toBe("anthropic/work");
+		expect(stale.get("defaultThinkingLevel")).toBe(Effort.Medium);
+		const reader = await load();
+		expect(reader.get("setupVersion")).toBe(2);
+		expect(reader.get("profiles.active")).toBe("other");
+		expect(reader.getModelRole("default")).toBe("openai/other");
+	});
+
+	it("keeps an activation made while an unrelated save is in flight", async () => {
+		const work = { modelRoles: { default: "anthropic/work" }, defaultThinkingLevel: "medium" };
+		const foreign = { modelRoles: { default: "openai/foreign" }, defaultThinkingLevel: "low" };
+		const latest = { modelRoles: { default: "google/latest" }, defaultThinkingLevel: "high" };
+		const seed = await load();
+		seed.setProfileItem("work", work);
+		seed.setProfileItem("foreign", foreign);
+		seed.setProfileItem("latest", latest);
+		seed.set("profiles.active", "work");
+		seed.set("modelRoles", work.modelRoles);
+		await seed.flush();
+
+		const settings = await seed.cloneForCwd(dir);
+		settings.cancelIfSessionOwned();
+		const writer = await load();
+		writer.activateProfile("foreign", foreign);
+		await writer.flush();
+
+		const saveEntered = Promise.withResolvers<void>();
+		const releaseSave = Promise.withResolvers<void>();
+		const rename = fsSync.promises.rename.bind(fsSync.promises);
+		const configPath = path.join(dir, "config.yml");
+		let intercepted = false;
+		const renameSpy = vi.spyOn(fsSync.promises, "rename").mockImplementation(async (source, target) => {
+			if (
+				!intercepted &&
+				String(source).endsWith(".tmp") &&
+				path.normalize(String(target)) === path.normalize(configPath)
+			) {
+				intercepted = true;
+				saveEntered.resolve();
+				await releaseSave.promise;
+			}
+			await rename(source, target);
+		});
+		const createdDuringSave = {
+			modelRoles: { default: "anthropic/concurrent" },
+			defaultThinkingLevel: "medium",
+		};
+		try {
+			settings.set("setupVersion", 2);
+			const firstFlush = settings.flush();
+			await saveEntered.promise;
+			settings.activateProfile("latest", latest);
+			settings.set("setupVersion", 3);
+			settings.setProfileItem("created-during-save", createdDuringSave);
+			releaseSave.resolve();
+			await firstFlush;
+
+			expect(settings.get("profiles.active")).toBe("latest");
+			expect(settings.get("setupVersion")).toBe(3);
+			expect(settings.get("profiles.items")).toHaveProperty("created-during-save", createdDuringSave);
+			await settings.flush();
+
+			expect(settings.getModelRole("default")).toBe("google/latest");
+			expect(settings.get("defaultThinkingLevel")).toBe(Effort.High);
+			const reader = await load();
+			expect(reader.get("profiles.active")).toBe("latest");
+			expect(reader.get("setupVersion")).toBe(3);
+			expect(reader.get("profiles.items")).toHaveProperty("created-during-save", createdDuringSave);
+			expect(reader.getModelRole("default")).toBe("google/latest");
+		} finally {
+			releaseSave.resolve();
+			renameSpy.mockRestore();
+		}
+	});
+
+	it("reconciles and notifies when reloadFromDisk adopts another active profile", async () => {
+		const work = { modelRoles: { default: "anthropic/work" }, defaultThinkingLevel: "medium" };
+		const other = { modelRoles: { default: "openai/other" }, defaultThinkingLevel: "low" };
+		const settings = await load();
+		settings.setProfileItem("work", work);
+		settings.setProfileItem("other", other);
+		settings.set("profiles.active", "work");
+		settings.set("modelRoles", work.modelRoles);
+		settings.set("defaultThinkingLevel", Effort.Medium);
+		await settings.flush();
+		settings.cancelPendingSaves();
+		rewriteConfig(config => {
+			config.profiles.active = "other";
+			config.modelRoles = other.modelRoles;
+			config.defaultThinkingLevel = other.defaultThinkingLevel;
+		});
+
+		const notifications: string[][] = [];
+		const unsubscribe = onSettingsSynchronized((source, changedPaths) => {
+			if (source === settings) notifications.push([...changedPaths]);
+		});
+		try {
+			await settings.reloadFromDisk();
+			expect(settings.get("profiles.active")).toBe("other");
+			expect(settings.getModelRole("default")).toBe("openai/other");
+			expect(settings.get("defaultThinkingLevel")).toBe(Effort.Low);
+			expect(notifications).toHaveLength(1);
+			expect(notifications[0]).toEqual(
+				expect.arrayContaining(["profiles.active", "modelRoles", "defaultThinkingLevel"]),
+			);
+		} finally {
+			unsubscribe();
+		}
 	});
 
 	it("does not emit an external synchronization event for local activation", async () => {
