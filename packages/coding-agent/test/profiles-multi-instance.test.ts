@@ -264,20 +264,21 @@ describe("profiles multi-instance persistence", () => {
 
 		const saveEntered = Promise.withResolvers<void>();
 		const releaseSave = Promise.withResolvers<void>();
-		const rename = fsSync.promises.rename.bind(fsSync.promises);
+		const open = fsSync.promises.open.bind(fsSync.promises);
 		const configPath = path.join(dir, "config.yml");
 		let intercepted = false;
-		const renameSpy = vi.spyOn(fsSync.promises, "rename").mockImplementation(async (source, target) => {
+		const openSpy = vi.spyOn(fsSync.promises, "open").mockImplementation(async (file, flags, mode) => {
 			if (
 				!intercepted &&
-				String(source).endsWith(".tmp") &&
-				path.normalize(String(target)) === path.normalize(configPath)
+				path.dirname(String(file)) === path.dirname(configPath) &&
+				path.basename(String(file)).startsWith(`${path.basename(configPath)}.`) &&
+				String(file).endsWith(".tmp")
 			) {
 				intercepted = true;
 				saveEntered.resolve();
 				await releaseSave.promise;
 			}
-			await rename(source, target);
+			return open(file, flags, mode);
 		});
 		try {
 			stale.renameProfileItem("old", "new", SNAP, true);
@@ -298,7 +299,7 @@ describe("profiles multi-instance persistence", () => {
 			});
 		} finally {
 			releaseSave.resolve();
-			renameSpy.mockRestore();
+			openSpy.mockRestore();
 		}
 	});
 	it("keeps an active-profile edit made while its rename save is in flight", async () => {
@@ -310,20 +311,21 @@ describe("profiles multi-instance persistence", () => {
 		const settings = await load();
 		const saveEntered = Promise.withResolvers<void>();
 		const releaseSave = Promise.withResolvers<void>();
-		const rename = fsSync.promises.rename.bind(fsSync.promises);
+		const open = fsSync.promises.open.bind(fsSync.promises);
 		const configPath = path.join(dir, "config.yml");
 		let intercepted = false;
-		const renameSpy = vi.spyOn(fsSync.promises, "rename").mockImplementation(async (source, target) => {
+		const openSpy = vi.spyOn(fsSync.promises, "open").mockImplementation(async (file, flags, mode) => {
 			if (
 				!intercepted &&
-				String(source).endsWith(".tmp") &&
-				path.normalize(String(target)) === path.normalize(configPath)
+				path.dirname(String(file)) === path.dirname(configPath) &&
+				path.basename(String(file)).startsWith(`${path.basename(configPath)}.`) &&
+				String(file).endsWith(".tmp")
 			) {
 				intercepted = true;
 				saveEntered.resolve();
 				await releaseSave.promise;
 			}
-			await rename(source, target);
+			return open(file, flags, mode);
 		});
 		try {
 			settings.renameProfileItem("old", "new", SNAP, true);
@@ -340,7 +342,7 @@ describe("profiles multi-instance persistence", () => {
 			expect(reader.get("profiles.active")).toBe("new");
 		} finally {
 			releaseSave.resolve();
-			renameSpy.mockRestore();
+			openSpy.mockRestore();
 		}
 	});
 
@@ -788,20 +790,21 @@ describe("profiles multi-instance persistence", () => {
 
 		const saveEntered = Promise.withResolvers<void>();
 		const releaseSave = Promise.withResolvers<void>();
-		const rename = fsSync.promises.rename.bind(fsSync.promises);
+		const open = fsSync.promises.open.bind(fsSync.promises);
 		const configPath = path.join(dir, "config.yml");
 		let intercepted = false;
-		const renameSpy = vi.spyOn(fsSync.promises, "rename").mockImplementation(async (source, target) => {
+		const openSpy = vi.spyOn(fsSync.promises, "open").mockImplementation(async (file, flags, mode) => {
 			if (
 				!intercepted &&
-				String(source).endsWith(".tmp") &&
-				path.normalize(String(target)) === path.normalize(configPath)
+				path.dirname(String(file)) === path.dirname(configPath) &&
+				path.basename(String(file)).startsWith(`${path.basename(configPath)}.`) &&
+				String(file).endsWith(".tmp")
 			) {
 				intercepted = true;
 				saveEntered.resolve();
 				await releaseSave.promise;
 			}
-			await rename(source, target);
+			return open(file, flags, mode);
 		});
 		const createdDuringSave = {
 			modelRoles: { default: "anthropic/concurrent" },
@@ -831,7 +834,7 @@ describe("profiles multi-instance persistence", () => {
 			expect(reader.getModelRole("default")).toBe("google/latest");
 		} finally {
 			releaseSave.resolve();
-			renameSpy.mockRestore();
+			openSpy.mockRestore();
 		}
 	});
 

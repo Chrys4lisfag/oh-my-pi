@@ -27,8 +27,6 @@ export function getEditorCommand(): string | undefined {
 export interface OpenInEditorOptions {
 	/** File extension for the temp file (default: ".md"). */
 	extension?: string;
-	/** Custom stdio configuration (default: all "inherit"). */
-	stdio?: [number | "inherit", number | "inherit", number | "inherit"];
 	/** Keep the file's trailing newline instead of trimming it from the returned text. */
 	trimTrailingNewline?: boolean;
 }
@@ -71,8 +69,6 @@ export async function openInEditor(
 	try {
 		await Bun.write(tmpFile, content);
 
-		const [stdin, stdout, stderr] = options?.stdio ?? ["inherit", "inherit", "inherit"];
-
 		// GUI editor launchers exit after delegating to a background daemon. Add
 		// their wait flag unless the configured command already supplies one.
 		const lowerCmd = editorCmd.toLowerCase();
@@ -82,12 +78,14 @@ export async function openInEditor(
 		const hasWaitFlag = lowerCmd.includes("--wait") || / -w(\s|$)/.test(lowerCmd);
 		const waitFlag = isGuiEditor && !hasWaitFlag ? (lowerCmd.includes("subl") ? "-w" : "--wait") : undefined;
 		const editorWithWait = `${editorCmd}${waitFlag ? ` ${waitFlag}` : ""}`;
-		const spawnCommandWithWait = resolveEditorSpawnCommand(editorWithWait, tmpFile);
-		const child = Bun.spawn(spawnCommandWithWait.cmd, {
-			stdin,
-			stdout,
-			stderr,
-			windowsVerbatimArguments: spawnCommandWithWait.windowsVerbatimArguments,
+		const spawnCommand = resolveEditorSpawnCommand(editorWithWait, tmpFile);
+		// Inherit the real pane pty so terminal editors (including emacsclient,
+		// which resolves the device via ttyname) render into the visible pane.
+		const child = Bun.spawn(spawnCommand.cmd, {
+			stdin: "inherit",
+			stdout: "inherit",
+			stderr: "inherit",
+			windowsVerbatimArguments: spawnCommand.windowsVerbatimArguments,
 		});
 		const exitCode = await child.exited;
 		if (exitCode === 0) {

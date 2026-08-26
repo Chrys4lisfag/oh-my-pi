@@ -6,10 +6,10 @@ from a fresh `can1357/oh-my-pi` checkout.
 
 ## Audit baseline
 
-- Audited fork merge: `048f62e34d`
-- Audited upstream parent: `3a8591a8af1a09b129188017513e7a0b1b088e4e`
-- Audit date: 2026-08-06
-- Live delta refresh: upstream v17.2.10 and trusted-extension changes
+- Audited fork content: `c0d3a3b57283ae578c3e976c1bf72adf590b8088`
+- Audited upstream parent: `b4e8e856ad40294167679a3f88417c07429fe59b`
+- Audit date: 2026-08-26
+- Live delta refresh: upstream v18.0.6 plus model/session runtime changes
 
 Hashes are checkpoints, not permanent patch targets. Current code is authoritative;
 these documents describe behavior and reapplication intent so upstream refactors can

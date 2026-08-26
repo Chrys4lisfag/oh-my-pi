@@ -252,6 +252,12 @@ export class ModelHubComponent implements Component {
 	#initialRegistrySync: Promise<void> = Promise.resolve();
 	#disposed = false;
 	#emptyProviderRetryTimer?: Timer;
+	// Optional discoverable locals (ollama, llama.cpp, lm-studio) hidden from
+	// the sidebar because discovery found nothing at their endpoint (#2761).
+	// Rebuilt on every sidebar build; consumed by the once-per-open re-probe.
+	#hiddenOptionalProviders = new Set<string>();
+	/** Providers already re-probed by {@link ModelHubComponent.#reprobeHiddenOptionalProviders} this hub open. */
+	#reprobedHiddenProviders = new Set<string>();
 
 	// Frame geometry from the last render, for mouse hit-testing (the
 	// fullscreen overlay paints from screen row 0, so mouse rows map 1:1).
@@ -284,7 +290,7 @@ export class ModelHubComponent implements Component {
 		this.#browser.onActivate = item => this.#activateItem(item);
 		this.#browser.onCancel = () => this.#callbacks.onCancel();
 		this.#browser.onQueryChange = query => this.#onQueryChanged(query);
-		this.#unsubscribeModelsUpdated = this.#registry.onModelsUpdated(() => {
+		this.#unsubscribeModelsUpdated = this.#registry.onModelsUpdated?.(() => {
 			const updatedProviders = new Set([...this.#refreshingProviders, ...this.#scheduledProviderRefreshes.keys()]);
 			for (const providerId of updatedProviders) {
 				const previousCount =
@@ -322,10 +328,11 @@ export class ModelHubComponent implements Component {
 		// the synchronous hydration above.
 		if (this.#scopedModels.length === 0) {
 			this.#initialRegistrySync = (async () => {
-				await registry.awaitBackgroundRefresh();
+				await registry.awaitBackgroundRefresh?.();
 				await registry.refresh("offline");
 				this.#syncFromRegistryState();
 			})()
+				.then(() => this.#reprobeHiddenOptionalProviders())
 				.catch(error => {
 					this.#configError = error instanceof Error ? error.message : String(error);
 				})
@@ -415,6 +422,7 @@ export class ModelHubComponent implements Component {
 	}
 
 	#buildSidebar(allModels: ReadonlyArray<Model>, availableModels: ReadonlyArray<Model>): void {
+		this.#hiddenOptionalProviders.clear();
 		const scoped = this.#scopedModels.length > 0;
 		let disabledProviders: ReadonlySet<string>;
 		try {
@@ -447,6 +455,20 @@ export class ModelHubComponent implements Component {
 				// locked; keyless/custom endpoints (ollama, vllm, …) surface as
 				// selectable so discovery can populate them.
 				if (authStorage.hasAuth(provider) || !locked.has(provider)) {
+					// #2761: implicit local endpoints (optional: true) stay hidden
+					// until discovery actually reaches a server. "idle" means never
+					// probed; "unavailable" means the endpoint is unreachable; both
+					// would render a dead tab for a provider the user never
+					// configured. models.yml discovery providers (optional: false)
+					// and providers with stored auth keep their entry so
+					// misconfigurations stay visible and diagnosable.
+					if (!authStorage.hasAuth(provider)) {
+						const discovery = this.#registry.getProviderDiscoveryState(provider);
+						if (discovery?.optional && (discovery.status === "idle" || discovery.status === "unavailable")) {
+							this.#hiddenOptionalProviders.add(provider);
+							continue;
+						}
+					}
 					locked.delete(provider);
 					unlocked.add(provider);
 				}
@@ -758,16 +780,15 @@ export class ModelHubComponent implements Component {
 				);
 			}
 		}
-		const queue = this.#entries
-			.filter(
-				entry =>
-					entry.kind === "provider" &&
-					!entry.locked &&
-					entry.providerId !== undefined &&
-					discoverable.has(entry.providerId) &&
-					!populated.has(entry.providerId),
-			)
-			.map(entry => entry.providerId!);
+		const eligibleProviders = new Set(
+			this.#entries
+				.filter(entry => entry.kind === "provider" && !entry.locked && entry.providerId !== undefined)
+				.map(entry => entry.providerId!),
+		);
+		for (const providerId of this.#reprobedHiddenProviders) eligibleProviders.add(providerId);
+		const queue = [...discoverable].filter(
+			providerId => eligibleProviders.has(providerId) && !populated.has(providerId),
+		);
 		let cursor = 0;
 		const worker = async () => {
 			for (;;) {
@@ -876,6 +897,12 @@ export class ModelHubComponent implements Component {
 		if (
 			!options?.force &&
 			retryableEmpty &&
+			(this.#providerRefreshState.emptyProviderAutoAttempts.get(providerId) ?? 0) >= 2
+		)
+			return;
+		if (
+			!options?.force &&
+			retryableEmpty &&
 			Date.now() < (this.#providerRefreshState.emptyProviderRetryAfter.get(providerId) ?? 0)
 		)
 			return;
@@ -925,6 +952,25 @@ export class ModelHubComponent implements Component {
 			this.#setProviderRefreshing(providerId, false);
 			if (!this.#disposed) this.#tui.requestRender();
 		}
+	}
+
+	/**
+	 * Background-probe optional discoverable providers hidden from the
+	 * sidebar (#2761). Runs once per provider per hub open, after the offline
+	 * hydration settles: when a previously dead local endpoint (ollama,
+	 * llama.cpp, lm-studio) is now serving models, the online refresh
+	 * repopulates the registry and the sync resurfaces its tab. Endpoints
+	 * still down keep their "unavailable" state and stay hidden.
+	 */
+	#reprobeHiddenOptionalProviders(): void {
+		if (this.#scopedModels.length > 0) return;
+		let added = false;
+		for (const provider of this.#hiddenOptionalProviders) {
+			if (this.#reprobedHiddenProviders.has(provider)) continue;
+			this.#reprobedHiddenProviders.add(provider);
+			added = true;
+		}
+		if (added) void this.#refreshEmptyProvidersInBackground();
 	}
 
 	#formatDiscoveryAge(fetchedAt: number | undefined): string | undefined {
@@ -2065,9 +2111,9 @@ export class ModelHubComponent implements Component {
 				value = theme.fg("dim", "—");
 			}
 
-			// Quick-cycle membership badge (`⟳2` = second stop of the ctrl+p cycle).
+			// Quick-cycle membership badge (`⟳ 2` = second stop of the ctrl+p cycle).
 			const cycleIndex = cycleOrder.indexOf(role);
-			const cycleStyled = cycleIndex >= 0 ? theme.fg("accent", `${theme.icon.loop}${cycleIndex + 1}`) : "";
+			const cycleStyled = cycleIndex >= 0 ? theme.fg("accent", `${theme.icon.loop} ${cycleIndex + 1}`) : "";
 
 			let line = ` ${cursor} ${dot} ${tagStyled}  ${value}`;
 			const right = [levelStyled, cycleStyled].filter(part => part.length > 0).join("  ");

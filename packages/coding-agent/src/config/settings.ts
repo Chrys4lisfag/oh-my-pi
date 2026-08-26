@@ -23,13 +23,11 @@ import {
 	getAgentDir,
 	getLastChangelogVersionPath,
 	getProjectDir,
-	hasFsCode,
 	isEnoent,
 	logger,
 	MAIN_CONFIG_FILENAMES,
 	procmgr,
 	setWorktreesDir,
-	toError,
 } from "@oh-my-pi/pi-utils";
 import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { JSONC, YAML } from "bun";
@@ -41,9 +39,11 @@ import { isLightTheme, setAutoThemeMapping, setColorBlindMode, setSymbolPreset }
 import { AgentStorage } from "../session/agent-storage";
 import { type CompactionMethod, DEFAULT_COMPACTION_METHOD_ORDER } from "../session/compaction-methods";
 import { AUTO_IMAGE_PROVIDER_ORDER, isImageProviderId } from "../tools/image-providers";
+import { replaceFileAtomically } from "../utils/atomic-file";
 import { type EditMode, normalizeEditMode } from "../utils/edit-mode";
 import { INSPECT_IMAGE_MODES } from "../utils/inspect-image-mode";
 import { isSearchProviderId, SEARCH_PROVIDER_ORDER } from "../web/search/types";
+import { stringifyYamlConfig } from "./config-file";
 import {
 	type BashInterceptorRule,
 	type GroupPrefix,
@@ -140,6 +140,51 @@ function setByPath(obj: RawSettings, segments: string[], value: unknown): void {
 		current = current[segment] as RawSettings;
 	}
 	current[segments[segments.length - 1]] = value;
+}
+
+/**
+ * Dotted-path prefixes that name settings groups (e.g. "tui" for "tui.*").
+ * A prefix may simultaneously be a schema leaf; those accept their declared
+ * value shape and are excluded from shadow detection.
+ */
+const SETTINGS_GROUP_ONLY_PREFIXES: Readonly<Record<string, true>> = (() => {
+	const prefixes: Record<string, true> = {};
+	for (const key of Object.keys(SETTINGS_SCHEMA)) {
+		for (let dot = key.indexOf("."); dot !== -1; dot = key.indexOf(".", dot + 1)) {
+			prefixes[key.slice(0, dot)] = true;
+		}
+	}
+	for (const key of Object.keys(SETTINGS_SCHEMA)) delete prefixes[key];
+	return prefixes;
+})();
+
+/**
+ * Drop entries from capability-provided project settings whose non-object
+ * value would shadow an entire settings group. `.claude/settings.json` is
+ * shared with other tools, and a foreign leaf like `"tui": "fullscreen"`
+ * deep-merges over omp's `tui` group, silently replacing every `tui.*`
+ * setting for sessions rooted in that project. Values at schema leaves,
+ * unknown keys, and well-formed nested objects pass through unchanged.
+ */
+export function dropSettingsGroupShadows(data: RawSettings, sourcePath: string, basePrefix = ""): RawSettings {
+	const result: RawSettings = {};
+	for (const key of Object.keys(data)) {
+		const value = data[key];
+		const path = basePrefix === "" ? key : `${basePrefix}.${key}`;
+		if (!Object.hasOwn(SETTINGS_GROUP_ONLY_PREFIXES, path)) {
+			result[key] = value;
+			continue;
+		}
+		if (typeof value !== "object" || value === null || Array.isArray(value)) {
+			logger.warn("Settings: ignoring project setting that would shadow a settings group", {
+				setting: path,
+				source: sourcePath,
+			});
+			continue;
+		}
+		result[key] = dropSettingsGroupShadows(value as RawSettings, sourcePath, path);
+	}
+	return result;
 }
 
 export function normalizeProviderMaxInFlightRequests(value: unknown): Record<string, number> {
@@ -846,6 +891,17 @@ export class Settings {
 		this.#fireEffectiveSettingChanged(path, this.get(path), prev);
 	}
 
+	/** Effective values of every setting that repartitions the Code Mode surface. */
+	#codeModeSignalSnapshot(): unknown[] {
+		return CODE_MODE_SIGNAL_PATHS.map(path => this.get(path));
+	}
+
+	/** Fires the Code Mode signal when a persisted-layer refresh changed the partition inputs. */
+	#fireCodeModeChangeIfNeeded(previous: unknown[]): void {
+		if (Bun.deepEquals(this.#codeModeSignalSnapshot(), previous)) return;
+		codeModeSignal.fire();
+	}
+
 	#fireEffectiveSettingChanged(path: SettingPath, value: unknown, prev: unknown): void {
 		if (Object.is(value, prev)) return;
 		if (path === "statusLine.sessionAccent") {
@@ -853,6 +909,9 @@ export class Settings {
 		}
 		if (path === "modelRoles") {
 			modelRolesSignal.fire();
+		}
+		if (CODE_MODE_SIGNAL_PATHS.includes(path)) {
+			codeModeSignal.fire();
 		}
 	}
 
@@ -1036,12 +1095,14 @@ export class Settings {
 		await this.flush();
 		this.#restoreRuntimeModelRoleOverrides();
 		const prevModelRoles = this.get("modelRoles");
+		const prevCodeModeValues = this.#codeModeSignalSnapshot();
 		this.#cwd = normalized;
 		if (this.#persist) {
 			this.#project = await this.#loadProjectSettings();
 		}
 		this.#rebuildMerged();
 		this.#fireEffectiveSettingChanged("modelRoles", this.get("modelRoles"), prevModelRoles);
+		this.#fireCodeModeChangeIfNeeded(prevCodeModeValues);
 		this.#fireAllHooks();
 	}
 
@@ -1814,7 +1875,7 @@ export class Settings {
 			const result = await loadCapability(settingsCapability.id, { cwd: this.#cwd });
 			for (const item of result.items as SettingsCapabilityItem[]) {
 				if (item.level === "project") {
-					merged = this.#deepMerge(merged, item.data as RawSettings);
+					merged = this.#deepMerge(merged, dropSettingsGroupShadows(item.data as RawSettings, item.path));
 					if (Object.hasOwn(item.data, "shellPath")) shellPathSource = item.path;
 				}
 			}
@@ -2054,6 +2115,30 @@ export class Settings {
 			todoObj.eager = todoObj.eager ? "always" : "default";
 		}
 
+		// features.unexpectedStopDetection (boolean) -> enum none|mechanical|smart.
+		// `true` reproduced the previous small-model-classified behavior, which is
+		// now "smart"; `false` maps to "none" so explicitly disabled configs remain
+		// off rather than inheriting the new "mechanical" default.
+		// Handles nested and quoted-dotted sources, like inspect_image above.
+		const featuresObj = isRecord(raw.features) ? (raw.features as Record<string, unknown>) : undefined;
+		const legacyUnexpectedStop =
+			typeof featuresObj?.unexpectedStopDetection === "boolean"
+				? featuresObj.unexpectedStopDetection
+				: typeof raw["features.unexpectedStopDetection"] === "boolean"
+					? (raw["features.unexpectedStopDetection"] as boolean)
+					: undefined;
+		if (legacyUnexpectedStop !== undefined) {
+			if (!featuresObj) {
+				raw.features = {};
+			}
+			const target = raw.features as Record<string, unknown>;
+			const current = target.unexpectedStopDetection;
+			const currentIsMode = typeof current === "string" && ["none", "mechanical", "smart"].includes(current);
+			if (!currentIsMode) {
+				target.unexpectedStopDetection = legacyUnexpectedStop ? "smart" : "none";
+			}
+			delete raw["features.unexpectedStopDetection"];
+		}
 		// task.isolation.mode: legacy values from before the pi-iso PAL refactor.
 		// `worktree` was git worktree → now lives under `rcopy`. `fuse-overlay`
 		// and `fuse-projfs` are now the platform-named `overlayfs` / `projfs`
@@ -2444,6 +2529,23 @@ export class Settings {
 			delete raw["advisor.subagents"];
 		}
 
+		// Early per-agent toggles were persisted as booleans even though the
+		// runtime record contract is "on"/"off"/model pattern. Normalize each
+		// layer before merging so project-level false still overrides global true.
+		{
+			const taskObj = isRecord(raw.task) ? raw.task : undefined;
+			if (taskObj) {
+				for (const key of ["agentPrewalk", "agentAdvisor"]) {
+					const overrides = isRecord(taskObj[key]) ? taskObj[key] : undefined;
+					if (!overrides) continue;
+					for (const agentName in overrides) {
+						const value = overrides[agentName];
+						if (typeof value === "boolean") overrides[agentName] = value ? "on" : "off";
+					}
+				}
+			}
+		}
+
 		// v17 renames that used to nest under a boolean parent path:
 		//   dev.autoqa.consent -> dev.autoqaConsent
 		//   todo.reminders.max -> todo.remindersMax
@@ -2603,61 +2705,16 @@ export class Settings {
 			const handle = await fs.promises.open(tempPath, "wx", 0o600);
 			removeTemp = true;
 			try {
-				await handle.writeFile(YAML.stringify(settings, null, 2), "utf8");
+				await handle.writeFile(stringifyYamlConfig(settings), "utf8");
 				await handle.sync();
 			} finally {
 				await handle.close();
 			}
-			try {
-				await fs.promises.rename(tempPath, filePath);
-			} catch (error) {
-				if (!hasFsCode(error, "EPERM")) throw error;
-				await this.#replaceYamlAfterEperm(tempPath, filePath, error);
-			}
+			await replaceFileAtomically(tempPath, filePath);
 			removeTemp = false;
 		} finally {
 			if (removeTemp) {
 				await fs.promises.rm(tempPath, { force: true }).catch(() => {});
-			}
-		}
-	}
-	async #replaceYamlAfterEperm(tempPath: string, filePath: string, renameError: unknown): Promise<void> {
-		const backupPath = `${filePath}.${process.pid}.${randomUUID()}.bak`;
-		try {
-			await fs.promises.rename(filePath, backupPath);
-		} catch (error) {
-			if (isEnoent(error)) {
-				await fs.promises.rename(tempPath, filePath);
-				return;
-			}
-			throw renameError;
-		}
-
-		try {
-			await fs.promises.rename(tempPath, filePath);
-		} catch (replaceError) {
-			try {
-				await fs.promises.rename(backupPath, filePath);
-			} catch (rollbackError) {
-				throw new Error(
-					`Failed to replace settings file after EPERM (original: ${toError(renameError).message}; retry: ${
-						toError(replaceError).message
-					}; rollback: ${toError(rollbackError).message})`,
-					{ cause: toError(renameError) },
-				);
-			}
-			throw replaceError;
-		}
-
-		try {
-			await fs.promises.rm(backupPath);
-		} catch (error) {
-			if (!isEnoent(error)) {
-				logger.warn("Settings: failed to remove atomic-write backup", {
-					path: filePath,
-					backupPath,
-					error: toError(error).message,
-				});
 			}
 		}
 	}
@@ -3472,6 +3529,24 @@ const settingsSynchronizedSignal = new SettingSignal<[source: Settings, changedP
 export const onSettingsSynchronized = (
 	cb: (source: Settings, changedPaths: readonly SettingPath[]) => void,
 ): (() => void) => settingsSynchronizedSignal.on(cb);
+
+/** Fires when Code Mode activation or its direct keep-set changes at runtime. */
+const codeModeSignal = new SettingSignal("providers.openai-codex.codeMode");
+
+/**
+ * Settings whose effective value changes the Code Mode tool partition. `edit.mode`
+ * belongs here because it renames `EditTool` on the wire (`apply_patch` vs `edit`),
+ * which the namespace metadata is keyed by.
+ */
+const CODE_MODE_SIGNAL_PATHS: readonly SettingPath[] = [
+	"providers.openai-codex.codeMode",
+	"providers.openai-codex.codeModeDirectTools",
+	"eval.js",
+	"edit.mode",
+];
+
+/** Subscribe to Code Mode setting changes. Returns an unsubscribe function. */
+export const onCodeModeChanged = (cb: () => void) => codeModeSignal.on(cb);
 
 /** Fires when `extendedContext` changes at runtime. */
 const extendedContextSignal = new SettingSignal("extendedContext");

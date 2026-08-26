@@ -10,7 +10,6 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { Browser, computeExecutablePath, detectBrowserPlatform, resolveBuildId } from "@oh-my-pi/pi-utils/browsers";
-import { APP_NAME } from "@oh-my-pi/pi-utils/dirs";
 import { PUPPETEER_REVISIONS } from "puppeteer-core/internal/revisions.js";
 
 const EXECUTABLE_PROBE = path.resolve(import.meta.dir, "../fixtures/browser-executable-probe.ts");
@@ -223,19 +222,15 @@ describe("browser executable selection", () => {
 		const tempDir = TempDir.createSync("@browser-macos-cft-");
 		try {
 			const home = path.join(tempDir.path(), "home");
-			const xdgCache = path.join(tempDir.path(), "cache");
-			// resolveIf() (packages/utils/src/dirs.ts) only redirects to an XDG
-			// root when its `<XDG>/omp` dir already exists, so create them to pin
-			// the child's puppeteer cache to this isolated location.
-			for (const xdg of [xdgCache, path.join(tempDir.path(), "data"), path.join(tempDir.path(), "state")]) {
-				fs.mkdirSync(path.join(xdg, APP_NAME), { recursive: true });
-			}
+			// The merged directory resolver deliberately uses the profile config
+			// root (`~/.omp`) rather than XDG cache roots. Pin both POSIX and
+			// Windows home variables so the child resolves an isolated cache.
+			const configRoot = path.join(home, ".omp");
+			fs.mkdirSync(configRoot, { recursive: true });
 			const env = {
 				...process.env,
 				HOME: home,
-				XDG_CACHE_HOME: xdgCache,
-				XDG_DATA_HOME: path.join(tempDir.path(), "data"),
-				XDG_STATE_HOME: path.join(tempDir.path(), "state"),
+				USERPROFILE: home,
 				OMP_BROWSER_PROBE_PLATFORM: "darwin",
 				PUPPETEER_EXECUTABLE_PATH: "",
 			};
@@ -246,10 +241,9 @@ describe("browser executable selection", () => {
 			await Bun.write(systemChrome, "#!/bin/sh\necho 'Google Chrome 151'\n");
 			fs.chmodSync(systemChrome, 0o755);
 
-			// Seed the isolated Chrome for Testing binary in the child's cache so the
-			// probe resolves it without a network download. getPuppeteerDir() resolves
-			// to `<XDG_CACHE_HOME>/omp/puppeteer` given the dirs created above.
-			const cacheDir = path.join(xdgCache, APP_NAME, "puppeteer");
+			// Seed the isolated Chrome for Testing binary in the child's profile
+			// cache so the probe resolves it without a network download.
+			const cacheDir = path.join(configRoot, "puppeteer");
 			const platform = detectBrowserPlatform();
 			if (!platform) throw new Error("unsupported host platform for Chrome-for-Testing selection test");
 			const buildId = await resolveBuildId(Browser.CHROME, platform, PUPPETEER_REVISIONS.chrome);
