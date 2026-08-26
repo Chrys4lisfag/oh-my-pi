@@ -27,6 +27,10 @@ import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 
 const SNAP = { modelRoles: { default: "anthropic/claude-sonnet-4" }, defaultThinkingLevel: "high" };
+type TestProfileSnapshot = { modelRoles: Record<string, string>; defaultThinkingLevel: string };
+function profileSnapshot(settings: Settings, name: string): TestProfileSnapshot | undefined {
+	return settings.get("profiles.items")[name] as TestProfileSnapshot | undefined;
+}
 
 describe("profiles multi-instance persistence", () => {
 	let dir: string;
@@ -213,6 +217,20 @@ describe("profiles multi-instance persistence", () => {
 		const reader = await load();
 		expect(reader.get("profiles.items")).toEqual({ new: edited });
 	});
+	it("persists a profile created and renamed before its first debounce flush", async () => {
+		const settings = await load();
+		settings.setProfileItem("old", SNAP);
+		settings.activateProfile("old", SNAP);
+		settings.renameProfileItem("old", "new", SNAP, true);
+		settings.set("defaultThinkingLevel", Effort.Medium);
+		await settings.flush();
+
+		const reader = await load();
+		expect(reader.get("profiles.items")).not.toHaveProperty("old");
+		expect(profileSnapshot(reader, "new")?.defaultThinkingLevel).toBe(Effort.Medium);
+		expect(reader.get("profiles.active")).toBe("new");
+	});
+
 	it("does not rename a stale source after another instance deletes it", async () => {
 		const seed = await load();
 		seed.setProfileItem("old", SNAP);
@@ -232,6 +250,7 @@ describe("profiles multi-instance persistence", () => {
 	it("does not overwrite a rename destination concurrently created by another instance", async () => {
 		const seed = await load();
 		seed.setProfileItem("old", SNAP);
+		seed.activateProfile("old", SNAP);
 		await seed.flush();
 
 		const stale = await load();
@@ -242,12 +261,89 @@ describe("profiles multi-instance persistence", () => {
 		};
 		creator.setProfileItem("new", concurrent);
 		await creator.flush();
-		stale.renameProfileItem("old", "new", SNAP, false);
-		await stale.flush();
 
-		const reader = await load();
-		expect(reader.get("profiles.items")).toEqual({ old: SNAP, new: concurrent });
+		const saveEntered = Promise.withResolvers<void>();
+		const releaseSave = Promise.withResolvers<void>();
+		const rename = fsSync.promises.rename.bind(fsSync.promises);
+		const configPath = path.join(dir, "config.yml");
+		let intercepted = false;
+		const renameSpy = vi.spyOn(fsSync.promises, "rename").mockImplementation(async (source, target) => {
+			if (
+				!intercepted &&
+				String(source).endsWith(".tmp") &&
+				path.normalize(String(target)) === path.normalize(configPath)
+			) {
+				intercepted = true;
+				saveEntered.resolve();
+				await releaseSave.promise;
+			}
+			await rename(source, target);
+		});
+		try {
+			stale.renameProfileItem("old", "new", SNAP, true);
+			const firstFlush = stale.flush();
+			await saveEntered.promise;
+			stale.set("defaultThinkingLevel", Effort.Low);
+			releaseSave.resolve();
+			await firstFlush;
+			await stale.flush();
+
+			expect(stale.get("profiles.active")).toBe("old");
+			expect(stale.get("defaultThinkingLevel")).toBe(Effort.Low);
+			expect(profileSnapshot(stale, "new")).toEqual(concurrent);
+			const reader = await load();
+			expect(reader.get("profiles.items")).toEqual({
+				old: { ...SNAP, defaultThinkingLevel: Effort.Low },
+				new: concurrent,
+			});
+		} finally {
+			releaseSave.resolve();
+			renameSpy.mockRestore();
+		}
 	});
+	it("keeps an active-profile edit made while its rename save is in flight", async () => {
+		const seed = await load();
+		seed.setProfileItem("old", SNAP);
+		seed.activateProfile("old", SNAP);
+		await seed.flush();
+
+		const settings = await load();
+		const saveEntered = Promise.withResolvers<void>();
+		const releaseSave = Promise.withResolvers<void>();
+		const rename = fsSync.promises.rename.bind(fsSync.promises);
+		const configPath = path.join(dir, "config.yml");
+		let intercepted = false;
+		const renameSpy = vi.spyOn(fsSync.promises, "rename").mockImplementation(async (source, target) => {
+			if (
+				!intercepted &&
+				String(source).endsWith(".tmp") &&
+				path.normalize(String(target)) === path.normalize(configPath)
+			) {
+				intercepted = true;
+				saveEntered.resolve();
+				await releaseSave.promise;
+			}
+			await rename(source, target);
+		});
+		try {
+			settings.renameProfileItem("old", "new", SNAP, true);
+			const firstFlush = settings.flush();
+			await saveEntered.promise;
+			settings.set("defaultThinkingLevel", Effort.Medium);
+			releaseSave.resolve();
+			await firstFlush;
+			await settings.flush();
+
+			const reader = await load();
+			expect(reader.get("profiles.items")).not.toHaveProperty("old");
+			expect(profileSnapshot(reader, "new")?.defaultThinkingLevel).toBe(Effort.Medium);
+			expect(reader.get("profiles.active")).toBe("new");
+		} finally {
+			releaseSave.resolve();
+			renameSpy.mockRestore();
+		}
+	});
+
 	it("activates the freshest target snapshot without writing a stale copy", async () => {
 		const old = { modelRoles: { default: "anthropic/old" }, defaultThinkingLevel: "low" };
 		const staleTarget = { modelRoles: { default: "anthropic/stale" }, defaultThinkingLevel: "medium" };
@@ -266,6 +362,9 @@ describe("profiles multi-instance persistence", () => {
 		stale.activateProfile("target", staleTarget);
 		await stale.flush();
 
+		expect(stale.get("profiles.active")).toBe("target");
+		expect(stale.getModelRole("default")).toBe("openai/fresh");
+		expect(stale.get("defaultThinkingLevel")).toBe(Effort.High);
 		const reader = await load();
 		expect(reader.get("profiles.items").target).toEqual(freshTarget);
 		expect(reader.get("profiles.active")).toBe("target");
@@ -362,6 +461,21 @@ describe("profiles multi-instance persistence", () => {
 		expect(peer.get("defaultThinkingLevel")).toBe(Effort.XHigh);
 	});
 
+	it("does not adopt another terminal's first activation when local selection is empty", async () => {
+		const emptyTerminal = await load();
+		const initialRoles = emptyTerminal.get("modelRoles");
+		const initialThinking = emptyTerminal.get("defaultThinkingLevel");
+		const writer = await load();
+		writer.setProfileItem("first", SNAP);
+		writer.activateProfile("first", SNAP);
+		await writer.flush();
+
+		await waitFor(() => "first" in emptyTerminal.get("profiles.items"));
+		expect(emptyTerminal.get("profiles.active")).toBe("");
+		expect(emptyTerminal.get("modelRoles")).toEqual(initialRoles);
+		expect(emptyTerminal.get("defaultThinkingLevel")).toBe(initialThinking);
+	});
+
 	it("does not switch other instances when one instance switches active profile", async () => {
 		const seed = await load();
 		seed.setProfileItem("work", {
@@ -388,6 +502,241 @@ describe("profiles multi-instance persistence", () => {
 
 		expect(peer.get("profiles.active")).toBe("work");
 		expect(peer.getModelRole("default")).toBe("anthropic/initial");
+	});
+
+	it("propagates a persisted thinking change to every terminal using the same profile", async () => {
+		const seed = await load();
+		seed.setProfileItem("gpt-edu", SNAP);
+		seed.activateProfile("gpt-edu", SNAP);
+		await seed.flush();
+
+		const first = await load();
+		const second = await load();
+		first.set("defaultThinkingLevel", Effort.Medium);
+		await first.flush();
+		await second.syncFromDisk();
+		await first.syncFromDisk();
+
+		expect(first.get("profiles.active")).toBe("gpt-edu");
+		expect(second.get("profiles.active")).toBe("gpt-edu");
+		expect(first.get("defaultThinkingLevel")).toBe(Effort.Medium);
+		expect(second.get("defaultThinkingLevel")).toBe(Effort.Medium);
+		expect(profileSnapshot(first, "gpt-edu")?.defaultThinkingLevel).toBe(Effort.Medium);
+		expect(profileSnapshot(second, "gpt-edu")?.defaultThinkingLevel).toBe(Effort.Medium);
+	});
+
+	it("propagates persisted model-role edits to every terminal using the same profile", async () => {
+		const seed = await load();
+		seed.setProfileItem("gpt-edu", SNAP);
+		seed.activateProfile("gpt-edu", SNAP);
+		await seed.flush();
+
+		const first = await load();
+		const second = await load();
+		first.setModelRole("default", "openai-codex/gpt-5.6");
+		await first.flush();
+		await second.syncFromDisk();
+		await first.syncFromDisk();
+
+		expect(first.getModelRole("default")).toBe("openai-codex/gpt-5.6");
+		expect(second.getModelRole("default")).toBe("openai-codex/gpt-5.6");
+		expect(profileSnapshot(first, "gpt-edu")?.modelRoles.default).toBe("openai-codex/gpt-5.6");
+		expect(profileSnapshot(second, "gpt-edu")?.modelRoles.default).toBe("openai-codex/gpt-5.6");
+	});
+
+	it("does not resurrect a profile deleted after a stale granular live edit", async () => {
+		const seed = await load();
+		seed.setProfileItem("shared", SNAP);
+		seed.activateProfile("shared", SNAP);
+		await seed.flush();
+
+		const stale = await load();
+		const deleter = await load();
+		stale.set("defaultThinkingLevel", Effort.Medium);
+		deleter.deleteProfileItem("shared");
+		await deleter.flush();
+		await stale.flush();
+
+		const reader = await load();
+		expect(reader.get("profiles.items")).toEqual({});
+		expect(reader.get("profiles.active")).toBe("");
+	});
+
+	it("merges disjoint same-profile role edits in either flush order", async () => {
+		const initial = {
+			modelRoles: { default: "anthropic/default-old", advisor: "anthropic/advisor-old" },
+			defaultThinkingLevel: "high",
+		};
+		const seed = await load();
+		seed.setProfileItem("shared", initial);
+		seed.activateProfile("shared", initial);
+		await seed.flush();
+
+		const first = await load();
+		const second = await load();
+		first.setModelRole("default", "openai/default-a");
+		second.setModelRole("advisor", "google/advisor-b");
+		await first.flush();
+		await second.flush();
+
+		const third = await load();
+		const fourth = await load();
+		third.setModelRole("default", "openai/default-c");
+		fourth.setModelRole("advisor", "google/advisor-d");
+		await fourth.flush();
+		await third.flush();
+
+		const reader = await load();
+		expect(profileSnapshot(reader, "shared")?.modelRoles).toEqual({
+			default: "openai/default-c",
+			advisor: "google/advisor-d",
+		});
+		expect(reader.get("modelRoles")).toEqual({ default: "openai/default-c", advisor: "google/advisor-d" });
+	});
+
+	it("merges concurrent same-profile thinking and role edits", async () => {
+		const seed = await load();
+		seed.setProfileItem("shared", SNAP);
+		seed.activateProfile("shared", SNAP);
+		await seed.flush();
+
+		const thinkingWriter = await load();
+		const roleWriter = await load();
+		thinkingWriter.set("defaultThinkingLevel", Effort.Medium);
+		roleWriter.setModelRole("advisor", "openai/advisor-new");
+		await Promise.all([thinkingWriter.flush(), roleWriter.flush()]);
+
+		const reader = await load();
+		expect(profileSnapshot(reader, "shared")).toEqual({
+			modelRoles: { ...SNAP.modelRoles, advisor: "openai/advisor-new" },
+			defaultThinkingLevel: Effort.Medium,
+		});
+		expect(reader.get("defaultThinkingLevel")).toBe(Effort.Medium);
+	});
+
+	it("merges a same-profile role deletion with a sibling role update", async () => {
+		const initial = {
+			modelRoles: { default: "anthropic/default-old", advisor: "anthropic/advisor-old" },
+			defaultThinkingLevel: "high",
+		};
+		const seed = await load();
+		seed.setProfileItem("shared", initial);
+		seed.activateProfile("shared", initial);
+		await seed.flush();
+
+		const deleter = await load();
+		const updater = await load();
+		deleter.setModelRole("default", undefined);
+		updater.setModelRole("advisor", "google/advisor-new");
+		await updater.flush();
+		await deleter.flush();
+
+		const reader = await load();
+		expect(profileSnapshot(reader, "shared")?.modelRoles).toEqual({ advisor: "google/advisor-new" });
+		expect(reader.get("modelRoles")).toEqual({ advisor: "google/advisor-new" });
+	});
+
+	it("keeps explicit runtime overrides while syncing the underlying same-profile snapshot", async () => {
+		const seed = await load();
+		seed.setProfileItem("gpt-edu", SNAP);
+		seed.activateProfile("gpt-edu", SNAP);
+		await seed.flush();
+
+		const writer = await load();
+		const overridden = await load();
+		overridden.overrideModelRoles({ default: "google/local-override" });
+		overridden.override("defaultThinkingLevel", Effort.XHigh);
+
+		writer.setModelRole("default", "openai-codex/gpt-5.6");
+		writer.set("defaultThinkingLevel", Effort.Medium);
+		await writer.flush();
+		await overridden.syncFromDisk();
+
+		expect(overridden.getModelRole("default")).toBe("google/local-override");
+		expect(overridden.get("defaultThinkingLevel")).toBe(Effort.XHigh);
+		expect(profileSnapshot(overridden, "gpt-edu")?.modelRoles.default).toBe("openai-codex/gpt-5.6");
+		expect(profileSnapshot(overridden, "gpt-edu")?.defaultThinkingLevel).toBe(Effort.Medium);
+	});
+
+	it("shares an edited profile without corrupting another startup profile's live fields", async () => {
+		const beta = { modelRoles: { default: "google/beta" }, defaultThinkingLevel: Effort.Low };
+		const seed = await load();
+		seed.setProfileItem("alpha", SNAP);
+		seed.setProfileItem("beta", beta);
+		seed.activateProfile("alpha", SNAP);
+		await seed.flush();
+
+		const alphaTerminal = await load();
+		const betaTerminal = await load();
+		betaTerminal.activateProfile("beta", beta);
+		await betaTerminal.flush();
+		await alphaTerminal.syncFromDisk();
+
+		alphaTerminal.setModelRole("default", "openai/alpha-new");
+		alphaTerminal.set("defaultThinkingLevel", Effort.Medium);
+		await alphaTerminal.flush();
+		await betaTerminal.syncFromDisk();
+		await alphaTerminal.syncFromDisk();
+
+		expect(alphaTerminal.get("profiles.active")).toBe("alpha");
+		expect(alphaTerminal.getModelRole("default")).toBe("openai/alpha-new");
+		expect(alphaTerminal.get("defaultThinkingLevel")).toBe(Effort.Medium);
+		expect(betaTerminal.get("profiles.active")).toBe("beta");
+		expect(betaTerminal.getModelRole("default")).toBe("google/beta");
+		expect(betaTerminal.get("defaultThinkingLevel")).toBe(Effort.Low);
+
+		const reader = await load();
+		expect(reader.get("profiles.active")).toBe("beta");
+		expect(reader.getModelRole("default")).toBe("google/beta");
+		expect(reader.get("defaultThinkingLevel")).toBe(Effort.Low);
+		expect(reader.get("profiles.items").alpha).toEqual({
+			modelRoles: { default: "openai/alpha-new" },
+			defaultThinkingLevel: Effort.Medium,
+		});
+	});
+
+	it("does not overwrite a local mutation that arrives during an external sync read", async () => {
+		const seed = await load();
+		seed.setProfileItem("base", SNAP);
+		seed.activateProfile("base", SNAP);
+		await seed.flush();
+
+		const settings = await load();
+		const readEntered = Promise.withResolvers<void>();
+		const releaseRead = Promise.withResolvers<void>();
+		const readFile = fsSync.promises.readFile.bind(fsSync.promises);
+		const configPath = path.join(dir, "config.yml");
+		let intercepted = false;
+		const readSpy = vi.spyOn(fsSync.promises, "readFile").mockImplementation((async (
+			file: fsSync.PathLike | fsSync.promises.FileHandle,
+			options?: unknown,
+		) => {
+			const content = await readFile(file, options as never);
+			if (!intercepted && path.normalize(String(file)) === path.normalize(configPath)) {
+				intercepted = true;
+				readEntered.resolve();
+				await releaseRead.promise;
+			}
+			return content;
+		}) as never);
+		try {
+			const synchronization = settings.syncFromDisk();
+			await readEntered.promise;
+			settings.setProfileItem("created-during-read", {
+				modelRoles: { default: "openai/local" },
+				defaultThinkingLevel: Effort.Medium,
+			});
+			releaseRead.resolve();
+			expect(await synchronization).toBe(false);
+			expect(settings.get("profiles.items")).toHaveProperty("created-during-read");
+			await settings.flush();
+
+			const reader = await load();
+			expect(reader.get("profiles.items")).toHaveProperty("created-during-read");
+		} finally {
+			releaseRead.resolve();
+			readSpy.mockRestore();
+		}
 	});
 
 	it("keeps its active profile when an unrelated save merges another terminal's activation", async () => {

@@ -537,10 +537,10 @@ export class ModelControls {
 		if (isChanging) {
 			this.#host.clearInheritedProviderPromptCacheKey();
 			this.#host.sessionManager.appendThinkingLevelChange(effectiveLevel, effectiveLevel);
-			if (persist && effectiveLevel !== undefined && effectiveLevel !== ThinkingLevel.Off) {
-				this.#host.settings.set("defaultThinkingLevel", effectiveLevel);
-			}
 			this.#host.emit({ type: "thinking_level_changed", thinkingLevel: effectiveLevel });
+		}
+		if (persist && effectiveLevel !== undefined && effectiveLevel !== ThinkingLevel.Off) {
+			this.#host.settings.set("defaultThinkingLevel", effectiveLevel);
 		}
 	}
 
@@ -557,7 +557,7 @@ export class ModelControls {
 	 * Cycle to next thinking level: off → auto → minimal..max → off.
 	 * @returns New selector, or undefined if model doesn't support thinking
 	 */
-	cycleThinkingLevel(): ConfiguredThinkingLevel | undefined {
+	cycleThinkingLevel(persist: boolean = false): ConfiguredThinkingLevel | undefined {
 		if (!this.#model?.reasoning) return undefined;
 
 		const levels: ConfiguredThinkingLevel[] = [
@@ -572,7 +572,7 @@ export class ModelControls {
 		const nextLevel = levels[nextIndex];
 		if (!nextLevel) return undefined;
 
-		this.setThinkingLevel(nextLevel);
+		this.setThinkingLevel(nextLevel, persist);
 		return nextLevel;
 	}
 

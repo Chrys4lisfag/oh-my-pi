@@ -281,6 +281,17 @@ export class SelectorController {
 				projectDir = cwd;
 			}
 			const dirs = { projectDir, agentDir };
+			// Reconcile cached/scoped model objects with the current registry before
+			// presenting choices. The picker then intersects any session scope with
+			// this live snapshot, so saving cannot immediately yield "no model
+			// matched" from an object pruned by discovery/auth changes.
+			try {
+				await this.ctx.session.modelRegistry.refresh();
+			} catch (error) {
+				this.ctx.showWarning(
+					`Model refresh failed before advisor configuration; using the current catalog. ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
 			const initialDoc = await loadWatchdogConfigFile(await resolveAdvisorConfigEditPath(initialScope, dirs));
 			// Fullscreen editor on the alternate screen (the /settings idiom): the
 			// overlay holds the alt buffer + mouse tracking; the transcript stays put.
@@ -907,7 +918,7 @@ export class SelectorController {
 								if (isAuto) {
 									this.ctx.session.setThinkingLevel(AUTO_THINKING, true);
 								} else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
-									this.ctx.session.setThinkingLevel(concreteThinking);
+									this.ctx.session.setThinkingLevel(concreteThinking, true);
 								}
 								this.ctx.statusLine.invalidate();
 								this.ctx.updateEditorBorderColor();
@@ -996,7 +1007,7 @@ export class SelectorController {
 									});
 									if (!switched) return;
 									if (effectiveIsAuto) {
-										this.ctx.session.setThinkingLevel(AUTO_THINKING, true);
+										this.ctx.session.setThinkingLevel(AUTO_THINKING);
 									} else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
 										this.ctx.session.setThinkingLevel(concreteThinking);
 									}

@@ -44,6 +44,13 @@ export interface SessionHeader {
 	previousSessionFiles?: string[];
 	/** Provider prompt-cache identity inherited by exact-route full forks. */
 	providerPromptCacheKey?: string;
+	/**
+	 * Config profile this session belongs to. Absent on legacy sessions created
+	 * before profile identity was recorded; such sessions are treated as
+	 * unbound on resume so persisted model/thinking edits cannot be routed to
+	 * an unrelated profile.
+	 */
+	profile?: string;
 }
 
 export interface NewSessionOptions {

@@ -4,7 +4,12 @@ import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { type AutocompleteProvider, matchesKey, type SlashCommand } from "@oh-my-pi/pi-tui";
 import { isEnoent, logger, sanitizeText } from "@oh-my-pi/pi-utils";
-import { cycleProfile, getActiveProfileName } from "../../config/profiles";
+import {
+	captureProfileActivationState,
+	cycleProfile,
+	getActiveProfileName,
+	restoreProfileActivation,
+} from "../../config/profiles";
 import { isSettingsInitialized, settings } from "../../config/settings";
 import { resolveLocalRoot } from "../../internal-urls";
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";
@@ -1911,7 +1916,7 @@ export class InputController {
 			this.ctx.showStatus("Model/thinking apply to the main session — press ←← to return first");
 			return;
 		}
-		const newLevel = this.ctx.session.cycleThinkingLevel();
+		const newLevel = this.ctx.session.cycleThinkingLevel(true);
 		if (newLevel === undefined) {
 			this.ctx.showStatus("Current model does not support thinking");
 		} else {
@@ -1921,6 +1926,7 @@ export class InputController {
 	}
 
 	async cycleModelProfile(): Promise<void> {
+		const previousActivation = captureProfileActivationState();
 		const result = cycleProfile();
 		if (!result) {
 			this.ctx.showStatus("No profiles to cycle (create with /profiles add <name>)");
@@ -1931,8 +1937,15 @@ export class InputController {
 			if (getActiveProfileName() !== result.name) {
 				throw new Error(`Profile "${result.name}" was deleted by another omp instance`);
 			}
-			await this.ctx.session.applyProfileToSession();
+			const bound = await this.ctx.session.bindSessionProfile(result.name);
+			if (!bound) throw new Error(`Profile "${result.name}" is no longer valid`);
 		} catch (err) {
+			try {
+				restoreProfileActivation(previousActivation);
+				await settings.flush();
+			} catch (rollbackError) {
+				logger.warn("Failed to persist cycled profile rollback", { error: String(rollbackError) });
+			}
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorBorderColor();
 			this.ctx.showError(err instanceof Error ? err.message : String(err));

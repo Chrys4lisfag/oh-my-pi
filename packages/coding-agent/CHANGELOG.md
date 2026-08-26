@@ -2,14 +2,28 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `discovery.baseUrl` for custom OpenAI-compatible providers whose `/models` catalog and inference traffic use different upstream routes; discovered models retain the provider inference URL, discovery queries are preserved, and caches are isolated by effective discovery endpoint.
+- Added `discovery.auth: none` for providers whose model catalog is public or rejects inference bearer credentials; inference keeps using the provider `apiKey`, discovery omits `Authorization`, and authenticated/anonymous catalogs have isolated caches.
+
 ### Fixed
 
+- Fixed authenticated discovery-only LiteLLM providers routing inference to the localhost default instead of their configured discovery URL, and stopped unfetched empty retry caches from being reported as successful authoritative discovery.
+- Fixed resumed sessions belonging to the wrong config profile: session headers now record their profile identity, resume binds the terminal locally to the recorded profile without touching the durable startup default, `/profiles` switch/add/delete-fallback/rename and cycling restamp the identity, and legacy sessions with no recorded profile refuse auto-synchronized profile applies until an explicit switch — so persisted model/thinking edits can no longer be written into an unrelated profile or clobbered by the startup default.
+- Fixed status-line model mismatches in both directions: role cycling now continues to show the live `smol`/`slow` runtime model instead of replacing it with the resolved default, while an unavailable configured default still renders its selector with `[unavailable]` and matches prompt preflight.
+- Fixed `/advisor configure` offering stale session-scoped model objects that saved successfully but immediately failed with `no model matched`: opening the editor now refreshes the registry and intersects scoped choices with live canonical provider/model entries before persistence.
+- Fixed `/models` providers becoming permanently stuck at zero models after an empty or unusable cached discovery: zero-model refreshes remain retryable across hub reopen, background registry completion updates the open overlay, and cached status claims a pending refresh only while one actually exists.
+- Fixed TUI thinking changes being session-only: keyboard thinking cycles and concrete default-model effort selections now persist into the active profile, allowing other running terminals on that profile to observe and apply the change through the config watcher.
+- Fixed same-profile live synchronization across terminals: persisted thinking and model-role edits now update the active profile snapshot, propagate to every session using that profile, and no longer roll the source terminal back, while different active profiles and explicit runtime overrides remain isolated.
 - Fixed multi-process profile persistence and runtime isolation: profile switches now stay local to each running terminal, unrelated saves retain that terminal-local selection while preserving the on-disk startup default, explicit reloads reconcile and notify live sessions, active-profile deletion propagates a deterministic fallback, stale clients preserve untouched sibling profiles and cannot resurrect deleted profiles, activation resolves the freshest target snapshot, prompt dispatch waits for queued live profile application, and teardown fences late profile mutations. Unavailable profile models no longer block switching while prompt submission remains safely blocked.
 
 ## [17.4.0] - 2026-08-20
 
 ### Added
 
+- Added a tracked try-compact reminder extension with per-session editor config, status, same-project preset loading, optional 275k-step mid-context reminders, durable session-ID checkpoint suppression across shake/follow-up turns, and checkpoint reset after full compaction.
+- Extended session-scoped try-shake for million-token models with a first 275k checkpoint and monotonic configurable follow-up spacing (`/tryshake step 150k` by default). Checkpoints consume success, no-op, and failure once, honor the existing 4k savings gate, avoid active maintenance, reset after full compaction/session boundaries, and are reported by `/tryshake status`.
 - `/cleanse` (and `omp cleanse`) — run the checker/repair loop in-session, with a live status board of running checkers, repair subagents, and token/cost totals.
 - `omp ps` — interactive monitor for daemon-supervised background processes.
 - Composer layouts — `composer.shape` picks the editor frame (rounded box, Claude Code rules, upstream-pi rules, borderless), with live previews in `/settings` and the setup wizard.

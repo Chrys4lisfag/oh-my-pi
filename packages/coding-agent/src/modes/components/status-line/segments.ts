@@ -116,16 +116,31 @@ const modelSegment: StatusLineSegment = {
 	render(ctx) {
 		const state = ctx.session.state;
 		const opts = ctx.options.model ?? {};
+		const configuredState = ctx.session.getConfiguredDefaultModelState?.();
 
-		let modelName = state.model?.name || state.model?.id || "no-model";
+		// The footer reports the live runtime model. Role cycling intentionally
+		// changes only that runtime model (for example `default` → `smol`) while
+		// leaving `modelRoles.default` untouched, so a resolved configured
+		// default must never replace `state.model` here. The one exception is an
+		// unresolved configured default: prompt preflight blocks dispatch, so
+		// show that selector with an explicit marker instead of falsely implying
+		// the retained runtime model can still serve.
+		let modelName: string;
+		const unavailable = Boolean(configuredState?.unavailable && configuredState.configuredSelector);
+		if (unavailable) {
+			modelName = configuredState?.configuredSelector?.trim() || "no-model";
+		} else {
+			modelName = state.model?.name || state.model?.id || "no-model";
+		}
 		if (modelName.startsWith("Claude ")) {
 			modelName = modelName.slice(7);
 		}
 
 		// Resolve the current thinking-level display ("◉ xhigh", "⟳ auto", …)
 		// when the model supports thinking and the segment isn't hiding it.
+		const thinkingModel = state.model;
 		let thinkingDisplay = "";
-		if (opts.showThinkingLevel !== false && state.model?.thinking) {
+		if (opts.showThinkingLevel !== false && thinkingModel?.thinking && !unavailable) {
 			if (ctx.session.isAutoThinking) {
 				// Pending (no turn classified yet / classifying) shows a symbol-theme
 				// question-box marker; once resolved it shows `<level>`.
@@ -153,11 +168,14 @@ const modelSegment: StatusLineSegment = {
 		// theme.fg resets only the fg, so the spans are concatenated (not
 		// nested) to keep each color intact.
 		let tail = "";
-		if (ctx.session.isFastModeActive() && theme.icon.fast) {
+		if (!unavailable && ctx.session.isFastModeActive() && theme.icon.fast) {
 			tail += ` ${theme.icon.fast}`;
 		}
 		if (!compact && thinkingDisplay) {
 			tail += `${theme.sep.dot}${thinkingDisplay}`;
+		}
+		if (unavailable) {
+			tail += theme.fg("error", " [unavailable]");
 		}
 
 		// `statusLineModel` is aliased to `accent` in many themes, so the badge

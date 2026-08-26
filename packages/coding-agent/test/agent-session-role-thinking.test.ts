@@ -91,6 +91,19 @@ describe("AgentSession role model thinking behavior", () => {
 		});
 	}
 
+	it("persists an explicit thinking selection even when effective level is unchanged", async () => {
+		const model = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		await createSession({
+			initialModelId: model.id,
+			initialThinkingLevel: Effort.Medium,
+			modelRoles: { default: `${model.provider}/${model.id}` },
+		});
+
+		session.setThinkingLevel(Effort.Medium, true);
+
+		expect(sessionSettings.get("defaultThinkingLevel")).toBe(Effort.Medium);
+	});
+
 	it("re-applies explicit role thinking each time that role is selected", async () => {
 		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
 		const slowModel = getAnthropicModelOrThrow("claude-sonnet-4-6");

@@ -21,6 +21,7 @@ be adopted without silently losing fork features.
 | ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [provider-fixes.md](provider-fixes.md)               | Gemini request normalization, Venice compatibility, Codex safety handling/account attribution, K12 classification, rate-limit and Anthropic retry policy |
 | [profiles-and-accounts.md](profiles-and-accounts.md) | Model profiles, advisor synchronization, multi-instance persistence, `/accounts` routing controls                                                        |
+| [model-catalog-and-session-runtime.md](model-catalog-and-session-runtime.md) | Split/anonymous provider discovery, zero-model recovery, session profile identity, status/advisor model consistency, tokenizer compatibility |
 | [memory-and-runtime.md](memory-and-runtime.md)       | Hindsight memory behavior, advisor provenance/tool telemetry, Windows EPIPE/browser launch, GUI editor wait, MCP timing, prompt helper                   |
 | [live-delta-manifest.md](live-delta-manifest.md)     | Active commit/file map, generated or stale changes, coverage gaps                                                                                        |
 | [reapply-checklist.md](reapply-checklist.md)         | Ordered fresh-fork and recurring-merge procedure, survival checks, test matrix                                                                           |
@@ -59,11 +60,24 @@ be adopted without silently losing fork features.
 14. Memory-related advisors receive a retrieval reminder after the configured number
     of advisor context reads without `recall`/`reflect`; `/advisor status` reports
     actual reminder injections per advisor and in aggregate.
-15. `/tryshake on` enables a session-scoped surgical shake preflight per automatic
-    compaction trigger; sufficient recovery skips full compaction, while no-op,
-    failed, or low-savings attempts fall through once to the configured strategy.
-    `/tryshake status` reports the current value. New, switched, and cleared sessions
-    reset the toggle; settings files never store it.
+15. `/tryshake on` enables session-scoped surgical shake. Million-token models add
+    monotonic checks at 275k then a configurable step (`/tryshake step 150k` by
+    default); the existing 4k savings gate decides eligibility. Automatic compaction
+    triggers still get one preflight, never a duplicate after a checkpoint attempt.
+    `/tryshake status` reports toggle, step, and next checkpoint. Logical-session
+    boundaries reset all try-shake state; settings files never store it.
+16. Custom provider discovery may use a separate URL and anonymous auth while
+    inference retains its bearer key; endpoint/protocol/auth cache identities stay
+    isolated, and unfetched empty caches never become authoritative.
+
+17. The tracked compact-reminder extension preserves visible post-compaction follow-ups
+    and adds per-session `/try-compact status|settings|load`, optional monotonic
+    mid-context reminders, session-ID checkpoint persistence, and compaction reset.
+18. Session headers own config-profile identity. Resume binds that profile locally,
+    legacy headers remain safely unbound until an explicit switch, role cycling keeps
+    the live runtime model visible, and unavailable defaults render explicitly.
+19. `/advisor configure` offers only live canonical registry models, and model-specific
+    native token counting falls back only for a proven stale-addon encoding mismatch.
 
 ## Important memory corrections
 

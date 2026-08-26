@@ -150,6 +150,8 @@ interface ChipRange {
 }
 
 const PROVIDER_REFRESH_DEBOUNCE_MS = 120;
+const EMPTY_PROVIDER_RETRY_COOLDOWN_MS = 30_000;
+const EMPTY_PROVIDER_REFRESH_CONCURRENCY = 4;
 const RECENT_LIMIT = 15;
 const SIDEBAR_MIN_WIDTH = 18;
 const SIDEBAR_MAX_WIDTH = 26;
@@ -159,11 +161,34 @@ const SIDEBAR_MAX_WIDTH = 26;
  * its live model list at most once per application lifetime (surviving hub
  * close/reopen); F5 re-fetches on demand.
  */
-const autoRefreshedProviders = new Set<string>();
+interface ProviderRefreshProcessState {
+	autoRefreshedProviders: Set<string>;
+	providerRefreshesInFlight: Set<string>;
+	emptyProviderRetryAfter: Map<string, number>;
+	emptyProviderAutoAttempts: Map<string, number>;
+}
+
+let providerRefreshStateByRegistry = new WeakMap<ModelRegistry, ProviderRefreshProcessState>();
+let activeProviderRefreshCount = 0;
+
+function providerRefreshState(registry: ModelRegistry): ProviderRefreshProcessState {
+	let state = providerRefreshStateByRegistry.get(registry);
+	if (!state) {
+		state = {
+			autoRefreshedProviders: new Set(),
+			providerRefreshesInFlight: new Set(),
+			emptyProviderRetryAfter: new Map(),
+			emptyProviderAutoAttempts: new Map(),
+		};
+		providerRefreshStateByRegistry.set(registry, state);
+	}
+	return state;
+}
 
 /** Test hook: forget which providers were auto-refreshed this process. */
 export function resetProviderAutoRefreshGuard(): void {
-	autoRefreshedProviders.clear();
+	providerRefreshStateByRegistry = new WeakMap();
+	activeProviderRefreshCount = 0;
 }
 
 /**
@@ -174,6 +199,7 @@ export class ModelHubComponent implements Component {
 	#tui: TUI;
 	#settings: Settings;
 	#registry: ModelRegistry;
+	#providerRefreshState: ProviderRefreshProcessState;
 	#scopedModels: ReadonlyArray<ScopedModelItem>;
 	#callbacks: ModelHubCallbacks;
 
@@ -222,6 +248,10 @@ export class ModelHubComponent implements Component {
 	#scheduledProviderRefreshes = new Map<string, Timer>();
 	#refreshSpinnerFrame = 0;
 	#refreshSpinnerInterval?: Timer;
+	#unsubscribeModelsUpdated?: () => void;
+	#initialRegistrySync: Promise<void> = Promise.resolve();
+	#disposed = false;
+	#emptyProviderRetryTimer?: Timer;
 
 	// Frame geometry from the last render, for mouse hit-testing (the
 	// fullscreen overlay paints from screen row 0, so mouse rows map 1:1).
@@ -244,6 +274,7 @@ export class ModelHubComponent implements Component {
 		this.#tui = tui;
 		this.#settings = settings;
 		this.#registry = registry;
+		this.#providerRefreshState = providerRefreshState(registry);
 		this.#scopedModels = scopedModels;
 		this.#callbacks = callbacks;
 
@@ -253,6 +284,26 @@ export class ModelHubComponent implements Component {
 		this.#browser.onActivate = item => this.#activateItem(item);
 		this.#browser.onCancel = () => this.#callbacks.onCancel();
 		this.#browser.onQueryChange = query => this.#onQueryChanged(query);
+		this.#unsubscribeModelsUpdated = this.#registry.onModelsUpdated(() => {
+			const updatedProviders = new Set([...this.#refreshingProviders, ...this.#scheduledProviderRefreshes.keys()]);
+			for (const providerId of updatedProviders) {
+				const previousCount =
+					this.#entries.find(entry => entry.kind === "provider" && entry.providerId === providerId)
+						?.catalogCount ?? 0;
+				const currentCount = this.#registry.getAll().filter(model => model.provider === providerId).length;
+				// Only an actual zero -> populated transition settles another pending
+				// refresh. Unrelated model events must never cancel an explicit F5.
+				if (previousCount > 0 || currentCount === 0) continue;
+				this.#providerRefreshState.emptyProviderRetryAfter.delete(providerId);
+				this.#providerRefreshState.emptyProviderAutoAttempts.delete(providerId);
+				const timer = this.#scheduledProviderRefreshes.get(providerId);
+				if (timer) clearTimeout(timer);
+				this.#scheduledProviderRefreshes.delete(providerId);
+				this.#setProviderRefreshing(providerId, false);
+			}
+			this.#syncFromRegistryState();
+			this.#tui.requestRender();
+		});
 
 		// Hydrate synchronously from the current registry snapshot so the first
 		// Enter after opening acts on cached models instead of being dropped
@@ -270,21 +321,33 @@ export class ModelHubComponent implements Component {
 		// scope is registry-independent, so the offline reload would only repeat
 		// the synchronous hydration above.
 		if (this.#scopedModels.length === 0) {
-			this.#registry
-				.refresh("offline")
-				.then(() => this.#syncFromRegistryState())
+			this.#initialRegistrySync = (async () => {
+				await registry.awaitBackgroundRefresh();
+				await registry.refresh("offline");
+				this.#syncFromRegistryState();
+			})()
 				.catch(error => {
 					this.#configError = error instanceof Error ? error.message : String(error);
 				})
-				.finally(() => this.#tui.requestRender());
+				.finally(() => {
+					if (!this.#disposed) this.#tui.requestRender();
+					void this.#refreshEmptyProvidersInBackground();
+				});
 		}
 	}
 
 	/** Cancel pending provider refresh timers and the spinner. Host calls this on overlay close. */
 	dispose(): void {
+		this.#disposed = true;
+		this.#unsubscribeModelsUpdated?.();
+		this.#unsubscribeModelsUpdated = undefined;
 		for (const [, timer] of this.#scheduledProviderRefreshes) clearTimeout(timer);
 		this.#scheduledProviderRefreshes.clear();
 		this.#refreshingProviders.clear();
+		if (this.#emptyProviderRetryTimer) {
+			clearTimeout(this.#emptyProviderRetryTimer);
+			this.#emptyProviderRetryTimer = undefined;
+		}
 		if (this.#refreshSpinnerInterval) {
 			clearInterval(this.#refreshSpinnerInterval);
 			this.#refreshSpinnerInterval = undefined;
@@ -348,6 +411,7 @@ export class ModelHubComponent implements Component {
 
 		this.#buildSidebar(allModels, availableModels);
 		this.#applyScope();
+		if (this.#browser.query.trim()) this.#onQueryChanged(this.#browser.query);
 	}
 
 	#buildSidebar(allModels: ReadonlyArray<Model>, availableModels: ReadonlyArray<Model>): void {
@@ -628,6 +692,129 @@ export class ModelHubComponent implements Component {
 		return false;
 	}
 
+	#finishProviderRefresh(providerId: string): void {
+		if (this.#providerRefreshState.providerRefreshesInFlight.delete(providerId)) {
+			activeProviderRefreshCount = Math.max(0, activeProviderRefreshCount - 1);
+		}
+		const providerHasModels = this.#registry.getAll().some(model => model.provider === providerId);
+		if (providerHasModels) {
+			this.#providerRefreshState.emptyProviderRetryAfter.delete(providerId);
+			this.#providerRefreshState.emptyProviderAutoAttempts.delete(providerId);
+		} else {
+			this.#providerRefreshState.autoRefreshedProviders.delete(providerId);
+			this.#providerRefreshState.emptyProviderRetryAfter.set(
+				providerId,
+				Date.now() + EMPTY_PROVIDER_RETRY_COOLDOWN_MS,
+			);
+		}
+		this.#scheduleEmptyProviderRetry();
+	}
+
+	#scheduleEmptyProviderRetry(): void {
+		if (this.#disposed || this.#emptyProviderRetryTimer) return;
+		const discoverable = new Set(this.#registry.getDiscoverableProviders());
+		const populated = new Set(this.#registry.getAll().map(model => model.provider));
+		const now = Date.now();
+		let earliest = Number.POSITIVE_INFINITY;
+		for (const providerId of discoverable) {
+			if (
+				populated.has(providerId) ||
+				(this.#providerRefreshState.emptyProviderAutoAttempts.get(providerId) ?? 0) >= 2
+			)
+				continue;
+			const retryAfter = this.#providerRefreshState.emptyProviderRetryAfter.get(providerId);
+			if (retryAfter !== undefined) earliest = Math.min(earliest, Math.max(now + 1, retryAfter));
+		}
+		if (!Number.isFinite(earliest)) return;
+		this.#emptyProviderRetryTimer = setTimeout(
+			() => {
+				this.#emptyProviderRetryTimer = undefined;
+				void this.#refreshEmptyProvidersInBackground();
+			},
+			Math.max(1, earliest - now),
+		);
+	}
+
+	async #refreshEmptyProvidersInBackground(): Promise<void> {
+		if (this.#disposed || this.#scopedModels.length > 0) return;
+		const discoverable = new Set(this.#registry.getDiscoverableProviders());
+		const populated = new Set(this.#registry.getAll().map(model => model.provider));
+		const now = Date.now();
+		for (const providerId of discoverable) {
+			if (populated.has(providerId) || this.#providerRefreshState.emptyProviderRetryAfter.has(providerId)) continue;
+			const state = this.#registry.getProviderDiscoveryState(providerId);
+			if (
+				state?.attemptedAt &&
+				state.status !== "ok" &&
+				now - state.attemptedAt < EMPTY_PROVIDER_RETRY_COOLDOWN_MS
+			) {
+				this.#providerRefreshState.emptyProviderRetryAfter.set(
+					providerId,
+					state.attemptedAt + EMPTY_PROVIDER_RETRY_COOLDOWN_MS,
+				);
+				this.#providerRefreshState.emptyProviderAutoAttempts.set(
+					providerId,
+					Math.max(1, this.#providerRefreshState.emptyProviderAutoAttempts.get(providerId) ?? 0),
+				);
+			}
+		}
+		const queue = this.#entries
+			.filter(
+				entry =>
+					entry.kind === "provider" &&
+					!entry.locked &&
+					entry.providerId !== undefined &&
+					discoverable.has(entry.providerId) &&
+					!populated.has(entry.providerId),
+			)
+			.map(entry => entry.providerId!);
+		let cursor = 0;
+		const worker = async () => {
+			for (;;) {
+				if (this.#disposed) return;
+				const providerId = queue[cursor++];
+				if (!providerId) return;
+				while (activeProviderRefreshCount >= EMPTY_PROVIDER_REFRESH_CONCURRENCY) {
+					if (this.#disposed) return;
+					await Bun.sleep(10);
+				}
+				while (this.#providerRefreshState.providerRefreshesInFlight.has(providerId)) {
+					if (this.#disposed) return;
+					await Bun.sleep(10);
+				}
+				if (
+					(this.#providerRefreshState.emptyProviderAutoAttempts.get(providerId) ?? 0) >= 2 ||
+					this.#registry.getAll().some(model => model.provider === providerId) ||
+					Date.now() < (this.#providerRefreshState.emptyProviderRetryAfter.get(providerId) ?? 0)
+				) {
+					continue;
+				}
+				this.#providerRefreshState.autoRefreshedProviders.add(providerId);
+				this.#providerRefreshState.emptyProviderAutoAttempts.set(
+					providerId,
+					(this.#providerRefreshState.emptyProviderAutoAttempts.get(providerId) ?? 0) + 1,
+				);
+				this.#providerRefreshState.providerRefreshesInFlight.add(providerId);
+				activeProviderRefreshCount += 1;
+				try {
+					await this.#registry.refreshProvider(providerId, "online");
+				} catch {
+					// Provider discovery state carries the actionable error when available.
+				} finally {
+					this.#finishProviderRefresh(providerId);
+					if (!this.#disposed) {
+						this.#syncFromRegistryState();
+						this.#tui.requestRender();
+					}
+				}
+			}
+		};
+		await Promise.all(
+			Array.from({ length: Math.min(EMPTY_PROVIDER_REFRESH_CONCURRENCY, queue.length) }, () => worker()),
+		);
+		this.#scheduleEmptyProviderRetry();
+	}
+
 	// ═══════════════════════════════════════════════════════════════════════
 	// Provider discovery refresh
 	// ═══════════════════════════════════════════════════════════════════════
@@ -673,23 +860,60 @@ export class ModelHubComponent implements Component {
 
 	#scheduleProviderRefresh(providerId: string, options?: { force?: boolean }): void {
 		if (this.#scopedModels.length > 0 || !providerId) return;
-		if (this.#scheduledProviderRefreshes.has(providerId) || this.#refreshingProviders.has(providerId)) return;
-		// Hovering a provider must not re-fetch on every visit: auto-refresh runs
-		// at most once per provider for the process lifetime. F5 forces a re-fetch.
-		if (!options?.force && autoRefreshedProviders.has(providerId)) return;
+		if (
+			this.#scheduledProviderRefreshes.has(providerId) ||
+			this.#refreshingProviders.has(providerId) ||
+			this.#providerRefreshState.providerRefreshesInFlight.has(providerId)
+		)
+			return;
+		// A successful provider with usable models refreshes at most once per
+		// process. Empty caches/results remain retryable: retaining the lifetime
+		// guard after a zero-model response strands the hub at 0 forever.
+		const providerHasModels = this.#registry.getAll().some(model => model.provider === providerId);
+		const retryableEmpty = !providerHasModels;
+		if (!options?.force && this.#providerRefreshState.autoRefreshedProviders.has(providerId) && !retryableEmpty)
+			return;
+		if (
+			!options?.force &&
+			retryableEmpty &&
+			Date.now() < (this.#providerRefreshState.emptyProviderRetryAfter.get(providerId) ?? 0)
+		)
+			return;
 		this.#setProviderRefreshing(providerId, true);
 		const timer = setTimeout(() => {
+			if (
+				this.#providerRefreshState.providerRefreshesInFlight.has(providerId) ||
+				(!options?.force && Date.now() < (this.#providerRefreshState.emptyProviderRetryAfter.get(providerId) ?? 0))
+			) {
+				this.#scheduledProviderRefreshes.delete(providerId);
+				this.#setProviderRefreshing(providerId, false);
+				this.#tui.requestRender();
+				return;
+			}
 			// Consume the once-guard only when the fetch actually starts: hopping
 			// through a provider cancels the debounce and must not burn its slot.
-			autoRefreshedProviders.add(providerId);
+			this.#providerRefreshState.autoRefreshedProviders.add(providerId);
+			if (!options?.force && retryableEmpty) {
+				this.#providerRefreshState.emptyProviderAutoAttempts.set(
+					providerId,
+					(this.#providerRefreshState.emptyProviderAutoAttempts.get(providerId) ?? 0) + 1,
+				);
+			}
+			this.#providerRefreshState.providerRefreshesInFlight.add(providerId);
+			activeProviderRefreshCount += 1;
 			this.#scheduledProviderRefreshes.delete(providerId);
-			void this.#refreshProviderInBackground(providerId);
+			void this.#refreshProviderInBackground(providerId, options?.force === true, retryableEmpty);
 		}, PROVIDER_REFRESH_DEBOUNCE_MS);
 		this.#scheduledProviderRefreshes.set(providerId, timer);
 	}
 
-	async #refreshProviderInBackground(providerId: string): Promise<void> {
+	async #refreshProviderInBackground(providerId: string, force: boolean, providerWasEmpty: boolean): Promise<void> {
 		try {
+			await this.#initialRegistrySync;
+			if (!force && providerWasEmpty && this.#registry.getAll().some(model => model.provider === providerId)) {
+				this.#providerRefreshState.autoRefreshedProviders.add(providerId);
+				return;
+			}
 			await this.#registry.refreshProvider(providerId, "online");
 			// The provider refresh already updated the registry snapshot;
 			// re-reading it here stays purely in-memory.
@@ -697,8 +921,9 @@ export class ModelHubComponent implements Component {
 		} catch (error) {
 			this.#configError = error instanceof Error ? error.message : String(error);
 		} finally {
+			this.#finishProviderRefresh(providerId);
 			this.#setProviderRefreshing(providerId, false);
-			this.#tui.requestRender();
+			if (!this.#disposed) this.#tui.requestRender();
 		}
 	}
 
@@ -722,10 +947,20 @@ export class ModelHubComponent implements Component {
 		if (!state) return undefined;
 		const age = this.#formatDiscoveryAge(state.fetchedAt);
 		switch (state.status) {
-			case "cached":
+			case "cached": {
+				const pending =
+					this.#refreshingProviders.has(providerId) ||
+					this.#scheduledProviderRefreshes.has(providerId) ||
+					this.#providerRefreshState.providerRefreshesInFlight.has(providerId);
+				if (pending) {
+					return age
+						? `  Using cached model list from ${age}. Live refresh is still pending.`
+						: "  Using cached model list. Live refresh is still pending.";
+				}
 				return age
-					? `  Using cached model list from ${age}. Live refresh is still pending.`
-					: "  Using cached model list. Live refresh is still pending.";
+					? `  Using cached model list from ${age}. Press F5 to refresh.`
+					: "  Using cached model list. Press F5 to refresh.";
+			}
 			case "unavailable": {
 				const httpMatch = state.error?.match(/^HTTP (\d+) from (.+)$/);
 				if (httpMatch?.[1] === "404") {

@@ -55,6 +55,31 @@ describe("Tokenizer", () => {
 });
 
 describe("countTokens with modes", () => {
+	test("stale native encoding degrades only non-strict modes", () => {
+		const staleEncodingError = Object.assign(
+			new Error('value `"KimiK2"` does not match any variant of enum `Encoding`'),
+			{ code: "InvalidArg" },
+		);
+		const staleNativeCounter = (() => {
+			throw staleEncodingError;
+		}) as never;
+		const tokenizer = new Tokenizer({ tokenizer: "kimi-k2" }, staleNativeCounter);
+
+		expect(tokenizer.countTokens("hello world", "approximate")).toBe(3);
+		expect(tokenizer.countTokens("hello world", "upperbound")).toBe(11);
+		expect(() => tokenizer.countTokens("hello world", "strict")).toThrow(staleEncodingError);
+	});
+
+	test("does not swallow unrelated native argument errors", () => {
+		const unrelated = Object.assign(new Error("bad tokenizer argument"), { code: "InvalidArg" });
+		const failingNativeCounter = (() => {
+			throw unrelated;
+		}) as never;
+		const tokenizer = new Tokenizer({ tokenizer: "kimi-k2" }, failingNativeCounter);
+
+		expect(() => tokenizer.countTokens("hello", "approximate")).toThrow(unrelated);
+	});
+
 	test("approximate mode uses fast estimation", () => {
 		const tokenizer = new Tokenizer();
 		expect(tokenizer.countTokens("hello world", "approximate")).toBe(3);
@@ -76,8 +101,10 @@ describe("countTokens with modes", () => {
 		// approximate/upperbound skip the encoding entirely under NODE_ENV=test
 		// (fast estimate for a snappy suite); strict is testEnv-independent, so
 		// it is the mode that proves per-instance encoding isolation here.
-		const claude = new Tokenizer({ tokenizer: "claude-v47" });
-		const generic = new Tokenizer({});
+		const nativeCounter = ((_text: string | string[], encoding?: Encoding | null) =>
+			encoding === Encoding.ClaudeV47 ? 7 : 2) as never;
+		const claude = new Tokenizer({ tokenizer: "claude-v47" }, nativeCounter);
+		const generic = new Tokenizer({}, nativeCounter);
 		expect(claude.countTokens("hello world", "strict")).not.toBe(generic.countTokens("hello world", "strict"));
 	});
 });

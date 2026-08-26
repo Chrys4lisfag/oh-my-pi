@@ -14,12 +14,15 @@
  * redraw — that per-event recompute is what previously froze large sessions.
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { Tokenizer } from "@oh-my-pi/pi-agent-core";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ContextUsage } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { StatusLineComponent } from "@oh-my-pi/pi-coding-agent/modes/components/status-line";
 import { initTheme, setSymbolPreset, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { computeNonMessageBreakdown } from "@oh-my-pi/pi-coding-agent/modes/utils/context-usage";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { getSessionAccentAnsi } from "@oh-my-pi/pi-coding-agent/utils/session-color";
+import { Encoding } from "@oh-my-pi/pi-natives";
 import { adjustHsv } from "@oh-my-pi/pi-utils";
 
 beforeAll(async () => {
@@ -111,6 +114,36 @@ function assistantMessage(text: string): unknown {
 }
 
 describe("StatusLineComponent context breakdown", () => {
+	it("renders finite usage when a stale native addon rejects the model encoding", () => {
+		const attemptedEncodings: Array<Encoding | null | undefined> = [];
+		const staleNativeCounter = ((_text: string | string[], encoding?: Encoding | null) => {
+			attemptedEncodings.push(encoding);
+			if (encoding === Encoding.KimiK2) {
+				throw Object.assign(new Error('value `"KimiK2"` does not match any variant of enum `Encoding`'), {
+					code: "InvalidArg",
+				});
+			}
+			return 3;
+		}) as never;
+		const tokenizer = new Tokenizer({ tokenizer: "kimi-k2" } as never, staleNativeCounter);
+		const source = { systemPrompt: ["base prompt", "profile context"], agent: { state: { tools: [] } }, skills: [] };
+		const { session } = makeSession({ messages: [userMessage("hello")], contextWindow: 128_000 });
+		(session as { getContextUsage: () => ContextUsage }).getContextUsage = () => {
+			const categories = computeNonMessageBreakdown(source as never, tokenizer);
+			const tokens = Object.values(categories).reduce((sum, value) => sum + value, 0);
+			return { tokens, contextWindow: 128_000, percent: (tokens / 128_000) * 100 };
+		};
+
+		const component = new StatusLineComponent(session);
+		const breakdown = component.getCachedContextBreakdown();
+		const border = component.getTopBorder(100);
+
+		expect(breakdown.usedTokens).toBeGreaterThan(0);
+		expect(Number.isFinite(breakdown.usedTokens / breakdown.contextWindow)).toBe(true);
+		expect(border.content.length).toBeGreaterThan(0);
+		expect(attemptedEncodings).toContain(Encoding.KimiK2);
+	});
+
 	it("surfaces the provider-anchored tokens and context window from getContextUsage", () => {
 		const { session } = makeSession({
 			messages: [userMessage("hi")],

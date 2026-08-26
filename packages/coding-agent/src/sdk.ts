@@ -1409,6 +1409,39 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	const hasThinkingEntry = existingBranch.some(entry => entry.type === "thinking_level_change");
 	const hasServiceTierEntry = existingBranch.some(entry => entry.type === "service_tier_change");
 
+	// A resumed session can belong to a different config profile than the one
+	// active on disk for this process. Bind the terminal-local Settings to the
+	// session's recorded profile before resolving role defaults or restoring
+	// the session model, so persisted edits route to the owning profile and the
+	// first-prompt synchronized apply re-pins to it instead of the startup
+	// default. Legacy sessions without a recorded profile stay explicitly
+	// unbound: auto-applying the disk-active profile would hijack the session's
+	// model, and persisted edits would corrupt an unrelated profile.
+	const sessionHeaderProfile = sessionManager.getHeader()?.profile;
+	const sessionProfile: string | null | undefined = hasExistingSession
+		? typeof sessionHeaderProfile === "string" && sessionHeaderProfile.length > 0
+			? settings.bindSessionToProfile(sessionHeaderProfile)
+				? sessionHeaderProfile
+				: null
+			: null
+		: undefined;
+
+	// Stamp the active config profile onto a brand-new session's header so a
+	// future resume can bind to the same profile. Legacy resumed sessions are
+	// deliberately left unbound above; stamping them here would attribute the
+	// session (and its persisted edits) to whichever profile is the startup
+	// default this process happened to load.
+	if (!hasExistingSession && !sessionManager.getSessionProfile()) {
+		const stampProfile = settings.activeProfileName();
+		if (stampProfile) await sessionManager.setSessionProfile(stampProfile);
+	}
+	if (sessionProfile === null) {
+		// With no recorded identity, retire profile ownership entirely so a
+		// persisted model/thinking edit can never be written into the loaded
+		// startup-default profile's snapshot. The user re-binds explicitly.
+		settings.unbindSessionFromProfile();
+	}
+
 	const deferredModelPatterns = Array.isArray(options.modelPattern)
 		? options.modelPattern.map(pattern => pattern.trim()).filter(Boolean)
 		: options.modelPattern?.trim()
@@ -3393,6 +3426,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// status-line cost total would restart at zero for the rest of the session.
 		const initialAdvisorCosts = await loadAdvisorTranscriptCosts(sessionManager.getSessionFile());
 		session = new AgentSession({
+			sessionProfile,
 			advisorWatchdogPrompt,
 			advisorContextPrompt,
 			advisorSharedInstructions: discoveredAdvisors.sharedInstructions,

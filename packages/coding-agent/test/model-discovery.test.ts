@@ -2243,6 +2243,35 @@ providers:
 		expect(registry.find("lm-studio-test", "local-vlm")?.input).toEqual(["text", "image"]);
 	});
 
+	test("lm-studio discovery uses its override without changing the inference route", async () => {
+		const inferenceBaseUrl = "https://example.com/v1/oneapi/proxy/11";
+		writeRawModelsJson({
+			"lm-studio-test": {
+				baseUrl: inferenceBaseUrl,
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "lm-studio", baseUrl: "https://catalog.example.com/v1?tenant=lm" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "https://catalog.example.com/v1/models?tenant=lm") {
+				return Response.json({ data: [{ id: "split-lm-studio" }] });
+			}
+			if (url === "https://catalog.example.com/api/v0/models?tenant=lm") {
+				return Response.json({
+					data: [{ id: "split-lm-studio", type: "vlm", capabilities: ["vision"], state: "loaded" }],
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+
+		expect(registry.find("lm-studio-test", "split-lm-studio")?.baseUrl).toBe(inferenceBaseUrl);
+		expect(registry.find("lm-studio-test", "split-lm-studio")?.input).toEqual(["text", "image"]);
+	});
+
 	test("proxy discovery honors API-reported context_length and endpoint routing", async () => {
 		writeRawModelsJson({
 			"proxy-test": {
@@ -2280,6 +2309,30 @@ providers:
 		// never pinning the model at a broken `0` window.
 		const zeroCtx = registry.getAll().find(m => m.provider === "proxy-test" && m.id === "zero-context-model");
 		expect(zeroCtx?.contextWindow).toBe(128000);
+	});
+
+	test("proxy discovery uses its override without changing the inference route", async () => {
+		const inferenceBaseUrl = "https://example.com/v1/oneapi/proxy/11";
+		writeRawModelsJson({
+			"proxy-test": {
+				baseUrl: inferenceBaseUrl,
+				auth: "none",
+				discovery: { type: "proxy", baseUrl: "https://catalog.example.com/v1?tenant=proxy" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "https://catalog.example.com/v1/models?tenant=proxy") {
+				return Response.json({
+					data: [{ id: "split-proxy", supported_endpoint_types: ["openai"] }],
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+
+		expect(registry.find("proxy-test", "split-proxy")?.baseUrl).toBe(inferenceBaseUrl);
 	});
 
 	test("proxy discovery uses proxy-reported name over bundled placeholder", async () => {
@@ -2383,6 +2436,82 @@ providers:
 		expect(model?.maxTokens).toBe(16_384);
 		expect(model?.input).toEqual(["text", "image"]);
 		expect(model?.reasoning).toBe(true);
+	});
+
+	test("litellm discovery uses its override without changing the inference route", async () => {
+		writeRawModelsJson({
+			"litellm-test": {
+				baseUrl: "https://example.com/v1/oneapi/proxy/11",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "litellm", baseUrl: "https://catalog.example.com/v1" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "https://catalog.example.com/model_group/info") {
+				return Response.json({ data: [{ model_group: "split-litellm" }] });
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+
+		expect(registry.find("litellm-test", "split-litellm")?.baseUrl).toBe("https://example.com/v1/oneapi/proxy/11");
+	});
+
+	test("litellm discovery-only base URL also becomes the inference route", async () => {
+		writeRawModelsJson({
+			"litellm-test": {
+				apiKey: "TEST_KEY",
+				api: "openai-completions",
+				auth: "apiKey",
+				discovery: { type: "litellm", baseUrl: "https://catalog.example.com/v1" },
+			},
+		});
+		const fetchMock: FetchImpl = async (input, init) => {
+			const url = String(input);
+			expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer TEST_KEY");
+			if (url === "https://catalog.example.com/model_group/info") {
+				return Response.json({ data: [{ model_group: "discovery-only" }] });
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+
+		expect(registry.find("litellm-test", "discovery-only")?.baseUrl).toBe("https://catalog.example.com/v1");
+	});
+
+	test("litellm fallback keeps split discovery and inference routes", async () => {
+		const inferenceBaseUrl = "https://example.com/v1/oneapi/proxy/11";
+		writeRawModelsJson({
+			"litellm-test": {
+				baseUrl: inferenceBaseUrl,
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "litellm", baseUrl: "https://catalog.example.com/v1" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (
+				url === "https://catalog.example.com/model_group/info" ||
+				url === "https://catalog.example.com/v2/model/info" ||
+				url === "https://catalog.example.com/model/info" ||
+				url === "https://catalog.example.com/v1/model/info"
+			) {
+				return new Response("{}", { status: 404 });
+			}
+			if (url === "https://catalog.example.com/v1/models") {
+				return Response.json({ data: [{ id: "split-fallback" }] });
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+
+		expect(registry.find("litellm-test", "split-fallback")?.baseUrl).toBe(inferenceBaseUrl);
 	});
 
 	test("litellm discovery enriches configured proxy models with bundled references", async () => {

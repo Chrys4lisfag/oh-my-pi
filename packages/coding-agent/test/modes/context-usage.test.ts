@@ -16,6 +16,7 @@ import {
 	estimateToolSchemaTokens,
 	renderContextUsage,
 } from "@oh-my-pi/pi-coding-agent/modes/utils/context-usage";
+import { Encoding } from "@oh-my-pi/pi-natives";
 
 const tokenizer = new Tokenizer();
 
@@ -105,6 +106,30 @@ describe("computeNonMessageTokens / computeNonMessageBreakdown memoization", () 
 	function makeSession(systemPrompt: string[], tools: unknown[] = [], skills: unknown[] = []) {
 		return { systemPrompt, agent: { state: { tools } }, skills };
 	}
+
+	it("keeps non-message breakdown usable when a stale native addon rejects the model encoding", () => {
+		const attemptedEncodings: Array<Encoding | null | undefined> = [];
+		const staleNativeCounter = ((_text: string | string[], encoding?: Encoding | null) => {
+			attemptedEncodings.push(encoding);
+			if (encoding === Encoding.KimiK2) {
+				throw Object.assign(new Error('value `"KimiK2"` does not match any variant of enum `Encoding`'), {
+					code: "InvalidArg",
+				});
+			}
+			return 3;
+		}) as never;
+		const staleCompatibleTokenizer = new Tokenizer({ tokenizer: "kimi-k2" } as never, staleNativeCounter);
+
+		const breakdown = computeNonMessageBreakdown(
+			makeSession(["base system prompt", "additional context"]) as never,
+			staleCompatibleTokenizer,
+		);
+
+		expect(Object.values(breakdown).every(Number.isFinite)).toBe(true);
+		expect(breakdown.systemContextTokens).toBeGreaterThan(0);
+		expect(attemptedEncodings).toContain(Encoding.KimiK2);
+		expect(attemptedEncodings).not.toContain(undefined);
+	});
 
 	it("recomputes when the system prompt reference changes and caches otherwise", () => {
 		const session = makeSession(["system prompt alpha"]);

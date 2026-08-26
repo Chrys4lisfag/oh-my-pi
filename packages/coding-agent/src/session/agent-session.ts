@@ -499,6 +499,10 @@ export class AgentSession {
 	#settingsSyncApplyPromise: Promise<void> = Promise.resolve();
 	#synchronizedProfileApplyPending = false;
 	#synchronizedProfileApplyGeneration = 0;
+	/** Config profile this session is bound to (resume/explicit switch). */
+	#sessionProfile?: string | null;
+	/** Legacy resumed session with no recorded profile: skip auto synchronized applies. */
+	#sessionProfileUnbound = false;
 	#unsubscribeExtendedContext?: () => void;
 	/** Last (enable, providerId) tuple resolved by `#syncAppendOnlyContext` — used to skip no-op invalidations. */
 	#lastAppendOnlyResolution?: { enable: boolean; providerId: string | undefined };
@@ -984,6 +988,8 @@ export class AgentSession {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
+		this.#sessionProfile = config.sessionProfile;
+		this.#sessionProfileUnbound = config.sessionProfile === null;
 		this.#modelRegistry = config.modelRegistry;
 		this.#codexResetCoordinator = config.codexResetCoordinator ?? defaultCodexAutoRedeemCoordinator;
 		const bashHost: BashRunnerHost = {
@@ -4811,6 +4817,18 @@ export class AgentSession {
 		return this.#tryShakeEnabled;
 	}
 
+	setTryShakeCheckpointStepTokens(tokens: number): void {
+		this.#maintenance.setTryShakeCheckpointStepTokens(tokens);
+	}
+
+	getTryShakeCheckpointStepTokens(): number {
+		return this.#maintenance.tryShakeCheckpointStepTokens;
+	}
+
+	getNextTryShakeCheckpointTokens(): number {
+		return this.#maintenance.nextTryShakeCheckpointTokens;
+	}
+
 	/**
 	 * Whether idle-flush tasks, auto-continuations, or other short-lived
 	 * post-prompt work are pending.  True in the brief window after
@@ -5007,6 +5025,7 @@ export class AgentSession {
 	/** Drop mutable tool decisions and directives owned by the previous logical session. */
 	#clearSessionScopedToolState(): void {
 		this.#tryShakeEnabled = false;
+		this.#maintenance.resetTryShakeCheckpoints();
 		this.agent.clearDeferredToolDirectives();
 		this.#toolChoiceQueue.clear();
 		this.#tools.clearAcpPermissionDecisions();
@@ -5652,11 +5671,13 @@ export class AgentSession {
 			this.#resetPromptMaintenanceState();
 			this.#recovery.setAcceptTerminalEmptyStop(options?.acceptTerminalEmptyStop === true);
 
-			// Validate configured default model
-			const configuredDefault = this.settings.getModelRole("default");
-			if (configuredDefault && !this.resolveRoleModel("default")) {
+			// Validate configured default model. Uses the same availability
+			// state the status line renders, so the reject and the footer can
+			// never name different models.
+			const configuredDefaultState = this.getConfiguredDefaultModelState();
+			if (configuredDefaultState.unavailable) {
 				throw new Error(
-					`Default model "${configuredDefault}" is unavailable.\n\n` +
+					`Default model "${configuredDefaultState.configuredSelector}" is unavailable.\n\n` +
 						"Use /login, set API key environment variables, or use /model to select a working model.",
 				);
 			}
@@ -7125,8 +7146,8 @@ export class AgentSession {
 	}
 
 	/** Advances through the thinking selectors supported by the active model. */
-	cycleThinkingLevel(): ConfiguredThinkingLevel | undefined {
-		return this.#models.cycleThinkingLevel();
+	cycleThinkingLevel(persist: boolean = false): ConfiguredThinkingLevel | undefined {
+		return this.#models.cycleThinkingLevel(persist);
 	}
 
 	/** Reports whether `/fast` is enabled for the active model family. */
@@ -9587,6 +9608,10 @@ export class AgentSession {
 	 * sent through the previous profile's model.
 	 */
 	#queueSynchronizedProfileApply(): void {
+		// A legacy resumed session without a recorded profile must not let every
+		// disk save re-pin its runtime model to the startup-default profile.
+		// Wait for an explicit `/profiles switch` to bind ownership first.
+		if (this.#sessionProfileUnbound) return;
 		const generation = ++this.#synchronizedProfileApplyGeneration;
 		this.#synchronizedProfileApplyPending = Boolean(
 			this.settings.getModelRole("default") && !this.resolveRoleModel("default"),
@@ -9669,6 +9694,51 @@ export class AgentSession {
 			}
 			throw error;
 		}
+	}
+
+	/** Config profile this session is bound to, or undefined when unbound/legacy. */
+	getSessionProfileName(): string | undefined {
+		if (this.#sessionProfile === null) return undefined;
+		if (this.#sessionProfile !== undefined) return this.#sessionProfile;
+		return this.settings.activeProfileName();
+	}
+
+	/**
+	 * Bind this session to an existing config profile and apply it live.
+	 * Terminal-local: the durable startup profile marker on disk is untouched.
+	 * Stamps the identity onto the session header, clears any legacy-unbound
+	 * guard, and re-pins the runtime model/thinking/advisors to the profile.
+	 * Returns false when `name` does not denote a valid profile.
+	 */
+	async bindSessionProfile(name: string): Promise<boolean> {
+		if (!this.settings.bindSessionToProfile(name)) return false;
+		this.#sessionProfile = name;
+		this.#sessionProfileUnbound = false;
+		await this.sessionManager.setSessionProfile(name);
+		await this.applyProfileToSession();
+		return true;
+	}
+
+	/**
+	 * Single source of truth for the configured default model's availability,
+	 * shared by prompt preflight and the status line so they can never diverge.
+	 * `runtimeModel` may lag `configuredSelector` while an unavailable default
+	 * keeps the previous runtime model in place for display/repair.
+	 */
+	getConfiguredDefaultModelState(): {
+		configuredSelector: string | undefined;
+		resolvedModel: Model | undefined;
+		runtimeModel: Model | undefined;
+		unavailable: boolean;
+	} {
+		const configuredSelector = this.settings.getModelRole("default");
+		const resolvedModel = configuredSelector ? this.resolveRoleModel("default") : undefined;
+		return {
+			configuredSelector,
+			resolvedModel,
+			runtimeModel: this.model,
+			unavailable: Boolean(configuredSelector && !resolvedModel),
+		};
 	}
 
 	/**

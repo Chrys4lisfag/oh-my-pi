@@ -123,6 +123,16 @@ export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
 	settings: Settings;
+	/**
+	 * Config profile this session is bound to. A concrete name means the
+	 * session's Settings are terminal-locally bound to that profile (resume or
+	 * explicit switch). `null` marks an explicitly unbound legacy resume:
+	 * synchronized profile applies must wait for an explicit profile switch so
+	 * the disk-active profile cannot hijack the session's model or receive its
+	 * persisted edits. Undefined (default) means a fresh session owned by the
+	 * current settings active profile.
+	 */
+	sessionProfile?: string | null;
 	/** Whether the session spawn policy permits the read-only `scout` subagent. Defaults to true. */
 	scoutAllowedBySpawnPolicy?: boolean;
 	/** Whether the caller explicitly requested yolo/auto-approve behavior for this session. */

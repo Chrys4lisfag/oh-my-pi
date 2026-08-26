@@ -1,4 +1,5 @@
 import { settings } from "./settings";
+import type { SettingValue } from "./settings-schema";
 
 export interface ProfileSnapshot {
 	modelRoles: Record<string, string>;
@@ -78,9 +79,7 @@ export function captureProfileActivationState(): ProfileActivationState {
 
 /** Restore live profile settings after a failed session-level apply. */
 export function restoreProfileActivation(state: ProfileActivationState): void {
-	settings.applyProfileSnapshot(state.snapshot);
-	const items = settings.get("profiles.items");
-	settings.set("profiles.active", state.name && asSnapshot(items[state.name]) ? state.name : "");
+	settings.restoreProfileActivation(state.name, state.snapshot);
 }
 
 /**
@@ -100,8 +99,9 @@ export function addProfile(name: string, snapshot?: ProfileSnapshot): void {
 		settings.setProfileItem("default", captureCurrentSnapshot());
 	}
 
-	settings.setProfileItem(name, snapshot ?? captureCurrentSnapshot());
-	settings.set("profiles.active", name);
+	const nextSnapshot = snapshot ?? captureCurrentSnapshot();
+	settings.setProfileItem(name, nextSnapshot);
+	settings.activateProfile(name, nextSnapshot);
 }
 
 /**
@@ -125,12 +125,9 @@ export function switchProfile(name: string): void {
 		return;
 	}
 
-	// Auto-save live config back to the active profile before switching, then
-	// pin the target. Both go through the per-key `setProfileItem` so a
-	// concurrent instance's other profiles are never clobbered on save.
-	if (active && active in items) {
-		settings.setProfileItem(active, captureCurrentSnapshot());
-	}
+	// Persisted live edits already update the active profile as granular
+	// thinking/per-role deltas. Do not replace its whole potentially stale
+	// snapshot here; explicit runtime overrides remain terminal-local.
 	settings.activateProfile(name, snapshot);
 }
 
@@ -185,7 +182,9 @@ export function saveActiveProfile(): void {
 		throw new Error("No active profile to save");
 	}
 
-	settings.setProfileItem(active, captureCurrentSnapshot());
+	const snapshot = captureCurrentSnapshot();
+	settings.set("modelRoles", snapshot.modelRoles);
+	settings.set("defaultThinkingLevel", snapshot.defaultThinkingLevel as SettingValue<"defaultThinkingLevel">);
 }
 
 /**

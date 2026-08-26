@@ -92,6 +92,43 @@ describe("status line model segment advisor badge", () => {
 	});
 });
 
+describe("status line model segment configured/runtime consistency", () => {
+	it("shows the active smol runtime model instead of the resolved default", () => {
+		const ctx = createModelContext(false);
+		ctx.session.state.model = { id: "deepseek-flash", name: "DeepSeek V4 Flash" } as never;
+		ctx.session.getConfiguredDefaultModelState = () =>
+			({
+				configuredSelector: "openai/gpt-5.6-sol:high",
+				resolvedModel: { id: "gpt-5.6-sol", name: "GPT-5.6-Sol" },
+				runtimeModel: ctx.session.state.model,
+				unavailable: false,
+			}) as never;
+
+		const content = Bun.stripANSI(renderSegment("model", ctx).content);
+		expect(content).toContain("DeepSeek V4 Flash");
+		expect(content).not.toContain("GPT-5.6-Sol");
+	});
+
+	it("shows an unavailable configured default instead of the retained runtime model", () => {
+		const ctx = createModelContext(false);
+		ctx.session.state.model = { id: "daybreak-blue", name: "Daybreak Blue" } as never;
+		ctx.session.isFastModeActive = () => true;
+		ctx.session.getConfiguredDefaultModelState = () =>
+			({
+				configuredSelector: "ollama-cloud/gpt-oss:120b:high",
+				resolvedModel: undefined,
+				runtimeModel: ctx.session.state.model,
+				unavailable: true,
+			}) as never;
+
+		const content = Bun.stripANSI(renderSegment("model", ctx).content);
+		expect(content).toContain("ollama-cloud/gpt-oss:120b:high");
+		expect(content).toContain("[unavailable]");
+		expect(content).not.toContain("Daybreak Blue");
+		if (theme.icon.fast) expect(content).not.toContain(theme.icon.fast);
+	});
+});
+
 describe("status line model segment compact thinking level", () => {
 	function createThinkingContext(compactThinkingLevel: boolean): SegmentContext {
 		return {

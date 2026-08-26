@@ -15,6 +15,10 @@ import { logger, TempDir } from "@oh-my-pi/pi-utils";
 const PROVIDER = "anthropic";
 const INITIAL_MODEL_ID = "claude-sonnet-4-5";
 const FALLBACK_MODEL_ID = "claude-haiku-4-5";
+type TestProfileSnapshot = { modelRoles: Record<string, string>; defaultThinkingLevel: string };
+function profileSnapshot(settings: Settings, name: string): TestProfileSnapshot | undefined {
+	return settings.get("profiles.items")[name] as TestProfileSnapshot | undefined;
+}
 
 describe("live profile synchronization", () => {
 	let tempDir: TempDir;
@@ -50,9 +54,10 @@ describe("live profile synchronization", () => {
 			modelRoles: { default: `${PROVIDER}/${FALLBACK_MODEL_ID}` },
 			defaultThinkingLevel: Effort.Low,
 		});
-		writer.set("profiles.active", "selected");
-		writer.set("modelRoles", { default: `${PROVIDER}/${INITIAL_MODEL_ID}` });
-		writer.set("defaultThinkingLevel", Effort.Medium);
+		writer.activateProfile("selected", {
+			modelRoles: { default: `${PROVIDER}/${INITIAL_MODEL_ID}` },
+			defaultThinkingLevel: Effort.Medium,
+		});
 		await writer.flush();
 
 		peer = await writer.cloneForCwd(tempDir.path());
@@ -96,32 +101,131 @@ describe("live profile synchronization", () => {
 		} catch {}
 	});
 
-	it("does not switch other running sessions when one terminal switches active profile", async () => {
+	it("isolates a switch and subsequent edit to a different active profile", async () => {
 		writer.activateProfile("fallback", {
 			modelRoles: { default: `${PROVIDER}/${FALLBACK_MODEL_ID}` },
 			defaultThinkingLevel: Effort.High,
 		});
+		writer.set("defaultThinkingLevel", Effort.Low);
 		await writer.flush();
 
-		await Bun.sleep(400);
+		await waitFor(() => profileSnapshot(peer, "fallback")?.defaultThinkingLevel === Effort.Low);
 
-		// Peer was on "selected" and "selected" still exists on disk, so peer must STAY on "selected"
 		expect(peer.get("profiles.active")).toBe("selected");
 		expect(peer.getModelRole("default")).toBe(`${PROVIDER}/${INITIAL_MODEL_ID}`);
 		expect(session.model?.id).toBe(INITIAL_MODEL_ID);
 		expect(peer.get("defaultThinkingLevel")).toBe(Effort.Medium);
+		expect(profileSnapshot(writer, "fallback")?.defaultThinkingLevel).toBe(Effort.Low);
 	});
 
-	it("does not switch other running sessions when one terminal updates its model roles", async () => {
-		writer.setModelRole("default", `${PROVIDER}/${FALLBACK_MODEL_ID}`);
+	it("applies the save-time freshest activation snapshot to the activating session", async () => {
+		writer.setProfileItem("fallback", {
+			modelRoles: { default: `${PROVIDER}/${FALLBACK_MODEL_ID}` },
+			defaultThinkingLevel: Effort.Low,
+		});
 		await writer.flush();
 
-		await Bun.sleep(400);
+		peer.activateProfile("fallback", {
+			modelRoles: { default: `${PROVIDER}/${INITIAL_MODEL_ID}` },
+			defaultThinkingLevel: Effort.High,
+		});
+		await peer.flush();
+		await waitFor(
+			() =>
+				peer.get("profiles.active") === "fallback" &&
+				peer.getModelRole("default") === `${PROVIDER}/${FALLBACK_MODEL_ID}` &&
+				peer.get("defaultThinkingLevel") === Effort.Low &&
+				session.model?.id === FALLBACK_MODEL_ID &&
+				session.thinkingLevel === Effort.Low,
+		);
+	});
 
-		// Peer keeps its active profile snapshot
-		expect(peer.get("profiles.active")).toBe("selected");
-		expect(peer.getModelRole("default")).toBe(`${PROVIDER}/${INITIAL_MODEL_ID}`);
-		expect(session.model?.id).toBe(INITIAL_MODEL_ID);
+	it("propagates a live model edit to both sessions using the same profile", async () => {
+		const initialModel = getBundledModel(PROVIDER, INITIAL_MODEL_ID);
+		const fallbackModel = getBundledModel(PROVIDER, FALLBACK_MODEL_ID);
+		if (!initialModel || !fallbackModel) throw new Error("Expected bundled profile test models");
+		const mock = createMockModel({ handler: () => ({ content: ["ok"] }) });
+		const writerSession = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model: initialModel,
+					thinkingLevel: Effort.Medium,
+					systemPrompt: ["Test"],
+					tools: [],
+					messages: [],
+				},
+				streamFn: mock.stream,
+			}),
+			sessionManager: SessionManager.inMemory(),
+			settings: writer,
+			modelRegistry,
+		});
+
+		try {
+			await writerSession.setModel(fallbackModel, "default", { persist: true });
+			await writer.flush();
+			await waitFor(
+				() =>
+					peer.getModelRole("default") === `${PROVIDER}/${FALLBACK_MODEL_ID}` &&
+					writerSession.model?.id === FALLBACK_MODEL_ID &&
+					session.model?.id === FALLBACK_MODEL_ID,
+			);
+
+			expect(peer.get("profiles.active")).toBe("selected");
+			expect(profileSnapshot(writer, "selected")?.modelRoles.default).toBe(`${PROVIDER}/${FALLBACK_MODEL_ID}`);
+			expect(profileSnapshot(peer, "selected")?.modelRoles.default).toBe(`${PROVIDER}/${FALLBACK_MODEL_ID}`);
+		} finally {
+			await writerSession.dispose();
+		}
+	});
+
+	it("propagates thinking edits between two live sessions without reverting the source", async () => {
+		const initialModel = getBundledModel(PROVIDER, INITIAL_MODEL_ID);
+		if (!initialModel) throw new Error(`Expected bundled model ${PROVIDER}/${INITIAL_MODEL_ID}`);
+		const mock = createMockModel({ handler: () => ({ content: ["ok"] }) });
+		const writerSession = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model: initialModel,
+					thinkingLevel: Effort.Medium,
+					systemPrompt: ["Test"],
+					tools: [],
+					messages: [],
+				},
+				streamFn: mock.stream,
+			}),
+			sessionManager: SessionManager.inMemory(),
+			settings: writer,
+			modelRegistry,
+		});
+
+		try {
+			writerSession.setThinkingLevel(Effort.High, true);
+			await writer.flush();
+			await waitFor(
+				() =>
+					peer.get("defaultThinkingLevel") === Effort.High &&
+					writerSession.thinkingLevel === Effort.High &&
+					session.thinkingLevel === Effort.High,
+			);
+
+			// Exact user scenario: terminal 1 changes shared profile high → medium.
+			session.setThinkingLevel(Effort.Medium, true);
+			await peer.flush();
+			// No manual sync: writer watcher must update terminal 2 and its live session.
+			await waitFor(
+				() =>
+					writer.get("defaultThinkingLevel") === Effort.Medium &&
+					peer.get("defaultThinkingLevel") === Effort.Medium &&
+					writerSession.thinkingLevel === Effort.Medium &&
+					session.thinkingLevel === Effort.Medium,
+			);
+
+			expect(profileSnapshot(writer, "selected")?.defaultThinkingLevel).toBe(Effort.Medium);
+			expect(profileSnapshot(peer, "selected")?.defaultThinkingLevel).toBe(Effort.Medium);
+		} finally {
+			await writerSession.dispose();
+		}
 	});
 
 	it("preserves local live model and thinking edits across unrelated external writes", async () => {
@@ -303,5 +407,114 @@ describe("live profile synchronization", () => {
 		await Bun.sleep(400);
 		// Peer was disposed, so it did not run deletion sync
 		expect(peer.get("profiles.active")).toBe("selected");
+	});
+
+	it("binds resumed settings to the recorded profile without changing the durable active marker", async () => {
+		expect(peer.bindSessionToProfile("fallback")).toBe(true);
+		expect(peer.get("profiles.active")).toBe("fallback");
+		expect(peer.getModelRole("default")).toBe(`${PROVIDER}/${FALLBACK_MODEL_ID}`);
+		expect(peer.get("defaultThinkingLevel")).toBe(Effort.High);
+		expect(peer.bindSessionToProfile("does-not-exist")).toBe(false);
+
+		// Binding is terminal-local: the next save keeps the startup marker.
+		await peer.flush();
+		await writer.syncFromDisk();
+		expect(writer.get("profiles.active")).toBe("selected");
+	});
+
+	it("routes persisted model edits to the bound profile, not the startup default", async () => {
+		const selectedModel = "openai/gpt-5";
+		writer.setProfileItem("selected", {
+			modelRoles: { default: selectedModel },
+			defaultThinkingLevel: Effort.Low,
+		});
+		await writer.flush();
+		await peer.syncFromDisk();
+
+		expect(peer.bindSessionToProfile("fallback")).toBe(true);
+		peer.setModelRole("default", `${PROVIDER}/${INITIAL_MODEL_ID}`);
+		await peer.flush();
+		await writer.syncFromDisk();
+
+		const items = writer.get("profiles.items") as Record<
+			string,
+			{ modelRoles: Record<string, string>; defaultThinkingLevel: string }
+		>;
+		expect(items.fallback.modelRoles.default).toBe(`${PROVIDER}/${INITIAL_MODEL_ID}`);
+		expect(items.selected.modelRoles.default).toBe(selectedModel);
+	});
+
+	it("keeps a legacy unbound resumed session from auto-applying the disk-active profile", async () => {
+		const fallbackModel = getBundledModel(PROVIDER, FALLBACK_MODEL_ID);
+		if (!fallbackModel) throw new Error(`Expected bundled model ${PROVIDER}/${FALLBACK_MODEL_ID}`);
+		const mock = createMockModel({ handler: () => ({ content: ["ok"] }) });
+		const legacySession = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model: fallbackModel,
+					thinkingLevel: Effort.High,
+					systemPrompt: ["Test"],
+					tools: [],
+					messages: [],
+				},
+				streamFn: mock.stream,
+			}),
+			sessionManager: SessionManager.inMemory(),
+			settings: peer,
+			modelRegistry,
+			sessionProfile: null,
+		});
+
+		try {
+			expect(legacySession.getSessionProfileName()).toBeUndefined();
+			// Resume of an unbound legacy session retires profile ownership so
+			// persisted edits cannot land in the startup-default snapshot.
+			peer.unbindSessionFromProfile();
+			expect(peer.get("profiles.active")).toBe("");
+			peer.setModelRole("default", `${PROVIDER}/${FALLBACK_MODEL_ID}`);
+			await peer.flush();
+			const items = peer.get("profiles.items") as Record<
+				string,
+				{ modelRoles: Record<string, string>; defaultThinkingLevel: string }
+			>;
+			expect(items.selected.modelRoles.default).toBe(`${PROVIDER}/${INITIAL_MODEL_ID}`);
+			expect(items.fallback.modelRoles.default).toBe(`${PROVIDER}/${FALLBACK_MODEL_ID}`);
+
+			// Disk-active profile "selected" wants INITIAL_MODEL_ID; a peer edit
+			// must not re-pin the legacy session's runtime model to it either.
+			writer.setProfileItem("related", {
+				modelRoles: { default: `${PROVIDER}/${INITIAL_MODEL_ID}` },
+				defaultThinkingLevel: Effort.Medium,
+			});
+			await writer.flush();
+			await peer.syncFromDisk();
+			await Bun.sleep(150);
+			expect(legacySession.model?.id).toBe(FALLBACK_MODEL_ID);
+
+			// An explicit switch binds and re-pins.
+			expect(await legacySession.bindSessionProfile("selected")).toBe(true);
+			expect(legacySession.getSessionProfileName()).toBe("selected");
+			expect(legacySession.sessionManager.getSessionProfile()).toBe("selected");
+			expect(legacySession.model?.id).toBe(INITIAL_MODEL_ID);
+		} finally {
+			await legacySession.dispose();
+		}
+	});
+
+	it("reports an unavailable configured default and rejects prompts with the same selector", async () => {
+		const staleSelector = "google/gemini-stale";
+		peer.setModelRole("default", staleSelector);
+		await peer.flush();
+
+		const state = session.getConfiguredDefaultModelState();
+		expect(state.configuredSelector).toBe(staleSelector);
+		expect(state.resolvedModel).toBeUndefined();
+		expect(state.runtimeModel?.id).toBe(INITIAL_MODEL_ID);
+		expect(state.unavailable).toBe(true);
+
+		await expect(session.prompt("preflight naming")).rejects.toThrow(
+			/Default model "google\/gemini-stale" is unavailable/,
+		);
+		expect(requestedModels).toEqual([]);
 	});
 });

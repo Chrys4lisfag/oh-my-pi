@@ -469,6 +469,8 @@ export class SessionManager {
 	#titleSource: SessionTitleSource | undefined;
 	#sessionFile: string | undefined;
 	#header!: SessionHeader;
+	/** Config profile identity stamped into new/loaded session headers. */
+	#sessionProfile: string | undefined;
 	#titleUpdatedAt = "";
 	#hasTitleSlot = true;
 	#entries: SessionEntry[] = [];
@@ -1103,6 +1105,7 @@ export class SessionManager {
 			cwd: this.#cwd,
 			parentSession: options?.parentSession,
 			providerPromptCacheKey: options?.providerPromptCacheKey,
+			profile: this.#sessionProfile,
 		};
 		const workspace = normalizeSessionWorkspace({
 			cwd: this.#cwd,
@@ -1149,6 +1152,7 @@ export class SessionManager {
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
 		this.#titleUpdatedAt = header.timestamp;
+		this.#sessionProfile = header.profile;
 		this.#index.rebuild(entries);
 	}
 
@@ -1443,6 +1447,7 @@ export class SessionManager {
 			additionalDirectories: this.#additionalDirectories.length > 0 ? [...this.#additionalDirectories] : undefined,
 			parentSession: parentSessionId,
 			providerPromptCacheKey: this.#header.providerPromptCacheKey ?? parentSessionId,
+			profile: this.#sessionProfile,
 		};
 		this.#sessionName = this.#header.title;
 		this.#titleSource = this.#header.titleSource;
@@ -2458,6 +2463,26 @@ export class SessionManager {
 
 	getHeader(): SessionHeader | null {
 		return this.#header;
+	}
+
+	/** Config profile this session belongs to, or undefined when unbound/legacy. */
+	getSessionProfile(): string | undefined {
+		return this.#sessionProfile ?? this.#header.profile;
+	}
+
+	/**
+	 * Stamp the config profile identity onto the current header and any session
+	 * created afterwards. When the session already has an on-disk file the
+	 * header rewrite is persisted so a later resume observes the identity.
+	 */
+	async setSessionProfile(name: string | undefined): Promise<void> {
+		this.#sessionProfile = name;
+		this.#header.profile = name;
+		if (this.#persist && this.#sessionFile && this.#shouldHaveSessionFile() && !this.#released) {
+			this.#fileIsCurrent = false;
+			this.#rewriteRequired = true;
+			await this.#rewriteAtomically();
+		}
 	}
 
 	/** All session entries (excludes header). Returns a shallow copy. */

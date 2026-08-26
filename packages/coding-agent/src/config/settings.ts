@@ -369,6 +369,11 @@ export class Settings {
 	#modified = new Set<string>();
 	/** Profile names changed locally. Creates may add an absent key; stale updates never resurrect a concurrently deleted profile. */
 	#modifiedProfileItems = new Map<string, "create" | "update" | "delete">();
+	/** Profile-owned live edits merged per field/role so stale terminals do not clobber disjoint edits. */
+	#modifiedProfileLiveFields = new Map<
+		string,
+		{ defaultThinkingLevel?: string; modelRoles: Map<string, string | undefined> }
+	>();
 	/** Cross-key profile renames, committed only when the source still exists and destination is still absent on disk. */
 	#modifiedProfileRenames = new Map<
 		string,
@@ -403,6 +408,8 @@ export class Settings {
 	>();
 	#profileOwnedThinkingOverride?: { profile: string; hadPrevious: boolean; previousValue?: unknown };
 	#profileRuntimeOwner?: string;
+	/** Prevent activation rollback helpers from rewriting a saved profile snapshot. */
+	#suppressActiveProfileSnapshotUpdate = false;
 	/** Pending activation; target snapshot is resolved from freshest disk state under write lock. */
 	#modifiedProfileActivation?: { targetName: string };
 
@@ -559,11 +566,15 @@ export class Settings {
 		this.#persistedMutationGeneration++;
 		if (this.#profileRuntimeOwner && path === "modelRoles") {
 			this.#replaceProfileOwnedModelRoles(this.#profileRuntimeOwner, value as SettingValue<"modelRoles">);
+			this.#updateActiveProfileSnapshot({ modelRoles: value as SettingValue<"modelRoles"> });
 		} else if (this.#profileRuntimeOwner && path === "defaultThinkingLevel") {
 			this.#setProfileOwnedThinkingOverride(
 				this.#profileRuntimeOwner,
 				value as SettingValue<"defaultThinkingLevel">,
 			);
+			this.#updateActiveProfileSnapshot({
+				defaultThinkingLevel: value as SettingValue<"defaultThinkingLevel">,
+			});
 		}
 		this.#modified.add(path);
 		this.#rebuildMerged();
@@ -578,6 +589,46 @@ export class Settings {
 		this.#fireEffectiveSettingChanged(path, next, prev);
 	}
 
+	/** Persist edits to profile-owned live fields back into that profile snapshot. */
+	#updateActiveProfileSnapshot(
+		update: Partial<{ modelRoles: Record<string, string>; defaultThinkingLevel: string }>,
+	): void {
+		if (this.#suppressActiveProfileSnapshotUpdate) return;
+		const profile = this.#profileRuntimeOwner;
+		if (!profile) return;
+		const raw = getByPath(this.#global, ["profiles", "items", profile]);
+		const snapshot = this.#profileSnapshotFromUnknown(raw);
+		if (!snapshot) return;
+		const next = {
+			modelRoles: { ...(update.modelRoles ?? snapshot.modelRoles) },
+			defaultThinkingLevel: update.defaultThinkingLevel ?? snapshot.defaultThinkingLevel,
+		};
+		setByPath(this.#global, ["profiles", "items", profile], next);
+
+		let persistenceProfile = profile;
+		for (;;) {
+			const source = [...this.#modifiedProfileRenames].find(
+				([, rename]) => rename.newName === persistenceProfile,
+			)?.[0];
+			if (!source) break;
+			persistenceProfile = source;
+		}
+		let delta = this.#modifiedProfileLiveFields.get(persistenceProfile);
+		if (!delta) {
+			delta = { modelRoles: new Map() };
+			this.#modifiedProfileLiveFields.set(persistenceProfile, delta);
+		}
+		if (update.modelRoles) {
+			for (const role of new Set([...Object.keys(snapshot.modelRoles), ...Object.keys(next.modelRoles)])) {
+				if (snapshot.modelRoles[role] === next.modelRoles[role]) continue;
+				delta.modelRoles.set(role, next.modelRoles[role]);
+			}
+		}
+		if (update.defaultThinkingLevel !== undefined && snapshot.defaultThinkingLevel !== next.defaultThinkingLevel) {
+			delta.defaultThinkingLevel = next.defaultThinkingLevel;
+		}
+	}
+
 	/**
 	 * Upsert one profile snapshot with per-key persistence. Existing local keys
 	 * are tracked as updates, so a stale omp process cannot recreate that key
@@ -590,6 +641,7 @@ export class Settings {
 		const pending = this.#modifiedProfileItems.get(name);
 		setByPath(this.#global, ["profiles", "items", name], snapshot);
 		this.#modifiedProfileItems.set(name, pending === "create" || !existed ? "create" : "update");
+		this.#modifiedProfileLiveFields.delete(name);
 		this.#persistedMutationGeneration++;
 		this.#rebuildMerged();
 		this.#queueSave();
@@ -607,6 +659,7 @@ export class Settings {
 			delete (items as Record<string, unknown>)[name];
 		}
 		this.#modifiedProfileItems.set(name, "delete");
+		this.#modifiedProfileLiveFields.delete(name);
 		this.#persistedMutationGeneration++;
 		if (rawActive === name) {
 			this.#reconcileDeletedActiveProfile(this.#global);
@@ -620,8 +673,66 @@ export class Settings {
 
 	/** Apply one profile snapshot to persisted live config and profile-owned runtime slots. */
 	applyProfileSnapshot(snapshot: { modelRoles: Record<string, string>; defaultThinkingLevel: string }): void {
-		this.set("modelRoles", { ...snapshot.modelRoles });
-		this.set("defaultThinkingLevel", snapshot.defaultThinkingLevel as SettingValue<"defaultThinkingLevel">);
+		this.#suppressActiveProfileSnapshotUpdate = true;
+		try {
+			this.set("modelRoles", { ...snapshot.modelRoles });
+			this.set("defaultThinkingLevel", snapshot.defaultThinkingLevel as SettingValue<"defaultThinkingLevel">);
+		} finally {
+			this.#suppressActiveProfileSnapshotUpdate = false;
+		}
+	}
+
+	/**
+	 * Bind this terminal's runtime profile ownership to `name` for a resumed
+	 * session WITHOUT changing the durable startup profile marker on disk.
+	 * Applies the stored snapshot to live role/thinking fields, reconciles
+	 * profile-owned runtime slots, and notifies synchronized peers of the new
+	 * local view. Returns false when `name` does not denote a valid profile.
+	 *
+	 * `#modifiedProfileActivation` is intentionally left untouched so the next
+	 * save keeps the durable `profiles.active` marker owned by whoever created
+	 * it; the binding is terminal-local and re-established on every resume.
+	 */
+	bindSessionToProfile(name: string): boolean {
+		const items = getByPath(this.#global, ["profiles", "items"]);
+		const snapshot = isRecord(items) ? this.#profileSnapshotFromUnknown(items[name]) : undefined;
+		if (!snapshot) return false;
+		const previous = this.#captureEffectiveSettings();
+		setByPath(this.#global, ["profiles", "active"], name);
+		setByPath(this.#global, ["modelRoles"], { ...snapshot.modelRoles });
+		setByPath(this.#global, ["defaultThinkingLevel"], snapshot.defaultThinkingLevel);
+		this.#replaceProfileRuntimeOverrides(name, snapshot);
+		this.#persistedMutationGeneration++;
+		this.#rebuildMerged();
+		this.#notifySynchronizedSettings(previous, false);
+		return true;
+	}
+
+	/**
+	 * Retire terminal-local profile ownership for a legacy resumed session
+	 * whose identity is unknown. Clears the in-memory active marker and all
+	 * profile-owned runtime slots WITHOUT touching the durable startup profile
+	 * on disk, so persisted model/thinking edits can never be written into an
+	 * unrelated profile snapshot. The user re-binds via an explicit
+	 * `/profiles switch`, at which point ownership (and header identity) is
+	 * re-established.
+	 */
+	unbindSessionFromProfile(): void {
+		if (!this.get("profiles.active")) return;
+		const previous = this.#captureEffectiveSettings();
+		this.#retireProfileRuntimeOverrides();
+		setByPath(this.#global, ["profiles", "active"], "");
+		this.#persistedMutationGeneration++;
+		this.#rebuildMerged();
+		this.#notifySynchronizedSettings(previous, false);
+	}
+
+	/** The valid active profile name, or undefined for an empty/stale/malformed marker. */
+	activeProfileName(): string | undefined {
+		const active = this.get("profiles.active");
+		if (!active) return undefined;
+		const items = this.get("profiles.items");
+		return isRecord(items) && this.#profileSnapshotFromUnknown(items[active]) ? active : undefined;
 	}
 
 	/**
@@ -641,6 +752,31 @@ export class Settings {
 		this.#queueSave();
 	}
 
+	/** Restore a captured activation atomically, including runtime ownership provenance. */
+	restoreProfileActivation(
+		name: string | undefined,
+		snapshot: { modelRoles: Record<string, string>; defaultThinkingLevel: string },
+	): void {
+		const items = getByPath(this.#global, ["profiles", "items"]);
+		if (name && isRecord(items) && this.#profileSnapshotFromUnknown(items[name])) {
+			this.activateProfile(name, snapshot);
+			return;
+		}
+		const previous = this.#captureEffectiveSettings();
+		setByPath(this.#global, ["profiles", "active"], "");
+		setByPath(this.#global, ["modelRoles"], { ...snapshot.modelRoles });
+		setByPath(this.#global, ["defaultThinkingLevel"], snapshot.defaultThinkingLevel);
+		this.#retireProfileRuntimeOverrides();
+		this.#modifiedProfileActivation = undefined;
+		this.#modified.add("profiles.active");
+		this.#modified.add("modelRoles");
+		this.#modified.add("defaultThinkingLevel");
+		this.#persistedMutationGeneration++;
+		this.#rebuildMerged();
+		this.#notifySynchronizedSettings(previous, false);
+		this.#queueSave();
+	}
+
 	/** Rename one profile atomically against the freshest on-disk profile map. */
 	renameProfileItem(
 		oldName: string,
@@ -653,7 +789,17 @@ export class Settings {
 			items[newName] = snapshot;
 			delete items[oldName];
 		}
-		if (wasActive) setByPath(this.#global, ["profiles", "active"], newName);
+		if (wasActive) {
+			setByPath(this.#global, ["profiles", "active"], newName);
+			if (this.#profileRuntimeOwner === oldName) {
+				this.#profileRuntimeOwner = newName;
+				for (const owned of this.#profileOwnedModelRoleOverrides.values()) owned.profile = newName;
+				if (this.#profileOwnedThinkingOverride) this.#profileOwnedThinkingOverride.profile = newName;
+			}
+			if (this.#modifiedProfileActivation?.targetName === oldName) {
+				this.#modifiedProfileActivation = { targetName: newName };
+			}
+		}
 		this.#modifiedProfileRenames.set(oldName, { newName, snapshot, wasActive });
 		this.#persistedMutationGeneration++;
 		this.#rebuildMerged();
@@ -1154,10 +1300,15 @@ export class Settings {
 		if (previousGlobal && previousActive === active) {
 			for (const role of new Set([...Object.keys(previousRoles), ...Object.keys(liveSnapshot.modelRoles)])) {
 				if (previousRoles[role] === liveSnapshot.modelRoles[role]) continue;
+				// A public runtime override supersedes profile ownership for this slot.
+				if (!this.#profileOwnedModelRoleOverrides.has(role)) continue;
 				if (liveSnapshot.modelRoles[role] === undefined) this.#retireProfileOwnedModelRole(role);
 				else this.#setProfileOwnedModelRole(active, role, liveSnapshot.modelRoles[role]);
 			}
-			if (previousThinking !== liveSnapshot.defaultThinkingLevel) {
+			if (
+				previousThinking !== liveSnapshot.defaultThinkingLevel &&
+				this.#profileOwnedThinkingOverride?.profile === active
+			) {
 				this.#setProfileOwnedThinkingOverride(active, liveSnapshot.defaultThinkingLevel);
 			}
 		}
@@ -1307,6 +1458,7 @@ export class Settings {
 		this.#persistedMutationGeneration++;
 
 		if (this.#profileRuntimeOwner) {
+			this.#updateActiveProfileSnapshot({ modelRoles: current });
 			if (modelId === undefined) {
 				this.#supersedeProfileOwnedModelRole(role);
 				const runtimeRoles = this.#getRuntimeModelRoleOverrides();
@@ -2591,8 +2743,14 @@ export class Settings {
 		const lifecycleEpoch = this.#lifecycleEpoch;
 		await this.flush();
 		if (this.#savesCancelled || lifecycleEpoch !== this.#lifecycleEpoch) return false;
+		const mutationGeneration = this.#persistedMutationGeneration;
 		const result = await this.#loadYamlIfPresent(this.#configPath);
-		if (this.#savesCancelled || lifecycleEpoch !== this.#lifecycleEpoch) return false;
+		if (
+			this.#savesCancelled ||
+			lifecycleEpoch !== this.#lifecycleEpoch ||
+			mutationGeneration !== this.#persistedMutationGeneration
+		)
+			return false;
 		if (result.kind !== "loaded") {
 			if (result.kind !== "missing") {
 				logger.warn("Settings: ignored invalid external config update", {
@@ -2607,23 +2765,34 @@ export class Settings {
 		const localActive = this.#profileRuntimeOwner;
 		const localLiveRoles = this.#modelRolesFromLayer(previousGlobal);
 		const previousThinking = getByPath(previousGlobal, ["defaultThinkingLevel"]);
+		const previousItems = getByPath(previousGlobal, ["profiles", "items"]);
+		const previousLocalSnapshot =
+			typeof localActive === "string" && isRecord(previousItems)
+				? this.#profileSnapshotFromUnknown(previousItems[localActive])
+				: undefined;
 		this.#global = result.settings;
 
 		const items = getByPath(this.#global, ["profiles", "items"]);
-		const localProfileExists =
-			typeof localActive === "string" &&
-			localActive.length > 0 &&
-			isRecord(items) &&
-			this.#profileSnapshotFromUnknown(items[localActive]) !== undefined;
+		const incomingLocalSnapshot =
+			typeof localActive === "string" && localActive.length > 0 && isRecord(items)
+				? this.#profileSnapshotFromUnknown(items[localActive])
+				: undefined;
 
-		if (localProfileExists) {
-			// Disk snapshots prove profile existence only. Another process may
-			// update that snapshot, but must not replace this terminal's dirty
-			// live role/thinking choices before an explicit save or switch.
+		if (incomingLocalSnapshot && localActive) {
 			setByPath(this.#global, ["profiles", "active"], localActive);
-			setByPath(this.#global, ["modelRoles"], localLiveRoles);
-			if (typeof previousThinking === "string") {
-				setByPath(this.#global, ["defaultThinkingLevel"], previousThinking);
+			if (!previousLocalSnapshot || !isDeepStrictEqual(previousLocalSnapshot, incomingLocalSnapshot)) {
+				// Same-profile edits are shared state: every terminal using this profile
+				// adopts its new model/thinking snapshot even when another profile is
+				// the startup default on disk.
+				setByPath(this.#global, ["modelRoles"], { ...incomingLocalSnapshot.modelRoles });
+				setByPath(this.#global, ["defaultThinkingLevel"], incomingLocalSnapshot.defaultThinkingLevel);
+			} else {
+				// A different terminal's activation changes root live fields but not this
+				// profile snapshot. Preserve this terminal's local profile state.
+				setByPath(this.#global, ["modelRoles"], localLiveRoles);
+				if (typeof previousThinking === "string") {
+					setByPath(this.#global, ["defaultThinkingLevel"], previousThinking);
+				}
 			}
 			this.#reconcileProfileRuntimeOverrides(this.#global, previousGlobal);
 		} else if (localActive) {
@@ -2633,7 +2802,14 @@ export class Settings {
 			this.#reconcileDeletedActiveProfile(this.#global);
 			this.#reconcileProfileRuntimeOverrides(this.#global, previousGlobal);
 		} else {
-			this.#reconcileDeletedActiveProfile(this.#global);
+			// Empty is a terminal-local selection too. Another terminal's first
+			// profile/activation only changes the startup default on disk.
+			setByPath(this.#global, ["profiles", "active"], "");
+			setByPath(this.#global, ["modelRoles"], localLiveRoles);
+			if (typeof previousThinking === "string") {
+				setByPath(this.#global, ["defaultThinkingLevel"], previousThinking);
+			}
+			this.#reconcileProfileRuntimeOverrides(this.#global, previousGlobal);
 		}
 
 		this.#rebuildMerged();
@@ -2703,6 +2879,7 @@ export class Settings {
 		if (
 			this.#modified.size === 0 &&
 			this.#modifiedProfileItems.size === 0 &&
+			this.#modifiedProfileLiveFields.size === 0 &&
 			this.#modifiedProfileRenames.size === 0 &&
 			this.#modifiedGlobalModelRoles.size === 0 &&
 			this.#modifiedProfileActivation === undefined
@@ -2718,6 +2895,13 @@ export class Settings {
 		this.#modified.clear();
 		const modifiedProfileItems = new Map(this.#modifiedProfileItems);
 		this.#modifiedProfileItems.clear();
+		const modifiedProfileLiveFields = new Map(
+			[...this.#modifiedProfileLiveFields].map(([profile, delta]) => [
+				profile,
+				{ defaultThinkingLevel: delta.defaultThinkingLevel, modelRoles: new Map(delta.modelRoles) },
+			]),
+		);
+		this.#modifiedProfileLiveFields.clear();
 		const modifiedProfileRenames = new Map(this.#modifiedProfileRenames);
 		this.#modifiedProfileRenames.clear();
 		this.#modifiedGlobalModelRoles.clear();
@@ -2746,22 +2930,9 @@ export class Settings {
 					setByPath(current, segments, value);
 				}
 
-				for (const [oldName, rename] of modifiedProfileRenames) {
-					const items = getByPath(current, ["profiles", "items"]);
-					const canRename =
-						isRecord(items) && Object.hasOwn(items, oldName) && !Object.hasOwn(items, rename.newName);
-					if (canRename) {
-						items[rename.newName] = structuredClone(items[oldName]);
-						delete items[oldName];
-						if (activeAtRead === oldName) setByPath(current, ["profiles", "active"], rename.newName);
-					}
-				}
-
-				// Merge touched profile keys individually. Updates only land when
-				// the key still exists on disk: absence is the durable tombstone
-				// that prevents a stale, still-open omp process from resurrecting
-				// a profile deleted by another process. Creates intentionally add
-				// absent keys, supporting explicit re-creation with the same name.
+				// Merge touched profile keys before renames. A profile created or
+				// updated and renamed within one debounce window must first exist at
+				// its durable source key; the rename then moves that fresh value.
 				for (const [profileName, op] of modifiedProfileItems) {
 					if (op === "delete") {
 						const items = getByPath(current, ["profiles", "items"]);
@@ -2772,12 +2943,53 @@ export class Settings {
 						const items = getByPath(current, ["profiles", "items"]);
 						if (!isRecord(items) || !Object.hasOwn(items, profileName)) continue;
 					}
+					let localProfileName = profileName;
+					for (;;) {
+						const rename = modifiedProfileRenames.get(localProfileName);
+						if (!rename) break;
+						localProfileName = rename.newName;
+					}
 					setByPath(
 						current,
 						["profiles", "items", profileName],
-						getByPath(this.#global, ["profiles", "items", profileName]),
+						structuredClone(getByPath(this.#global, ["profiles", "items", localProfileName])),
 					);
 				}
+
+				for (const [profileName, delta] of modifiedProfileLiveFields) {
+					const items = getByPath(current, ["profiles", "items"]);
+					const snapshot = isRecord(items) ? this.#profileSnapshotFromUnknown(items[profileName]) : undefined;
+					if (!snapshot) continue;
+					const modelRoles = { ...snapshot.modelRoles };
+					for (const [role, modelId] of delta.modelRoles) {
+						if (modelId === undefined) delete modelRoles[role];
+						else modelRoles[role] = modelId;
+					}
+					setByPath(current, ["profiles", "items", profileName], {
+						modelRoles,
+						defaultThinkingLevel: delta.defaultThinkingLevel ?? snapshot.defaultThinkingLevel,
+					});
+				}
+
+				const successfulProfileRenames = new Map<string, string>();
+				const failedActiveProfileRenames = new Map<string, string>();
+				for (const [oldName, rename] of modifiedProfileRenames) {
+					const items = getByPath(current, ["profiles", "items"]);
+					const canRename =
+						isRecord(items) && Object.hasOwn(items, oldName) && !Object.hasOwn(items, rename.newName);
+					if (canRename) {
+						successfulProfileRenames.set(oldName, rename.newName);
+						items[rename.newName] = structuredClone(items[oldName]);
+						delete items[oldName];
+						if (activeAtRead === oldName) setByPath(current, ["profiles", "active"], rename.newName);
+					} else if (rename.wasActive) {
+						failedActiveProfileRenames.set(oldName, rename.newName);
+						if (modifiedProfileActivation?.targetName === rename.newName) {
+							modifiedProfileActivation.targetName = oldName;
+						}
+					}
+				}
+
 				// Merge only the model roles captured by this save. Then retain
 				// any role changed while the async read/lock was pending before
 				// replacing #global, so the follow-up save still sees its value.
@@ -2829,6 +3041,18 @@ export class Settings {
 				// writer's stale memory. Resolve the durable marker and live settings
 				// together so every watcher observes one deterministic fallback.
 				this.#reconcileDeletedActiveProfile(current);
+				const durableActive = getByPath(current, ["profiles", "active"]);
+				const durableItems = getByPath(current, ["profiles", "items"]);
+				const durableSnapshot =
+					typeof durableActive === "string" && isRecord(durableItems)
+						? this.#profileSnapshotFromUnknown(durableItems[durableActive])
+						: undefined;
+				if (durableSnapshot) {
+					// Root live fields are the startup profile projection. A terminal
+					// editing a different local profile updates only that profile item.
+					setByPath(current, ["modelRoles"], { ...durableSnapshot.modelRoles });
+					setByPath(current, ["defaultThinkingLevel"], durableSnapshot.defaultThinkingLevel);
+				}
 
 				// Keep this terminal's live state separate while the durable merged
 				// snapshot is written. Local mutations may arrive during the await.
@@ -2836,14 +3060,81 @@ export class Settings {
 				this.#globalWatchFingerprint = this.#readGlobalWatchFingerprint();
 				this.#quarantinedYamlTargets.delete(configPath);
 				const latestLocalGlobal = this.#global;
-				localActive = getByPath(latestLocalGlobal, ["profiles", "active"]);
-				localLiveRoles = this.#modelRolesFromLayer(latestLocalGlobal);
-				localThinking = getByPath(latestLocalGlobal, ["defaultThinkingLevel"]);
+				for (const [oldName, newName] of failedActiveProfileRenames) {
+					if (this.#modifiedProfileActivation !== undefined || this.#profileRuntimeOwner !== newName) continue;
+					const currentItems = getByPath(current, ["profiles", "items"]);
+					const sourceSnapshot = isRecord(currentItems)
+						? this.#profileSnapshotFromUnknown(currentItems[oldName])
+						: undefined;
+					if (!sourceSnapshot) continue;
+					this.#profileRuntimeOwner = oldName;
+					for (const owned of this.#profileOwnedModelRoleOverrides.values()) owned.profile = oldName;
+					if (this.#profileOwnedThinkingOverride) this.#profileOwnedThinkingOverride.profile = oldName;
+
+					const restoredSnapshot = structuredClone(sourceSnapshot);
+					const pendingNewDelta = this.#modifiedProfileLiveFields.get(newName);
+					if (pendingNewDelta) {
+						let pendingOldDelta = this.#modifiedProfileLiveFields.get(oldName);
+						if (!pendingOldDelta) {
+							pendingOldDelta = { modelRoles: new Map() };
+							this.#modifiedProfileLiveFields.set(oldName, pendingOldDelta);
+						}
+						if (pendingNewDelta.defaultThinkingLevel !== undefined) {
+							pendingOldDelta.defaultThinkingLevel = pendingNewDelta.defaultThinkingLevel;
+							restoredSnapshot.defaultThinkingLevel = pendingNewDelta.defaultThinkingLevel;
+						}
+						for (const [role, modelId] of pendingNewDelta.modelRoles) {
+							pendingOldDelta.modelRoles.set(role, modelId);
+							if (modelId === undefined) delete restoredSnapshot.modelRoles[role];
+							else restoredSnapshot.modelRoles[role] = modelId;
+						}
+						this.#modifiedProfileLiveFields.delete(newName);
+					}
+
+					setByPath(latestLocalGlobal, ["profiles", "active"], oldName);
+					setByPath(latestLocalGlobal, ["profiles", "items", oldName], restoredSnapshot);
+					if (isRecord(currentItems) && Object.hasOwn(currentItems, newName)) {
+						setByPath(latestLocalGlobal, ["profiles", "items", newName], structuredClone(currentItems[newName]));
+					}
+					setByPath(latestLocalGlobal, ["modelRoles"], { ...restoredSnapshot.modelRoles });
+					setByPath(latestLocalGlobal, ["defaultThinkingLevel"], restoredSnapshot.defaultThinkingLevel);
+				}
+				for (const [oldName, newName] of successfulProfileRenames) {
+					const pendingOld = this.#modifiedProfileLiveFields.get(oldName);
+					if (!pendingOld) continue;
+					let pendingNew = this.#modifiedProfileLiveFields.get(newName);
+					if (!pendingNew) {
+						pendingNew = { modelRoles: new Map() };
+						this.#modifiedProfileLiveFields.set(newName, pendingNew);
+					}
+					if (pendingNew.defaultThinkingLevel === undefined) {
+						pendingNew.defaultThinkingLevel = pendingOld.defaultThinkingLevel;
+					}
+					for (const [role, modelId] of pendingOld.modelRoles) {
+						if (!pendingNew.modelRoles.has(role)) pendingNew.modelRoles.set(role, modelId);
+					}
+					this.#modifiedProfileLiveFields.delete(oldName);
+				}
+				const activationTarget = modifiedProfileActivation?.targetName;
+				const hasNewerActivationState =
+					this.#modifiedProfileActivation !== undefined ||
+					(activationTarget !== undefined &&
+						(this.#modifiedProfileItems.has(activationTarget) ||
+							this.#modifiedProfileLiveFields.has(activationTarget))) ||
+					this.#modified.has("modelRoles") ||
+					this.#modified.has("defaultThinkingLevel") ||
+					this.#modifiedGlobalModelRoles.size > 0;
+				const localStateSource =
+					localProfileActivationApplied && !hasNewerActivationState ? current : latestLocalGlobal;
+				localActive = getByPath(localStateSource, ["profiles", "active"]);
+				localLiveRoles = this.#modelRolesFromLayer(localStateSource);
+				localThinking = getByPath(localStateSource, ["defaultThinkingLevel"]);
 				for (const modPath of this.#modified) {
 					const segments = modPath.split(".");
 					setByPath(current, segments, structuredClone(getByPath(latestLocalGlobal, segments)));
 				}
 				const pendingProfileNames = new Set(this.#modifiedProfileItems.keys());
+				for (const profileName of this.#modifiedProfileLiveFields.keys()) pendingProfileNames.add(profileName);
 				for (const [oldName, rename] of this.#modifiedProfileRenames) {
 					pendingProfileNames.add(oldName);
 					pendingProfileNames.add(rename.newName);
@@ -2891,6 +3182,19 @@ export class Settings {
 					this.#modifiedProfileItems.set(profileName, op);
 				}
 			}
+			for (const [profileName, failedDelta] of modifiedProfileLiveFields) {
+				let pending = this.#modifiedProfileLiveFields.get(profileName);
+				if (!pending) {
+					pending = { modelRoles: new Map() };
+					this.#modifiedProfileLiveFields.set(profileName, pending);
+				}
+				if (pending.defaultThinkingLevel === undefined) {
+					pending.defaultThinkingLevel = failedDelta.defaultThinkingLevel;
+				}
+				for (const [role, modelId] of failedDelta.modelRoles) {
+					if (!pending.modelRoles.has(role)) pending.modelRoles.set(role, modelId);
+				}
+			}
 			for (const [oldName, rename] of modifiedProfileRenames) {
 				if (!this.#modifiedProfileRenames.has(oldName)) this.#modifiedProfileRenames.set(oldName, rename);
 			}
@@ -2924,7 +3228,7 @@ export class Settings {
 		}
 		this.#reconcileProfileRuntimeOverrides(this.#global, previousGlobal);
 		this.#rebuildMerged();
-		this.#notifySynchronizedSettings(effectiveBeforeSave, !localProfileActivationApplied);
+		this.#notifySynchronizedSettings(effectiveBeforeSave);
 	}
 	#queueProjectSave(): void {
 		if (!this.#persist) return;

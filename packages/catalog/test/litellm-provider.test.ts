@@ -115,6 +115,33 @@ afterEach(() => {
 });
 
 describe("LiteLLM provider discovery", () => {
+	test("preserves base URL query routing on rich metadata endpoints", async () => {
+		const calls: string[] = [];
+		const fetchMock: FetchImpl = async input => {
+			const url = inputUrl(input);
+			calls.push(url);
+			if (url === "https://catalog.example.com/model_group/info?tenant=acme") {
+				return Response.json({ data: [{ model_group: "query-model" }] });
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+
+		const models = await fetchLiteLLMRichModels({
+			api: "openai-completions",
+			provider: "litellm",
+			baseUrl: "https://catalog.example.com/v1?tenant=acme",
+			fetch: fetchMock,
+		});
+
+		expect(calls).toEqual([
+			"https://catalog.example.com/model_group/info?tenant=acme",
+			"https://catalog.example.com/v2/model/info?tenant=acme",
+			"https://catalog.example.com/model/info?tenant=acme",
+			"https://catalog.example.com/v1/model/info?tenant=acme",
+		]);
+		expect(models?.map(model => model.id)).toEqual(["query-model"]);
+	});
+
 	test("uses LITELLM_BASE_URL when no explicit baseUrl is configured", async () => {
 		Bun.env.LITELLM_BASE_URL = "http://litellm.example:4100/v1";
 		const fetchMock = makeFetchMock("http://litellm.example:4100/v1/models");

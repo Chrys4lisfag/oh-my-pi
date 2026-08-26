@@ -25,6 +25,11 @@ afterEach(() => {
 	resetSettingsForTest();
 });
 
+type TestProfileSnapshot = { modelRoles: Record<string, string>; defaultThinkingLevel: string };
+function profileSnapshot(settings: Settings, name: string): TestProfileSnapshot | undefined {
+	return settings.get("profiles.items")[name] as TestProfileSnapshot | undefined;
+}
+
 describe("profiles", () => {
 	describe("captureCurrentSnapshot", () => {
 		it("captures modelRoles and defaultThinkingLevel from live settings", async () => {
@@ -124,13 +129,11 @@ describe("profiles", () => {
 	describe("switchProfile", () => {
 		it("overwrites live settings from profile snapshot", () => {
 			const s = Settings.instance;
-			s.set("modelRoles", { default: "a/b" });
-			s.set("defaultThinkingLevel", Effort.High);
-			addProfile("first");
-
-			s.set("modelRoles", { default: "x/y", smol: "x/z" });
-			s.set("defaultThinkingLevel", Effort.Low);
-			addProfile("second");
+			addProfile("first", { modelRoles: { default: "a/b" }, defaultThinkingLevel: Effort.High });
+			addProfile("second", {
+				modelRoles: { default: "x/y", smol: "x/z" },
+				defaultThinkingLevel: Effort.Low,
+			});
 
 			switchProfile("first");
 
@@ -147,19 +150,20 @@ describe("profiles", () => {
 			// advisor roles + distinct thinking levels prove the write is real
 			// (not a happy-path no-op that reads the live value back).
 			const s = Settings.instance;
-			s.set("modelRoles", {
-				default: "anthropic/claude-sonnet-4",
-				advisor: "anthropic/claude-haiku",
+			addProfile("with-haiku-advisor", {
+				modelRoles: {
+					default: "anthropic/claude-sonnet-4",
+					advisor: "anthropic/claude-haiku",
+				},
+				defaultThinkingLevel: Effort.High,
 			});
-			s.set("defaultThinkingLevel", Effort.High);
-			addProfile("with-haiku-advisor");
-
-			s.set("modelRoles", {
-				default: "anthropic/claude-sonnet-4",
-				advisor: "openai/gpt-4o-mini",
+			addProfile("with-openai-advisor", {
+				modelRoles: {
+					default: "anthropic/claude-sonnet-4",
+					advisor: "openai/gpt-4o-mini",
+				},
+				defaultThinkingLevel: Effort.Low,
 			});
-			s.set("defaultThinkingLevel", Effort.Low);
-			addProfile("with-openai-advisor");
 
 			switchProfile("with-haiku-advisor");
 			expect(s.get("modelRoles")).toEqual({
@@ -182,13 +186,8 @@ describe("profiles", () => {
 			const s = Settings.instance;
 
 			// Create two profiles
-			s.set("modelRoles", { default: "a/original" });
-			s.set("defaultThinkingLevel", Effort.High);
-			addProfile("first");
-
-			s.set("modelRoles", { default: "b/original" });
-			s.set("defaultThinkingLevel", Effort.Low);
-			addProfile("second");
+			addProfile("first", { modelRoles: { default: "a/original" }, defaultThinkingLevel: Effort.High });
+			addProfile("second", { modelRoles: { default: "b/original" }, defaultThinkingLevel: Effort.Low });
 
 			// Switch to first
 			switchProfile("first");
@@ -211,11 +210,14 @@ describe("profiles", () => {
 			const s = Settings.instance;
 
 			// Start with an anthropic-baselined profile (like user's gem-proxy).
-			s.set("modelRoles", { default: "anthropic/claude-opus-4-7:high" });
-			addProfile("gem-proxy");
-
-			s.set("modelRoles", { default: "anthropic/claude-sonnet" });
-			addProfile("other");
+			addProfile("gem-proxy", {
+				modelRoles: { default: "anthropic/claude-opus-4-7:high" },
+				defaultThinkingLevel: Effort.High,
+			});
+			addProfile("other", {
+				modelRoles: { default: "anthropic/claude-sonnet" },
+				defaultThinkingLevel: Effort.High,
+			});
 
 			switchProfile("gem-proxy");
 			expect(s.get("modelRoles").default).toBe("anthropic/claude-opus-4-7:high");
@@ -630,6 +632,45 @@ describe("profiles", () => {
 			expect(getActiveProfileName()).toBe("one");
 			expect(s.get("modelRoles")).toEqual({ default: "provider/live-one" });
 			expect(s.get("defaultThinkingLevel")).toBe(Effort.XHigh);
+
+			// Rollback must retag ownership synchronously: an immediate edit belongs
+			// to restored profile one, never failed target two.
+			s.set("defaultThinkingLevel", Effort.Medium);
+			expect(profileSnapshot(s, "one")?.defaultThinkingLevel).toBe(Effort.Medium);
+			expect(profileSnapshot(s, "two")?.defaultThinkingLevel).toBe("low");
+		});
+
+		it("clears failed target ownership when rolling back to no active profile", () => {
+			const s = Settings.instance;
+			s.set("modelRoles", { default: "provider/base" });
+			s.set("defaultThinkingLevel", Effort.High);
+			s.setProfileItem("target", {
+				modelRoles: { default: "provider/target" },
+				defaultThinkingLevel: Effort.Low,
+			});
+			const before = captureProfileActivationState();
+
+			switchProfile("target");
+			restoreProfileActivation(before);
+			s.set("defaultThinkingLevel", Effort.Medium);
+
+			expect(getActiveProfileName()).toBeUndefined();
+			expect(profileSnapshot(s, "target")?.defaultThinkingLevel).toBe(Effort.Low);
+			expect(s.get("defaultThinkingLevel")).toBe(Effort.Medium);
+		});
+
+		it("attributes immediate edits to newly added and actively renamed profiles", () => {
+			const s = Settings.instance;
+			s.set("modelRoles", { default: "provider/base" });
+			s.set("defaultThinkingLevel", Effort.High);
+			addProfile("added");
+			s.set("defaultThinkingLevel", Effort.Medium);
+			expect(profileSnapshot(s, "added")?.defaultThinkingLevel).toBe(Effort.Medium);
+
+			renameProfile("added", "renamed");
+			s.set("defaultThinkingLevel", Effort.Low);
+			expect(profileSnapshot(s, "renamed")?.defaultThinkingLevel).toBe(Effort.Low);
+			expect(s.get("profiles.items")).not.toHaveProperty("added");
 		});
 	});
 
@@ -637,15 +678,17 @@ describe("profiles", () => {
 		it("preserves changes across profile switches", () => {
 			const s = Settings.instance;
 
-			// Step 1: Set up initial config and create "work" profile
-			s.set("modelRoles", { default: "anthropic/claude-sonnet-4", smol: "anthropic/claude-haiku" });
-			s.set("defaultThinkingLevel", Effort.High);
-			addProfile("work");
+			// Step 1: Create distinct saved profiles explicitly.
+			addProfile("work", {
+				modelRoles: { default: "anthropic/claude-sonnet-4", smol: "anthropic/claude-haiku" },
+				defaultThinkingLevel: Effort.High,
+			});
 
-			// Step 2: Change to different models and create "personal" profile
-			s.set("modelRoles", { default: "ollama/llama3" });
-			s.set("defaultThinkingLevel", Effort.Medium);
-			addProfile("personal");
+			// Step 2: Create the distinct "personal" profile.
+			addProfile("personal", {
+				modelRoles: { default: "ollama/llama3" },
+				defaultThinkingLevel: Effort.Medium,
+			});
 
 			// Step 3: Switch to "work"
 			switchProfile("work");

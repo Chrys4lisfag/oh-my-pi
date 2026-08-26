@@ -3461,10 +3461,29 @@ export interface LmStudioNativeModelMetadataOptions {
 
 const LM_STUDIO_NATIVE_METADATA_TIMEOUT_MS = 250;
 
+function appendUrlPathPreservingSearch(baseUrl: string, suffix: string): string {
+	try {
+		const parsed = new URL(baseUrl);
+		const path = parsed.pathname.replace(/\/+$/g, "");
+		parsed.pathname = `${path}${suffix}`;
+		return `${parsed.protocol}//${parsed.host}${parsed.pathname}${parsed.search}`;
+	} catch {
+		return `${baseUrl.replace(/\/+$/g, "")}${suffix}`;
+	}
+}
+
 function toLmStudioNativeBaseUrl(baseUrl: string): string {
 	const trimmed = baseUrl.trim();
-	const normalized = trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
-	return normalized.endsWith("/v1") ? normalized.slice(0, -3) : normalized;
+	try {
+		const parsed = new URL(trimmed);
+		const path = parsed.pathname.replace(/\/+$/g, "");
+		parsed.pathname = path.endsWith("/v1") ? path.slice(0, -3) || "/" : path || "/";
+		const nativePath = parsed.pathname === "/" ? "" : parsed.pathname;
+		return `${parsed.protocol}//${parsed.host}${nativePath}${parsed.search}`;
+	} catch {
+		const normalized = trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
+		return normalized.endsWith("/v1") ? normalized.slice(0, -3) : normalized;
+	}
 }
 
 function getLmStudioCapabilityNames(value: unknown): string[] {
@@ -3508,7 +3527,7 @@ export async function fetchLmStudioNativeModelMetadata(
 	const nativeBaseUrl = toLmStudioNativeBaseUrl(baseUrl);
 	const fetchMetadata = async (signal?: AbortSignal): Promise<Map<string, LmStudioNativeModelMetadata> | null> => {
 		try {
-			const response = await fetchImpl(`${nativeBaseUrl}/api/v0/models`, {
+			const response = await fetchImpl(appendUrlPathPreservingSearch(nativeBaseUrl, "/api/v0/models"), {
 				method: "GET",
 				headers: { Accept: "application/json", ...(options?.headers ?? {}) },
 				signal,
@@ -4694,8 +4713,8 @@ export function normalizeLiteLLMManagementBaseUrl(baseUrl: string): string {
 		const parsed = new URL(trimmed);
 		const path = parsed.pathname.replace(/\/+$/g, "");
 		parsed.pathname = path.endsWith("/v1") ? path.slice(0, -3) || "/" : path || "/";
-		const normalized = `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
-		return normalized.endsWith("/") ? normalized.slice(0, -1) : normalized;
+		const managementPath = parsed.pathname === "/" ? "" : parsed.pathname;
+		return `${parsed.protocol}//${parsed.host}${managementPath}${parsed.search}`;
 	} catch {
 		return trimmed.replace(/\/v1$/, "");
 	}
@@ -4943,7 +4962,7 @@ async function fetchLiteLLMRichEndpoint<TApi extends Api>(
 	}
 	let response: Response;
 	try {
-		response = await fetchImpl(`${managementBaseUrl}${endpoint}`, {
+		response = await fetchImpl(appendUrlPathPreservingSearch(managementBaseUrl, endpoint), {
 			method: "GET",
 			headers: requestHeaders,
 			signal,

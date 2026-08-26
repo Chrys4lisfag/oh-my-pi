@@ -620,7 +620,8 @@ export async function discoverLlamaCppModels(
 		]);
 		return [payload, metadata] as const;
 	};
-	const apiKey = await ctx.getBearerApiKeyResolver(providerConfig.provider);
+	const apiKey =
+		providerConfig.discovery.auth === "none" ? undefined : await ctx.getBearerApiKeyResolver(providerConfig.provider);
 	const [payload, serverMetadata] = apiKey
 		? await withAuth(apiKey, key => attempt({ ...baseHeaders, Authorization: `Bearer ${key}` }))
 		: await attempt(baseHeaders);
@@ -753,8 +754,13 @@ export async function discoverOpenAIModelsList(
 	providerConfig: DiscoveryProviderConfig,
 	ctx: DiscoveryContext,
 ): Promise<Model<Api>[]> {
-	const baseUrl = normalizeOpenAIModelsListBaseUrl(providerConfig.baseUrl);
-	const modelsUrl = `${baseUrl}/models`;
+	const discoverySourceUrl = providerConfig.discovery.baseUrl ?? providerConfig.baseUrl;
+	const discoveryBaseUrl = normalizeOpenAIModelsListDiscoveryBaseUrl(discoverySourceUrl);
+	const inferenceBaseUrl =
+		providerConfig.discovery.baseUrl && providerConfig.baseUrl
+			? providerConfig.baseUrl.replace(/\/+$/g, "")
+			: normalizeOpenAIModelsListBaseUrl(discoverySourceUrl);
+	const modelsUrl = buildOpenAIModelsListDiscoveryUrl(discoverySourceUrl);
 
 	const baseHeaders: Record<string, string> = { ...(providerConfig.headers ?? {}) };
 	let headers = baseHeaders;
@@ -763,7 +769,7 @@ export async function discoverOpenAIModelsList(
 		const nativeMetadataPromise =
 			providerConfig.discovery.type === "lm-studio"
 				? withTimeoutSignal(timeoutMs, signal =>
-						fetchLmStudioNativeModelMetadata(baseUrl, ctx.fetch, { headers: h, signal }),
+						fetchLmStudioNativeModelMetadata(discoveryBaseUrl, ctx.fetch, { headers: h, signal }),
 					)
 				: Promise.resolve(null);
 		const [payload, nativeMetadata] = await Promise.all([
@@ -791,7 +797,8 @@ export async function discoverOpenAIModelsList(
 		]);
 		return [payload, nativeMetadata] as const;
 	};
-	const apiKey = await ctx.getBearerApiKeyResolver(providerConfig.provider);
+	const apiKey =
+		providerConfig.discovery.auth === "none" ? undefined : await ctx.getBearerApiKeyResolver(providerConfig.provider);
 	const [payload, nativeMetadata] = apiKey
 		? await withAuth(apiKey, key => attempt({ ...baseHeaders, Authorization: `Bearer ${key}` }))
 		: await attempt(baseHeaders);
@@ -825,7 +832,7 @@ export async function discoverOpenAIModelsList(
 				name: reference?.name ?? id,
 				api: providerConfig.api,
 				provider: providerConfig.provider,
-				baseUrl,
+				baseUrl: inferenceBaseUrl,
 				reasoning: reference?.reasoning ?? false,
 				thinking: inheritReferenceThinking(undefined, reference, providerConfig.provider),
 				input: nativeMetadataForModel?.input ??
@@ -863,7 +870,12 @@ export async function discoverLiteLLMModels(
 	providerConfig: DiscoveryProviderConfig,
 	ctx: DiscoveryContext,
 ): Promise<Model<Api>[]> {
-	const baseUrl = normalizeLiteLLMDiscoveryBaseUrl(providerConfig.baseUrl);
+	const discoverySourceUrl = providerConfig.discovery.baseUrl ?? providerConfig.baseUrl ?? "http://localhost:4000/v1";
+	const discoveryBaseUrl = normalizeOpenAIModelsListDiscoveryBaseUrl(discoverySourceUrl);
+	const inferenceBaseUrl =
+		providerConfig.discovery.baseUrl && providerConfig.baseUrl
+			? providerConfig.baseUrl.replace(/\/+$/g, "")
+			: normalizeLiteLLMDiscoveryBaseUrl(discoverySourceUrl);
 	const references = getBundledModelReferenceIndex();
 	const resolveReference = (id: string) => resolveModelReference(id, references) as ModelSpec<Api> | undefined;
 	const baseHeaders: Record<string, string> = { ...(providerConfig.headers ?? {}) };
@@ -884,7 +896,7 @@ export async function discoverLiteLLMModels(
 			fetchLiteLLMRichModels({
 				api: providerConfig.api,
 				provider: providerConfig.provider,
-				baseUrl,
+				baseUrl: discoveryBaseUrl,
 				headers: h,
 				fetch: authAwareFetch,
 				referenceResolver: resolveReference,
@@ -896,7 +908,8 @@ export async function discoverLiteLLMModels(
 		}
 		return models;
 	};
-	const apiKey = await ctx.getBearerApiKeyResolver(providerConfig.provider);
+	const apiKey =
+		providerConfig.discovery.auth === "none" ? undefined : await ctx.getBearerApiKeyResolver(providerConfig.provider);
 	let richModels: ModelSpec<Api>[] | null;
 	try {
 		richModels = apiKey
@@ -910,9 +923,9 @@ export async function discoverLiteLLMModels(
 		richModels = null;
 	}
 	if (!richModels || richModels.length === 0) {
-		return discoverOpenAIModelsList({ ...providerConfig, baseUrl }, ctx);
+		return discoverOpenAIModelsList({ ...providerConfig, baseUrl: providerConfig.baseUrl ?? inferenceBaseUrl }, ctx);
 	}
-	return richModels.map(spec => buildModel({ ...spec, headers }));
+	return richModels.map(spec => buildModel({ ...spec, baseUrl: inferenceBaseUrl, headers }));
 }
 
 /**
@@ -934,8 +947,12 @@ export async function discoverProxyModels(
 	providerConfig: DiscoveryProviderConfig,
 	ctx: DiscoveryContext,
 ): Promise<Model<Api>[]> {
-	const baseUrl = normalizeOpenAIModelsListBaseUrl(providerConfig.baseUrl);
-	const modelsUrl = `${baseUrl}/models`;
+	const discoverySourceUrl = providerConfig.discovery.baseUrl ?? providerConfig.baseUrl;
+	const inferenceBaseUrl =
+		providerConfig.discovery.baseUrl && providerConfig.baseUrl
+			? providerConfig.baseUrl.replace(/\/+$/g, "")
+			: normalizeOpenAIModelsListBaseUrl(discoverySourceUrl);
+	const modelsUrl = buildOpenAIModelsListDiscoveryUrl(discoverySourceUrl);
 
 	const baseHeaders: Record<string, string> = { ...(providerConfig.headers ?? {}) };
 	let headers = baseHeaders;
@@ -954,7 +971,8 @@ export async function discoverProxyModels(
 				data?: Array<{ id?: string; name?: string; supported_endpoint_types?: string[]; context_length?: number }>;
 			};
 		});
-	const apiKey = await ctx.getBearerApiKeyResolver(providerConfig.provider);
+	const apiKey =
+		providerConfig.discovery.auth === "none" ? undefined : await ctx.getBearerApiKeyResolver(providerConfig.provider);
 	const payload = apiKey
 		? await withAuth(apiKey, key => attempt({ ...baseHeaders, Authorization: `Bearer ${key}` }))
 		: await attempt(baseHeaders);
@@ -984,7 +1002,7 @@ export async function discoverProxyModels(
 				name: displayName,
 				api,
 				provider: providerConfig.provider,
-				baseUrl,
+				baseUrl: inferenceBaseUrl,
 				reasoning: reference?.reasoning ?? false,
 				thinking: inheritReferenceThinking(undefined, reference, providerConfig.provider),
 				input: reference?.input ?? ["text"],
@@ -1051,6 +1069,27 @@ function toLlamaCppNativeBaseUrl(baseUrl: string): string {
 
 export function normalizeLiteLLMDiscoveryBaseUrl(baseUrl?: string): string {
 	return normalizeOpenAIModelsListBaseUrl(baseUrl ?? "http://localhost:4000/v1");
+}
+
+function normalizeOpenAIModelsListDiscoveryBaseUrl(baseUrl?: string): string {
+	const normalizedBaseUrl = normalizeOpenAIModelsListBaseUrl(baseUrl);
+	try {
+		const source = new URL(baseUrl ?? "http://127.0.0.1:1234/v1");
+		return `${normalizedBaseUrl}${source.search}`;
+	} catch {
+		return normalizedBaseUrl;
+	}
+}
+
+export function buildOpenAIModelsListDiscoveryUrl(baseUrl?: string): string {
+	const normalizedBaseUrl = normalizeOpenAIModelsListDiscoveryBaseUrl(baseUrl);
+	try {
+		const parsed = new URL(normalizedBaseUrl);
+		parsed.pathname = `${parsed.pathname.replace(/\/+$/g, "")}/models`;
+		return `${parsed.protocol}//${parsed.host}${parsed.pathname}${parsed.search}`;
+	} catch {
+		return `${normalizedBaseUrl}/models`;
+	}
 }
 
 export function normalizeOpenAIModelsListBaseUrl(baseUrl?: string): string {

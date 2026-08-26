@@ -265,7 +265,18 @@ export const getModelsConfigSchemaBundle = once(() => {
 	const ProviderDiscoverySchema = type({
 		type: '"ollama" | "llama.cpp" | "lm-studio" | "openai-models-list" | "proxy" | "litellm"',
 		"timeoutMs?": "number",
+		"baseUrl?": "string",
+		"auth?": '"provider" | "none"',
 	}).narrow((value, ctx) => {
+		if (value.baseUrl !== undefined && (typeof value.baseUrl !== "string" || value.baseUrl.trim().length === 0)) {
+			return ctx.mustBe("discovery.baseUrl a non-empty string");
+		}
+		if (
+			value.baseUrl !== undefined &&
+			!["lm-studio", "openai-models-list", "proxy", "litellm"].includes(value.type)
+		) {
+			return ctx.mustBe("discovery.baseUrl supported for lm-studio, openai-models-list, proxy, or litellm");
+		}
 		if (
 			value.timeoutMs !== undefined &&
 			(typeof value.timeoutMs !== "number" || value.timeoutMs <= 0 || !Number.isFinite(value.timeoutMs))

@@ -71,6 +71,8 @@ export interface ProviderDiscoveryState {
 	optional: boolean;
 	stale: boolean;
 	fetchedAt?: number;
+	/** Last actual remote discovery attempt in this process. */
+	attemptedAt?: number;
 	models: string[];
 	error?: string;
 }

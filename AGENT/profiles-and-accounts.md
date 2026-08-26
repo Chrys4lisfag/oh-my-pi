@@ -60,20 +60,32 @@ force-switch every other terminal.
 **Contract.** Profile mutations persist per profile name, not by replacing the whole
 map. Persistent `Settings` instances poll `config.yml` without holding filesystem
 watch handles and merge fresh profile definitions. Each running terminal keeps its
-locally active profile, exact model roles, and thinking level while that profile still
-exists. A switch only changes that terminal; `profiles.active` on disk is a startup
-default for future sessions. If a terminal's local profile is deleted, only terminals
-using that profile switch to the first valid lexical fallback.
+locally active profile. A switch only changes that terminal; `profiles.active` on disk
+is a startup default for future sessions. Persisted model-role or thinking edits update
+the locally active profile snapshot and propagate to every terminal using that same
+profile, while terminals using other profiles retain their own snapshots. Explicit
+runtime overrides that superseded profile ownership remain terminal-local. If a
+terminal's local profile is deleted, only terminals using that profile switch to the
+first valid lexical fallback.
 Implementation in `packages/coding-agent/src/config/settings.ts`:
 
-- per-profile mutation tracking for create, update, rename, and deletion tombstones
+- per-profile mutation tracking for create, whole-snapshot update, rename, and deletion tombstones
+- active-profile live edits tracked as one thinking scalar plus per-model-role set/delete
+  deltas, merged under the config lock so stale terminals preserve disjoint edits
 - `setProfileItem`
 - `deleteProfileItem`
 - save path re-reads the latest on-disk config under the existing lock and applies
   only touched names
-- external synchronization preserves each running terminal's valid local profile and
-  snapshot, ignoring another terminal's `profiles.active`, `modelRoles`, and thinking
-  selection
+- external synchronization ignores another terminal's `profiles.active` and root live
+  projection, but adopts changed model/thinking snapshots for the terminal's own active
+  profile
+- persisted live model/thinking edits are written into the active profile item; terminals
+  on different profiles and explicit runtime override slots remain isolated
+- durable root `modelRoles`/thinking always project durable `profiles.active`, so editing a
+  different terminal-local profile cannot corrupt the next session's startup state
+- activation resolves the freshest target snapshot under lock and reapplies that snapshot
+  to the activating terminal; add, active rename, and rollback retag runtime ownership
+  synchronously before another edit can be attributed
 - a later unrelated save writes against the freshest disk state, then restores that
   terminal's valid local profile/model/thinking in memory instead of importing the
   startup default it preserved on disk

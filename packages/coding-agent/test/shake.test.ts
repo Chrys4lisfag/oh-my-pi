@@ -112,11 +112,25 @@ describe("AgentSession shake", () => {
 
 	it("resets try-shake at a logical session boundary", async () => {
 		session.setTryShakeEnabled(true);
+		session.setTryShakeCheckpointStepTokens(200_000);
 		expect(session.isTryShakeEnabled()).toBe(true);
+		expect(session.getTryShakeCheckpointStepTokens()).toBe(200_000);
 
 		expect(await session.newSession()).toBe(true);
 
 		expect(session.isTryShakeEnabled()).toBe(false);
+		expect(session.getTryShakeCheckpointStepTokens()).toBe(150_000);
+		expect(session.getNextTryShakeCheckpointTokens()).toBe(275_000);
+	});
+
+	it("validates try-shake checkpoint step boundaries on the real session API", () => {
+		for (const accepted of [1_000, 1_000_000]) {
+			session.setTryShakeCheckpointStepTokens(accepted);
+			expect(session.getTryShakeCheckpointStepTokens()).toBe(accepted);
+		}
+		for (const rejected of [999, 1_000_001, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+			expect(() => session.setTryShakeCheckpointStepTokens(rejected)).toThrow();
+		}
 	});
 
 	describe("elide", () => {
@@ -365,6 +379,288 @@ describe("AgentSession shake", () => {
 			});
 			return promise;
 		}
+		function useMillionContextModel(): void {
+			const current = session.agent.state.model;
+			session.agent.setModel({ ...current, contextWindow: 1_000_000 });
+			session.settings.set("compaction.enabled", false);
+			session.settings.set("contextPromotion.enabled", false);
+			session.setTryShakeEnabled(true);
+		}
+
+		async function emitContextTokens(contextTokens: number): Promise<void> {
+			const assistantMessage: AssistantMessage = {
+				role: "assistant",
+				content: [{ type: "text", text: "checkpoint" }],
+				...apiInfo,
+				stopReason: "stop",
+				usage: {
+					input: contextTokens - 1_000,
+					output: 1_000,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: contextTokens,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				timestamp: Date.now(),
+			};
+			const settled = waitForAgentEnd();
+			session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
+			session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
+			await settled;
+			await session.waitForIdle();
+		}
+
+		it("checks million-context shake at 275k then each configured step without rearming", async () => {
+			useMillionContextModel();
+			const shakeSpy = vi
+				.spyOn(session, "shake")
+				.mockResolvedValue({ mode: "elide", toolResultsDropped: 1, blocksDropped: 0, tokensFreed: 20_000 });
+
+			await emitContextTokens(274_999);
+			expect(shakeSpy).not.toHaveBeenCalled();
+			await emitContextTokens(275_000);
+			expect(shakeSpy).toHaveBeenCalledTimes(1);
+			expect(shakeSpy).toHaveBeenLastCalledWith(
+				"elide",
+				expect.objectContaining({ config: expect.objectContaining({ minSavings: 4_000 }) }),
+			);
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(425_000);
+
+			// A successful shake may drop live usage below 275k; the checkpoint
+			// remains consumed and cannot spam on a second crossing.
+			await emitContextTokens(300_000);
+			await emitContextTokens(424_999);
+			expect(shakeSpy).toHaveBeenCalledTimes(1);
+			await emitContextTokens(425_000);
+			expect(shakeSpy).toHaveBeenCalledTimes(2);
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(575_000);
+			await emitContextTokens(425_000);
+			expect(shakeSpy).toHaveBeenCalledTimes(2);
+			await emitContextTokens(575_000);
+			expect(shakeSpy).toHaveBeenCalledTimes(3);
+		});
+
+		it("continues terminal-settle todo policy after a successful checkpoint rewrite", async () => {
+			useMillionContextModel();
+			session.setTodoPhases([{ name: "Work", tasks: [{ content: "finish", status: "pending" }] }]);
+			const todoReminder = Promise.withResolvers<void>();
+			const unsubscribe = session.subscribe(event => {
+				if (event.type !== "todo_reminder") return;
+				session.setTodoPhases([]);
+				todoReminder.resolve();
+			});
+			vi.spyOn(session, "shake").mockResolvedValue({
+				mode: "elide",
+				toolResultsDropped: 1,
+				blocksDropped: 0,
+				tokensFreed: 20_000,
+			});
+			const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+			const assistantMessage: AssistantMessage = {
+				role: "assistant",
+				content: [{ type: "text", text: "terminal checkpoint" }],
+				...apiInfo,
+				stopReason: "stop",
+				usage: {
+					input: 274_000,
+					output: 1_000,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 275_000,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				timestamp: Date.now(),
+			};
+			session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
+			session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
+			await Promise.race([
+				todoReminder.promise,
+				scheduler.wait(2_000).then(() => {
+					throw new Error("Todo reminder did not run after checkpoint shake");
+				}),
+			]);
+			await scheduler.wait(150);
+			unsubscribe();
+
+			expect(events.some(event => event.type === "todo_reminder")).toBe(true);
+			expect(continueSpy).toHaveBeenCalled();
+		});
+
+		it("uses the session-configured checkpoint step", async () => {
+			useMillionContextModel();
+			const shakeSpy = vi
+				.spyOn(session, "shake")
+				.mockResolvedValue({ mode: "elide", toolResultsDropped: 1, blocksDropped: 0, tokensFreed: 20_000 });
+
+			await emitContextTokens(275_000);
+			await emitContextTokens(425_000);
+			expect(shakeSpy).toHaveBeenCalledTimes(2);
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(575_000);
+			session.setTryShakeCheckpointStepTokens(100_000);
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(525_000);
+			await emitContextTokens(524_999);
+			expect(shakeSpy).toHaveBeenCalledTimes(2);
+			await emitContextTokens(525_000);
+			expect(shakeSpy).toHaveBeenCalledTimes(3);
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(625_000);
+		});
+
+		it("requires both try-shake enablement and a million-token model", async () => {
+			const current = session.agent.state.model;
+			session.agent.setModel({ ...current, contextWindow: 1_000_000 });
+			session.settings.set("compaction.enabled", false);
+			const shakeSpy = vi
+				.spyOn(session, "shake")
+				.mockResolvedValue({ mode: "elide", toolResultsDropped: 1, blocksDropped: 0, tokensFreed: 20_000 });
+
+			await emitContextTokens(275_000);
+			expect(shakeSpy).not.toHaveBeenCalled();
+			session.setTryShakeEnabled(true);
+			session.agent.setModel({ ...current, contextWindow: 999_999 });
+			await emitContextTokens(275_000);
+			expect(shakeSpy).not.toHaveBeenCalled();
+		});
+
+		it("consumes all crossed intervals with one late first check", async () => {
+			useMillionContextModel();
+			const shakeSpy = vi
+				.spyOn(session, "shake")
+				.mockResolvedValue({ mode: "elide", toolResultsDropped: 1, blocksDropped: 0, tokensFreed: 20_000 });
+
+			await emitContextTokens(760_000);
+			expect(shakeSpy).toHaveBeenCalledTimes(1);
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(875_000);
+		});
+
+		it("resets consumed checkpoint state on a new logical session", async () => {
+			useMillionContextModel();
+			vi.spyOn(session, "shake").mockResolvedValue({
+				mode: "elide",
+				toolResultsDropped: 1,
+				blocksDropped: 0,
+				tokensFreed: 20_000,
+			});
+			await emitContextTokens(275_000);
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(425_000);
+
+			expect(await session.newSession()).toBe(true);
+			const current = session.agent.state.model;
+			session.agent.setModel({ ...current, contextWindow: 1_000_000 });
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(275_000);
+		});
+
+		it("resets toggle, step, and consumed checkpoint when session context is cleared", async () => {
+			useMillionContextModel();
+			session.setTryShakeCheckpointStepTokens(200_000);
+			vi.spyOn(session, "shake").mockResolvedValue({
+				mode: "elide",
+				toolResultsDropped: 1,
+				blocksDropped: 0,
+				tokensFreed: 20_000,
+			});
+			await emitContextTokens(275_000);
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(475_000);
+
+			expect(await session.resetSessionContext()).toBeDefined();
+			const current = session.agent.state.model;
+			session.agent.setModel({ ...current, contextWindow: 1_000_000 });
+			expect(session.isTryShakeEnabled()).toBe(false);
+			expect(session.getTryShakeCheckpointStepTokens()).toBe(150_000);
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(275_000);
+		});
+
+		it("skips candidates below the default 4k savings gate and consumes the checkpoint", async () => {
+			useMillionContextModel();
+			seedHeavyToolResult("X ".repeat(2_000));
+			sessionManager.appendMessage({
+				role: "user",
+				content: [{ type: "text", text: "tail ".repeat(20_000) }],
+				timestamp: Date.now(),
+			});
+
+			await emitContextTokens(275_000);
+			expect(branchToolResults()[0].content[0]).toMatchObject({ text: expect.stringMatching(/^X /) });
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(425_000);
+			expect(events.find(event => event.type === "auto_compaction_end" && event.action === "shake")).toMatchObject({
+				skipped: true,
+			});
+		});
+
+		it("consumes weak and failed checkpoints instead of retry-spamming", async () => {
+			useMillionContextModel();
+			const shakeSpy = vi
+				.spyOn(session, "shake")
+				.mockResolvedValueOnce({ mode: "elide", toolResultsDropped: 0, blocksDropped: 0, tokensFreed: 0 })
+				.mockRejectedValueOnce(new Error("injected shake failure"));
+
+			await emitContextTokens(275_000);
+			await emitContextTokens(300_000);
+			expect(shakeSpy).toHaveBeenCalledTimes(1);
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(425_000);
+			await emitContextTokens(425_000);
+			await emitContextTokens(500_000);
+			expect(shakeSpy).toHaveBeenCalledTimes(2);
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(575_000);
+		});
+
+		it("does not run try-shake twice when a weak checkpoint reaches ordinary compaction", async () => {
+			useMillionContextModel();
+			session.settings.set("compaction.enabled", true);
+			session.settings.set("compaction.methodOrder", ["soft"]);
+			session.settings.set("compaction.thresholdTokens", 800_000);
+			session.settings.set("compaction.keepRecentTokens", 1);
+			session.settings.set("compaction.asyncEnabled", false);
+			sessionManager.appendMessage({
+				role: "user",
+				content: [{ type: "text", text: "source turn" }],
+				timestamp: Date.now() - 2,
+			});
+			sessionManager.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: "source response" }],
+				...apiInfo,
+				stopReason: "stop",
+				usage,
+				timestamp: Date.now() - 1,
+			});
+			const shakeSpy = vi
+				.spyOn(session, "shake")
+				.mockResolvedValue({ mode: "elide", toolResultsDropped: 1, blocksDropped: 0, tokensFreed: 20_000 });
+			const compactSpy = vi.spyOn(compactionModule, "compact");
+
+			await emitContextTokens(875_000);
+
+			expect(shakeSpy).toHaveBeenCalledTimes(1);
+			expect(compactSpy).toHaveBeenCalled();
+		});
+
+		it("does not dispatch a second checkpoint while shake maintenance is active", async () => {
+			useMillionContextModel();
+			const firstStarted = Promise.withResolvers<void>();
+			const releaseFirst = Promise.withResolvers<void>();
+			const shakeSpy = vi.spyOn(session, "shake").mockImplementationOnce(async () => {
+				firstStarted.resolve();
+				await releaseFirst.promise;
+				return { mode: "elide", toolResultsDropped: 1, blocksDropped: 0, tokensFreed: 20_000 };
+			});
+
+			const first = emitContextTokens(275_000);
+			await firstStarted.promise;
+			const second = emitContextTokens(425_000);
+			await scheduler.wait(20);
+			expect(shakeSpy).toHaveBeenCalledTimes(1);
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(425_000);
+			releaseFirst.resolve();
+			await Promise.all([first, second]);
+			expect(shakeSpy).toHaveBeenCalledTimes(1);
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(425_000);
+
+			shakeSpy.mockResolvedValue({ mode: "elide", toolResultsDropped: 1, blocksDropped: 0, tokensFreed: 20_000 });
+			await emitContextTokens(425_000);
+			expect(shakeSpy).toHaveBeenCalledTimes(2);
+		});
+
 		it("dispatches the elide path and emits a shake action for threshold maintenance", async () => {
 			session.settings.set("compaction.methodOrder", ["shake", "soft"]);
 			session.settings.set("compaction.thresholdPercent", 1);

@@ -82,6 +82,36 @@ export interface AdvisorConfigDeps {
 	defaultModelLabel?: string;
 }
 
+/**
+ * Resolve advisor picker choices against the live registry snapshot.
+ *
+ * Session-scoped models are long-lived concrete objects and can outlive a
+ * provider refresh, auth disable, or catalog prune. Persisting one blindly
+ * produces a selector the advisor runtime immediately rejects because it
+ * resolves against `modelRegistry.getAvailable()`. Intersect by canonical
+ * provider/id and return the live model objects so every offered choice is
+ * resolvable by the runtime at picker-open time.
+ */
+export function resolveAdvisorPickerModels(
+	availableModels: ReadonlyArray<Model>,
+	scopedModels: ReadonlyArray<{ model: Model }>,
+): ReadonlyArray<Model> {
+	if (scopedModels.length === 0) return availableModels;
+	const modelKey = (model: Pick<Model, "provider" | "id">) =>
+		`${model.provider.toLowerCase()}\0${model.id.toLowerCase()}`;
+	const availableByKey = new Map(availableModels.map(model => [modelKey(model), model]));
+	const seen = new Set<string>();
+	const resolved: Model[] = [];
+	for (const scoped of scopedModels) {
+		const key = modelKey(scoped.model);
+		const live = availableByKey.get(key);
+		if (!live || seen.has(key)) continue;
+		seen.add(key);
+		resolved.push(live);
+	}
+	return resolved;
+}
+
 const PREVIEW_WIDTH = 60;
 
 function previewLine(text: string | undefined): string {
@@ -525,16 +555,13 @@ export class AdvisorConfigOverlayComponent implements Component {
 	#showModelPicker(index: number): void {
 		const storage = this.#settings.getStorage();
 		const mruOrder = storage?.getModelUsageOrder() ?? [];
-		let models: ReadonlyArray<Model>;
-		if (this.#scopedModels.length > 0) {
-			models = this.#scopedModels.map(scoped => scoped.model);
-		} else {
-			try {
-				models = this.#modelRegistry.getAvailable();
-			} catch {
-				models = [];
-			}
+		let availableModels: ReadonlyArray<Model>;
+		try {
+			availableModels = this.#modelRegistry.getAvailable();
+		} catch {
+			availableModels = [];
 		}
+		const models = resolveAdvisorPickerModels(availableModels, this.#scopedModels);
 		const items = buildBrowserItems(models);
 		sortModelItems(items, { mruOrder });
 

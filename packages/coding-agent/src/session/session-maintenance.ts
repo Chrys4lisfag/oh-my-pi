@@ -178,6 +178,11 @@ const PRUNE_IDLE_FLUSH_MS = 90 * 60_000;
  * most-recent kept turn already exceeds the threshold (the snapcompact thrash).
  */
 const COMPACTION_RECOVERY_BAND = 0.8;
+const MILLION_CONTEXT_WINDOW_TOKENS = 1_000_000;
+export const TRY_SHAKE_FIRST_CHECKPOINT_TOKENS = 275_000;
+export const DEFAULT_TRY_SHAKE_CHECKPOINT_STEP_TOKENS = 150_000;
+export const MIN_TRY_SHAKE_CHECKPOINT_STEP_TOKENS = 1_000;
+export const MAX_TRY_SHAKE_CHECKPOINT_STEP_TOKENS = 1_000_000;
 
 /** A speculation-produced compaction result, ready to commit at threshold. */
 interface ArmedSpeculation {
@@ -338,6 +343,8 @@ export class SessionMaintenance {
 	/** In-flight or armed background speculative compaction, if any. */
 	#speculation: SpeculationRun | undefined;
 	#skipPostTurnMaintenanceAssistantTimestamp: number | undefined;
+	#tryShakeCheckpointStepTokens = DEFAULT_TRY_SHAKE_CHECKPOINT_STEP_TOKENS;
+	readonly #lastMillionContextShakeCheckpointByModel = new Map<string, number>();
 	readonly #host: SessionMaintenanceHost;
 
 	get #model(): Model | undefined {
@@ -354,6 +361,41 @@ export class SessionMaintenance {
 
 	constructor(host: SessionMaintenanceHost) {
 		this.#host = host;
+	}
+
+	setTryShakeCheckpointStepTokens(tokens: number): void {
+		if (
+			!Number.isSafeInteger(tokens) ||
+			tokens < MIN_TRY_SHAKE_CHECKPOINT_STEP_TOKENS ||
+			tokens > MAX_TRY_SHAKE_CHECKPOINT_STEP_TOKENS
+		) {
+			throw new RangeError(
+				`Try-shake checkpoint step must be ${MIN_TRY_SHAKE_CHECKPOINT_STEP_TOKENS}-${MAX_TRY_SHAKE_CHECKPOINT_STEP_TOKENS} tokens`,
+			);
+		}
+		this.#tryShakeCheckpointStepTokens = tokens;
+	}
+
+	get tryShakeCheckpointStepTokens(): number {
+		return this.#tryShakeCheckpointStepTokens;
+	}
+
+	get nextTryShakeCheckpointTokens(): number {
+		const model = this.#model;
+		if (!model || (model.contextWindow ?? 0) < MILLION_CONTEXT_WINDOW_TOKENS) {
+			return TRY_SHAKE_FIRST_CHECKPOINT_TOKENS;
+		}
+		const last = this.#lastMillionContextShakeCheckpointByModel.get(`${model.provider}/${model.id}`);
+		return last === undefined ? TRY_SHAKE_FIRST_CHECKPOINT_TOKENS : last + this.#tryShakeCheckpointStepTokens;
+	}
+
+	resetTryShakeCheckpoints(): void {
+		this.#tryShakeCheckpointStepTokens = DEFAULT_TRY_SHAKE_CHECKPOINT_STEP_TOKENS;
+		this.#lastMillionContextShakeCheckpointByModel.clear();
+	}
+
+	#resetTryShakeCheckpointsAfterCompaction(): void {
+		this.#lastMillionContextShakeCheckpointByModel.clear();
 	}
 
 	/** Whether manual or automatic context maintenance is active. */
@@ -1385,6 +1427,7 @@ export class SessionMaintenance {
 		const sessionContext = this.#host.buildDisplaySessionContext();
 		this.#host.agent.replaceMessages(sessionContext.messages);
 		this.#host.rebaseAfterCompaction();
+		this.#resetTryShakeCheckpointsAfterCompaction();
 		// Compaction discarded the conversation history that carried the approved
 		// plan reference. Clear the sent-flag so #buildPlanReferenceMessage re-reads
 		// the plan from disk and re-injects it on the next turn (issue #1246).
@@ -1640,6 +1683,63 @@ export class SessionMaintenance {
 			messagesAfter: activeMessages.length,
 		});
 	}
+	async #runMillionContextShakeCheckpoint(options: {
+		contextTokens: number;
+		generation: number;
+		autoContinue: boolean;
+		terminalTextAnswer: boolean;
+		allowDefer: boolean;
+		sameModel: boolean | undefined;
+	}): Promise<{ attempted: boolean; busy?: boolean; result?: CompactionCheckResult }> {
+		const model = this.#model;
+		if (
+			!model ||
+			(model.contextWindow ?? 0) < MILLION_CONTEXT_WINDOW_TOKENS ||
+			!this.#host.tryShakeEnabled?.() ||
+			!options.sameModel ||
+			!options.allowDefer ||
+			options.contextTokens < TRY_SHAKE_FIRST_CHECKPOINT_TOKENS
+		) {
+			return { attempted: false };
+		}
+		const modelKey = `${model.provider}/${model.id}`;
+		const lastCheckpoint = this.#lastMillionContextShakeCheckpointByModel.get(modelKey);
+		const nextCheckpoint =
+			lastCheckpoint === undefined
+				? TRY_SHAKE_FIRST_CHECKPOINT_TOKENS
+				: lastCheckpoint + this.#tryShakeCheckpointStepTokens;
+		if (options.contextTokens < nextCheckpoint) return { attempted: false };
+		if (this.isCompacting || this.#host.isGeneratingHandoff()) return { attempted: false, busy: true };
+
+		// Consume every crossed interval with one check. Recording before the await
+		// prevents concurrent agent_end routes, weak shakes, and failures from
+		// repeatedly firing at the same checkpoint.
+		const checkpointAnchor = lastCheckpoint ?? TRY_SHAKE_FIRST_CHECKPOINT_TOKENS;
+		const crossedCheckpoint =
+			checkpointAnchor +
+			Math.floor((options.contextTokens - checkpointAnchor) / this.#tryShakeCheckpointStepTokens) *
+				this.#tryShakeCheckpointStepTokens;
+		this.#lastMillionContextShakeCheckpointByModel.set(modelKey, crossedCheckpoint);
+		logger.debug("Million-context try-shake checkpoint reached", {
+			model: modelKey,
+			contextTokens: options.contextTokens,
+			checkpointTokens: crossedCheckpoint,
+			nextCheckpointTokens: crossedCheckpoint + this.#tryShakeCheckpointStepTokens,
+		});
+		const outcome = await this.#runAutoShake(
+			"threshold",
+			false,
+			options.generation,
+			options.autoContinue,
+			options.terminalTextAnswer,
+			options.contextTokens,
+			false,
+			false,
+			"checkpoint",
+		);
+		return { attempted: true, result: outcome === "fallback" ? COMPACTION_CHECK_NONE : outcome };
+	}
+
 	/**
 	 * Check if context maintenance or promotion is needed and run it.
 	 * Called after agent_end and before prompt submission.
@@ -1805,15 +1905,9 @@ export class SessionMaintenance {
 		// setting.
 		const supersedeResult = await this.#pruneStaleToolResults();
 
-		const compactionSettings = this.#host.settings.getGroup("compaction");
-		if (!compactionSettings.enabled || !hasConfiguredCompactionMethod(compactionSettings))
-			return COMPACTION_CHECK_NONE;
-
-		// Case 4: Threshold - turn succeeded but context is getting large
-		// Skip if this was an error (non-overflow errors don't have usage data)
+		// Case 4: Threshold - turn succeeded but context is getting large.
+		// Skip if this was an error (non-overflow errors don't have usage data).
 		if (assistantMessage.stopReason === "error") return COMPACTION_CHECK_NONE;
-		const pruneResult = await this.#pruneToolOutputs();
-		const maintenanceTokensFreed = (supersedeResult?.tokensSaved ?? 0) + (pruneResult?.tokensSaved ?? 0);
 		// `errorIsFromBeforeCompaction` (computed above) is the general
 		// "this assistant message predates the latest compaction" predicate here,
 		// not just an error-specific one; alias it locally so the threshold intent
@@ -1828,6 +1922,27 @@ export class SessionMaintenance {
 		const assistantUsageContextTokens = assistantPredatesCompaction
 			? 0
 			: calculateContextTokens(assistantMessage.usage);
+		const checkpointContextTokens = compactionContextTokens(
+			assistantUsageContextTokens,
+			this.#estimateStoredContextTokens(),
+		);
+		const checkpointResult = await this.#runMillionContextShakeCheckpoint({
+			contextTokens: checkpointContextTokens,
+			generation,
+			autoContinue,
+			terminalTextAnswer: isTerminalTextAssistantAnswer(assistantMessage),
+			allowDefer,
+			sameModel,
+		});
+		if (checkpointResult.busy) return COMPACTION_CHECK_NONE;
+		if (checkpointResult.result?.historyRewritten) return checkpointResult.result;
+
+		const compactionSettings = this.#host.settings.getGroup("compaction");
+		if (!compactionSettings.enabled || !hasConfiguredCompactionMethod(compactionSettings)) {
+			return COMPACTION_CHECK_NONE;
+		}
+		const pruneResult = await this.#pruneToolOutputs();
+		const maintenanceTokensFreed = (supersedeResult?.tokensSaved ?? 0) + (pruneResult?.tokensSaved ?? 0);
 		const storedContextTokens = this.#estimateStoredContextTokens();
 		// Pruning frees bytes for the NEXT prompt; it does not change the size of
 		// the prompt the LLM just billed for. Earlier revisions subtracted the
@@ -1884,6 +1999,7 @@ export class SessionMaintenance {
 					triggerContextTokens: postMaintenanceContextTokens,
 					phase: "pre_turn",
 					terminalTextAnswer: isTerminalTextAssistantAnswer(assistantMessage),
+					shakePreflightAttempted: checkpointResult.attempted,
 				});
 			}
 			logger.debug("Auto-compaction threshold satisfied but context promotion took over", {
@@ -2638,6 +2754,7 @@ export class SessionMaintenance {
 		const sessionContext = this.#host.buildDisplaySessionContext();
 		this.#host.agent.replaceMessages(sessionContext.messages);
 		this.#host.rebaseAfterCompaction();
+		this.#resetTryShakeCheckpointsAfterCompaction();
 		// Same post-rewrite bookkeeping as the regular compaction append: the
 		// rebuilt context no longer carries the transient plan reference (#1246),
 		// and advisor cursors / todo phases were derived from the replaced
@@ -3730,10 +3847,11 @@ export class SessionMaintenance {
 		triggerContextTokens?: number,
 		suppressContinuation = false,
 		detachPostCommit = false,
-		mode: "strategy" | "preflight" = "strategy",
+		mode: "strategy" | "preflight" | "checkpoint" = "strategy",
 	): Promise<CompactionCheckResult | "fallback"> {
 		const action = "shake";
 		const preflight = mode === "preflight";
+		const checkpoint = mode === "checkpoint";
 		this.#autoCompactionAbortController?.abort();
 		const controller = new AbortController();
 		this.#autoCompactionAbortController = controller;
@@ -3782,16 +3900,20 @@ export class SessionMaintenance {
 				if (typeof triggerContextTokens === "number" && Number.isFinite(triggerContextTokens)) {
 					const correctedTokens = Math.max(0, triggerContextTokens - result.tokensFreed);
 					const thresholdTokens = resolveThresholdTokens(contextWindow, compactionSettings);
-					const recoveryBand = Math.floor(thresholdTokens * COMPACTION_RECOVERY_BAND);
-					stillOverThreshold = correctedTokens > recoveryBand;
+					const recoveryTarget = checkpoint
+						? thresholdTokens
+						: Math.floor(thresholdTokens * COMPACTION_RECOVERY_BAND);
+					stillOverThreshold = correctedTokens > recoveryTarget;
 				} else {
 					const postShakeTokens = this.#host.getContextUsage({ contextWindow })?.tokens ?? 0;
 					stillOverThreshold = shouldCompact(postShakeTokens, contextWindow, compactionSettings);
 				}
 			}
-			const shouldFallBack = preflight
-				? !reclaimed || stillOverThreshold
-				: reason !== "idle" && ((reason === "overflow" && !reclaimed) || stillOverThreshold);
+			const shouldFallBack = checkpoint
+				? stillOverThreshold
+				: preflight
+					? !reclaimed || stillOverThreshold
+					: reason !== "idle" && ((reason === "overflow" && !reclaimed) || stillOverThreshold);
 			if (shouldFallBack) {
 				const fallbackTarget = preflight
 					? "the configured compaction method"
@@ -3824,6 +3946,10 @@ export class SessionMaintenance {
 				},
 				detachPostCommit,
 			);
+
+			if (checkpoint) {
+				return reclaimed ? { ...COMPACTION_CHECK_NONE, historyRewritten: true } : COMPACTION_CHECK_NONE;
+			}
 
 			let continuationScheduled = false;
 			if (willRetry) {

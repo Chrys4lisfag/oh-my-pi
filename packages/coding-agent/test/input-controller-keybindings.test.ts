@@ -97,6 +97,7 @@ async function createContext() {
 	const prompt = vi.fn(async () => {});
 	const retry = vi.fn(async () => true);
 	const abort = vi.fn(async () => {});
+	const cycleThinkingLevel = vi.fn(() => undefined);
 	const session = {
 		isStreaming: false,
 		isCompacting: false,
@@ -108,6 +109,7 @@ async function createContext() {
 		queuedMessageCount: 0,
 		abort,
 		retry,
+		cycleThinkingLevel,
 	};
 	const updatePendingMessagesDisplay = vi.fn();
 	const handleBtwBranchKey = vi.fn(async () => true);
@@ -250,6 +252,7 @@ async function createContext() {
 			requestRender,
 			retry,
 			abort,
+			cycleThinkingLevel,
 			resetDisplay,
 			clearInlineImages,
 			refreshAppearance,
@@ -267,6 +270,15 @@ async function createContext() {
 }
 
 describe("InputController keybinding setup", () => {
+	it("persists user-triggered thinking cycles for profile synchronization", async () => {
+		const { InputController, ctx, spies } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.cycleThinkingLevel();
+
+		expect(spies.cycleThinkingLevel).toHaveBeenCalledWith(true);
+	});
+
 	it("registers model selector and display reset actions separately", async () => {
 		const { InputController, ctx, editor, spies } = await createContext();
 		const controller = new InputController(ctx);

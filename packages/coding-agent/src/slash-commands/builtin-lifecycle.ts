@@ -40,6 +40,20 @@ function parseShakeMode(args: string): ShakeMode | { error: string } {
 	return { error: `Unknown /shake mode "${verb}". Use elide or images.` };
 }
 
+function parseTryShakeTokenAmount(value: string): number | undefined {
+	const match = /^(\d+(?:\.\d+)?)\s*([km]?)$/i.exec(value.trim());
+	if (!match) return undefined;
+	const multiplier = match[2].toLowerCase() === "m" ? 1_000_000 : match[2].toLowerCase() === "k" ? 1_000 : 1;
+	const tokens = Number(match[1]) * multiplier;
+	return Number.isSafeInteger(tokens) && tokens > 0 ? tokens : undefined;
+}
+
+function formatTryShakeTokens(tokens: number): string {
+	if (tokens % 1_000_000 === 0) return `${tokens / 1_000_000}m`;
+	if (tokens % 1_000 === 0) return `${tokens / 1_000}k`;
+	return tokens.toLocaleString("en-US");
+}
+
 /** Format the session's workspace directories (cwd + additional) for display. */
 function formatWorkspaceDirectories(runtime: SlashCommandRuntime, note?: string): string {
 	const cwd = runtime.sessionManager.getCwd();
@@ -201,17 +215,35 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			{ name: "on", description: "Try shake before automatic compaction" },
 			{ name: "off", description: "Use the configured compaction strategy directly" },
 			{ name: "status", description: "Show current session try-shake status" },
+			{ name: "step", description: "Set million-context checkpoint spacing (for example 150k)", usage: "<tokens>" },
 		],
-		acpInputHint: "[on|off|status]",
+		acpInputHint: "[on|off|status|step <tokens>]",
 		allowArgs: true,
 		handle: async (command, runtime) => {
 			const arg = command.args.trim().toLowerCase();
 			if (arg === "status") {
 				const enabled = runtime.session.isTryShakeEnabled();
-				await runtime.output(`Try-shake is ${enabled ? "enabled" : "disabled"} for this session.`);
+				const step = runtime.session.getTryShakeCheckpointStepTokens();
+				const next = runtime.session.getNextTryShakeCheckpointTokens();
+				await runtime.output(
+					`Try-shake is ${enabled ? "enabled" : "disabled"} for this session. First: 275k; step: ${formatTryShakeTokens(step)}; next: ${formatTryShakeTokens(next)}.`,
+				);
 				return commandConsumed();
 			}
-			if (arg !== "on" && arg !== "off") return usage("Usage: /tryshake [on|off|status]", runtime);
+			if (arg.startsWith("step ")) {
+				const tokens = parseTryShakeTokenAmount(arg.slice(5));
+				if (tokens === undefined) return usage("Usage: /tryshake step <tokens> (for example 150k)", runtime);
+				try {
+					runtime.session.setTryShakeCheckpointStepTokens(tokens);
+				} catch (error) {
+					return usage(error instanceof Error ? error.message : String(error), runtime);
+				}
+				await runtime.output(`Try-shake checkpoint step set to ${formatTryShakeTokens(tokens)} for this session.`);
+				return commandConsumed();
+			}
+			if (arg !== "on" && arg !== "off") {
+				return usage("Usage: /tryshake [on|off|status|step <tokens>]", runtime);
+			}
 			const enabled = arg === "on";
 			runtime.session.setTryShakeEnabled(enabled);
 			await runtime.output(`Try-shake ${enabled ? "enabled" : "disabled"} for this session.`);

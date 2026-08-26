@@ -16,7 +16,7 @@ import type {
 } from "@oh-my-pi/pi-ai/types";
 import type { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { readModelCache } from "@oh-my-pi/pi-catalog/model-cache";
+import { readModelCache, writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import {
 	createModelManager,
 	type ModelManagerOptions,
@@ -57,6 +57,7 @@ import {
 } from "./model-config-values";
 import {
 	applyLlamaCppQwenThinking,
+	buildOpenAIModelsListDiscoveryUrl,
 	DISCOVERY_DEFAULT_MAX_TOKENS,
 	type DiscoveryContext,
 	type DiscoveryProviderConfig,
@@ -113,6 +114,8 @@ import { type Settings, settings } from "./settings";
 // DeviceCheck attestation (`x-oai-attestation`) for ChatGPT-OAuth Codex
 // requests; the pi-ai provider resolves it just-in-time per request.
 setCodexAttestationProvider(generateCodexAttestation);
+
+const CONFIGURED_DISCOVERY_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 /** Result of loading custom models config. */
 interface CustomModelsResult {
@@ -185,6 +188,7 @@ export class ModelRegistry {
 	#lastStaticLoadMtime: number | null = null;
 	#registeredProviderSources: Set<string> = new Set();
 	#providerDiscoveryStates: Map<string, ProviderDiscoveryState> = new Map();
+	#providerLastDiscoveryAttemptAt = new Map<string, number>();
 	#cacheDbPath?: string;
 	#suppressedSelectors: Map<string, number> = new Map();
 	#backgroundRefresh?: Promise<void>;
@@ -794,18 +798,14 @@ export class ModelRegistry {
 	#loadCachedDiscoverableModels(): Model<Api>[] {
 		const cachedModels: Model<Api>[] = [];
 		for (const providerConfig of this.#discoverableProviders) {
-			const cache = readModelCache<Api>(
-				this.#configuredDiscoveryCacheProviderId(providerConfig),
-				24 * 60 * 60 * 1000,
-				Date.now,
-				this.#cacheDbPath,
-			);
+			const cache = this.#readConfiguredDiscoveryCache(providerConfig);
 			if (!cache) {
 				this.#providerDiscoveryStates.set(providerConfig.provider, {
 					provider: providerConfig.provider,
 					status: "idle",
 					optional: providerConfig.optional ?? false,
 					stale: false,
+					attemptedAt: this.#providerLastDiscoveryAttemptAt.get(providerConfig.provider),
 					models: [],
 				});
 				continue;
@@ -840,6 +840,7 @@ export class ModelRegistry {
 					configStale ||
 					omittedHeaderIds.size > 0,
 				fetchedAt: cache.updatedAt,
+				attemptedAt: this.#providerLastDiscoveryAttemptAt.get(providerConfig.provider),
 				models: models.map(model => model.id),
 			});
 		}
@@ -1004,9 +1005,11 @@ export class ModelRegistry {
 				const disableStrictCompat = providerConfig.disableStrictTools ? { disableStrictTools: true } : undefined;
 				overrides.set(providerName, {
 					baseUrl:
-						providerConfig.discovery?.type === "litellm"
-							? normalizeLiteLLMDiscoveryBaseUrl(providerConfig.baseUrl)
-							: providerConfig.baseUrl,
+						providerConfig.discovery?.baseUrl && providerConfig.baseUrl
+							? providerConfig.baseUrl.replace(/\/+$/g, "")
+							: providerConfig.discovery?.type === "litellm"
+								? normalizeLiteLLMDiscoveryBaseUrl(providerConfig.baseUrl ?? providerConfig.discovery.baseUrl)
+								: providerConfig.baseUrl,
 					headers: resolvedProviderHeaders,
 					apiKey: providerConfig.apiKey,
 					authHeader: providerConfig.authHeader,
@@ -1091,7 +1094,16 @@ export class ModelRegistry {
 			this.#discoverBuiltInProviderModels(strategy, providerFilter),
 		]);
 		const discovered = [...configuredDiscovered, ...builtInDiscovery.models];
-		if (discovered.length === 0 && builtInDiscovery.authoritativeProviders.size === 0) {
+		const successfulEmptyConfiguredProviders = new Set(
+			selectedDiscoverableProviders
+				.filter(provider => this.#providerDiscoveryStates.get(provider.provider)?.status === "empty")
+				.map(provider => provider.provider),
+		);
+		if (
+			discovered.length === 0 &&
+			builtInDiscovery.authoritativeProviders.size === 0 &&
+			successfulEmptyConfiguredProviders.size === 0
+		) {
 			return;
 		}
 		this.#ensureFullSnapshot();
@@ -1106,6 +1118,9 @@ export class ModelRegistry {
 		);
 		const authoritativeProviders = providersWithAuthoritativeProjectCatalog(discoveredModels);
 		for (const provider of builtInDiscovery.authoritativeProviders) {
+			authoritativeProviders.add(provider);
+		}
+		for (const provider of successfulEmptyConfiguredProviders) {
 			authoritativeProviders.add(provider);
 		}
 		const baseModels =
@@ -1126,22 +1141,98 @@ export class ModelRegistry {
 	}
 
 	#configuredDiscoveryCacheProviderId(providerConfig: DiscoveryProviderConfig): string {
+		const discoveryType = providerConfig.discovery.type;
+		const urlBackedDiscovery = ["lm-studio", "openai-models-list", "proxy", "litellm"].includes(discoveryType);
+		const endpointBaseUrl =
+			providerConfig.discovery.baseUrl ??
+			providerConfig.baseUrl ??
+			(discoveryType === "litellm" ? "http://localhost:4000/v1" : undefined);
+		const endpointSuffix = urlBackedDiscovery
+			? `:endpoint-${Bun.hash(buildOpenAIModelsListDiscoveryUrl(endpointBaseUrl)).toString(36)}`
+			: "";
+		const authSuffix = providerConfig.discovery.auth === "none" ? ":auth-none" : "";
 		if (providerConfig.discovery.type === "ollama") {
-			return resolveOllamaModelCacheProviderId(providerConfig.provider, providerConfig.baseUrl);
+			return `${resolveOllamaModelCacheProviderId(providerConfig.provider, providerConfig.baseUrl)}${authSuffix}`;
 		}
 		if (providerConfig.discovery.type === "openai-models-list") {
 			// context-v3 invalidates rows cached before server-advertised input
 			// modalities were parsed from `/v1/models`; warm v2 rows pinned
 			// vision-capable ids at `input: ["text"]` until a forced refresh.
-			return `${providerConfig.provider}:openai-models-list-context-v3`;
+			return `${providerConfig.provider}:openai-models-list-context-v3${endpointSuffix}${authSuffix}`;
 		}
 		if (providerConfig.discovery.type === "litellm") {
 			// rich-v2 invalidates rows cached before reseller usage-suffix stripping
 			// (stale display names like `MiniMax-M3 (3x usage)`); keep in lockstep
 			// with the catalog package's `litellm:rich-vN` namespace.
+			return `${providerConfig.provider}:litellm-rich-v2${endpointSuffix}${authSuffix}`;
+		}
+		if (providerConfig.discovery.type === "proxy" || providerConfig.discovery.type === "lm-studio") {
+			return `${providerConfig.provider}:${providerConfig.discovery.type}${endpointSuffix}${authSuffix}`;
+		}
+		return `${providerConfig.provider}${endpointSuffix}${authSuffix}`;
+	}
+
+	#legacyConfiguredDiscoveryCacheProviderId(providerConfig: DiscoveryProviderConfig): string {
+		if (providerConfig.discovery.type === "ollama") {
+			return resolveOllamaModelCacheProviderId(providerConfig.provider, providerConfig.baseUrl);
+		}
+		if (providerConfig.discovery.type === "openai-models-list") {
+			return `${providerConfig.provider}:openai-models-list-context-v3`;
+		}
+		if (providerConfig.discovery.type === "litellm") {
 			return `${providerConfig.provider}:litellm-rich-v2`;
 		}
 		return providerConfig.provider;
+	}
+
+	#readConfiguredDiscoveryCache(providerConfig: DiscoveryProviderConfig) {
+		const cacheProviderId = this.#configuredDiscoveryCacheProviderId(providerConfig);
+		const current = readModelCache<Api>(
+			cacheProviderId,
+			CONFIGURED_DISCOVERY_CACHE_TTL_MS,
+			Date.now,
+			this.#cacheDbPath,
+		);
+		if (current || providerConfig.discovery.baseUrl || providerConfig.discovery.auth === "none") {
+			return current;
+		}
+
+		const legacyProviderId = this.#legacyConfiguredDiscoveryCacheProviderId(providerConfig);
+		if (legacyProviderId === cacheProviderId) {
+			return null;
+		}
+		const legacy = readModelCache<Api>(
+			legacyProviderId,
+			CONFIGURED_DISCOVERY_CACHE_TTL_MS,
+			Date.now,
+			this.#cacheDbPath,
+		);
+		if (!legacy) {
+			return null;
+		}
+
+		// Pre-endpoint cache rows cannot prove which base URL produced them.
+		// Migrate only configs without an explicit discovery override, drop rows
+		// whose required live headers cannot be restored, and age the copy past
+		// TTL so online startup probes the endpoint while offline/error paths keep
+		// a safe backward-compatible fallback.
+		const omittedHeaderIds = new Set(legacy.headerOmittedModelIds);
+		const models = legacy.models.filter(model => !omittedHeaderIds.has(model.id)).map(model => buildModel(model));
+		const migratedAt = Math.min(legacy.updatedAt, Date.now() - CONFIGURED_DISCOVERY_CACHE_TTL_MS - 1);
+		const authoritative = legacy.authoritative && omittedHeaderIds.size === 0;
+		writeModelCache(cacheProviderId, migratedAt, models, authoritative, legacy.staticFingerprint, this.#cacheDbPath);
+		return (
+			readModelCache<Api>(cacheProviderId, CONFIGURED_DISCOVERY_CACHE_TTL_MS, Date.now, this.#cacheDbPath) ?? {
+				models: models.map(toModelSpec),
+				fresh: false,
+				authoritative,
+				updatedAt: migratedAt,
+				headerOmittedModelIds: [],
+				unrestorableHeaderModelIds: [],
+				legacyHeaderRestoreMarkers: false,
+				staticFingerprint: legacy.staticFingerprint,
+			}
+		);
 	}
 
 	#isDiscoveryCacheOlderThanModelsConfig(cacheUpdatedAt: number): boolean {
@@ -1154,12 +1245,13 @@ export class ModelRegistry {
 		strategy: ModelRefreshStrategy,
 	): Promise<Model<Api>[]> {
 		const cacheProviderId = this.#configuredDiscoveryCacheProviderId(providerConfig);
-		const cached = readModelCache<Api>(cacheProviderId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
+		const cached = this.#readConfiguredDiscoveryCache(providerConfig);
 		const cacheOlderThanConfig = cached !== null && this.#isDiscoveryCacheOlderThanModelsConfig(cached.updatedAt);
 		const bypassFreshCache = providerConfig.discovery.type === "llama.cpp" && strategy === "online-if-uncached";
 		const effectiveStrategy =
 			strategy === "online-if-uncached" && (cacheOlderThanConfig || bypassFreshCache) ? "online" : strategy;
-		const requiresAuth = !this.#keylessProviders.has(providerConfig.provider);
+		const requiresAuth =
+			providerConfig.discovery.auth !== "none" && !this.#keylessProviders.has(providerConfig.provider);
 		if (requiresAuth) {
 			const apiKey = await this.#peekApiKeyForProvider(providerConfig.provider);
 			if (!isAuthenticated(apiKey)) {
@@ -1169,6 +1261,7 @@ export class ModelRegistry {
 					optional: providerConfig.optional ?? false,
 					stale: cached !== null,
 					fetchedAt: cached?.updatedAt,
+					attemptedAt: this.#providerLastDiscoveryAttemptAt.get(providerConfig.provider),
 					models: cached?.models.map(model => model.id) ?? [],
 				});
 				this.#lastDiscoveryWarnings.delete(providerConfig.provider);
@@ -1202,10 +1295,11 @@ export class ModelRegistry {
 			staticModels: [],
 			cacheDbPath: this.#cacheDbPath,
 			cacheProviderId,
-			cacheTtlMs: 24 * 60 * 60 * 1000,
+			cacheTtlMs: CONFIGURED_DISCOVERY_CACHE_TTL_MS,
 			fetchDynamicModels,
 		});
 		const result = await manager.refresh(effectiveStrategy);
+		if (result.fetched) this.#providerLastDiscoveryAttemptAt.set(providerId, Date.now());
 		const status = discoveryError
 			? result.models.length > 0
 				? "cached"
@@ -1216,13 +1310,18 @@ export class ModelRegistry {
 					: "idle"
 				: result.models.length > 0
 					? "ok"
-					: "empty";
+					: result.fetched
+						? "empty"
+						: cached
+							? "cached"
+							: "idle";
 		this.#providerDiscoveryStates.set(providerId, {
 			provider: providerId,
 			status,
 			optional: providerConfig.optional ?? false,
 			stale: result.stale || status === "cached" || ((cacheOlderThanConfig || bypassFreshCache) && status !== "ok"),
-			fetchedAt: discoveryError ? cached?.updatedAt : Date.now(),
+			fetchedAt: result.fetched ? Date.now() : cached?.updatedAt,
+			attemptedAt: this.#providerLastDiscoveryAttemptAt.get(providerId),
 			models: result.models.map(model => model.id),
 			error: discoveryError,
 		});

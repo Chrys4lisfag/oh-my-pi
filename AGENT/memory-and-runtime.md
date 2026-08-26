@@ -360,13 +360,27 @@ status rendering. Do not conflate reminder injections with
 
 ## 11. Try-shake compaction preflight
 
-`/tryshake on` sets in-memory state on the current `AgentSession`, while
-`/tryshake status` reports that state without mutating it. New, switched, and cleared
-logical sessions reset it, and no settings file stores it. On each
-automatic compaction trigger, OMP runs one conservative `DEFAULT_SHAKE_CONFIG`
-elide pass before the current non-`shake` method from `compaction.methodOrder`. When
-the ordered dispatcher reaches `shake` itself, it does not run a duplicate preflight.
-Disabled/off auto-compaction still wins.
+`/tryshake on` sets in-memory state on the current `AgentSession`. `/tryshake step
+150k` changes the session-scoped million-context checkpoint spacing (plain integers and
+`k`/`m` suffixes are accepted), while `/tryshake status` reports enabled state, first
+checkpoint, step, and next checkpoint. New, switched, and cleared logical sessions reset
+the toggle, step, and checkpoint map; no settings file stores them.
+
+For a selected model whose context window is at least 1,000,000 tokens, successful
+post-turn maintenance first checks at 275k used tokens, then at the configured step
+(default 150k: 425k, 575k, 725k, 875k). Each crossed checkpoint is attempted at most
+once even when context drops and later re-crosses it; no-op, failure, and success all
+advance the checkpoint, preventing repeated 275k shakes. A late first observation runs
+one check and consumes every crossed interval. `DEFAULT_SHAKE_CONFIG.minSavings` (4k)
+is the pre-mutation "large enough" gate. Active compaction/handoff defers the check
+without consuming it, and full compaction resets the current model's checkpoint cycle.
+This proactive path remains available when automatic compaction is disabled.
+
+Separately, on each automatic compaction trigger OMP runs one conservative
+`DEFAULT_SHAKE_CONFIG` elide pass before the current non-`shake` method from
+`compaction.methodOrder`. When the ordered dispatcher reaches `shake` itself, it does
+not run a duplicate preflight. A checkpoint attempt suppresses that trigger's duplicate
+preflight before the configured method runs.
 
 The preflight skips the current method only after recovering the existing
 headroom/recovery target. No eligible regions, a shake failure, or residual pressure
@@ -392,7 +406,33 @@ recovery-band math, retries, aborts, and dead-end rescue. Reapply only the
 session-scoped state and reset, single-attempt preflight guard, ordered-method
 fallthrough, and slash command.
 
-## 12. Confirmed non-features and stale history
+## 12. Try-compact reminder extension
+
+The tracked `examples/extensions/compact-reminder.ts` is installed as
+`~/.omp/agent/extensions/compact-reminder.ts`. It preserves the prior visible,
+user-attributed follow-up prompt after compaction and adds `/try-compact`:
+
+- `/try-compact status` reports the current session's config and consumed mid-context checkpoint.
+- `/try-compact settings` opens a validated editor document; config appends only after a valid save.
+- `/try-compact load [number]` imports a config preset from another session in the same project session directory.
+- `/compact-remind` remains a compatibility alias.
+
+Config is stored as custom entries in the current session (`enabled` defaults on,
+`midremind` defaults off, `midremindstep` defaults 275k). Mid-remind state is a
+separate custom entry keyed by session ID. The state entry is persisted before the
+visible reminder is queued, so shake-driven context drops or reminder follow-up turns
+cannot retrigger the same step. A late observation consumes the highest crossed step.
+Full manual/automatic compaction resets the session's step state to zero; shake does
+not. Compaction-event deduplication is session-ID scoped, and an existing continuation
+defers the reminder without consuming its checkpoint. Presets copy config only, never
+checkpoint state.
+
+Implementation and tests:
+
+- `packages/coding-agent/examples/extensions/compact-reminder.ts`
+- `packages/coding-agent/test/extensions/compact-reminder.test.ts`
+
+## 13. Confirmed non-features and stale history
 
 Do not recreate these from old branches unless a new requirement exists:
 

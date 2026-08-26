@@ -55,21 +55,25 @@ function installTestTheme(): void {
 interface RegistryOverrides {
 	refresh?: (mode: string) => Promise<void>;
 	refreshProvider?: (providerId: string, mode: string) => Promise<void>;
+	awaitBackgroundRefresh?: () => Promise<void>;
 	getAvailable?: () => Model[];
 	getAll?: () => Model[];
 	getDiscoverableProviders?: () => string[];
 	getProviderDiscoveryState?: (providerId: string) => unknown;
+	onModelsUpdated?: (listener: () => void) => () => void;
 }
 
 function makeRegistry(models: () => Model[], overrides: RegistryOverrides = {}): ModelRegistry {
 	return {
 		refresh: overrides.refresh ?? (async () => {}),
 		refreshProvider: overrides.refreshProvider ?? (async () => {}),
+		awaitBackgroundRefresh: overrides.awaitBackgroundRefresh ?? (async () => {}),
 		getError: () => undefined,
 		getAvailable: overrides.getAvailable ?? models,
 		getAll: overrides.getAll ?? models,
 		getDiscoverableProviders: overrides.getDiscoverableProviders ?? (() => []),
 		getProviderDiscoveryState: overrides.getProviderDiscoveryState ?? (() => undefined),
+		onModelsUpdated: overrides.onModelsUpdated ?? (() => () => {}),
 		authStorage: { hasAuth: () => false },
 	} as unknown as ModelRegistry;
 }
@@ -90,6 +94,7 @@ function createHub(options: {
 	scoped?: boolean;
 	settings?: Settings;
 	registry?: RegistryOverrides;
+	registryInstance?: ModelRegistry;
 	hub?: ModelHubOptions;
 	callbacks?: Partial<ModelHubCallbacks>;
 	terminalRows?: number;
@@ -97,7 +102,7 @@ function createHub(options: {
 	installTestTheme();
 	const modelsFn = typeof options.models === "function" ? options.models : () => options.models as Model[];
 	const settings = options.settings ?? Settings.isolated({});
-	const registry = makeRegistry(modelsFn, options.registry);
+	const registry = options.registryInstance ?? makeRegistry(modelsFn, options.registry);
 	const ui = { requestRender: vi.fn(), terminal: { rows: options.terminalRows ?? 40 } } as unknown as TUI;
 	const onAssign = vi.fn();
 	const onUnassign = vi.fn();
@@ -136,6 +141,14 @@ const DOWN = "\x1b[B";
 const UP = "\x1b[A";
 const LEFT = "\x1b[D";
 const ESC = "\x1b";
+
+async function waitForCondition(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate()) {
+		if (Date.now() >= deadline) throw new Error("Timed out waiting for model hub condition");
+		await Bun.sleep(10);
+	}
+}
 
 describe("ModelHub", () => {
 	beforeAll(async () => {
@@ -1100,12 +1113,206 @@ describe("ModelHub", () => {
 	});
 
 	describe("provider refresh lifecycle", () => {
+		test("does not immediately duplicate a fresh empty startup discovery", async () => {
+			const now = vi.spyOn(Date, "now").mockReturnValue(3_000_000);
+			const refreshProvider = vi.fn(async () => {});
+			const { hub } = createHub({
+				models: [],
+				registry: {
+					refreshProvider,
+					getDiscoverableProviders: () => ["prov-fresh-empty"],
+					getProviderDiscoveryState: () => ({
+						provider: "prov-fresh-empty",
+						status: "empty",
+						models: [],
+						fetchedAt: 3_000_000,
+						attemptedAt: 3_000_000,
+					}),
+				},
+			});
+			await Bun.sleep(140);
+			expect(refreshProvider).not.toHaveBeenCalled();
+
+			// Explicit F5 remains an immediate escape hatch from the cooldown.
+			hub.handleInput(DOWN);
+			hub.handleInput("\x1b[15~");
+			await Bun.sleep(140);
+			expect(refreshProvider).toHaveBeenCalledTimes(1);
+			now.mockRestore();
+		});
+
+		test("limits an always-empty provider to two automatic attempts", async () => {
+			const now = vi.spyOn(Date, "now").mockReturnValue(4_000_000);
+			let state = { provider: "prov-always-empty", status: "cached", models: [] as string[], fetchedAt: 0 };
+			const refreshProvider = vi.fn(async () => {
+				state = { ...state, status: "empty", fetchedAt: Date.now() };
+			});
+			const registryInstance = makeRegistry(() => [], {
+				refreshProvider,
+				getDiscoverableProviders: () => ["prov-always-empty"],
+				getProviderDiscoveryState: () => state,
+			});
+			const first = createHub({ models: [], registryInstance }).hub;
+			await waitForCondition(() => refreshProvider.mock.calls.length === 1);
+			first.dispose();
+
+			now.mockReturnValue(4_031_000);
+			const second = createHub({ models: [], registryInstance }).hub;
+			await waitForCondition(() => refreshProvider.mock.calls.length === 2);
+			second.dispose();
+
+			now.mockReturnValue(4_062_000);
+			createHub({ models: [], registryInstance });
+			await Bun.sleep(140);
+			expect(refreshProvider).toHaveBeenCalledTimes(2);
+		});
+
+		test("refreshes every zero-model discoverable provider on open without entering them", async () => {
+			const models: Model[] = [makeModel("prov-populated", "already-present")];
+			const states = new Map<string, { provider: string; status: string; models: string[] }>([
+				["prov-zero-a", { provider: "prov-zero-a", status: "cached", models: [] }],
+				["prov-zero-b", { provider: "prov-zero-b", status: "cached", models: [] }],
+			]);
+			const refreshProvider = vi.fn(async (providerId: string) => {
+				const model = makeModel(providerId, `${providerId}-live`);
+				models.push(model);
+				states.set(providerId, { provider: providerId, status: "ok", models: [model.id] });
+			});
+			const { hub } = createHub({
+				models: () => models,
+				registry: {
+					refreshProvider,
+					getDiscoverableProviders: () => ["prov-populated", "prov-zero-a", "prov-zero-b"],
+					getProviderDiscoveryState: providerId => states.get(providerId),
+				},
+			});
+
+			await waitForCondition(() => models.length === 3);
+			expect(refreshProvider.mock.calls.map(call => call[0]).sort()).toEqual(["prov-zero-a", "prov-zero-b"]);
+			const rendered = normalize(hub.render(220));
+			expect(rendered).toContain("All models 3");
+			expect(rendered).toContain("prov-zero-a-live");
+			expect(rendered).toContain("prov-zero-b-live");
+		});
+
+		test("keeps an All-models search live while bulk discovery arrives", async () => {
+			const models: Model[] = [];
+			const gate = Promise.withResolvers<void>();
+			const refreshProvider = vi.fn(async () => {
+				await gate.promise;
+				models.push(makeModel("prov-search", "needle-arrived"));
+			});
+			const { hub } = createHub({
+				models: () => models,
+				registry: {
+					refreshProvider,
+					getDiscoverableProviders: () => ["prov-search"],
+				},
+			});
+			hub.handleInput("needle");
+			await waitForCondition(() => refreshProvider.mock.calls.length === 1);
+			expect(normalize(hub.render(220))).not.toContain("needle-arrived");
+
+			gate.resolve();
+			await waitForCondition(() => models.length === 1);
+			const rendered = normalize(hub.render(220));
+			expect(rendered).toContain("needle-arrived");
+			expect(rendered).toContain("All models 1");
+			expect(rendered).toContain("prov-search 1");
+		});
+
+		test("does not share same-name provider guards across independent registries", async () => {
+			const refreshA = vi.fn(async () => {});
+			const refreshB = vi.fn(async () => {});
+			const registryA = makeRegistry(() => [], {
+				refreshProvider: refreshA,
+				getDiscoverableProviders: () => ["same-provider"],
+			});
+			const registryB = makeRegistry(() => [], {
+				refreshProvider: refreshB,
+				getDiscoverableProviders: () => ["same-provider"],
+			});
+			createHub({ models: [], registryInstance: registryA });
+			createHub({ models: [], registryInstance: registryB });
+
+			await waitForCondition(() => refreshA.mock.calls.length === 1 && refreshB.mock.calls.length === 1);
+			expect(refreshA).toHaveBeenCalledWith("same-provider", "online");
+			expect(refreshB).toHaveBeenCalledWith("same-provider", "online");
+		});
+
+		test("caps automatic zero-provider discovery at four concurrent requests", async () => {
+			const providerIds = Array.from({ length: 7 }, (_, index) => `prov-bulk-${index}`);
+			const gate = Promise.withResolvers<void>();
+			let active = 0;
+			let maxActive = 0;
+			const refreshProvider = vi.fn(async () => {
+				active += 1;
+				maxActive = Math.max(maxActive, active);
+				await gate.promise;
+				active -= 1;
+			});
+			createHub({
+				models: [],
+				registry: { refreshProvider, getDiscoverableProviders: () => providerIds },
+			});
+
+			await waitForCondition(() => refreshProvider.mock.calls.length === 4);
+			expect(maxActive).toBe(4);
+			expect(refreshProvider).toHaveBeenCalledTimes(4);
+			gate.resolve();
+			await waitForCondition(() => refreshProvider.mock.calls.length === providerIds.length);
+			expect(maxActive).toBe(4);
+		});
+		test("waits for startup background discovery before offline hydration and empty-provider fetch", async () => {
+			const models: Model[] = [];
+			const discovered = makeModel("prov-startup", "model-from-startup");
+			const background = Promise.withResolvers<void>();
+			const order: string[] = [];
+			const refreshProvider = vi.fn(async () => {
+				order.push("provider-online");
+			});
+			const { hub } = createHub({
+				models: () => models,
+				registry: {
+					awaitBackgroundRefresh: async () => {
+						order.push("background-wait");
+						await background.promise;
+						order.push("background-done");
+					},
+					refresh: async mode => {
+						order.push(mode);
+					},
+					refreshProvider,
+					getDiscoverableProviders: () => ["prov-startup"],
+				},
+			});
+			hub.handleInput(DOWN);
+			await Bun.sleep(140);
+			expect(refreshProvider).not.toHaveBeenCalled();
+			expect(order).toEqual(["background-wait"]);
+
+			models.push(discovered);
+			background.resolve();
+			await Bun.sleep(10);
+			expect(order).toEqual(["background-wait", "background-done", "offline"]);
+			expect(refreshProvider).not.toHaveBeenCalled();
+			expect(normalize(hub.render(220))).toContain("model-from-startup");
+		});
+
 		test("auto-refreshes a provider once per process; F5 forces a re-fetch", async () => {
 			const model = makeModel("prov-a", "model-a");
 			const refreshProvider = vi.fn(async () => {});
 			const { hub } = createHub({
 				models: [model],
-				registry: { refreshProvider },
+				registry: {
+					refreshProvider,
+					getProviderDiscoveryState: () => ({
+						provider: "prov-a",
+						status: "cached",
+						models: [model.id],
+						fetchedAt: Date.now(),
+					}),
+				},
 			});
 			installTestTheme();
 
@@ -1126,6 +1333,240 @@ describe("ModelHub", () => {
 			hub.handleInput("\x1b[15~"); // F5
 			await Bun.sleep(140);
 			expect(refreshProvider).toHaveBeenCalledTimes(2);
+		});
+
+		test("retains the nonempty once-per-process guard after close and reopen", async () => {
+			const model = makeModel("prov-warm", "model-warm");
+			const refreshProvider = vi.fn(async () => {});
+			const registryInstance = makeRegistry(() => [model], { refreshProvider });
+			const { hub } = createHub({ models: [model], registryInstance });
+			hub.handleInput(DOWN);
+			await Bun.sleep(140);
+			expect(refreshProvider).toHaveBeenCalledTimes(1);
+			hub.dispose();
+
+			const { hub: reopened } = createHub({ models: [model], registryInstance });
+			reopened.handleInput(DOWN);
+			await Bun.sleep(140);
+			expect(refreshProvider).toHaveBeenCalledTimes(1);
+		});
+
+		test("does not let unrelated model updates cancel an explicit F5 refresh", async () => {
+			const model = makeModel("prov-force", "model-a");
+			let notifyModelsUpdated: (() => void) | undefined;
+			const refreshProvider = vi.fn(async () => {});
+			const { hub } = createHub({
+				models: [model],
+				registry: {
+					refreshProvider,
+					getProviderDiscoveryState: () => ({
+						provider: "prov-force",
+						status: "ok",
+						models: [model.id],
+					}),
+					onModelsUpdated: listener => {
+						notifyModelsUpdated = listener;
+						return () => {
+							notifyModelsUpdated = undefined;
+						};
+					},
+				},
+			});
+			hub.handleInput(DOWN);
+			await Bun.sleep(140);
+			expect(refreshProvider).toHaveBeenCalledTimes(1);
+			hub.handleInput("\x1b[15~");
+			notifyModelsUpdated?.();
+			await Bun.sleep(140);
+			expect(refreshProvider).toHaveBeenCalledTimes(2);
+		});
+
+		test("updates an open zero-model provider when a background registry refresh settles", async () => {
+			const models: Model[] = [];
+			let state = {
+				provider: "prov-background",
+				status: "cached",
+				models: [] as string[],
+				fetchedAt: Date.now(),
+			};
+			let notifyModelsUpdated: (() => void) | undefined;
+			const refreshProvider = vi.fn(async () => {});
+			const { hub } = createHub({
+				models: () => models,
+				registry: {
+					refreshProvider,
+					getDiscoverableProviders: () => ["prov-background"],
+					getProviderDiscoveryState: () => state,
+					onModelsUpdated: listener => {
+						notifyModelsUpdated = listener;
+						return () => {
+							notifyModelsUpdated = undefined;
+						};
+					},
+				},
+			});
+			hub.handleInput(DOWN);
+			expect(normalize(hub.render(220))).toContain("refreshing model list");
+
+			const discovered = makeModel("prov-background", "arrived-in-background");
+			models.push(discovered);
+			state = { ...state, status: "ok", models: [discovered.id] };
+			notifyModelsUpdated?.();
+
+			const rendered = normalize(hub.render(220));
+			expect(rendered).toContain("prov-background · 1 model");
+			expect(rendered).toContain("arrived-in-background");
+			await Bun.sleep(140);
+			expect(refreshProvider).not.toHaveBeenCalled();
+			hub.handleInput("\x1b[15~");
+			await Bun.sleep(140);
+			expect(refreshProvider).toHaveBeenCalledTimes(1);
+		});
+
+		test("retries an empty cached provider after the hub is closed and reopened", async () => {
+			const discovered = makeModel("prov-empty", "model-live");
+			const models: Model[] = [];
+			const now = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+			let state = {
+				provider: "prov-empty",
+				status: "cached",
+				models: [] as string[],
+				fetchedAt: Date.now(),
+			};
+			const refreshProvider = vi.fn(async () => {
+				if (refreshProvider.mock.calls.length === 1) {
+					state = { ...state, status: "cached", models: ["unusable-cache-row"] };
+					return;
+				}
+				models.push(discovered);
+				state = { ...state, status: "ok", models: [discovered.id] };
+			});
+			const registryInstance = makeRegistry(() => models, {
+				refreshProvider,
+				getDiscoverableProviders: () => ["prov-empty"],
+				getProviderDiscoveryState: () => state,
+			});
+			const { hub } = createHub({ models: () => models, registryInstance });
+
+			hub.handleInput(DOWN);
+			await Bun.sleep(140);
+			expect(refreshProvider).toHaveBeenCalledTimes(1);
+			expect(normalize(hub.render(220))).toContain("Using cached model list");
+
+			hub.dispose();
+			const { hub: reopened } = createHub({ models: () => models, registryInstance });
+			reopened.handleInput(DOWN);
+			await Bun.sleep(140);
+			expect(refreshProvider).toHaveBeenCalledTimes(1);
+			expect(normalize(reopened.render(220))).toContain("Press F5 to refresh");
+
+			now.mockReturnValue(1_031_000);
+			reopened.handleInput(UP);
+			reopened.handleInput(DOWN);
+			await Bun.sleep(140);
+			expect(refreshProvider).toHaveBeenCalledTimes(2);
+			const rendered = normalize(reopened.render(220));
+			expect(rendered).toContain("model-live");
+			expect(rendered).not.toContain("Live refresh is still pending");
+		});
+
+		test("does not duplicate an empty-provider request when hub reopens while fetch is in flight", async () => {
+			const models: Model[] = [];
+			const discovered = makeModel("prov-inflight", "model-from-first-request");
+			let state = { provider: "prov-inflight", status: "cached", models: [] as string[], fetchedAt: Date.now() };
+			const gate = Promise.withResolvers<void>();
+			const listeners = new Set<() => void>();
+			const refreshProvider = vi.fn(async () => {
+				await gate.promise;
+				models.push(discovered);
+				state = { ...state, status: "ok", models: [discovered.id] };
+				for (const listener of listeners) listener();
+			});
+			const registryInstance = makeRegistry(() => models, {
+				refreshProvider,
+				getDiscoverableProviders: () => ["prov-inflight"],
+				getProviderDiscoveryState: () => state,
+				onModelsUpdated: listener => {
+					listeners.add(listener);
+					return () => listeners.delete(listener);
+				},
+			});
+			const { hub } = createHub({ models: () => models, registryInstance });
+			hub.handleInput(DOWN);
+			await Bun.sleep(140);
+			expect(refreshProvider).toHaveBeenCalledTimes(1);
+			hub.dispose();
+
+			const { hub: reopened } = createHub({ models: () => models, registryInstance });
+			reopened.handleInput(DOWN);
+			await Bun.sleep(140);
+			expect(refreshProvider).toHaveBeenCalledTimes(1);
+
+			gate.resolve();
+			await Bun.sleep(0);
+			expect(normalize(reopened.render(220))).toContain("model-from-first-request");
+		});
+
+		test("retries after a rejected refresh leaves the provider empty", async () => {
+			const models: Model[] = [];
+			const now = vi.spyOn(Date, "now").mockReturnValue(2_000_000);
+			const discovered = makeModel("prov-reject", "model-after-retry");
+			let state = { provider: "prov-reject", status: "cached", models: [] as string[], fetchedAt: Date.now() };
+			const refreshProvider = vi.fn(async () => {
+				if (refreshProvider.mock.calls.length === 1) throw new Error("injected network failure");
+				models.push(discovered);
+				state = { ...state, status: "ok", models: [discovered.id] };
+			});
+			const registryInstance = makeRegistry(() => models, {
+				refreshProvider,
+				getDiscoverableProviders: () => ["prov-reject"],
+				getProviderDiscoveryState: () => state,
+			});
+			const { hub } = createHub({ models: () => models, registryInstance });
+			hub.handleInput(DOWN);
+			await Bun.sleep(140);
+			expect(refreshProvider).toHaveBeenCalledTimes(1);
+
+			hub.dispose();
+			now.mockReturnValue(2_031_000);
+			const { hub: reopened } = createHub({ models: () => models, registryInstance });
+			reopened.handleInput(DOWN);
+			await Bun.sleep(140);
+			expect(refreshProvider).toHaveBeenCalledTimes(2);
+			expect(normalize(reopened.render(220))).toContain("model-after-retry");
+		});
+
+		test("replaces cached zero models after a delayed live refresh completes", async () => {
+			const discovered = makeModel("prov-delayed", "model-after-refresh");
+			const models: Model[] = [];
+			let state = {
+				provider: "prov-delayed",
+				status: "cached",
+				models: [] as string[],
+				fetchedAt: Date.now(),
+			};
+			const gate = Promise.withResolvers<void>();
+			const { hub } = createHub({
+				models: () => models,
+				registry: {
+					refreshProvider: async () => {
+						await gate.promise;
+						models.push(discovered);
+						state = { ...state, status: "ok", models: [discovered.id] };
+					},
+					getDiscoverableProviders: () => ["prov-delayed"],
+					getProviderDiscoveryState: () => state,
+				},
+			});
+
+			hub.handleInput(DOWN);
+			await Bun.sleep(140);
+			expect(normalize(hub.render(220))).toContain("Live refresh is still pending");
+			gate.resolve();
+			await Bun.sleep(0);
+			const rendered = normalize(hub.render(220));
+			expect(rendered).toContain("model-after-refresh");
+			expect(rendered).not.toContain("Live refresh is still pending");
 		});
 
 		test("shows a refreshing status while the provider fetch is in flight", async () => {

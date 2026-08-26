@@ -373,6 +373,43 @@ providers:
         maxTokens: 32000
 ```
 
+Inference and model discovery can use different upstream routes:
+
+```yaml
+providers:
+  split-proxy:
+    # POST https://example.com/v1/oneapi/proxy/11/chat/completions
+    baseUrl: https://example.com/v1/oneapi/proxy/11
+    api: openai-completions
+    apiKey: ${SPLIT_PROXY_API_KEY}
+    discovery:
+      type: openai-models-list
+      # GET https://example.com/v1/models
+      baseUrl: https://example.com/v1
+```
+
+`discovery.baseUrl` is supported by `openai-models-list`, `lm-studio`, `proxy`, and `litellm`.
+Discovered models retain the provider-level `baseUrl` for inference, and discovery endpoint identity is isolated in the model cache.
+
+When inference requires a bearer key but the model-list endpoint must be called
+anonymously, set discovery authentication independently:
+
+```yaml
+providers:
+  public-catalog:
+    baseUrl: https://llm.example.com/v1
+    api: openai-completions
+    apiKey: ${INFERENCE_API_KEY}
+    discovery:
+      type: openai-models-list
+      auth: none # GET /v1/models has no Authorization header
+```
+
+`discovery.auth` defaults to `provider`, which reuses the provider inference
+credential. `none` suppresses only discovery bearer authentication; inference
+continues using `apiKey`. Anonymous and authenticated catalogs use separate
+cache identities.
+
 Run `omp models spark` to verify discovery. Then run `omp setup` and choose the model in the default-model step, or open `/model` in a session and assign it to the `default` role.
 
 To preconfigure the default without the picker, add the selector to `~/.omp/agent/config.yml`:

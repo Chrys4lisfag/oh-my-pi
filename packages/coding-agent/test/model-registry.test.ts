@@ -1038,6 +1038,303 @@ describe("ModelRegistry", () => {
 			expect(model?.baseUrl).toBe("https://my-proxy.example.com/v1");
 		});
 
+		test("successful empty discovery prunes stale cached provider models and emits update", async () => {
+			writeRawModelsJson({
+				"empty-proxy": {
+					baseUrl: "https://empty.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					discovery: { type: "openai-models-list" },
+					models: [],
+				},
+			});
+			writeModelCache(
+				"empty-proxy:openai-models-list-context-v3",
+				Date.now(),
+				[
+					buildModel({
+						id: "stale-model",
+						name: "Stale model",
+						api: "openai-completions",
+						provider: "empty-proxy",
+						baseUrl: "https://empty.example.com/v1",
+						reasoning: false,
+						input: ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 128_000,
+						maxTokens: 8_192,
+					}),
+				],
+				true,
+				"",
+				path.join(tempDir, "models.db"),
+			);
+			const fetchMock = mockOpenAiCompatibleModels("https://empty.example.com/v1/models", []);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+			expect(registry.find("empty-proxy", "stale-model")).toBeDefined();
+			let updates = 0;
+			registry.onModelsUpdated(() => {
+				updates += 1;
+			});
+
+			await registry.refreshProvider("empty-proxy", "online");
+
+			expect(registry.find("empty-proxy", "stale-model")).toBeUndefined();
+			const attemptedAt = registry.getProviderDiscoveryState("empty-proxy")?.attemptedAt;
+			expect(registry.getProviderDiscoveryState("empty-proxy")?.status).toBe("empty");
+			expect(attemptedAt).toBeNumber();
+			expect(updates).toBe(1);
+
+			await registry.refreshProvider("empty-proxy", "offline");
+			expect(registry.getProviderDiscoveryState("empty-proxy")?.status).toBe("cached");
+			expect(registry.getProviderDiscoveryState("empty-proxy")?.attemptedAt).toBe(attemptedAt);
+		});
+
+		test("uses separate inference and discovery base URLs with isolated caches", async () => {
+			const inferenceBaseUrl = "https://example.com/v1/oneapi/proxy/11";
+			const discoveryA = "https://example.com/v1";
+			const discoveryB = "https://catalog.example.com/v1";
+			const requestedUrls: string[] = [];
+			const fetchMock: FetchImpl = async input => {
+				const url = String(input);
+				requestedUrls.push(url);
+				if (url === `${discoveryA}/models`) {
+					return new Response(JSON.stringify({ data: [{ id: "model-a" }] }), { status: 200 });
+				}
+				if (url === `${discoveryB}/models`) {
+					return new Response(JSON.stringify({ data: [{ id: "model-b" }] }), { status: 200 });
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			};
+			const writeConfig = (discoveryBaseUrl: string) =>
+				writeRawModelsJson({
+					"split-proxy": {
+						baseUrl: `${inferenceBaseUrl}/`,
+						apiKey: "TEST_KEY",
+						api: "openai-completions",
+						discovery: { type: "openai-models-list", baseUrl: discoveryBaseUrl },
+						models: [],
+					},
+				});
+
+			writeConfig(discoveryA);
+			writeModelCache(
+				"split-proxy:openai-models-list-context-v3",
+				Date.now(),
+				[
+					buildModel({
+						id: "legacy-model",
+						name: "Legacy model",
+						api: "openai-completions",
+						provider: "split-proxy",
+						baseUrl: inferenceBaseUrl,
+						reasoning: false,
+						input: ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 128_000,
+						maxTokens: 8_192,
+					}),
+				],
+				true,
+				"",
+				path.join(tempDir, "models.db"),
+			);
+			const first = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+			expect(first.find("split-proxy", "legacy-model")).toBeUndefined();
+			await first.refreshProvider("split-proxy", "online");
+			expect(first.find("split-proxy", "model-a")?.baseUrl).toBe(inferenceBaseUrl);
+			expect(requestedUrls).toContain(`${discoveryA}/models`);
+
+			writeConfig(discoveryB);
+			fs.utimesSync(modelsJsonPath, new Date(1_000), new Date(1_000));
+			const second = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+			await second.refreshProvider("split-proxy", "online-if-uncached");
+			expect(second.find("split-proxy", "model-b")?.baseUrl).toBe(inferenceBaseUrl);
+			expect(second.find("split-proxy", "model-a")).toBeUndefined();
+			expect(requestedUrls).toContain(`${discoveryB}/models`);
+
+			writeConfig(`${discoveryB}/`);
+			fs.utimesSync(modelsJsonPath, new Date(1_000), new Date(1_000));
+			const slashVariant = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+			await slashVariant.refreshProvider("split-proxy", "online-if-uncached");
+			expect(slashVariant.find("split-proxy", "model-b")?.baseUrl).toBe(inferenceBaseUrl);
+
+			const db = new Database(path.join(tempDir, "models.db"), { readonly: true });
+			const cacheIds = db
+				.query<{ provider_id: string }, []>(
+					"SELECT provider_id FROM model_cache WHERE provider_id LIKE 'split-proxy:openai-models-list-context-v3:endpoint-%'",
+				)
+				.all()
+				.map(row => row.provider_id);
+			db.close();
+			expect(new Set(cacheIds).size).toBe(2);
+		});
+
+		test("isolates configured discovery cache when provider base URL changes", async () => {
+			const baseA = "https://provider-a.example.com/v1";
+			const baseB = "https://provider-b.example.com/v1";
+			const requestedUrls: string[] = [];
+			const fetchMock: FetchImpl = async input => {
+				const url = String(input);
+				requestedUrls.push(url);
+				if (url === `${baseA}/models`) {
+					return Response.json({ data: [{ id: "model-a" }] });
+				}
+				if (url === `${baseB}/models`) {
+					return Response.json({ data: [{ id: "model-b" }] });
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			};
+			const writeConfig = (baseUrl: string) =>
+				writeRawModelsJson({
+					"endpoint-proxy": {
+						baseUrl,
+						apiKey: "TEST_KEY",
+						api: "openai-completions",
+						discovery: { type: "openai-models-list" },
+						models: [],
+					},
+				});
+
+			writeConfig(baseA);
+			const first = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+			await first.refreshProvider("endpoint-proxy", "online");
+			expect(first.find("endpoint-proxy", "model-a")).toBeDefined();
+
+			writeConfig(baseB);
+			fs.utimesSync(modelsJsonPath, new Date(1_000), new Date(1_000));
+			const second = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+			await second.refreshProvider("endpoint-proxy", "online-if-uncached");
+			expect(second.find("endpoint-proxy", "model-b")).toBeDefined();
+			expect(second.find("endpoint-proxy", "model-a")).toBeUndefined();
+			expect(requestedUrls).toEqual([`${baseA}/models`, `${baseB}/models`]);
+		});
+
+		test("preserves discovery query routing and isolates query-specific caches", async () => {
+			const inferenceBaseUrl = "https://example.com/v1/oneapi/proxy/11";
+			const discoveryBaseUrl = "https://catalog.example.com/v1";
+			const requestedUrls: string[] = [];
+			const fetchMock: FetchImpl = async input => {
+				const url = String(input);
+				requestedUrls.push(url);
+				if (url === `${discoveryBaseUrl}/models?signature=a%20~&tenant=a`) {
+					return Response.json({ data: [{ id: "tenant-a" }] });
+				}
+				if (url === `${discoveryBaseUrl}/models?signature=a%20~&tenant=b`) {
+					return Response.json({ data: [{ id: "tenant-b" }] });
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			};
+			const writeConfig = (tenant: string) =>
+				writeRawModelsJson({
+					"query-proxy": {
+						baseUrl: inferenceBaseUrl,
+						apiKey: "TEST_KEY",
+						api: "openai-completions",
+						discovery: {
+							type: "openai-models-list",
+							baseUrl: `${discoveryBaseUrl}?signature=a%20~&tenant=${tenant}`,
+						},
+						models: [],
+					},
+				});
+
+			writeConfig("a");
+			const first = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+			await first.refreshProvider("query-proxy", "online");
+			expect(first.find("query-proxy", "tenant-a")?.baseUrl).toBe(inferenceBaseUrl);
+
+			writeConfig("b");
+			fs.utimesSync(modelsJsonPath, new Date(1_000), new Date(1_000));
+			const second = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+			await second.refreshProvider("query-proxy", "online-if-uncached");
+			expect(second.find("query-proxy", "tenant-b")?.baseUrl).toBe(inferenceBaseUrl);
+			expect(second.find("query-proxy", "tenant-a")).toBeUndefined();
+			expect(requestedUrls).toEqual([
+				`${discoveryBaseUrl}/models?signature=a%20~&tenant=a`,
+				`${discoveryBaseUrl}/models?signature=a%20~&tenant=b`,
+			]);
+		});
+
+		test("anonymous discovery suppresses bearer auth and bypasses authenticated empty caches", async () => {
+			const baseUrl = "https://catalog.example.com/v1";
+			const authorizationHeaders: Array<string | null> = [];
+			const fetchMock: FetchImpl = async (input, init) => {
+				expect(String(input)).toBe(`${baseUrl}/models`);
+				const authorization = new Headers(init?.headers).get("Authorization");
+				authorizationHeaders.push(authorization);
+				return authorization
+					? Response.json({ data: null, object: "list" })
+					: Response.json({ data: [{ id: "public-model" }], object: "list" });
+			};
+			const writeConfig = (auth?: "none") =>
+				writeRawModelsJson({
+					"anonymous-proxy": {
+						baseUrl,
+						apiKey: "TEST_KEY",
+						api: "openai-completions",
+						discovery: { type: "openai-models-list", ...(auth ? { auth } : {}) },
+						models: [],
+					},
+				});
+
+			// Provider-default discovery sends its inference key. This endpoint
+			// responds successfully but scopes the catalog to an empty `data`.
+			writeConfig();
+			const authenticated = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+			await authenticated.refreshProvider("anonymous-proxy", "online");
+			expect(authenticated.getProviderDiscoveryState("anonymous-proxy")?.status).toBe("empty");
+
+			// Switching only discovery auth must use a distinct cache namespace,
+			// fetch without Authorization, and retain the key for inference.
+			writeConfig("none");
+			fs.utimesSync(modelsJsonPath, new Date(1_000), new Date(1_000));
+			const anonymous = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+			await anonymous.refreshProvider("anonymous-proxy", "online-if-uncached");
+			const model = anonymous.find("anonymous-proxy", "public-model");
+			expect(model?.baseUrl).toBe(baseUrl);
+			expect(await anonymous.getApiKeyForProvider("anonymous-proxy")).toBe("TEST_KEY");
+			expect(authorizationHeaders).toEqual(["Bearer TEST_KEY", null]);
+
+			const db = new Database(path.join(tempDir, "models.db"), { readonly: true });
+			const anonymousCacheIds = db
+				.query<{ provider_id: string }, []>(
+					"SELECT provider_id FROM model_cache WHERE provider_id LIKE 'anonymous-proxy:%:auth-none'",
+				)
+				.all();
+			db.close();
+			expect(anonymousCacheIds).toHaveLength(1);
+		});
+
+		test("never classifies a non-authoritative empty cache as successful discovery", async () => {
+			let fetchCalls = 0;
+			writeRawModelsJson({
+				"retrying-proxy": {
+					baseUrl: "https://retrying.example.com/v1",
+					api: "openai-completions",
+					auth: "none",
+					discovery: { type: "openai-models-list" },
+					models: [],
+				},
+			});
+			const fetchMock: FetchImpl = async () => {
+				fetchCalls++;
+				throw new Error("transient discovery failure");
+			};
+
+			const first = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+			await first.refreshProvider("retrying-proxy", "online");
+			expect(first.getProviderDiscoveryState("retrying-proxy")?.status).toBe("unavailable");
+
+			const second = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+			await second.refreshProvider("retrying-proxy", "online-if-uncached");
+			expect(
+				new Set(["cached", "unavailable"]).has(second.getProviderDiscoveryState("retrying-proxy")?.status ?? ""),
+			).toBe(true);
+			expect(second.find("retrying-proxy", "stale-model")).toBeUndefined();
+			expect(fetchCalls).toBeGreaterThanOrEqual(1);
+		});
+
 		test("discoverable custom-only gpt-5.4 survives refresh", async () => {
 			writeRawModelsJson({
 				"custom-local": {

@@ -69,6 +69,8 @@ export interface ModelManagerOptions<TApi extends Api = Api, TModelsDevPayload =
 export interface ModelResolutionResult<TApi extends Api = Api> {
 	models: Model<TApi>[];
 	stale: boolean;
+	/** Whether this refresh cycle attempted remote sources. */
+	fetched: boolean;
 }
 
 /**
@@ -240,7 +242,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 		cacheFingerprintMatches &&
 		!cacheHasUnresolvedHeaders
 	) {
-		return { models: collapseBuiltModelVariants(restoredCache.models), stale: false };
+		return { models: collapseBuiltModelVariants(restoredCache.models), stale: false, fetched: false };
 	}
 
 	const [fetchedModelsDevModels, fetchedDynamicModels] = shouldFetchFromNetwork
@@ -328,6 +330,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	return {
 		models,
 		stale: !dynamicAuthoritative,
+		fetched: shouldFetchFromNetwork,
 	};
 }
 

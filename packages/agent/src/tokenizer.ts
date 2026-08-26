@@ -35,6 +35,17 @@ export function tokenizerEncodingForModel(model: Pick<Model, "tokenizer"> | null
  */
 export type TokenCountMode = "strict" | "approximate" | "upperbound";
 
+type NativeTokenCounter = typeof countTokensNat;
+
+/** Whether napi-rs rejected an encoding unknown to a stale workspace addon. */
+function isUnsupportedNativeEncodingError(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	const nativeError = error as Error & { code?: string };
+	return (
+		nativeError.code === "InvalidArg" && nativeError.message.includes("does not match any variant of enum `Encoding`")
+	);
+}
+
 /** Options for {@link Tokenizer.countMessage} / {@link Tokenizer.countMessages}. */
 export interface MessageCountOptions {
 	/**
@@ -105,6 +116,7 @@ interface MessageEstimate {
  */
 export class Tokenizer {
 	readonly #encoding: Encoding | null;
+	readonly #nativeTokenCounter: NativeTokenCounter;
 
 	/**
 	 * Per-message estimate memo. Keyed by message identity, deliberately not a
@@ -116,8 +128,9 @@ export class Tokenizer {
 	 */
 	#estimates = new WeakMap<AgentMessage, MessageEstimate>();
 
-	constructor(model?: Pick<Model, "tokenizer"> | null) {
+	constructor(model?: Pick<Model, "tokenizer"> | null, nativeTokenCounter: NativeTokenCounter = countTokensNat) {
 		this.#encoding = tokenizerEncodingForModel(model);
+		this.#nativeTokenCounter = nativeTokenCounter;
 	}
 
 	get encoding(): Encoding | null {
@@ -125,9 +138,18 @@ export class Tokenizer {
 	}
 
 	countTokens(text: string | string[], mode: TokenCountMode = "approximate"): number {
-		if (mode === "strict") return countTokensNat(text, this.#encoding);
-		if (!testEnv && this.#encoding !== null) return countTokensNat(text, this.#encoding);
-		if (accurate) return countTokensNat(text);
+		if (mode === "strict") return this.#nativeTokenCounter(text, this.#encoding);
+		// Dependency-injected counters exercise the production native branch in tests.
+		if (this.#encoding !== null && (!testEnv || this.#nativeTokenCounter !== countTokensNat)) {
+			try {
+				return this.#nativeTokenCounter(text, this.#encoding);
+			} catch (error) {
+				if (!isUnsupportedNativeEncodingError(error)) throw error;
+				// Preserve mode guarantees. Never label a different tokenizer as exact.
+				return sumFragments(text, mode === "upperbound" ? byteLength : byteEstimate);
+			}
+		}
+		if (accurate) return this.#nativeTokenCounter(text);
 		return sumFragments(text, mode === "upperbound" ? byteLength : byteEstimate);
 	}
 

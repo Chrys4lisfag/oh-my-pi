@@ -58,6 +58,32 @@ commit count alone proves behavior survived.
 `packages/ai/src/providers/google-gemini-cli.ts` differs only by explanatory comments
 at this baseline; it is not a separate fork behavior.
 
+### Session profile identity and model-state consistency
+
+Session headers record the config profile that owns them. Resume binds the
+terminal-local `Settings` to the recorded profile (never the durable startup
+default), `/profiles` switch/add/delete-fallback/rename and profile cycling
+restamp the identity, and legacy sessions with no recorded profile refuse
+auto-synchronized profile applies until an explicit switch — so persisted
+model/thinking edits can no longer corrupt an unrelated profile or get
+clobbered by the startup default. Prompt preflight and the status-line model
+segment share configured-default availability only for the blocking
+`[unavailable]` state; otherwise the footer renders the live runtime model so
+`smol`/`slow` role cycling remains visible.
+
+- `packages/coding-agent/src/session/session-entries.ts`
+  - optional `profile` on `SessionHeader`
+- `packages/coding-agent/src/session/session-manager.ts`
+  - `getSessionProfile` / `setSessionProfile` identity stamping
+- `packages/coding-agent/src/session/agent-session-types.ts`
+  - `sessionProfile` config field (`null` = explicitly unbound legacy)
+- `packages/coding-agent/src/session/agent-session.ts`
+  - unbound-legacy sync guard, `bindSessionProfile`, `getConfiguredDefaultModelState`
+- `packages/coding-agent/src/modes/components/status-line/segments.ts`
+  - live role-runtime display plus configured-default unavailable marker
+- `packages/coding-agent/src/modes/controllers/input-controller.ts`
+  - profile cycle rebinding
+
 ### Profiles/advisor
 
 - `packages/coding-agent/src/advisor/config.ts`
@@ -66,14 +92,23 @@ at this baseline; it is not a separate fork behavior.
   - memory-advisor classification, retrieval cadence, injection counter, and reminder formatting
 - `packages/coding-agent/src/advisor/transcript-recorder.ts`
   - append-only advisor transcript replay for restart-safe tool counters
+- `packages/coding-agent/src/modes/components/advisor-config.ts`
+  - intersects session-scoped picker models with live canonical registry models
 - `packages/coding-agent/src/config/keybindings.ts`
 - `packages/coding-agent/src/config/model-registry.ts`
+  - isolates authenticated and anonymous discovery cache identities
+- `packages/coding-agent/src/config/model-discovery.ts`
+  - separate `discovery.baseUrl` transport from provider inference `baseUrl`
+  - supports `discovery.auth: none` without changing inference authentication
+- `packages/coding-agent/src/config/models-config-schema-bundle.ts`
+  - validates discovery URL and authentication overrides
 - `packages/coding-agent/src/config/profiles.ts`
 - `packages/coding-agent/src/config/settings-schema.ts`
 - `packages/coding-agent/src/config/settings.ts`
 - `packages/coding-agent/src/modes/controllers/command-controller.ts`
 - `packages/coding-agent/src/modes/controllers/selector-controller.ts`
   - applies live Memory Advisor reminder-interval changes by rebuilding advisors
+  - refreshes the model registry before opening `/advisor configure`
 - `packages/coding-agent/src/main.ts`
   - keeps protocol-host advisor reminder cadence at the neutral schema default
 - `packages/coding-agent/src/sdk.ts`
@@ -111,7 +146,7 @@ subagent inheritance. Preserve all domains when resolving its conflicts.
 - `packages/coding-agent/src/session/session-maintenance.ts`
   - fork-only automatic action selection plus one-shot try-shake preflight; upstream owns remote transport and lifecycle
 - `packages/coding-agent/src/slash-commands/builtin-lifecycle.ts`
-  - session-scoped `/tryshake on|off|status` command
+  - session-scoped `/tryshake on|off|status|step <tokens>` command
 - `packages/coding-agent/src/tools/memory-reflect.ts`
 - `packages/coding-agent/src/tools/xdev.ts`
 - `packages/coding-agent/src/utils/external-editor.ts`
@@ -142,6 +177,9 @@ subagent inheritance. Preserve all domains when resolving its conflicts.
 - `packages/coding-agent/test/session-maintenance-compaction-action.test.ts`
 - `packages/coding-agent/test/shake.test.ts`
 - `packages/coding-agent/test/slash-commands/tryshake.test.ts`
+- `packages/coding-agent/examples/extensions/compact-reminder.ts`
+  - tracked source for installed `/try-compact` / `/compact-remind` extension
+- `packages/coding-agent/test/extensions/compact-reminder.test.ts`
 - `packages/coding-agent/test/memory-tools.test.ts`
 - `packages/coding-agent/test/tools/browser-launch.test.ts`
 - `packages/coding-agent/test/tools/browser-tab-evaluate.test.ts`

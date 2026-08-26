@@ -15,10 +15,12 @@ import { formatDuration, logger, Snowflake, sanitizeText } from "@oh-my-pi/pi-ut
 import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-mode";
 import {
 	addProfile,
+	captureProfileActivationState,
 	deleteProfile,
 	getActiveProfileName,
 	listProfiles,
 	renameProfile,
+	restoreProfileActivation,
 	saveActiveProfile,
 	switchProfile,
 } from "../../config/profiles";
@@ -1205,6 +1207,7 @@ export class CommandController {
 			}
 			try {
 				addProfile(name);
+				await this.#applyProfileModelToSession(name);
 				this.ctx.statusLine.invalidate();
 				this.ctx.showStatus(`Profile "${name}" created and activated.`);
 			} catch (err) {
@@ -1219,12 +1222,15 @@ export class CommandController {
 				this.ctx.showStatus("Usage: /profiles switch <name>");
 				return;
 			}
+			const previousActivation = captureProfileActivationState();
+			let activationStarted = false;
 			try {
 				switchProfile(name);
+				activationStarted = true;
 				await this.ctx.settings.flush();
 				if (getActiveProfileName() !== name)
 					throw new Error(`Profile "${name}" was deleted by another omp instance`);
-				await this.#applyProfileModelToSession();
+				await this.#applyProfileModelToSession(name);
 				this.ctx.statusLine.invalidate();
 				this.ctx.updateEditorBorderColor();
 				const configuredDefault = this.ctx.settings.getModelRole("default");
@@ -1236,6 +1242,14 @@ export class CommandController {
 					this.ctx.showStatus(`Switched to profile "${name}".`);
 				}
 			} catch (err) {
+				if (activationStarted) {
+					try {
+						restoreProfileActivation(previousActivation);
+						await this.ctx.settings.flush();
+					} catch (rollbackError) {
+						logger.warn("Failed to persist profile activation rollback", { error: String(rollbackError) });
+					}
+				}
 				this.ctx.statusLine.invalidate();
 				this.ctx.updateEditorBorderColor();
 				this.ctx.showError(err instanceof Error ? err.message : String(err));
@@ -1256,7 +1270,7 @@ export class CommandController {
 					if (getActiveProfileName() !== result.activated.name) {
 						throw new Error(`Fallback profile "${result.activated.name}" was deleted by another omp instance`);
 					}
-					await this.#applyProfileModelToSession();
+					await this.#applyProfileModelToSession(result.activated.name);
 				}
 				this.ctx.statusLine.invalidate();
 				this.ctx.updateEditorBorderColor();
@@ -1292,6 +1306,9 @@ export class CommandController {
 				if (names.has(oldName) || !names.has(newName)) {
 					throw new Error(`Profile rename "${oldName}" to "${newName}" conflicted with another omp instance`);
 				}
+				if (this.ctx.session.getSessionProfileName() === oldName) {
+					await this.#applyProfileModelToSession(newName);
+				}
 				this.ctx.statusLine.invalidate();
 				this.ctx.showStatus(`Profile renamed: "${oldName}" → "${newName}".`);
 			} catch (err) {
@@ -1315,9 +1332,16 @@ export class CommandController {
 	}
 
 	/** Apply a freshly-switched profile to the live session (primary model,
-	 *  thinking level, and advisor models). Delegates to the session so the sync
-	 *  logic lives in one tested place. */
-	async #applyProfileModelToSession(): Promise<void> {
+	 *  thinking level, and advisor models), and when a profile name is provided
+	 *  also stamp its identity onto the session header so a future resume binds
+	 *  to it. Delegates to the session so the sync logic lives in one tested
+	 *  place. */
+	async #applyProfileModelToSession(profileName?: string): Promise<void> {
+		if (profileName) {
+			const bound = await this.ctx.session.bindSessionProfile(profileName);
+			if (!bound) throw new Error(`Profile "${profileName}" is no longer valid`);
+			return;
+		}
 		await this.ctx.session.applyProfileToSession();
 	}
 
