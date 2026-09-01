@@ -32,12 +32,16 @@ intent into current upstream architecture.
 2. Add per-profile dirty tracking and locked freshest-file merge in `Settings`.
 3. Keep terminal profile identity immutable during sync/reload/save/deletion; only
    same-name model/thinking snapshots synchronize.
-4. Persist session header profile name + snapshot and bind it before model restoration.
-5. Add `config/profiles.ts`; every API accepts the session `Settings` instance and every
+4. Preserve upstream's `shouldWrite` gate in `#saveNow`, but set it from every
+   fork profile mutation (item write/delete, live-field delta, successful and
+   failed active rename, activation, durable-projection change). A missed flag
+   silently skips the atomic write and hangs any flow that awaits it.
+5. Persist session header profile name + snapshot and bind it before model restoration.
+6. Add `config/profiles.ts`; every API accepts the session `Settings` instance and every
    mutation uses `setProfileItem` or `deleteProfileItem`.
-6. Add `/profiles` registry/context/delegate/controller layers.
-7. Add `app.profile.cycle = alt+c`; keybind cycle uses/reports `ctx.settings`.
-8. Run `profile-terminal-identity.test.ts` (all 20 numbered contracts), process,
+7. Add `/profiles` registry/context/delegate/controller layers.
+8. Add `app.profile.cycle = alt+c`; keybind cycle uses/reports `ctx.settings`.
+9. Run `profile-terminal-identity.test.ts` (all 20 numbered contracts), process,
    multi-instance, resume, keybind, and advisor coupling suites.
 
 ### 2. Advisor synchronization

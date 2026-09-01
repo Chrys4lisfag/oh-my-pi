@@ -4,7 +4,7 @@
  * "keys":["enable_thinking"]}]}` on every turn.
  *
  * Root cause: Venice's chat-completions schema is `additionalProperties: false`
- * and rejects unknown top-level keys. `buildOpenAICompat` picked
+ * and rejects unknown top-level keys. `resolveModelPolicy` picked
  * `thinkingFormat: "qwen"` from the `qwen*` id for any host that wasn't NVIDIA
  * NIM or Fireworks, so Venice-hosted Qwen turns shipped a top-level
  * `enable_thinking` field — the same failure class as NVIDIA NIM (#2299).
@@ -17,7 +17,7 @@ import { describe, expect, it } from "bun:test";
 import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import type { Context } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { buildOpenAICompat } from "@oh-my-pi/pi-catalog/compat/openai";
+import { resolveModelPolicy } from "@oh-my-pi/pi-catalog/compat/resolve";
 import type { FetchImpl, Model, ModelSpec } from "@oh-my-pi/pi-catalog/types";
 
 function veniceQwenSpec(): ModelSpec<"openai-completions"> {
@@ -44,7 +44,7 @@ function sseDoneResponse(): Response {
 
 describe("Venice qwen thinking format", () => {
 	it("routes Venice-hosted qwen models to the openai format (not top-level enable_thinking)", () => {
-		expect(buildOpenAICompat(veniceQwenSpec()).thinkingFormat).toBe("openai");
+		expect(resolveModelPolicy(veniceQwenSpec()).compat.thinkingFormat).toBe("openai");
 	});
 
 	it("keeps non-Venice qwen models (Alibaba DashScope) on the top-level enable_thinking format", () => {
@@ -60,7 +60,7 @@ describe("Venice qwen thinking format", () => {
 			contextWindow: 131072,
 			reasoning: true,
 		};
-		expect(buildOpenAICompat(dashscope).thinkingFormat).toBe("qwen");
+		expect(resolveModelPolicy(dashscope).compat.thinkingFormat).toBe("qwen");
 	});
 
 	it("never emits enable_thinking (top-level or chat_template_kwargs) on the Venice wire", async () => {

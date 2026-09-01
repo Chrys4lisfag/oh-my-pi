@@ -258,7 +258,6 @@ export class ModelHubComponent implements Component {
 	#hiddenOptionalProviders = new Set<string>();
 	/** Providers already re-probed by {@link ModelHubComponent.#reprobeHiddenOptionalProviders} this hub open. */
 	#reprobedHiddenProviders = new Set<string>();
-
 	// Frame geometry from the last render, for mouse hit-testing (the
 	// fullscreen overlay paints from screen row 0, so mouse rows map 1:1).
 	#contentRowStart = 1;
@@ -422,7 +421,6 @@ export class ModelHubComponent implements Component {
 	}
 
 	#buildSidebar(allModels: ReadonlyArray<Model>, availableModels: ReadonlyArray<Model>): void {
-		this.#hiddenOptionalProviders.clear();
 		const scoped = this.#scopedModels.length > 0;
 		let disabledProviders: ReadonlySet<string>;
 		try {
@@ -465,7 +463,6 @@ export class ModelHubComponent implements Component {
 					if (!authStorage.hasAuth(provider)) {
 						const discovery = this.#registry.getProviderDiscoveryState(provider);
 						if (discovery?.optional && (discovery.status === "idle" || discovery.status === "unavailable")) {
-							this.#hiddenOptionalProviders.add(provider);
 							continue;
 						}
 					}
@@ -972,7 +969,6 @@ export class ModelHubComponent implements Component {
 		}
 		if (added) void this.#refreshEmptyProvidersInBackground();
 	}
-
 	#formatDiscoveryAge(fetchedAt: number | undefined): string | undefined {
 		if (!fetchedAt) return undefined;
 		const ageMs = Math.max(0, Date.now() - fetchedAt);

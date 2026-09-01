@@ -22,7 +22,6 @@ import { initTheme, setSymbolPreset, theme } from "@oh-my-pi/pi-coding-agent/mod
 import { computeNonMessageBreakdown } from "@oh-my-pi/pi-coding-agent/modes/utils/context-usage";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { getSessionAccentAnsi } from "@oh-my-pi/pi-coding-agent/utils/session-color";
-import { Encoding } from "@oh-my-pi/pi-natives";
 import { adjustHsv } from "@oh-my-pi/pi-utils";
 
 beforeAll(async () => {
@@ -116,18 +115,8 @@ function assistantMessage(text: string): unknown {
 }
 
 describe("StatusLineComponent context breakdown", () => {
-	it("renders finite usage when a stale native addon rejects the model encoding", () => {
-		const attemptedEncodings: Array<Encoding | null | undefined> = [];
-		const staleNativeCounter = ((_text: string | string[], encoding?: Encoding | null) => {
-			attemptedEncodings.push(encoding);
-			if (encoding === Encoding.KimiK2) {
-				throw Object.assign(new Error('value `"KimiK2"` does not match any variant of enum `Encoding`'), {
-					code: "InvalidArg",
-				});
-			}
-			return 3;
-		}) as never;
-		const tokenizer = new Tokenizer({ tokenizer: "kimi-k2" } as never, staleNativeCounter);
+	it("renders finite usage for a model whose encoding a stale native addon may reject", () => {
+		const tokenizer = new Tokenizer({ tokenizer: "kimi-k2" } as never);
 		const source = { systemPrompt: ["base prompt", "profile context"], agent: { state: { tools: [] } }, skills: [] };
 		const { session } = makeSession({ messages: [userMessage("hello")], contextWindow: 128_000 });
 		(session as { getContextUsage: () => ContextUsage }).getContextUsage = () => {
@@ -143,7 +132,6 @@ describe("StatusLineComponent context breakdown", () => {
 		expect(breakdown.usedTokens).toBeGreaterThan(0);
 		expect(Number.isFinite(breakdown.usedTokens / breakdown.contextWindow)).toBe(true);
 		expect(border.content.length).toBeGreaterThan(0);
-		expect(attemptedEncodings).toContain(Encoding.KimiK2);
 	});
 
 	it("surfaces the provider-anchored tokens and context window from getContextUsage", () => {
@@ -429,6 +417,49 @@ describe("StatusLineComponent context breakdown", () => {
 			settings.clearOverride("statusLine.preset");
 		}
 	});
+
+	it("reserves embedded context labels when a long session title consumes the status line", () => {
+		const { session } = makeSession({
+			messages: [userMessage("hi"), assistantMessage("done")],
+			usage: { tokens: 50_000, contextWindow: 200_000, percent: 25 },
+			sessionName: "28大学生AI赋能司法行政创新挑战 law agent",
+		});
+		const comp = new StatusLineComponent(session);
+		comp.updateSettings({
+			preset: "custom",
+			leftSegments: ["pi", "model", "path", "context_pct"],
+			rightSegments: ["session_name"],
+			separator: "powerline-thin",
+			sessionAccent: false,
+			contextLine: "embedded",
+		});
+
+		const border = comp.getTopBorder(48);
+		const plain = border.content.replaceAll(/\x1b\[[0-9;]*m/g, "");
+		expect(border.width).toBe(48);
+		expect(plain).toContain("25%");
+		expect(plain).toContain("200K");
+	});
+
+	it("preserves a status segment when embedded context labels cannot fit", () => {
+		const { session } = makeSession({
+			messages: [userMessage("hi"), assistantMessage("done")],
+			usage: { tokens: 50_000, contextWindow: 200_000, percent: 25 },
+		});
+		const comp = new StatusLineComponent(session);
+		comp.updateSettings({
+			preset: "custom",
+			leftSegments: ["pi", "context_pct"],
+			rightSegments: [],
+			separator: "powerline-thin",
+			contextLine: "embedded",
+		});
+
+		const border = comp.getTopBorder(8);
+		expect(border.content).not.toBe("");
+		expect(border.width).toBe(8);
+	});
+
 	it("embedded overflow (>100%) breaks the raw percent past the window label in error color", () => {
 		const { session } = makeSession({
 			messages: [userMessage("hi"), assistantMessage("done")],
@@ -553,7 +584,7 @@ describe("StatusLineComponent context breakdown", () => {
 		const comp = new StatusLineComponent(session);
 		expect(comp.render(80)).toHaveLength(0); // box mode: main status lives in the editor border
 
-		comp.setComposerStyle({ bottomBar: "full", bottomBarGap: false });
+		comp.setComposerStyle({ statusAttachment: "none", bottomBar: "full", bottomBarGap: false });
 		const lines = comp.render(80);
 		expect(lines).toHaveLength(1);
 		// Plain bar: transparent background, no powerline caps or bg fill.
@@ -562,7 +593,7 @@ describe("StatusLineComponent context breakdown", () => {
 
 		// Styles without bottom chrome (rule/field/rail) request a spacer row so
 		// the bar doesn't sit flush against the last input row.
-		comp.setComposerStyle({ bottomBar: "full", bottomBarGap: true });
+		comp.setComposerStyle({ statusAttachment: "none", bottomBar: "full", bottomBarGap: true });
 		const gapped = comp.render(80);
 		expect(gapped).toHaveLength(2);
 		expect(gapped[0]).toBe("");
@@ -575,7 +606,7 @@ describe("StatusLineComponent context breakdown", () => {
 			usage: { tokens: 1000, contextWindow: 100_000, percent: 1 },
 		});
 		const comp = new StatusLineComponent(session);
-		comp.setComposerStyle({ bottomBar: "full", bottomBarGap: true });
+		comp.setComposerStyle({ statusAttachment: "none", bottomBar: "full", bottomBarGap: true });
 		let menuOpen = true;
 		comp.setAutocompleteActiveProbe(() => menuOpen);
 		expect(comp.render(80)).toHaveLength(0);
@@ -596,7 +627,7 @@ describe("StatusLineComponent context breakdown", () => {
 			separator: "none",
 			sessionAccent: false,
 		});
-		comp.setComposerStyle({ bottomBar: "left", bottomBarGap: false });
+		comp.setComposerStyle({ statusAttachment: "top-rule-chip", bottomBar: "left", bottomBarGap: false });
 
 		const bottom = comp.render(80);
 		expect(bottom).toHaveLength(1);

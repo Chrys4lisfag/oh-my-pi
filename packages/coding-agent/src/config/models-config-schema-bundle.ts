@@ -53,10 +53,12 @@ export const getModelsConfigSchemaBundle = once(() => {
 		"streamMarkupHealingPattern?": '"kimi" | "dsml" | "qwen" | "thinking"',
 		"supportsLongPromptCacheRetention?": "boolean",
 		"supportsReasoningParams?": "boolean",
+		"supportsReasoningSummary?": "boolean",
 		"alwaysSendMaxTokens?": "boolean",
 		"strictResponsesPairing?": "boolean",
 		"supportsImageDetailOriginal?": "boolean",
 		// anthropic-messages compat flags (same `compat` slot, per-api interpretation)
+		"supportsContextManagement?": "boolean",
 		"supportsEagerToolInputStreaming?": "boolean",
 		"allowAnthropicHeaderOverrides?": "boolean",
 		"requiresToolResultId?": "boolean",
@@ -188,6 +190,7 @@ export const getModelsConfigSchemaBundle = once(() => {
 		"contextWindow?": "number",
 		"maxTokens?": "number",
 		"omitMaxOutputTokens?": "boolean",
+		"preferWebsockets?": "boolean",
 		"headers?": { "[string]": "string" },
 		"compat?": ApiCompatSchema,
 		"contextPromotionTarget?": "string",
@@ -239,6 +242,7 @@ export const getModelsConfigSchemaBundle = once(() => {
 		"contextWindow?": "number",
 		"maxTokens?": "number",
 		"omitMaxOutputTokens?": "boolean",
+		"preferWebsockets?": "boolean",
 		"headers?": { "[string]": "string" },
 		"compat?": ApiCompatSchema,
 		"contextPromotionTarget?": "string",
@@ -270,6 +274,14 @@ export const getModelsConfigSchemaBundle = once(() => {
 		"timeoutMs?": "number",
 		"baseUrl?": "string",
 		"auth?": '"provider" | "none"',
+		/**
+		 * Defaults to `true`. Set `false` to fetch the model list from
+		 * `{baseUrl}/models` without injecting `/v1` — for gateways that root
+		 * their OpenAI-compatible surface at a versioned path (e.g.
+		 * `https://api.opper.ai/v3/compat`) where the forced `/v1/models`
+		 * returns a different, smaller model list.
+		 */
+		"injectV1?": "boolean",
 	}).narrow((value, ctx) => {
 		if (value.baseUrl !== undefined && (typeof value.baseUrl !== "string" || value.baseUrl.trim().length === 0)) {
 			return ctx.mustBe("discovery.baseUrl a non-empty string");
@@ -279,6 +291,9 @@ export const getModelsConfigSchemaBundle = once(() => {
 			!["lm-studio", "openai-models-list", "proxy", "litellm"].includes(value.type)
 		) {
 			return ctx.mustBe("discovery.baseUrl supported for lm-studio, openai-models-list, proxy, or litellm");
+		}
+		if (value.injectV1 !== undefined && value.type !== "openai-models-list") {
+			return ctx.mustBe("injectV1 only on openai-models-list discovery");
 		}
 		if (
 			value.timeoutMs !== undefined &&

@@ -94,7 +94,7 @@ describe("live profile synchronization", () => {
 		vi.useRealTimers();
 		if (session) await session.dispose();
 		resetSettingsForTest();
-		AgentStorage.resetInstance();
+		AgentStorage.close();
 		if (authStorage) authStorage.close();
 		try {
 			await tempDir.remove();

@@ -107,7 +107,7 @@ describe("terminal-pinned profile identity", () => {
 	});
 
 	afterEach(async () => {
-		AgentStorage.resetInstance();
+		AgentStorage.close();
 		await resetSettingsForTestAsync();
 		await removeWithRetries(dir);
 	});

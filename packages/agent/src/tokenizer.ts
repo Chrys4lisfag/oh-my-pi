@@ -1,6 +1,6 @@
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { ModelTokenizer } from "@oh-my-pi/pi-catalog/types";
-import { countTokens as countTokensNat, Encoding } from "@oh-my-pi/pi-natives";
+import * as natives from "@oh-my-pi/pi-natives";
 import { stringifyJson } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { isEstimateCacheable, messageEstimateVersion } from "./compaction/message-cache";
@@ -9,42 +9,32 @@ import type { AgentMessage } from "./types";
 const testEnv = Bun.env.NODE_ENV === "test";
 const accurate = process.env.PI_TOKENIZER_ACCURATE === "1" && !testEnv;
 
-const NATIVE_ENCODING: Record<ModelTokenizer, Encoding> = {
-	"claude-v3": Encoding.ClaudeV3,
-	"claude-v47": Encoding.ClaudeV47,
-	"claude-v5": Encoding.ClaudeV5,
-	"claude-v5-sonnet": Encoding.ClaudeV5Sonnet,
-	qwen3: Encoding.Qwen3,
-	"deepseek-v3": Encoding.DeepSeekV3,
-	"kimi-k2": Encoding.KimiK2,
-	glm5: Encoding.Glm5,
+const NATIVE_ENCODING: Record<ModelTokenizer, natives.Encoding> = {
+	"claude-v3": natives.Encoding.ClaudeV3,
+	"claude-v47": natives.Encoding.ClaudeV47,
+	"claude-v5": natives.Encoding.ClaudeV5,
+	"claude-v5-sonnet": natives.Encoding.ClaudeV5Sonnet,
+	qwen3: natives.Encoding.Qwen3,
+	"deepseek-v3": natives.Encoding.DeepSeekV3,
+	"kimi-k2": natives.Encoding.KimiK2,
+	glm5: natives.Encoding.Glm5,
 };
 
 /** Maps the catalog-resolved tokenizer family to its native implementation. */
-export function tokenizerEncodingForModel(model: Pick<Model, "tokenizer"> | null | undefined): Encoding | null {
+export function tokenizerEncodingForModel(model: Pick<Model, "tokenizer"> | null | undefined): natives.Encoding | null {
 	return model?.tokenizer ? NATIVE_ENCODING[model.tokenizer] : null;
 }
 
 /**
- * `strict` always pays for an exact native count (the catalog-resolved
- * tokenizer when known, o200k_base otherwise). `approximate` and
+ * `strict` always tries an exact native count (the catalog-resolved tokenizer
+ * when known, o200k_base otherwise), falling back to the byte upper bound when
+ * the loaded addon does not recognize that encoding. `approximate` and
  * `upperbound` prefer the same exact count for known tokenizer families or
  * when `PI_TOKENIZER_ACCURATE=1` is set; otherwise they use a cheap heuristic:
  * `approximate` a bytes/4 guess, `upperbound` the raw byte length (never
  * undercounts).
  */
 export type TokenCountMode = "strict" | "approximate" | "upperbound";
-
-type NativeTokenCounter = typeof countTokensNat;
-
-/** Whether napi-rs rejected an encoding unknown to a stale workspace addon. */
-function isUnsupportedNativeEncodingError(error: unknown): boolean {
-	if (!(error instanceof Error)) return false;
-	const nativeError = error as Error & { code?: string };
-	return (
-		nativeError.code === "InvalidArg" && nativeError.message.includes("does not match any variant of enum `Encoding`")
-	);
-}
 
 /** Options for {@link Tokenizer.countMessage} / {@link Tokenizer.countMessages}. */
 export interface MessageCountOptions {
@@ -72,17 +62,41 @@ function sumFragments(text: string | string[], perFragment: (t: string) => numbe
 	return Array.isArray(text) ? text.reduce((sum, t) => sum + perFragment(t), 0) : perFragment(text);
 }
 
+interface NativeTokenCount {
+	tokens: number;
+	exact: boolean;
+}
+
+function countTokensNat(
+	text: string | string[],
+	encoding: natives.Encoding | null | undefined,
+	mode: TokenCountMode,
+): NativeTokenCount {
+	try {
+		return { tokens: natives.countTokens(text, encoding), exact: true };
+	} catch (error) {
+		if (
+			!(error instanceof Error) ||
+			(!error.message.includes("does not match any variant of enum") &&
+				!error.message.includes("unknown enum variant"))
+		) {
+			throw error;
+		}
+		const tokens = sumFragments(text, mode === "approximate" ? byteEstimate : byteLength);
+		return { tokens, exact: false };
+	}
+}
+
 /** Verdict from {@link Tokenizer.checkTokenBudget}. */
 export interface TokenBudgetCheck {
 	/** Whether the text fits the budget. */
 	fits: boolean;
 	/**
 	 * Token count behind the verdict: the exact native count when `exact` is
-	 * set, otherwise the cheap byte upper bound (which already fit, so it is
-	 * only an over-estimate of a count known to be under budget).
+	 * set, otherwise the conservative byte upper bound.
 	 */
 	tokens: number;
-	/** Whether the exact tokenizer had to run because the cheap bound busted. */
+	/** Whether `tokens` came from the exact native tokenizer. */
 	exact: boolean;
 }
 
@@ -115,8 +129,7 @@ interface MessageEstimate {
  * `PI_TOKENIZER_ACCURATE=1`).
  */
 export class Tokenizer {
-	readonly #encoding: Encoding | null;
-	readonly #nativeTokenCounter: NativeTokenCounter;
+	readonly #encoding: natives.Encoding | null;
 
 	/**
 	 * Per-message estimate memo. Keyed by message identity, deliberately not a
@@ -128,28 +141,18 @@ export class Tokenizer {
 	 */
 	#estimates = new WeakMap<AgentMessage, MessageEstimate>();
 
-	constructor(model?: Pick<Model, "tokenizer"> | null, nativeTokenCounter: NativeTokenCounter = countTokensNat) {
+	constructor(model?: Pick<Model, "tokenizer"> | null) {
 		this.#encoding = tokenizerEncodingForModel(model);
-		this.#nativeTokenCounter = nativeTokenCounter;
 	}
 
-	get encoding(): Encoding | null {
+	get encoding(): natives.Encoding | null {
 		return this.#encoding;
 	}
 
 	countTokens(text: string | string[], mode: TokenCountMode = "approximate"): number {
-		if (mode === "strict") return this.#nativeTokenCounter(text, this.#encoding);
-		// Dependency-injected counters exercise the production native branch in tests.
-		if (this.#encoding !== null && (!testEnv || this.#nativeTokenCounter !== countTokensNat)) {
-			try {
-				return this.#nativeTokenCounter(text, this.#encoding);
-			} catch (error) {
-				if (!isUnsupportedNativeEncodingError(error)) throw error;
-				// Preserve mode guarantees. Never label a different tokenizer as exact.
-				return sumFragments(text, mode === "upperbound" ? byteLength : byteEstimate);
-			}
-		}
-		if (accurate) return this.#nativeTokenCounter(text);
+		if (mode === "strict") return countTokensNat(text, this.#encoding, mode).tokens;
+		if (!testEnv && this.#encoding !== null) return countTokensNat(text, this.#encoding, mode).tokens;
+		if (accurate) return countTokensNat(text, undefined, mode).tokens;
 		return sumFragments(text, mode === "upperbound" ? byteLength : byteEstimate);
 	}
 
@@ -167,8 +170,12 @@ export class Tokenizer {
 	checkTokenBudget(text: string | string[], budget: number): TokenBudgetCheck {
 		const bound = sumFragments(text, byteLength);
 		if (bound <= budget) return { fits: true, tokens: bound, exact: false };
-		const tokens = this.countTokens(text, "strict");
-		return { fits: tokens <= budget, tokens, exact: true };
+		const result = countTokensNat(text, this.#encoding, "strict");
+		return {
+			fits: result.tokens <= budget,
+			tokens: result.tokens,
+			exact: result.exact,
+		};
 	}
 
 	/**

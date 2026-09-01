@@ -41,7 +41,7 @@ describe("profiles multi-instance persistence", () => {
 	});
 
 	afterEach(async () => {
-		AgentStorage.resetInstance();
+		AgentStorage.close();
 		await resetSettingsForTestAsync();
 		await removeWithRetries(dir);
 	});

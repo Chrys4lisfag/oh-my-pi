@@ -1,8 +1,31 @@
 # Live fork delta manifest
 
-This manifest classifies fork content through `c0d3a3b572`, reconciled against
-upstream parent `b4e8e856ad` (v18.0.6). Refresh it after every upstream merge;
+This manifest classifies fork content through `fd1710f3e4`, reconciled against
+upstream parent `530664c8f5` (v18.1.2). Refresh it after every upstream merge;
 never assume commit count alone proves behavior survived.
+
+### Contracts upstream has absorbed (do not reapply)
+
+- Tokenizer unknown-encoding fallback: upstream `countTokensNat` catches the
+  stale-addon rejection and reports `exact: false`, so the fork's injected
+  `NativeTokenCounter` and `isUnsupportedNativeEncodingError` are retired.
+  Strict mode now degrades to the byte bound instead of throwing.
+- Venice Qwen `enable_thinking` carve-out: `resolveModelPolicy` (compat/resolve)
+  owns host-keyed thinking dialects; `buildOpenAICompat` no longer exists.
+
+### Merge-sensitive seams (v18.1.2)
+
+- `Settings.#saveNow` gained upstream's generation-tracked mutation apply and a
+  `shouldWrite` gate. Every fork profile mutation (item write/delete, live-field
+  delta, rename success AND failed active rename, activation, durable projection
+  change) MUST set `shouldWrite`; the watcher fingerprint is refreshed only when
+  a write actually happened, and `#global` is never replaced by the merged
+  durable snapshot.
+- `discovery.baseUrl`/`discovery.auth` compose with upstream `discovery.injectV1`:
+  the discovery source URL is fork-selected, then `injectV1` decides `/v1`
+  injection, and the cache namespace carries endpoint, auth, and bare suffixes.
+- `ModelResolutionResult` carries fork `fetched` alongside upstream
+  `source`/`updatedAt`; discovery state keeps `attemptedAt` next to `source`.
 
 ## Fork commit ledger
 
