@@ -2077,7 +2077,10 @@ export class EventController {
 	async #handleRetryFallbackApplied(
 		event: Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>,
 	): Promise<void> {
-		this.ctx.showWarning(`Fallback: ${event.from} -> ${event.to}`);
+		// Name the trigger: a bare `A -> B` line gives the operator nothing to act
+		// on, and the provider error is the only thing that explains the switch.
+		const reason = event.reason ? ` — ${event.reason}` : "";
+		this.ctx.showWarning(`Fallback: ${event.from} -> ${event.to}${reason}`);
 	}
 
 	async #handleRetryFallbackSucceeded(

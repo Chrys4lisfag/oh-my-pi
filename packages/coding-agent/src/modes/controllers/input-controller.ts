@@ -188,6 +188,7 @@ export class InputController {
 
 	#enhancedPaste?: EnhancedPasteController;
 	#draftText: string | undefined;
+	#profileCycleGeneration = 0;
 	#focusedLeftTapListenerInstalled = false;
 	#focusedPasteListenerInstalled = false;
 	#btwBranchListenerInstalled = false;
@@ -2016,44 +2017,47 @@ export class InputController {
 	}
 
 	async cycleModelProfile(): Promise<void> {
-		const previousActivation = captureProfileActivationState();
-		const result = cycleProfile();
+		const generation = ++this.#profileCycleGeneration;
+		const previousActivation = captureProfileActivationState(this.ctx.settings);
+		const result = cycleProfile(this.ctx.settings);
 		if (!result) {
 			this.ctx.showStatus("No profiles to cycle (create with /profiles add <name>)");
 			return;
 		}
-		try {
-			await settings.flush();
-			if (getActiveProfileName() !== result.name) {
-				throw new Error(`Profile "${result.name}" was deleted by another omp instance`);
-			}
-			const bound = await this.ctx.session.bindSessionProfile(result.name);
-			if (!bound) throw new Error(`Profile "${result.name}" is no longer valid`);
-		} catch (err) {
-			try {
-				restoreProfileActivation(previousActivation);
-				await settings.flush();
-			} catch (rollbackError) {
-				logger.warn("Failed to persist cycled profile rollback", { error: String(rollbackError) });
-			}
-			this.ctx.statusLine.invalidate();
-			this.ctx.updateEditorBorderColor();
-			this.ctx.showError(err instanceof Error ? err.message : String(err));
-			return;
-		}
+
+		// Profile selection is an in-memory terminal action. Paint it before any
+		// model metadata refresh or session-header persistence can yield.
 		this.ctx.statusLine.invalidate();
 		this.ctx.updateEditorBorderColor();
 		const profileName = theme.bold(theme.fg("accent", result.name));
-		const liveRoles = settings.get("modelRoles");
-		const rolesSummary = Object.entries(liveRoles)
+		const rolesSummary = Object.entries(result.snapshot.modelRoles)
 			.map(([role, model]) => `${theme.fg("muted", role)}: ${model.split("/").pop()}`)
 			.join(theme.fg("dim", ", "));
-		const configuredDefault = settings.getModelRole("default");
+		const configuredDefault = result.snapshot.modelRoles.default;
 		const unavailableNotice =
 			configuredDefault && !this.ctx.session.resolveRoleModel("default")
 				? ` ${theme.fg("warning", "[model unavailable]")}`
 				: "";
 		this.ctx.showStatus(`Profile: ${profileName} (${rolesSummary})${unavailableNotice}`, { dim: false });
+		this.ctx.ui.requestRender();
+
+		try {
+			const bound = await this.ctx.session.bindSessionProfile(result.name);
+			if (!bound) throw new Error(`Profile "${result.name}" is no longer valid`);
+		} catch (err) {
+			// A newer keypress owns current identity and feedback. Never let an
+			// older async failure roll it back or overwrite its status.
+			if (generation !== this.#profileCycleGeneration || getActiveProfileName(this.ctx.settings) !== result.name)
+				return;
+			try {
+				restoreProfileActivation(previousActivation, this.ctx.settings);
+			} catch (rollbackError) {
+				logger.warn("Failed to restore cycled profile", { error: String(rollbackError) });
+			}
+			this.ctx.statusLine.invalidate();
+			this.ctx.updateEditorBorderColor();
+			this.ctx.showError(err instanceof Error ? err.message : String(err));
+		}
 	}
 
 	async cycleRoleModel(direction: "forward" | "backward" = "forward"): Promise<void> {

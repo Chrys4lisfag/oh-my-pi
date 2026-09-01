@@ -425,6 +425,51 @@ export class SessionMaintenance {
 		this.#lastMillionContextShakeCheckpointByModel.clear();
 	}
 
+	/**
+	 * Re-anchor the checkpoint ladder to what the context actually holds after a
+	 * shake, so the step measures NEW growth instead of an absolute high-water
+	 * mark.
+	 *
+	 * The absolute ladder made a productive shake punish itself: a pass that took
+	 * 700k down to 425k still had to wait for 850k, i.e. 425k of regrowth, before
+	 * the next checkpoint. Anchoring on the post-shake occupancy asks only for one
+	 * `step` of fresh context (575k here), which is the cadence the step setting
+	 * is supposed to express.
+	 *
+	 * Occupancy is derived provider-anchored — the trigger figure the caller
+	 * billed minus the shake's own savings — for the same reason the recovery-band
+	 * check prefers it (#2275): the local estimator undercounts thinking payloads,
+	 * so a live re-measure can read far below what the provider charges.
+	 *
+	 * Only ever lowers the anchor, and only by real savings, so the recorded
+	 * checkpoint keeps its pre-await anti-refire guarantee: the next checkpoint
+	 * still sits a full `step` above current occupancy.
+	 */
+	#reanchorTryShakeCheckpoint(
+		modelKey: string,
+		options: { crossedCheckpoint: number; triggerContextTokens: number; tokensFreed: number },
+	): void {
+		if (options.tokensFreed <= 0) return;
+		if (this.#lastMillionContextShakeCheckpointByModel.get(modelKey) !== options.crossedCheckpoint) {
+			// A compaction (or another checkpoint) already moved the ladder.
+			return;
+		}
+		const occupancy = Math.max(0, options.triggerContextTokens - options.tokensFreed);
+		const anchor = Math.max(
+			// Never schedule the next checkpoint below the first one.
+			TRY_SHAKE_FIRST_CHECKPOINT_TOKENS - this.#tryShakeCheckpointStepTokens,
+			Math.min(options.crossedCheckpoint, occupancy),
+		);
+		if (anchor >= options.crossedCheckpoint) return;
+		this.#lastMillionContextShakeCheckpointByModel.set(modelKey, anchor);
+		logger.debug("Million-context try-shake checkpoint re-anchored", {
+			model: modelKey,
+			postShakeTokens: occupancy,
+			previousCheckpointTokens: options.crossedCheckpoint,
+			nextCheckpointTokens: anchor + this.#tryShakeCheckpointStepTokens,
+		});
+	}
+
 	/** Whether manual or automatic context maintenance is active. */
 	get isCompacting(): boolean {
 		return this.#autoCompactionAbortController !== undefined || this.#compactionAbortController !== undefined;
@@ -1814,6 +1859,7 @@ export class SessionMaintenance {
 			checkpointTokens: crossedCheckpoint,
 			nextCheckpointTokens: crossedCheckpoint + this.#tryShakeCheckpointStepTokens,
 		});
+		let tokensFreed = 0;
 		const outcome = await this.#runAutoShake(
 			"threshold",
 			false,
@@ -1824,7 +1870,15 @@ export class SessionMaintenance {
 			false,
 			false,
 			"checkpoint",
+			result => {
+				tokensFreed = Math.max(0, result.tokensFreed);
+			},
 		);
+		this.#reanchorTryShakeCheckpoint(modelKey, {
+			crossedCheckpoint,
+			triggerContextTokens: options.contextTokens,
+			tokensFreed,
+		});
 		return { attempted: true, result: outcome === "fallback" ? COMPACTION_CHECK_NONE : outcome };
 	}
 
@@ -4005,6 +4059,7 @@ export class SessionMaintenance {
 		suppressContinuation = false,
 		detachPostCommit = false,
 		mode: "strategy" | "preflight" | "checkpoint" = "strategy",
+		onShakeResult?: (result: ShakeResult) => void,
 	): Promise<CompactionCheckResult | "fallback"> {
 		const action = "shake";
 		const preflight = mode === "preflight";
@@ -4016,6 +4071,7 @@ export class SessionMaintenance {
 		try {
 			await this.#emitLifecycleEvent({ type: "auto_compaction_start", reason, action }, false);
 			const result = await this.#host.shake("elide", { config: DEFAULT_SHAKE_CONFIG, signal });
+			onShakeResult?.(result);
 			if (signal.aborted) {
 				await this.#emitLifecycleEvent(
 					{

@@ -62,7 +62,10 @@ be adopted without silently losing fork features.
     actual reminder injections per advisor and in aggregate.
 15. `/tryshake on` enables session-scoped surgical shake. Million-token models add
     monotonic checks at 275k then a configurable step (`/tryshake step 150k` by
-    default); the existing 4k savings gate decides eligibility. Automatic compaction
+    default); the existing 4k savings gate decides eligibility. A settled shake
+    re-anchors the ladder to post-shake occupancy (never upward, floored at
+    `275k - step`), so the next check requires one step of new context instead of
+    regrowth above the old high-water mark. Automatic compaction
     triggers still get one preflight, never a duplicate after a checkpoint attempt.
     `/tryshake status` reports toggle, step, and next checkpoint. Logical-session
     boundaries reset all try-shake state; settings files never store it.
@@ -73,9 +76,9 @@ be adopted without silently losing fork features.
 17. The tracked compact-reminder extension preserves visible post-compaction follow-ups
     and adds per-session `/try-compact status|settings|load`, optional monotonic
     mid-context reminders, session-ID checkpoint persistence, and compaction reset.
-18. Session headers own config-profile identity. Resume binds that profile locally,
-    legacy headers remain safely unbound until an explicit switch, role cycling keeps
-    the live runtime model visible, and unavailable defaults render explicitly.
+18. Running terminals own immutable profile identities: only explicit local
+    add/switch/cycle/rename changes them, same-name models/thinking still synchronize,
+    and session headers restore name plus snapshot before model restoration.
 19. `/advisor configure` offers only live canonical registry models, and model-specific
     native token counting falls back only for a proven stale-addon encoding mismatch.
 

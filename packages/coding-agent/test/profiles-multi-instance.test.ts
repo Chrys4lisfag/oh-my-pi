@@ -180,7 +180,7 @@ describe("profiles multi-instance persistence", () => {
 		expect(reader.get("profiles.items")).toEqual({ shared: replacement });
 	});
 
-	it("does not persist a stale active marker for a concurrently deleted profile", async () => {
+	it("keeps a stale selected identity local without resurrecting its deleted definition", async () => {
 		const seed = await load();
 		seed.setProfileItem("shared", SNAP);
 		seed.set("profiles.active", "shared");
@@ -199,9 +199,11 @@ describe("profiles multi-instance persistence", () => {
 		stale.set("profiles.active", "shared");
 		await stale.flush();
 
+		const disk = YAML.parse(fsSync.readFileSync(path.join(dir, "config.yml"), "utf8")) as Record<string, any>;
+		expect(disk.profiles.items).toEqual({});
 		const reader = await load();
-		expect(reader.get("profiles.items")).toEqual({});
-		expect(reader.get("profiles.active")).toBe("");
+		expect(reader.get("profiles.active")).toBe("shared");
+		expect(profileSnapshot(reader, "shared")).toBeDefined();
 	});
 
 	it("keeps create intent when a new profile is edited again before its first flush", async () => {
@@ -229,6 +231,25 @@ describe("profiles multi-instance persistence", () => {
 		expect(reader.get("profiles.items")).not.toHaveProperty("old");
 		expect(profileSnapshot(reader, "new")?.defaultThinkingLevel).toBe(Effort.Medium);
 		expect(reader.get("profiles.active")).toBe("new");
+	});
+
+	it("collapses an inverse rename before the debounce flush", async () => {
+		const original = {
+			modelRoles: { default: "anthropic/original" },
+			defaultThinkingLevel: Effort.High,
+		};
+		const settings = await load();
+		settings.setProfileItem("alpha", original);
+		settings.activateProfile("alpha", original);
+		settings.renameProfileItem("alpha", "beta", original, true);
+		settings.renameProfileItem("beta", "alpha", original, true);
+		await settings.flush();
+
+		expect(settings.get("profiles.items")).toEqual({ alpha: original });
+		expect(settings.get("profiles.active")).toBe("alpha");
+		const reader = await load();
+		expect(reader.get("profiles.items")).toEqual({ alpha: original });
+		expect(reader.get("profiles.active")).toBe("alpha");
 	});
 
 	it("does not rename a stale source after another instance deletes it", async () => {
@@ -424,7 +445,7 @@ describe("profiles multi-instance persistence", () => {
 		expect(reader.get("modelRoles")).toEqual(other.modelRoles);
 	});
 
-	it("preserves unrelated explicit overrides and retires profile-owned slots after final deletion", async () => {
+	it("preserves pinned profile-owned slots and unrelated overrides after final deletion", async () => {
 		const seed = await load();
 		seed.setProfileItem("only", SNAP);
 		seed.set("profiles.active", "only");
@@ -457,10 +478,10 @@ describe("profiles multi-instance persistence", () => {
 			config.defaultThinkingLevel = "low";
 		});
 		await peer.syncFromDisk();
-		expect(peer.getModelRole("default")).toBe("runtime/default");
+		expect(peer.getModelRole("default")).toBe(SNAP.modelRoles.default);
 		expect(peer.getModelRole("advisor")).toBe("runtime/advisor");
 		expect(peer.getModelRole("smol")).toBe("project/smol");
-		expect(peer.get("defaultThinkingLevel")).toBe(Effort.XHigh);
+		expect(peer.get("defaultThinkingLevel")).toBe(Effort.High);
 	});
 
 	it("does not adopt another terminal's first activation when local selection is empty", async () => {
@@ -546,7 +567,7 @@ describe("profiles multi-instance persistence", () => {
 		expect(profileSnapshot(second, "gpt-edu")?.modelRoles.default).toBe("openai-codex/gpt-5.6");
 	});
 
-	it("does not resurrect a profile deleted after a stale granular live edit", async () => {
+	it("keeps stale granular edits local after the persisted definition is deleted", async () => {
 		const seed = await load();
 		seed.setProfileItem("shared", SNAP);
 		seed.activateProfile("shared", SNAP);
@@ -559,9 +580,11 @@ describe("profiles multi-instance persistence", () => {
 		await deleter.flush();
 		await stale.flush();
 
+		const disk = YAML.parse(fsSync.readFileSync(path.join(dir, "config.yml"), "utf8")) as Record<string, any>;
+		expect(disk.profiles.items).toEqual({});
 		const reader = await load();
-		expect(reader.get("profiles.items")).toEqual({});
-		expect(reader.get("profiles.active")).toBe("");
+		expect(reader.get("profiles.active")).toBe("shared");
+		expect(reader.get("defaultThinkingLevel")).toBe(Effort.Medium);
 	});
 
 	it("merges disjoint same-profile role edits in either flush order", async () => {
@@ -614,6 +637,49 @@ describe("profiles multi-instance persistence", () => {
 			defaultThinkingLevel: Effort.Medium,
 		});
 		expect(reader.get("defaultThinkingLevel")).toBe(Effort.Medium);
+	});
+
+	it("requeues same-profile role and thinking deltas after an atomic write failure", async () => {
+		const seed = await load();
+		seed.setProfileItem("shared", SNAP);
+		seed.activateProfile("shared", SNAP);
+		await seed.flush();
+
+		const writer = await load();
+		writer.set("defaultThinkingLevel", Effort.Medium);
+		writer.setModelRole("advisor", "openai/advisor-retried");
+
+		const open = fsSync.promises.open.bind(fsSync.promises);
+		const configPath = path.join(dir, "config.yml");
+		let failed = false;
+		const openSpy = vi.spyOn(fsSync.promises, "open").mockImplementation(async (file, flags, mode) => {
+			if (
+				!failed &&
+				path.dirname(String(file)) === path.dirname(configPath) &&
+				path.basename(String(file)).startsWith(`${path.basename(configPath)}.`) &&
+				String(file).endsWith(".tmp")
+			) {
+				failed = true;
+				throw new Error("synthetic atomic write failure");
+			}
+			return open(file, flags, mode);
+		});
+		try {
+			await expect(writer.flush()).rejects.toThrow("synthetic atomic write failure");
+			expect(writer.get("profiles.active")).toBe("shared");
+
+			await writer.flush();
+
+			const disk = YAML.parse(fsSync.readFileSync(configPath, "utf8")) as Record<string, any>;
+			expect(disk.profiles.items.shared).toEqual({
+				modelRoles: { ...SNAP.modelRoles, advisor: "openai/advisor-retried" },
+				defaultThinkingLevel: Effort.Medium,
+			});
+			expect(disk.profiles.active).toBe("shared");
+			expect(writer.get("profiles.active")).toBe("shared");
+		} finally {
+			openSpy.mockRestore();
+		}
 	});
 
 	it("merges a same-profile role deletion with a sibling role update", async () => {
@@ -838,18 +904,18 @@ describe("profiles multi-instance persistence", () => {
 		}
 	});
 
-	it("reconciles and notifies when reloadFromDisk adopts another active profile", async () => {
+	it("reloadFromDisk synchronizes same-profile models but never adopts another active identity", async () => {
 		const work = { modelRoles: { default: "anthropic/work" }, defaultThinkingLevel: "medium" };
+		const workUpdated = { modelRoles: { default: "anthropic/work-new" }, defaultThinkingLevel: "high" };
 		const other = { modelRoles: { default: "openai/other" }, defaultThinkingLevel: "low" };
 		const settings = await load();
 		settings.setProfileItem("work", work);
 		settings.setProfileItem("other", other);
-		settings.set("profiles.active", "work");
-		settings.set("modelRoles", work.modelRoles);
-		settings.set("defaultThinkingLevel", Effort.Medium);
+		settings.activateProfile("work", work);
 		await settings.flush();
 		settings.cancelPendingSaves();
 		rewriteConfig(config => {
+			config.profiles.items.work = workUpdated;
 			config.profiles.active = "other";
 			config.modelRoles = other.modelRoles;
 			config.defaultThinkingLevel = other.defaultThinkingLevel;
@@ -861,19 +927,18 @@ describe("profiles multi-instance persistence", () => {
 		});
 		try {
 			await settings.reloadFromDisk();
-			expect(settings.get("profiles.active")).toBe("other");
-			expect(settings.getModelRole("default")).toBe("openai/other");
-			expect(settings.get("defaultThinkingLevel")).toBe(Effort.Low);
+			expect(settings.get("profiles.active")).toBe("work");
+			expect(settings.getModelRole("default")).toBe("anthropic/work-new");
+			expect(settings.get("defaultThinkingLevel")).toBe(Effort.High);
 			expect(notifications).toHaveLength(1);
-			expect(notifications[0]).toEqual(
-				expect.arrayContaining(["profiles.active", "modelRoles", "defaultThinkingLevel"]),
-			);
+			expect(notifications[0]).not.toContain("profiles.active");
+			expect(notifications[0]).toEqual(expect.arrayContaining(["modelRoles", "defaultThinkingLevel"]));
 		} finally {
 			unsubscribe();
 		}
 	});
 
-	it("does not emit an external synchronization event for local activation", async () => {
+	it("keeps an explicit local activation selected after persistence", async () => {
 		const settings = await load();
 		settings.setProfileItem("old", {
 			modelRoles: { default: "anthropic/old" },
@@ -887,17 +952,10 @@ describe("profiles multi-instance persistence", () => {
 		settings.set("profiles.active", "old");
 		await settings.flush();
 
-		let synchronizations = 0;
-		const unsubscribe = onSettingsSynchronized(source => {
-			if (source === settings) synchronizations++;
-		});
-		try {
-			settings.activateProfile("target", target);
-			await settings.flush();
-			expect(synchronizations).toBe(0);
-		} finally {
-			unsubscribe();
-		}
+		settings.activateProfile("target", target);
+		await settings.flush();
+		expect(settings.get("profiles.active")).toBe("target");
+		expect(settings.getModelRole("default")).toBe("openai/target");
 	});
 
 	it("keeps concurrent local activations isolated while last flush sets startup default", async () => {
@@ -938,7 +996,7 @@ describe("profiles multi-instance persistence", () => {
 		}
 	});
 
-	it("autoswitches every live peer when its selected profile is deleted", async () => {
+	it("keeps every live peer pinned when its selected definition is deleted", async () => {
 		const seed = await load();
 		seed.setProfileItem("selected", {
 			modelRoles: { default: "anthropic/selected" },
@@ -952,9 +1010,10 @@ describe("profiles multi-instance persistence", () => {
 			modelRoles: { default: "openai/alpha" },
 			defaultThinkingLevel: "high",
 		});
-		seed.set("profiles.active", "selected");
-		seed.set("modelRoles", { default: "anthropic/selected" });
-		seed.set("defaultThinkingLevel", Effort.Low);
+		seed.activateProfile("selected", {
+			modelRoles: { default: "anthropic/selected" },
+			defaultThinkingLevel: "low",
+		});
 		await seed.flush();
 
 		const deleter = await load();
@@ -963,23 +1022,18 @@ describe("profiles multi-instance persistence", () => {
 
 		deleter.deleteProfileItem("selected");
 		await deleter.flush();
-		await waitFor(
-			() =>
-				peer.get("profiles.active") === "alpha" &&
-				peer.getModelRole("default") === "openai/alpha" &&
-				!("selected" in peer.get("profiles.items")),
-		);
+		await peer.syncFromDisk();
+		expect(peer.get("profiles.active")).toBe("selected");
+		expect(peer.getModelRole("default")).toBe("google/gemini-stale");
+		expect(peer.get("profiles.items")).toHaveProperty("selected");
 
 		peer.setModelRole("advisor", "anthropic/advisor-after-delete");
 		await peer.flush();
+		const disk = YAML.parse(fsSync.readFileSync(path.join(dir, "config.yml"), "utf8")) as Record<string, any>;
+		expect(disk.profiles.items).not.toHaveProperty("selected");
 		const reader = await load();
-		expect(reader.get("profiles.active")).toBe("alpha");
-		expect(reader.get("profiles.items")).not.toHaveProperty("selected");
-		expect(reader.get("modelRoles")).toEqual({
-			default: "openai/alpha",
-			advisor: "anthropic/advisor-after-delete",
-		});
-		expect(reader.get("defaultThinkingLevel")).toBe(Effort.High);
+		expect(reader.get("profiles.active")).toBe("selected");
+		expect(reader.getModelRole("advisor")).toBe("anthropic/advisor-after-delete");
 	});
 
 	it("synchronizes inactive-profile deletion without changing the active profile", async () => {

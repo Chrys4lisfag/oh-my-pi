@@ -272,6 +272,8 @@ export interface RetryFallbackAppliedEvent {
 	from: string;
 	to: string;
 	role: string;
+	/** Provider error (or policy) that triggered the switch, when known. */
+	reason?: string;
 }
 
 /** Fired when a request succeeds on the fallback model applied by auto-retry. */

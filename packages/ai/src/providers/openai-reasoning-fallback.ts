@@ -360,5 +360,12 @@ export function resolveOpenAIReasoningEffortFallback(
 		return fallback && fallback !== normalizedCurrent ? fallback : null;
 	}
 	if (normalizedCurrent === "none") return null;
-	return nearestEnabledReasoningFallback(normalizedCurrent, allowed) ?? null;
+	const nearest = nearestEnabledReasoningFallback(normalizedCurrent, allowed);
+	if (nearest !== undefined) return nearest;
+	// No enabled level is acceptable for this request shape (e.g. OpenAI-style
+	// gateways rejecting "Function tools with reasoning_effort ... set
+	// reasoning_effort to 'none'"). Deleting the field is not equivalent: a
+	// reasoning model defaults to reasoning ON when it is absent, so the retry
+	// re-trips the same 400. Honor the server's explicit `none` offer instead.
+	return allowed.has("none") ? "none" : null;
 }

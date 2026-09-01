@@ -172,8 +172,13 @@ export class TranscriptContainer extends Container {
 		this.invalidate();
 	}
 
-	/** Whether a transient block may be discarded without leaving tape history. */
-	canRemoveBlock(component: Component): boolean {
+	/**
+	 * Whether a mounted block can still be mutated in place with visible effect.
+	 * Once any of its rows are emitted into native history (or the whole block
+	 * retires), the terminal owns those bytes: later `setText`-style edits render
+	 * nowhere. Callers that update a previously presented block must gate on this.
+	 */
+	isBlockLive(component: Component): boolean {
 		this.#syncEntries();
 		const index = this.#entries.findIndex(entry => entry.component === component);
 		if (index < 0) return false;
@@ -182,6 +187,11 @@ export class TranscriptContainer extends Container {
 		if (this.#offered?.kind === "commit" && index < this.#offered.end) return false;
 		if (this.#offered?.kind === "append" && index === this.#offered.entry) return false;
 		return true;
+	}
+
+	/** Whether a transient block may be discarded without leaving tape history. */
+	canRemoveBlock(component: Component): boolean {
+		return this.isBlockLive(component);
 	}
 
 	/** Lifecycle state per block in transcript order (diagnostics and tests). */

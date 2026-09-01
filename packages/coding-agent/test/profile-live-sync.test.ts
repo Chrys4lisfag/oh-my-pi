@@ -140,6 +140,83 @@ describe("live profile synchronization", () => {
 		);
 	});
 
+	it("runs one live apply for an explicit profile bind", async () => {
+		const apply = vi.spyOn(session, "applyProfileToSession");
+		peer.activateProfile("fallback", {
+			modelRoles: { default: `${PROVIDER}/${FALLBACK_MODEL_ID}` },
+			defaultThinkingLevel: Effort.High,
+		});
+
+		expect(await session.bindSessionProfile("fallback")).toBe(true);
+		await session.waitForIdle();
+
+		expect(apply).toHaveBeenCalledTimes(1);
+		expect(session.model?.id).toBe(FALLBACK_MODEL_ID);
+		expect(session.thinkingLevel).toBe(Effort.High);
+	});
+
+	it("blocks prompt dispatch until an explicit profile bind finishes", async () => {
+		const applyStarted = Promise.withResolvers<void>();
+		const releaseApply = Promise.withResolvers<void>();
+		const setModel = session.setModel.bind(session);
+		vi.spyOn(session, "setModel").mockImplementation(async (model, role, options) => {
+			applyStarted.resolve();
+			await releaseApply.promise;
+			return setModel(model, role, options);
+		});
+
+		peer.activateProfile("fallback", {
+			modelRoles: { default: `${PROVIDER}/${FALLBACK_MODEL_ID}` },
+			defaultThinkingLevel: Effort.High,
+		});
+		const binding = session.bindSessionProfile("fallback");
+		await applyStarted.promise;
+		const prompting = session.prompt("after explicit profile bind");
+
+		expect(await Promise.race([prompting.then(() => true), Bun.sleep(100).then(() => false)])).toBe(false);
+		expect(requestedModels).toEqual([]);
+
+		releaseApply.resolve();
+		expect(await binding).toBe(true);
+		await prompting;
+		expect(requestedModels).toEqual([FALLBACK_MODEL_ID]);
+	});
+
+	it("does not let an older failed bind roll back a newer profile", async () => {
+		const firstStarted = Promise.withResolvers<void>();
+		const firstApply = Promise.withResolvers<void>();
+		let applyCount = 0;
+		vi.spyOn(session, "applyProfileToSession").mockImplementation(async () => {
+			applyCount++;
+			if (applyCount !== 1) return;
+			firstStarted.resolve();
+			await firstApply.promise;
+		});
+
+		peer.activateProfile("fallback", {
+			modelRoles: { default: `${PROVIDER}/${FALLBACK_MODEL_ID}` },
+			defaultThinkingLevel: Effort.High,
+		});
+		const olderBind = session.bindSessionProfile("fallback");
+		await firstStarted.promise;
+
+		peer.activateProfile("inactive", {
+			modelRoles: { default: `${PROVIDER}/${FALLBACK_MODEL_ID}` },
+			defaultThinkingLevel: Effort.Low,
+		});
+		const newerBind = session.bindSessionProfile("inactive");
+
+		firstApply.reject(new Error("injected older bind failure"));
+		await expect(olderBind).rejects.toThrow("injected older bind failure");
+		expect(await newerBind).toBe(true);
+		await session.waitForIdle();
+
+		expect(peer.activeProfileName()).toBe("inactive");
+		expect(session.getSessionProfileName()).toBe("inactive");
+		expect(session.sessionManager.getSessionProfile()).toBe("inactive");
+		expect(session.sessionManager.getSessionProfileSnapshot()?.defaultThinkingLevel).toBe(Effort.Low);
+	});
+
 	it("propagates a live model edit to both sessions using the same profile", async () => {
 		const initialModel = getBundledModel(PROVIDER, INITIAL_MODEL_ID);
 		const fallbackModel = getBundledModel(PROVIDER, FALLBACK_MODEL_ID);
@@ -174,6 +251,12 @@ describe("live profile synchronization", () => {
 			expect(peer.get("profiles.active")).toBe("selected");
 			expect(profileSnapshot(writer, "selected")?.modelRoles.default).toBe(`${PROVIDER}/${FALLBACK_MODEL_ID}`);
 			expect(profileSnapshot(peer, "selected")?.modelRoles.default).toBe(`${PROVIDER}/${FALLBACK_MODEL_ID}`);
+			expect(writerSession.sessionManager.getSessionProfileSnapshot()?.modelRoles.default).toBe(
+				`${PROVIDER}/${FALLBACK_MODEL_ID}`,
+			);
+			expect(session.sessionManager.getSessionProfileSnapshot()?.modelRoles.default).toBe(
+				`${PROVIDER}/${FALLBACK_MODEL_ID}`,
+			);
 		} finally {
 			await writerSession.dispose();
 		}
@@ -247,20 +330,17 @@ describe("live profile synchronization", () => {
 		expect(session.model?.id).toBe(FALLBACK_MODEL_ID);
 		expect(session.thinkingLevel).toBe(Effort.XHigh);
 	});
-	it("autoswitches settings and the live session when another terminal deletes the selected profile", async () => {
+	it("keeps the selected profile and live session when another terminal deletes its definition", async () => {
 		peer.overrideModelRoles({ default: "google/gemini-stale" });
 
 		writer.deleteProfileItem("selected");
 		await writer.flush();
+		await peer.syncFromDisk();
 
-		await waitFor(
-			() =>
-				peer.get("profiles.active") === "fallback" &&
-				peer.getModelRole("default") === `${PROVIDER}/${FALLBACK_MODEL_ID}` &&
-				session.model?.id === FALLBACK_MODEL_ID &&
-				session.thinkingLevel === Effort.High,
-		);
-		expect(peer.get("profiles.items")).not.toHaveProperty("selected");
+		expect(peer.get("profiles.active")).toBe("selected");
+		expect(peer.getModelRole("default")).toBe("google/gemini-stale");
+		expect(session.model?.id).toBe(INITIAL_MODEL_ID);
+		expect(peer.get("profiles.items")).toHaveProperty("selected");
 	});
 
 	it("syncs an inactive deletion without changing the selected live model", async () => {
@@ -295,7 +375,10 @@ describe("live profile synchronization", () => {
 		onProviderCall = () => providerCalled.resolve();
 		const prompting = session.prompt("use synchronized profile");
 		await apiKeyLookupStarted.promise;
-		writer.deleteProfileItem("selected");
+		writer.setProfileItem("selected", {
+			modelRoles: { default: `${PROVIDER}/${FALLBACK_MODEL_ID}` },
+			defaultThinkingLevel: Effort.High,
+		});
 		await writer.flush();
 		await peer.syncFromDisk();
 		await applyStarted.promise;
@@ -326,7 +409,10 @@ describe("live profile synchronization", () => {
 			return setModel(model, role, options);
 		});
 
-		writer.deleteProfileItem("selected");
+		writer.setProfileItem("selected", {
+			modelRoles: { default: `${PROVIDER}/${FALLBACK_MODEL_ID}` },
+			defaultThinkingLevel: Effort.High,
+		});
 		await writer.flush();
 		await peer.syncFromDisk();
 		await applyStarted.promise;
@@ -379,7 +465,10 @@ describe("live profile synchronization", () => {
 			await neverSettles;
 		});
 
-		writer.deleteProfileItem("selected");
+		writer.setProfileItem("selected", {
+			modelRoles: { default: `${PROVIDER}/${FALLBACK_MODEL_ID}` },
+			defaultThinkingLevel: Effort.High,
+		});
 		await writer.flush();
 		await peer.syncFromDisk();
 		await applyStarted.promise;

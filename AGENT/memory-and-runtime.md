@@ -368,13 +368,27 @@ the toggle, step, and checkpoint map; no settings file stores them.
 
 For a selected model whose context window is at least 1,000,000 tokens, successful
 post-turn maintenance first checks at 275k used tokens, then at the configured step
-(default 150k: 425k, 575k, 725k, 875k). Each crossed checkpoint is attempted at most
-once even when context drops and later re-crosses it; no-op, failure, and success all
-advance the checkpoint, preventing repeated 275k shakes. A late first observation runs
-one check and consumes every crossed interval. `DEFAULT_SHAKE_CONFIG.minSavings` (4k)
-is the pre-mutation "large enough" gate. Active compaction/handoff defers the check
-without consuming it, and full compaction resets the current model's checkpoint cycle.
-This proactive path remains available when automatic compaction is disabled.
+(default 150k). Each crossed checkpoint is attempted at most once even when context
+drops and later re-crosses it; no-op, failure, and success all advance the checkpoint,
+preventing repeated 275k shakes. A late first observation runs one check and consumes
+every crossed interval. `DEFAULT_SHAKE_CONFIG.minSavings` (4k) is the pre-mutation
+"large enough" gate. Active compaction/handoff defers the check without consuming it,
+and full compaction resets the current model's checkpoint cycle. This proactive path
+remains available when automatic compaction is disabled.
+
+The ladder is relative, not absolute: once a shake settles, the checkpoint re-anchors
+to post-shake occupancy, so the next check always asks for one step of *new* context
+rather than regrowth above the old high-water mark (275k trigger freeing 20k → next
+405k, not 425k; a 700k trigger freeing 275k → 575k, not 850k). Occupancy is
+`triggerContextTokens - tokensFreed`, using the provider-anchored trigger metric for
+the same reason the recovery band does. The anchor only ever moves down
+(`min(crossedCheckpoint, occupancy)`), never up, so a zero-gain shake keeps the
+absolute ladder; it is floored at `275k - step` so a large shake cannot schedule the
+next check below the first checkpoint; and because the next check is always
+`anchor + step`, a shake can never make the very next turn re-fire. The crossed
+checkpoint is still recorded before the shake is awaited, so concurrent routes cannot
+double-fire, and re-anchoring is skipped when that recorded value changed meanwhile
+(compaction reset or another checkpoint).
 
 Separately, on each automatic compaction trigger OMP runs one conservative
 `DEFAULT_SHAKE_CONFIG` elide pass before the current non-`shake` method from

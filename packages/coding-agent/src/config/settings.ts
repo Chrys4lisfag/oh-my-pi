@@ -67,6 +67,49 @@ export interface RawSettings {
 	[key: string]: unknown;
 }
 
+/** Model/thinking state owned by one named profile. */
+export interface SettingsProfileSnapshot {
+	modelRoles: Record<string, string>;
+	defaultThinkingLevel: string;
+}
+
+type CapturedOwnValue = { hadValue: boolean; value?: unknown };
+type ProfileOwnedModelRoleOverride = {
+	profile: string;
+	hadPrevious: boolean;
+	previousValue?: unknown;
+};
+type ProfileOwnedThinkingOverride = {
+	profile: string;
+	hadPrevious: boolean;
+	previousValue?: unknown;
+};
+
+type PendingProfileRename = {
+	newName: string;
+	snapshot: SettingsProfileSnapshot;
+	wasActive: boolean;
+};
+
+const TERMINAL_PROFILE_ACTIVATION_STATE: unique symbol = Symbol("terminalProfileActivationState");
+
+/**
+ * Opaque rollback token for terminal-local profile activation. Callers can
+ * retain and restore it, but cannot construct one independently.
+ */
+export interface TerminalProfileActivationState {
+	readonly [TERMINAL_PROFILE_ACTIVATION_STATE]: {
+		profiles: CapturedOwnValue;
+		modelRoles: CapturedOwnValue;
+		defaultThinkingLevel: CapturedOwnValue;
+		overrideModelRoles: CapturedOwnValue;
+		overrideThinkingLevel: CapturedOwnValue;
+		profileRuntimeOwner: string | undefined;
+		profileOwnedModelRoleOverrides: Array<[string, ProfileOwnedModelRoleOverride]>;
+		profileOwnedThinkingOverride: ProfileOwnedThinkingOverride | undefined;
+	};
+}
+
 type YamlLoadResult =
 	| { kind: "missing" }
 	| { kind: "loaded"; settings: RawSettings }
@@ -420,14 +463,7 @@ export class Settings {
 		{ defaultThinkingLevel?: string; modelRoles: Map<string, string | undefined> }
 	>();
 	/** Cross-key profile renames, committed only when the source still exists and destination is still absent on disk. */
-	#modifiedProfileRenames = new Map<
-		string,
-		{
-			newName: string;
-			snapshot: { modelRoles: Record<string, string>; defaultThinkingLevel: string };
-			wasActive: boolean;
-		}
-	>();
+	#modifiedProfileRenames = new Map<string, PendingProfileRename>();
 	/** Individual project model roles modified during this session */
 	#modifiedProjectModelRoles = new Set<string>();
 	/** Individual global model roles modified during this session (for partial save) */
@@ -447,11 +483,8 @@ export class Settings {
 	 * records value displaced by profile activation so removing final profile
 	 * restores explicit runtime state instead of inferring ownership from value.
 	 */
-	#profileOwnedModelRoleOverrides = new Map<
-		string,
-		{ profile: string; hadPrevious: boolean; previousValue?: unknown }
-	>();
-	#profileOwnedThinkingOverride?: { profile: string; hadPrevious: boolean; previousValue?: unknown };
+	#profileOwnedModelRoleOverrides = new Map<string, ProfileOwnedModelRoleOverride>();
+	#profileOwnedThinkingOverride?: ProfileOwnedThinkingOverride;
 	#profileRuntimeOwner?: string;
 	/** Prevent activation rollback helpers from rewriting a saved profile snapshot. */
 	#suppressActiveProfileSnapshotUpdate = false;
@@ -651,7 +684,14 @@ export class Settings {
 		setByPath(this.#global, ["profiles", "items", profile], next);
 
 		let persistenceProfile = profile;
+		const visitedProfiles = new Set<string>();
 		for (;;) {
+			if (visitedProfiles.has(persistenceProfile)) {
+				// Defensive fallback for pending state created by an older build.
+				persistenceProfile = [...visitedProfiles].sort()[0] ?? profile;
+				break;
+			}
+			visitedProfiles.add(persistenceProfile);
 			const source = [...this.#modifiedProfileRenames].find(
 				([, rename]) => rename.newName === persistenceProfile,
 			)?.[0];
@@ -693,25 +733,20 @@ export class Settings {
 	}
 
 	/**
-	 * Delete a single profile with per-key persistence (multi-instance safe;
-	 * see {@link setProfileItem}). The deletion is propagated to the freshest
-	 * on-disk map at save time without disturbing sibling profiles.
+	 * Delete one persisted profile definition without changing this terminal's
+	 * selected identity. When deleting the local active profile, retain its
+	 * last valid snapshot/runtime ownership in memory; an explicit switch is
+	 * the only operation allowed to select another profile.
 	 */
 	deleteProfileItem(name: string): void {
 		const items = getByPath(this.#global, ["profiles", "items"]);
 		const rawActive = getByPath(this.#global, ["profiles", "active"]);
-		if (items && typeof items === "object") {
+		if (items && typeof items === "object" && rawActive !== name) {
 			delete (items as Record<string, unknown>)[name];
 		}
 		this.#modifiedProfileItems.set(name, "delete");
 		this.#modifiedProfileLiveFields.delete(name);
 		this.#persistedMutationGeneration++;
-		if (rawActive === name) {
-			this.#reconcileDeletedActiveProfile(this.#global);
-		} else if (typeof rawActive === "string" && rawActive.length > 0 && !this.#hasValidActiveProfile(this.#global)) {
-			setByPath(this.#global, ["profiles", "active"], "");
-		}
-		this.#reconcileProfileRuntimeOverrides(this.#global);
 		this.#rebuildMerged();
 		this.#queueSave();
 	}
@@ -738,11 +773,16 @@ export class Settings {
 	 * save keeps the durable `profiles.active` marker owned by whoever created
 	 * it; the binding is terminal-local and re-established on every resume.
 	 */
-	bindSessionToProfile(name: string): boolean {
+	bindSessionToProfile(name: string, fallbackSnapshot?: SettingsProfileSnapshot): boolean {
 		const items = getByPath(this.#global, ["profiles", "items"]);
-		const snapshot = isRecord(items) ? this.#profileSnapshotFromUnknown(items[name]) : undefined;
+		const persisted = isRecord(items) ? this.#profileSnapshotFromUnknown(items[name]) : undefined;
+		const snapshot = persisted ?? (fallbackSnapshot ? structuredClone(fallbackSnapshot) : undefined);
 		if (!snapshot) return false;
 		const previous = this.#captureEffectiveSettings();
+		// A missing/malformed disk entry becomes an in-memory session-owned
+		// profile. It is not marked for persistence; explicit user edits decide
+		// whether to recreate it on disk.
+		setByPath(this.#global, ["profiles", "items", name], structuredClone(snapshot));
 		setByPath(this.#global, ["profiles", "active"], name);
 		setByPath(this.#global, ["modelRoles"], { ...snapshot.modelRoles });
 		setByPath(this.#global, ["defaultThinkingLevel"], snapshot.defaultThinkingLevel);
@@ -772,12 +812,80 @@ export class Settings {
 		this.#notifySynchronizedSettings(previous, false);
 	}
 
-	/** The valid active profile name, or undefined for an empty/stale/malformed marker. */
+	/** Terminal-local active identity. Validity never changes the selected name. */
 	activeProfileName(): string | undefined {
 		const active = this.get("profiles.active");
-		if (!active) return undefined;
+		return active || undefined;
+	}
+
+	/** Return a defensive copy of a valid profile snapshot. */
+	profileSnapshot(name: string): SettingsProfileSnapshot | undefined {
 		const items = this.get("profiles.items");
-		return isRecord(items) && this.#profileSnapshotFromUnknown(items[active]) ? active : undefined;
+		const snapshot = isRecord(items) ? this.#profileSnapshotFromUnknown(items[name]) : undefined;
+		return snapshot ? structuredClone(snapshot) : undefined;
+	}
+
+	/** Snapshot the current terminal-local profile-controlled live fields. */
+	currentProfileSnapshot(): SettingsProfileSnapshot {
+		return {
+			modelRoles: { ...this.get("modelRoles") },
+			defaultThinkingLevel: this.get("defaultThinkingLevel"),
+		};
+	}
+
+	/**
+	 * Capture every terminal-local setting and ownership record changed by
+	 * resume binding/unbinding. Token remains independent of durable activation:
+	 * rollback must not schedule a config write.
+	 */
+	captureTerminalProfileActivation(): TerminalProfileActivationState {
+		const capture = (target: RawSettings, key: string): CapturedOwnValue =>
+			Object.hasOwn(target, key) ? { hadValue: true, value: structuredClone(target[key]) } : { hadValue: false };
+		return {
+			[TERMINAL_PROFILE_ACTIVATION_STATE]: {
+				profiles: capture(this.#global, "profiles"),
+				modelRoles: capture(this.#global, "modelRoles"),
+				defaultThinkingLevel: capture(this.#global, "defaultThinkingLevel"),
+				overrideModelRoles: capture(this.#overrides, "modelRoles"),
+				overrideThinkingLevel: capture(this.#overrides, "defaultThinkingLevel"),
+				profileRuntimeOwner: this.#profileRuntimeOwner,
+				profileOwnedModelRoleOverrides: [...this.#profileOwnedModelRoleOverrides].map(
+					([role, owned]) => [role, structuredClone(owned)] as [string, ProfileOwnedModelRoleOverride],
+				),
+				profileOwnedThinkingOverride: this.#profileOwnedThinkingOverride
+					? structuredClone(this.#profileOwnedThinkingOverride)
+					: undefined,
+			},
+		};
+	}
+
+	/**
+	 * Roll back terminal-local resume activation exactly. Binding is
+	 * session-local, so restoration marks no profile item or activation dirty.
+	 */
+	restoreTerminalProfileActivation(state: TerminalProfileActivationState): void {
+		const captured = state[TERMINAL_PROFILE_ACTIVATION_STATE];
+		const previous = this.#captureEffectiveSettings();
+		const restore = (target: RawSettings, key: string, value: CapturedOwnValue): void => {
+			if (value.hadValue) target[key] = structuredClone(value.value);
+			else delete target[key];
+		};
+		restore(this.#global, "profiles", captured.profiles);
+		restore(this.#global, "modelRoles", captured.modelRoles);
+		restore(this.#global, "defaultThinkingLevel", captured.defaultThinkingLevel);
+		restore(this.#overrides, "modelRoles", captured.overrideModelRoles);
+		restore(this.#overrides, "defaultThinkingLevel", captured.overrideThinkingLevel);
+		this.#profileRuntimeOwner = captured.profileRuntimeOwner;
+		this.#profileOwnedModelRoleOverrides = new Map(
+			captured.profileOwnedModelRoleOverrides.map(([role, owned]) => [role, structuredClone(owned)] as const),
+		);
+		this.#profileOwnedThinkingOverride = captured.profileOwnedThinkingOverride
+			? structuredClone(captured.profileOwnedThinkingOverride)
+			: undefined;
+		// Invalidate a disk reload that may have captured temporary startup view.
+		this.#persistedMutationGeneration++;
+		this.#rebuildMerged();
+		this.#notifySynchronizedSettings(previous, false);
 	}
 
 	/**
@@ -803,8 +911,12 @@ export class Settings {
 		snapshot: { modelRoles: Record<string, string>; defaultThinkingLevel: string },
 	): void {
 		const items = getByPath(this.#global, ["profiles", "items"]);
-		if (name && isRecord(items) && this.#profileSnapshotFromUnknown(items[name])) {
-			this.activateProfile(name, snapshot);
+		if (name) {
+			const persisted = isRecord(items) ? this.#profileSnapshotFromUnknown(items[name]) : undefined;
+			setByPath(this.#global, ["profiles", "items", name], structuredClone(snapshot));
+			this.bindSessionToProfile(name, snapshot);
+			if (persisted) this.#modifiedProfileActivation = { targetName: name };
+			this.#queueSave();
 			return;
 		}
 		const previous = this.#captureEffectiveSettings();
@@ -822,6 +934,34 @@ export class Settings {
 		this.#queueSave();
 	}
 
+	/**
+	 * Add a pending rename and collapse any cycle it closes. Sequential renames
+	 * describe one immutable identity, so a cycle means that identity returned
+	 * to an earlier name (A→B→A), not that multiple profiles swapped.
+	 */
+	#recordProfileRename(oldName: string, rename: PendingProfileRename): void {
+		this.#modifiedProfileRenames.set(oldName, rename);
+		const path: string[] = [];
+		const indexes = new Map<string, number>();
+		let cursor = oldName;
+		for (;;) {
+			const cycleStart = indexes.get(cursor);
+			if (cycleStart !== undefined) {
+				// Remove cycle edges only. Any incoming predecessor remains as
+				// deterministic net rename into the cycle's final name.
+				for (let i = cycleStart; i < path.length; i++) {
+					this.#modifiedProfileRenames.delete(path[i]);
+				}
+				return;
+			}
+			indexes.set(cursor, path.length);
+			const next = this.#modifiedProfileRenames.get(cursor);
+			if (!next) return;
+			path.push(cursor);
+			cursor = next.newName;
+		}
+	}
+
 	/** Rename one profile atomically against the freshest on-disk profile map. */
 	renameProfileItem(
 		oldName: string,
@@ -829,6 +969,7 @@ export class Settings {
 		snapshot: { modelRoles: Record<string, string>; defaultThinkingLevel: string },
 		wasActive: boolean,
 	): void {
+		if (oldName === newName) return;
 		const items = getByPath(this.#global, ["profiles", "items"]);
 		if (isRecord(items)) {
 			items[newName] = snapshot;
@@ -845,7 +986,7 @@ export class Settings {
 				this.#modifiedProfileActivation = { targetName: newName };
 			}
 		}
-		this.#modifiedProfileRenames.set(oldName, { newName, snapshot, wasActive });
+		this.#recordProfileRename(oldName, { newName, snapshot, wasActive });
 		this.#persistedMutationGeneration++;
 		this.#rebuildMerged();
 		this.#queueSave();
@@ -902,7 +1043,12 @@ export class Settings {
 		codeModeSignal.fire();
 	}
 
-	#fireEffectiveSettingChanged(path: SettingPath, value: unknown, prev: unknown): void {
+	#fireEffectiveSettingChanged(
+		path: SettingPath,
+		value: unknown,
+		prev: unknown,
+		suppressCodeModeSignal = false,
+	): void {
 		if (Object.is(value, prev)) return;
 		if (path === "statusLine.sessionAccent") {
 			statusLineSessionAccentSignal.fire();
@@ -910,7 +1056,7 @@ export class Settings {
 		if (path === "modelRoles") {
 			modelRolesSignal.fire();
 		}
-		if (CODE_MODE_SIGNAL_PATHS.includes(path)) {
+		if (!suppressCodeModeSignal && CODE_MODE_SIGNAL_PATHS.includes(path)) {
 			codeModeSignal.fire();
 		}
 	}
@@ -988,6 +1134,7 @@ export class Settings {
 		if (
 			this.#modified.size > 0 ||
 			this.#modifiedProfileItems.size > 0 ||
+			this.#modifiedProfileLiveFields.size > 0 ||
 			this.#modifiedProfileRenames.size > 0 ||
 			this.#modifiedGlobalModelRoles.size > 0 ||
 			this.#modifiedProfileActivation !== undefined
@@ -1069,8 +1216,7 @@ export class Settings {
 			this.#projectShellPathSource = projectResult.value.shellPathSource;
 			this.#configOverlay = overlayResult.value.settings;
 			this.#overlayShellPathSource = overlayResult.value.shellPathSource;
-			this.#reconcileDeletedActiveProfile(this.#global);
-			this.#reconcileProfileRuntimeOverrides(this.#global, previousGlobal);
+			this.#preserveTerminalProfileView(previousGlobal);
 			this.#rebuildMerged();
 			this.#notifySynchronizedSettings(previous);
 			return;
@@ -1333,15 +1479,20 @@ export class Settings {
 	 */
 	#reconcileProfileRuntimeOverrides(nextGlobal: RawSettings, previousGlobal?: RawSettings): void {
 		const active = getByPath(nextGlobal, ["profiles", "active"]);
-		const items = getByPath(nextGlobal, ["profiles", "items"]);
-		const snapshot =
-			typeof active === "string" && active.length > 0 && isRecord(items)
-				? this.#profileSnapshotFromUnknown(items[active])
-				: undefined;
-		if (!snapshot || typeof active !== "string") {
+		if (typeof active !== "string" || active.length === 0) {
 			this.#retireProfileRuntimeOverrides();
 			return;
 		}
+		const items = getByPath(nextGlobal, ["profiles", "items"]);
+		const persisted = isRecord(items) ? this.#profileSnapshotFromUnknown(items[active]) : undefined;
+		const fallbackThinking = getByPath(nextGlobal, ["defaultThinkingLevel"]);
+		const snapshot =
+			persisted ??
+			({
+				modelRoles: this.#modelRolesFromLayer(nextGlobal),
+				defaultThinkingLevel: typeof fallbackThinking === "string" ? fallbackThinking : "medium",
+			} satisfies SettingsProfileSnapshot);
+		if (!persisted) setByPath(nextGlobal, ["profiles", "items", active], structuredClone(snapshot));
 
 		const liveSnapshot = {
 			modelRoles: this.#modelRolesFromLayer(nextGlobal),
@@ -2729,27 +2880,19 @@ export class Settings {
 
 	#notifySynchronizedSettings(previous: Map<SettingPath, unknown>, emitSynchronizationSignal = true): void {
 		const changedPaths: SettingPath[] = [];
+		let codeModeChanged = false;
 		for (const settingPath of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
 			const before = previous.get(settingPath);
 			const after = this.get(settingPath);
 			if (isDeepStrictEqual(after, before)) continue;
 			const hook = SETTING_HOOKS[settingPath];
 			if (hook) hook(after as never, before as never);
-			this.#fireEffectiveSettingChanged(settingPath, after, before);
+			this.#fireEffectiveSettingChanged(settingPath, after, before, true);
+			if (CODE_MODE_SIGNAL_PATHS.includes(settingPath)) codeModeChanged = true;
 			changedPaths.push(settingPath);
 		}
+		if (codeModeChanged) codeModeSignal.fire();
 		if (emitSynchronizationSignal && changedPaths.length > 0) settingsSynchronizedSignal.fire(this, changedPaths);
-	}
-
-	#hasValidActiveProfile(target: RawSettings): boolean {
-		const active = getByPath(target, ["profiles", "active"]);
-		const items = getByPath(target, ["profiles", "items"]);
-		return (
-			typeof active === "string" &&
-			active.length > 0 &&
-			isRecord(items) &&
-			this.#profileSnapshotFromUnknown(items[active]) !== undefined
-		);
 	}
 
 	#profileSnapshotFromUnknown(
@@ -2766,32 +2909,57 @@ export class Settings {
 		return { modelRoles, defaultThinkingLevel: raw.defaultThinkingLevel };
 	}
 
-	#reconcileDeletedActiveProfile(target: RawSettings): void {
-		const active = getByPath(target, ["profiles", "active"]);
-		if (typeof active !== "string" || active.length === 0) return;
-		const items = getByPath(target, ["profiles", "items"]);
-		if (isRecord(items) && this.#profileSnapshotFromUnknown(items[active])) return;
+	/**
+	 * Historical hook retained for save-path compatibility. Missing profile
+	 * definitions never select a fallback: keep the marker/root projection so
+	 * existing sessions can restore their pinned snapshot.
+	 */
+	#reconcileDeletedActiveProfile(_target: RawSettings): void {}
 
-		const fallback = isRecord(items)
-			? Object.entries(items)
-					.map(([name, raw]) => ({ name, snapshot: this.#profileSnapshotFromUnknown(raw) }))
-					.filter(
-						(
-							entry,
-						): entry is {
-							name: string;
-							snapshot: { modelRoles: Record<string, string>; defaultThinkingLevel: string };
-						} => entry.snapshot !== undefined,
-					)
-					.sort((a, b) => a.name.localeCompare(b.name))[0]
-			: undefined;
-		if (!fallback) {
-			setByPath(target, ["profiles", "active"], "");
+	/**
+	 * Reapply this running terminal's pinned profile identity after replacing a
+	 * persisted layer. The incoming snapshot for the SAME name wins so model
+	 * and thinking edits synchronize; another terminal's active marker/root
+	 * projection never participates. Missing or malformed incoming definitions
+	 * fall back to the last local snapshot and remain session-local.
+	 */
+	#preserveTerminalProfileView(previousGlobal: RawSettings): void {
+		const localProfile = this.#profileRuntimeOwner;
+		const previousRoles = this.#modelRolesFromLayer(previousGlobal);
+		const previousThinking = getByPath(previousGlobal, ["defaultThinkingLevel"]);
+		if (!localProfile) {
+			const incomingActive = getByPath(this.#global, ["profiles", "active"]);
+			setByPath(this.#global, ["profiles", "active"], "");
+			// Profile-less terminals reload ordinary global settings, but never
+			// adopt another terminal's profile activation/root projection.
+			if (typeof incomingActive === "string" && incomingActive.length > 0) {
+				setByPath(this.#global, ["modelRoles"], previousRoles);
+				if (typeof previousThinking === "string") {
+					setByPath(this.#global, ["defaultThinkingLevel"], previousThinking);
+				}
+			}
+			this.#reconcileProfileRuntimeOverrides(this.#global, previousGlobal);
 			return;
 		}
-		setByPath(target, ["profiles", "active"], fallback.name);
-		setByPath(target, ["modelRoles"], { ...fallback.snapshot.modelRoles });
-		setByPath(target, ["defaultThinkingLevel"], fallback.snapshot.defaultThinkingLevel);
+
+		const incomingItems = getByPath(this.#global, ["profiles", "items"]);
+		const incoming = isRecord(incomingItems)
+			? this.#profileSnapshotFromUnknown(incomingItems[localProfile])
+			: undefined;
+		const previousItems = getByPath(previousGlobal, ["profiles", "items"]);
+		const previous = isRecord(previousItems)
+			? this.#profileSnapshotFromUnknown(previousItems[localProfile])
+			: undefined;
+		const snapshot = incoming ??
+			previous ?? {
+				modelRoles: previousRoles,
+				defaultThinkingLevel: typeof previousThinking === "string" ? previousThinking : "medium",
+			};
+		setByPath(this.#global, ["profiles", "items", localProfile], structuredClone(snapshot));
+		setByPath(this.#global, ["profiles", "active"], localProfile);
+		setByPath(this.#global, ["modelRoles"], { ...snapshot.modelRoles });
+		setByPath(this.#global, ["defaultThinkingLevel"], snapshot.defaultThinkingLevel);
+		this.#reconcileProfileRuntimeOverrides(this.#global, previousGlobal);
 	}
 
 	/** Reload global settings after another process atomically replaces config.yml. */
@@ -2819,55 +2987,8 @@ export class Settings {
 		}
 		const previous = this.#captureEffectiveSettings();
 		const previousGlobal = this.#global;
-		const localActive = this.#profileRuntimeOwner;
-		const localLiveRoles = this.#modelRolesFromLayer(previousGlobal);
-		const previousThinking = getByPath(previousGlobal, ["defaultThinkingLevel"]);
-		const previousItems = getByPath(previousGlobal, ["profiles", "items"]);
-		const previousLocalSnapshot =
-			typeof localActive === "string" && isRecord(previousItems)
-				? this.#profileSnapshotFromUnknown(previousItems[localActive])
-				: undefined;
 		this.#global = result.settings;
-
-		const items = getByPath(this.#global, ["profiles", "items"]);
-		const incomingLocalSnapshot =
-			typeof localActive === "string" && localActive.length > 0 && isRecord(items)
-				? this.#profileSnapshotFromUnknown(items[localActive])
-				: undefined;
-
-		if (incomingLocalSnapshot && localActive) {
-			setByPath(this.#global, ["profiles", "active"], localActive);
-			if (!previousLocalSnapshot || !isDeepStrictEqual(previousLocalSnapshot, incomingLocalSnapshot)) {
-				// Same-profile edits are shared state: every terminal using this profile
-				// adopts its new model/thinking snapshot even when another profile is
-				// the startup default on disk.
-				setByPath(this.#global, ["modelRoles"], { ...incomingLocalSnapshot.modelRoles });
-				setByPath(this.#global, ["defaultThinkingLevel"], incomingLocalSnapshot.defaultThinkingLevel);
-			} else {
-				// A different terminal's activation changes root live fields but not this
-				// profile snapshot. Preserve this terminal's local profile state.
-				setByPath(this.#global, ["modelRoles"], localLiveRoles);
-				if (typeof previousThinking === "string") {
-					setByPath(this.#global, ["defaultThinkingLevel"], previousThinking);
-				}
-			}
-			this.#reconcileProfileRuntimeOverrides(this.#global, previousGlobal);
-		} else if (localActive) {
-			// Locally active profile was deleted by another instance: reconcile to
-			// the first valid remaining fallback profile and sync the change.
-			setByPath(this.#global, ["profiles", "active"], localActive);
-			this.#reconcileDeletedActiveProfile(this.#global);
-			this.#reconcileProfileRuntimeOverrides(this.#global, previousGlobal);
-		} else {
-			// Empty is a terminal-local selection too. Another terminal's first
-			// profile/activation only changes the startup default on disk.
-			setByPath(this.#global, ["profiles", "active"], "");
-			setByPath(this.#global, ["modelRoles"], localLiveRoles);
-			if (typeof previousThinking === "string") {
-				setByPath(this.#global, ["defaultThinkingLevel"], previousThinking);
-			}
-			this.#reconcileProfileRuntimeOverrides(this.#global, previousGlobal);
-		}
+		this.#preserveTerminalProfileView(previousGlobal);
 
 		this.#rebuildMerged();
 		this.#notifySynchronizedSettings(previous);
@@ -3001,7 +3122,15 @@ export class Settings {
 						if (!isRecord(items) || !Object.hasOwn(items, profileName)) continue;
 					}
 					let localProfileName = profileName;
+					const visitedProfileNames = new Set<string>();
 					for (;;) {
+						if (visitedProfileNames.has(localProfileName)) {
+							// Deterministic recovery for pending state captured
+							// before rename-cycle normalization existed.
+							localProfileName = [...visitedProfileNames].sort()[0] ?? profileName;
+							break;
+						}
+						visitedProfileNames.add(localProfileName);
 						const rename = modifiedProfileRenames.get(localProfileName);
 						if (!rename) break;
 						localProfileName = rename.newName;
@@ -3253,7 +3382,7 @@ export class Settings {
 				}
 			}
 			for (const [oldName, rename] of modifiedProfileRenames) {
-				if (!this.#modifiedProfileRenames.has(oldName)) this.#modifiedProfileRenames.set(oldName, rename);
+				if (!this.#modifiedProfileRenames.has(oldName)) this.#recordProfileRename(oldName, rename);
 			}
 			for (const role of modifiedModelRoles) {
 				this.#modifiedGlobalModelRoles.add(role);
@@ -3265,23 +3394,20 @@ export class Settings {
 			throw error;
 		}
 
-		const items = getByPath(this.#global, ["profiles", "items"]);
-		const localProfileExists =
-			typeof localActive === "string" &&
-			localActive.length > 0 &&
-			isRecord(items) &&
-			this.#profileSnapshotFromUnknown(items[localActive]) !== undefined;
-		if (localProfileExists) {
-			// Preserve this terminal's active profile while retaining unrelated
-			// values merged from disk. The durable active marker was already written.
+		if (typeof localActive === "string" && localActive.length > 0) {
+			const localSnapshot: SettingsProfileSnapshot = {
+				modelRoles: localLiveRoles,
+				defaultThinkingLevel:
+					typeof localThinking === "string"
+						? localThinking
+						: ((previousGlobal.defaultThinkingLevel as string | undefined) ?? "medium"),
+			};
+			setByPath(this.#global, ["profiles", "items", localActive], structuredClone(localSnapshot));
 			setByPath(this.#global, ["profiles", "active"], localActive);
-			setByPath(this.#global, ["modelRoles"], localLiveRoles);
-			if (typeof localThinking === "string") {
-				setByPath(this.#global, ["defaultThinkingLevel"], localThinking);
-			}
-		} else if (typeof localActive === "string" && localActive.length > 0) {
-			setByPath(this.#global, ["profiles", "active"], localActive);
-			this.#reconcileDeletedActiveProfile(this.#global);
+			setByPath(this.#global, ["modelRoles"], { ...localSnapshot.modelRoles });
+			setByPath(this.#global, ["defaultThinkingLevel"], localSnapshot.defaultThinkingLevel);
+		} else {
+			setByPath(this.#global, ["profiles", "active"], "");
 		}
 		this.#reconcileProfileRuntimeOverrides(this.#global, previousGlobal);
 		this.#rebuildMerged();

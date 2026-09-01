@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { type Api, type AssistantMessage, Effort, type Model } from "@oh-my-pi/pi-ai";
@@ -63,13 +63,22 @@ describe("AgentSession model persistence", () => {
 		defaultRoleValue: string,
 		smolRoleValue: string,
 		lastRole = "smol",
+		profile?: { name: string; snapshot: { modelRoles: Record<string, string>; defaultThinkingLevel: string } },
 	): Promise<string> {
 		const targetSessionFile = path.join(tempDir.path(), `target-${Bun.nanoseconds()}.jsonl`);
 		const timestamp = "2026-06-01T00:00:00.000Z";
 		await Bun.write(
 			targetSessionFile,
 			`${[
-				{ type: "session", version: 3, id: "target-session", timestamp, cwd: tempDir.path() },
+				{
+					type: "session",
+					version: 3,
+					id: "target-session",
+					timestamp,
+					cwd: tempDir.path(),
+					profile: profile?.name,
+					profileSnapshot: profile?.snapshot,
+				},
 				{
 					type: "model_change",
 					id: "default-model",
@@ -191,11 +200,64 @@ describe("AgentSession model persistence", () => {
 			initialModel: defaultModel,
 			modelRoles: { default: modelValue(defaultModel) },
 		});
+		const profileSnapshot = {
+			modelRoles: { default: modelValue(defaultModel) },
+			defaultThinkingLevel: "medium",
+		};
+		created.settings.set("profiles.items", { "gpt-edu": profileSnapshot });
+		created.settings.set("profiles.active", "gpt-edu");
+		await created.session.bindSessionProfile("gpt-edu");
 
 		await created.session.setModel(nextModel, "default", { persist: true });
 
 		expect(created.session.model?.id).toBe(nextModel.id);
 		expect(created.settings.getModelRole("default")).toBe(modelValue(nextModel));
+		expect(created.session.sessionManager.getSessionProfileSnapshot()?.modelRoles.default).toBe(
+			modelValue(nextModel),
+		);
+	});
+
+	it("persists cycleThinkingLevel changes into the bound profile snapshot and session header", async () => {
+		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const profileSnapshot = {
+			modelRoles: { default: modelValue(defaultModel) },
+			defaultThinkingLevel: Effort.Medium,
+		};
+		const created = await createSession({
+			initialModel: defaultModel,
+			modelRoles: profileSnapshot.modelRoles,
+			persist: true,
+		});
+		created.settings.set("profiles.items", { "gpt-edu": profileSnapshot });
+		created.settings.set("profiles.active", "gpt-edu");
+		expect(await created.session.bindSessionProfile("gpt-edu")).toBe(true);
+		await created.session.waitForIdle();
+		await created.session.sessionManager.ensureOnDisk();
+
+		const nextThinkingLevel = created.session.cycleThinkingLevel(true);
+		await created.session.waitForIdle();
+		await created.session.sessionManager.flush();
+
+		expect(nextThinkingLevel).toBe(Effort.High);
+		expect(created.settings.get("defaultThinkingLevel")).toBe(Effort.High);
+		expect(created.settings.profileSnapshot("gpt-edu")?.defaultThinkingLevel).toBe(Effort.High);
+		expect(created.session.sessionManager.getSessionProfileSnapshot()?.defaultThinkingLevel).toBe(Effort.High);
+
+		const sessionFile = created.session.sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persisted session file");
+		const header = (await Bun.file(sessionFile).text())
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as Record<string, unknown>)
+			.find(entry => entry.type === "session");
+		if (!header) throw new Error("Expected persisted session header");
+		expect(header).toMatchObject({
+			profile: "gpt-edu",
+			profileSnapshot: {
+				modelRoles: profileSnapshot.modelRoles,
+				defaultThinkingLevel: Effort.High,
+			},
+		});
 	});
 
 	it("switches the active model even when the live context is over the target window", async () => {
@@ -305,6 +367,70 @@ describe("AgentSession model persistence", () => {
 		await expect(created.session.switchSession(targetSessionFile)).resolves.toBe(true);
 		expect(created.session.model?.id).toBe(smolModel.id);
 	});
+	it("binds an empty persisted session from its header profile", async () => {
+		const eduModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const cyberModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		const eduSnapshot = {
+			modelRoles: { default: modelValue(eduModel) },
+			defaultThinkingLevel: "medium",
+		};
+		const cyberSnapshot = {
+			modelRoles: { default: modelValue(cyberModel) },
+			defaultThinkingLevel: "high",
+		};
+		const targetSessionFile = path.join(tempDir.path(), `empty-profile-${Bun.nanoseconds()}.jsonl`);
+		await Bun.write(
+			targetSessionFile,
+			`${JSON.stringify({
+				type: "session",
+				version: 3,
+				id: "empty-profile-session",
+				timestamp: "2026-06-01T00:00:00.000Z",
+				cwd: tempDir.path(),
+				profile: "gpt-edu",
+				profileSnapshot: eduSnapshot,
+			})}\n`,
+		);
+		const settings = Settings.isolated();
+		settings.set("profiles.items", { "gpt-edu": eduSnapshot, "gpt-cyber": cyberSnapshot });
+		settings.set("profiles.active", "gpt-cyber");
+		settings.set("modelRoles", cyberSnapshot.modelRoles);
+
+		const result = await createStartupResumeSession(targetSessionFile, settings);
+
+		expect(settings.activeProfileName()).toBe("gpt-edu");
+		expect(result.session.getSessionProfileName()).toBe("gpt-edu");
+		expect(result.session.model?.id).toBe(eduModel.id);
+	});
+
+	it("keeps an empty persisted legacy session unbound instead of stamping disk active", async () => {
+		const cyberModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		const cyberSnapshot = {
+			modelRoles: { default: modelValue(cyberModel) },
+			defaultThinkingLevel: "high",
+		};
+		const targetSessionFile = path.join(tempDir.path(), `empty-legacy-${Bun.nanoseconds()}.jsonl`);
+		await Bun.write(
+			targetSessionFile,
+			`${JSON.stringify({
+				type: "session",
+				version: 3,
+				id: "empty-legacy-session",
+				timestamp: "2026-06-01T00:00:00.000Z",
+				cwd: tempDir.path(),
+			})}\n`,
+		);
+		const settings = Settings.isolated();
+		settings.set("profiles.items", { "gpt-cyber": cyberSnapshot });
+		settings.set("profiles.active", "gpt-cyber");
+		settings.set("modelRoles", cyberSnapshot.modelRoles);
+
+		const result = await createStartupResumeSession(targetSessionFile, settings);
+
+		expect(settings.activeProfileName()).toBeUndefined();
+		expect(result.session.getSessionProfileName()).toBeUndefined();
+		expect(result.session.sessionManager.getSessionProfile()).toBeUndefined();
+	});
 
 	it("restores the last active role model during startup resume", async () => {
 		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
@@ -316,6 +442,253 @@ describe("AgentSession model persistence", () => {
 		const result = await createStartupResumeSession(targetSessionFile);
 
 		expect(result.session.model?.id).toBe(smolModel.id);
+	});
+
+	it("restores each session's profile, model, thinking, settings, and header snapshot when switching both ways", async () => {
+		const eduModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const cyberModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		const eduSnapshot = {
+			modelRoles: { default: modelValue(eduModel) },
+			defaultThinkingLevel: Effort.Medium,
+		};
+		const cyberSnapshot = {
+			modelRoles: { default: modelValue(cyberModel) },
+			defaultThinkingLevel: Effort.High,
+		};
+		const targetSessionFile = await writeRoleModelSession(modelValue(eduModel), modelValue(eduModel), "default", {
+			name: "gpt-edu",
+			snapshot: eduSnapshot,
+		});
+		const created = await createSession({ initialModel: cyberModel, persist: true });
+		created.settings.set("profiles.items", { "gpt-edu": eduSnapshot, "gpt-cyber": cyberSnapshot });
+		created.settings.set("profiles.active", "gpt-cyber");
+		created.settings.set("modelRoles", cyberSnapshot.modelRoles);
+		expect(await created.session.bindSessionProfile("gpt-cyber")).toBe(true);
+		await created.session.waitForIdle();
+		created.session.sessionManager.appendModelChange(modelValue(cyberModel), "default");
+		await created.session.sessionManager.ensureOnDisk();
+		const sourceSessionFile = created.session.sessionManager.getSessionFile();
+		if (!sourceSessionFile) throw new Error("Expected source session file");
+
+		await expect(created.session.switchSession(targetSessionFile)).resolves.toBe(true);
+		await created.session.waitForIdle();
+
+		expect(created.settings.activeProfileName()).toBe("gpt-edu");
+		expect(created.settings.currentProfileSnapshot()).toEqual(eduSnapshot);
+		expect(created.settings.getModelRole("default")).toBe(modelValue(eduModel));
+		expect(created.settings.get("defaultThinkingLevel")).toBe(Effort.Medium);
+		expect(created.session.getSessionProfileName()).toBe("gpt-edu");
+		expect(created.session.model?.id).toBe(eduModel.id);
+		expect(created.session.configuredThinkingLevel()).toBe(Effort.Medium);
+		expect(created.session.sessionManager.getHeader()).toMatchObject({
+			profile: "gpt-edu",
+			profileSnapshot: eduSnapshot,
+		});
+
+		await expect(created.session.switchSession(sourceSessionFile)).resolves.toBe(true);
+		await created.session.waitForIdle();
+
+		expect(created.settings.activeProfileName()).toBe("gpt-cyber");
+		expect(created.settings.currentProfileSnapshot()).toEqual(cyberSnapshot);
+		expect(created.settings.getModelRole("default")).toBe(modelValue(cyberModel));
+		expect(created.settings.get("defaultThinkingLevel")).toBe(Effort.High);
+		expect(created.session.getSessionProfileName()).toBe("gpt-cyber");
+		expect(created.session.model?.id).toBe(cyberModel.id);
+		expect(created.session.configuredThinkingLevel()).toBe(Effort.High);
+		expect(created.session.sessionManager.getHeader()).toMatchObject({
+			profile: "gpt-cyber",
+			profileSnapshot: cyberSnapshot,
+		});
+	});
+
+	it("rolls back profile binding ownership, runtime, settings, and header when target model apply fails", async () => {
+		const sourceModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const targetModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		const sourceSnapshot = {
+			modelRoles: { default: modelValue(sourceModel) },
+			defaultThinkingLevel: Effort.Medium,
+		};
+		const targetSnapshot = {
+			modelRoles: { default: modelValue(targetModel) },
+			defaultThinkingLevel: Effort.High,
+		};
+		const created = await createSession({ initialModel: sourceModel, persist: true });
+		created.settings.set("profiles.items", {
+			"source-profile": sourceSnapshot,
+			"target-profile": targetSnapshot,
+		});
+		created.settings.set("profiles.active", "source-profile");
+		expect(await created.session.bindSessionProfile("source-profile")).toBe(true);
+		await created.session.waitForIdle();
+		await created.session.sessionManager.ensureOnDisk();
+
+		const failure = new Error("injected target model apply failure");
+		const setModel = created.session.setModel.bind(created.session);
+		const setModelSpy = vi.spyOn(created.session, "setModel").mockImplementation(async (model, role, options) => {
+			if (model.id === targetModel.id) {
+				created.session.agent.setModel(model);
+				throw failure;
+			}
+			return setModel(model, role, options);
+		});
+
+		try {
+			await expect(created.session.bindSessionProfile("target-profile")).rejects.toThrow(failure);
+			await created.session.waitForIdle();
+		} finally {
+			setModelSpy.mockRestore();
+		}
+
+		expect(created.settings.activeProfileName()).toBe("source-profile");
+		expect(created.settings.currentProfileSnapshot()).toEqual(sourceSnapshot);
+		expect(created.settings.getModelRole("default")).toBe(modelValue(sourceModel));
+		expect(created.settings.get("defaultThinkingLevel")).toBe(Effort.Medium);
+		expect(created.session.getSessionProfileName()).toBe("source-profile");
+		expect(created.session.model?.id).toBe(sourceModel.id);
+		expect(created.session.configuredThinkingLevel()).toBe(Effort.Medium);
+		expect(created.session.sessionManager.getHeader()).toMatchObject({
+			profile: "source-profile",
+			profileSnapshot: sourceSnapshot,
+		});
+	});
+
+	it("rolls back profile, model, thinking, settings, and header when a session switch fails after target apply", async () => {
+		const sourceModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		const targetModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const sourceSnapshot = {
+			modelRoles: { default: modelValue(sourceModel) },
+			defaultThinkingLevel: Effort.High,
+		};
+		const targetSnapshot = {
+			modelRoles: { default: modelValue(targetModel) },
+			defaultThinkingLevel: Effort.Medium,
+		};
+		const targetSessionFile = await writeRoleModelSession(
+			modelValue(targetModel),
+			modelValue(targetModel),
+			"default",
+			{ name: "target-profile", snapshot: targetSnapshot },
+		);
+		const created = await createSession({ initialModel: sourceModel, persist: true });
+		created.settings.set("profiles.items", {
+			"source-profile": sourceSnapshot,
+			"target-profile": targetSnapshot,
+		});
+		created.settings.set("profiles.active", "source-profile");
+		created.settings.set("modelRoles", sourceSnapshot.modelRoles);
+		expect(await created.session.bindSessionProfile("source-profile")).toBe(true);
+		await created.session.waitForIdle();
+		created.session.sessionManager.appendModelChange(modelValue(sourceModel), "default");
+		await created.session.sessionManager.ensureOnDisk();
+		const sourceSessionFile = created.session.sessionManager.getSessionFile();
+		if (!sourceSessionFile) throw new Error("Expected source session file");
+
+		const failure = new Error("injected switch failure after target runtime apply");
+		const getSessionId = created.session.sessionManager.getSessionId.bind(created.session.sessionManager);
+		let injected = false;
+		const getSessionIdSpy = vi.spyOn(created.session.sessionManager, "getSessionId").mockImplementation(() => {
+			const activeFile = created.session.sessionManager.getSessionFile();
+			if (
+				!injected &&
+				activeFile &&
+				path.resolve(activeFile) === path.resolve(targetSessionFile) &&
+				created.session.model?.id === targetModel.id &&
+				created.session.configuredThinkingLevel() === Effort.Medium
+			) {
+				injected = true;
+				throw failure;
+			}
+			return getSessionId();
+		});
+
+		try {
+			await expect(created.session.switchSession(targetSessionFile)).rejects.toThrow(failure);
+		} finally {
+			getSessionIdSpy.mockRestore();
+		}
+
+		expect(injected).toBe(true);
+		expect(created.session.sessionManager.getSessionFile()).toBe(sourceSessionFile);
+		expect(created.settings.activeProfileName()).toBe("source-profile");
+		expect(created.settings.currentProfileSnapshot()).toEqual(sourceSnapshot);
+		expect(created.settings.getModelRole("default")).toBe(modelValue(sourceModel));
+		expect(created.settings.get("defaultThinkingLevel")).toBe(Effort.High);
+		expect(created.session.getSessionProfileName()).toBe("source-profile");
+		expect(created.session.model?.id).toBe(sourceModel.id);
+		expect(created.session.configuredThinkingLevel()).toBe(Effort.High);
+		expect(created.session.sessionManager.getHeader()).toMatchObject({
+			profile: "source-profile",
+			profileSnapshot: sourceSnapshot,
+		});
+	});
+
+	it("restores the session profile instead of the disk startup profile", async () => {
+		const eduModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const cyberModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		const eduSnapshot = {
+			modelRoles: { default: modelValue(eduModel), smol: modelValue(eduModel) },
+			defaultThinkingLevel: "medium",
+		};
+		const cyberSnapshot = {
+			modelRoles: { default: modelValue(cyberModel) },
+			defaultThinkingLevel: "high",
+		};
+		const targetSessionFile = await writeRoleModelSession(modelValue(eduModel), modelValue(eduModel), "smol", {
+			name: "gpt-edu",
+			snapshot: eduSnapshot,
+		});
+		const settings = Settings.isolated();
+		settings.set("profiles.items", { "gpt-edu": eduSnapshot, "gpt-cyber": cyberSnapshot });
+		settings.set("profiles.active", "gpt-cyber");
+		settings.set("modelRoles", cyberSnapshot.modelRoles);
+
+		const result = await createStartupResumeSession(targetSessionFile, settings);
+
+		expect(settings.activeProfileName()).toBe("gpt-edu");
+		expect(settings.getModelRole("default")).toBe(modelValue(eduModel));
+		expect(result.session.getSessionProfileName()).toBe("gpt-edu");
+	});
+
+	it("restores a missing session profile from the header snapshot", async () => {
+		const eduModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const eduSnapshot = {
+			modelRoles: { default: modelValue(eduModel) },
+			defaultThinkingLevel: "medium",
+		};
+		const targetSessionFile = await writeRoleModelSession(modelValue(eduModel), modelValue(eduModel), "default", {
+			name: "deleted-profile",
+			snapshot: eduSnapshot,
+		});
+		const settings = Settings.isolated();
+		settings.set("profiles.items", {});
+		settings.set("profiles.active", "other");
+
+		await createStartupResumeSession(targetSessionFile, settings);
+
+		expect(settings.activeProfileName()).toBe("deleted-profile");
+		expect(settings.profileSnapshot("deleted-profile")).toEqual(eduSnapshot);
+	});
+
+	it("restores a malformed session profile from the header snapshot", async () => {
+		const eduModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const eduSnapshot = {
+			modelRoles: { default: modelValue(eduModel) },
+			defaultThinkingLevel: "high",
+		};
+		const targetSessionFile = await writeRoleModelSession(modelValue(eduModel), modelValue(eduModel), "default", {
+			name: "broken-profile",
+			snapshot: eduSnapshot,
+		});
+		const settings = Settings.isolated();
+		settings.set("profiles.items", {
+			"broken-profile": { modelRoles: { default: 7 }, defaultThinkingLevel: "low" },
+		});
+		settings.set("profiles.active", "other");
+
+		await createStartupResumeSession(targetSessionFile, settings);
+
+		expect(settings.activeProfileName()).toBe("broken-profile");
+		expect(settings.profileSnapshot("broken-profile")).toEqual(eduSnapshot);
 	});
 
 	it("falls back to the saved default model when switch-session role restore is unavailable", async () => {

@@ -14,7 +14,11 @@ describe("startup composer prepaint graph", () => {
 			proc.exited,
 		]);
 		expect(code, err).toBe(0);
-		const modules: string[] = JSON.parse(out.trim().split("\n").at(-1)!);
+		// Module keys carry native separators; normalize so the contract below is
+		// expressed with `/` on every platform (Windows used to fail the controls).
+		const modules: string[] = (JSON.parse(out.trim().split("\n").at(-1)!) as string[]).map(entry =>
+			entry.replaceAll("\\", "/"),
+		);
 		expect(modules.length).toBeGreaterThan(50); // sanity: registry actually enumerated
 		// Positive controls — the scene really is on this graph.
 		expect(modules.some(m => m.includes("modes/components/welcome"))).toBe(true);

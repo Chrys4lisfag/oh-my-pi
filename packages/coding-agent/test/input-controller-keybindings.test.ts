@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
-import type { ImageContent } from "@oh-my-pi/pi-ai";
+import { Effort, type ImageContent } from "@oh-my-pi/pi-ai";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { TreeSelectorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tree-selector";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
@@ -226,6 +227,7 @@ async function createContext() {
 		showDebugSelector: vi.fn(),
 		showHistorySearch: vi.fn(),
 		toggleThinkingBlockVisibility: vi.fn(),
+		statusLine: { invalidate: vi.fn() },
 		showModelSelector,
 		updateEditorBorderColor: vi.fn(),
 		hasActiveBtw,
@@ -285,6 +287,117 @@ describe("InputController keybinding setup", () => {
 		controller.cycleThinkingLevel();
 
 		expect(spies.cycleThinkingLevel).toHaveBeenCalledWith(true);
+	});
+
+	it("cycles and reports only session settings through the registered profile keybinding", async () => {
+		await initTheme(false);
+		resetSettingsForTest();
+		const singleton = await Settings.init({ inMemory: true });
+		try {
+			singleton.set("profiles.items", {
+				"singleton-current": {
+					modelRoles: { default: "provider/singleton-current" },
+					defaultThinkingLevel: "low",
+				},
+				"singleton-next": {
+					modelRoles: { default: "provider/singleton-next" },
+					defaultThinkingLevel: "high",
+				},
+			});
+			singleton.set("profiles.active", "singleton-current");
+			singleton.set("modelRoles", { default: "provider/singleton-live" });
+			singleton.set("defaultThinkingLevel", Effort.Medium);
+
+			const peer = Settings.isolated();
+			peer.set("profiles.items", {
+				"peer-current": {
+					modelRoles: { default: "provider/peer-current" },
+					defaultThinkingLevel: "low",
+				},
+				"peer-next": {
+					modelRoles: { default: "provider/peer-next" },
+					defaultThinkingLevel: "high",
+				},
+			});
+			peer.set("profiles.active", "peer-current");
+			peer.set("modelRoles", { default: "provider/peer-live" });
+			peer.set("defaultThinkingLevel", Effort.Medium);
+
+			const { InputController, ctx, customHandlers, setKeybinding } = await createContext();
+			const local = Settings.isolated();
+			local.set("profiles.items", {
+				"local-current": {
+					modelRoles: { default: "provider/local-current" },
+					defaultThinkingLevel: "medium",
+				},
+				nightly: {
+					modelRoles: { default: "provider/model-zeta" },
+					defaultThinkingLevel: "high",
+				},
+			});
+			local.set("profiles.active", "local-current");
+			local.set("modelRoles", { default: "provider/local-live" });
+			local.set("defaultThinkingLevel", Effort.Medium);
+			ctx.settings = local;
+
+			const singletonBefore = {
+				active: singleton.activeProfileName(),
+				modelRoles: structuredClone(singleton.get("modelRoles")),
+				thinking: singleton.get("defaultThinkingLevel"),
+				items: structuredClone(singleton.get("profiles.items")),
+			};
+			const peerBefore = {
+				active: peer.activeProfileName(),
+				modelRoles: structuredClone(peer.get("modelRoles")),
+				thinking: peer.get("defaultThinkingLevel"),
+				items: structuredClone(peer.get("profiles.items")),
+			};
+			const binding = Promise.withResolvers<boolean>();
+			const bindSessionProfile = vi.fn(() => binding.promise);
+			const flush = vi.spyOn(local, "flush");
+			ctx.session.bindSessionProfile = bindSessionProfile;
+			ctx.session.resolveRoleModel = vi.fn(() => ({ id: "model-zeta", provider: "provider" })) as never;
+			const reported = Promise.withResolvers<void>();
+			const showStatus = ctx.showStatus as Mock<(message: string, options?: { dim?: boolean }) => void>;
+			showStatus.mockImplementation(() => reported.resolve());
+			setKeybinding("app.profile.cycle", ["alt+c"]);
+			const controller = new InputController(ctx);
+
+			controller.setupKeyHandlers();
+			const profileCycleHandler = customHandlers.get("alt+c");
+			expect(profileCycleHandler).toBeDefined();
+			profileCycleHandler?.();
+			await reported.promise;
+			// Feedback and in-memory identity must not wait for model/session I/O.
+			expect(bindSessionProfile).toHaveBeenCalledTimes(1);
+			expect(showStatus).toHaveBeenCalledTimes(1);
+			expect(flush).not.toHaveBeenCalled();
+			binding.resolve(true);
+			await binding.promise;
+
+			expect(local.activeProfileName()).toBe("nightly");
+			expect(local.get("modelRoles")).toEqual({ default: "provider/model-zeta" });
+			expect(local.get("defaultThinkingLevel")).toBe(Effort.High);
+			expect(bindSessionProfile).toHaveBeenCalledTimes(1);
+			expect(bindSessionProfile).toHaveBeenCalledWith("nightly");
+			expect(showStatus).toHaveBeenCalledTimes(1);
+			expect(Bun.stripANSI(showStatus.mock.calls[0]?.[0] ?? "")).toBe("Profile: nightly (default: model-zeta)");
+			expect(showStatus).toHaveBeenCalledWith(expect.any(String), { dim: false });
+			expect({
+				active: singleton.activeProfileName(),
+				modelRoles: singleton.get("modelRoles"),
+				items: singleton.get("profiles.items"),
+				thinking: singleton.get("defaultThinkingLevel"),
+			}).toEqual(singletonBefore);
+			expect({
+				active: peer.activeProfileName(),
+				modelRoles: peer.get("modelRoles"),
+				items: peer.get("profiles.items"),
+				thinking: peer.get("defaultThinkingLevel"),
+			}).toEqual(peerBefore);
+		} finally {
+			resetSettingsForTest();
+		}
 	});
 
 	it("registers model selector and display reset actions separately", async () => {

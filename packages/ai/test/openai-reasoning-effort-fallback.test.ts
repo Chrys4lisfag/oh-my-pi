@@ -134,6 +134,28 @@ function summaryReasoningErrorResponse(): Response {
 }
 
 /**
+ * Bifrost/OpenAI-style gateway rejection for GPT-5.6-class models: function
+ * tools and `reasoning_effort` cannot be combined on `/v1/chat/completions`,
+ * and the only in-band remedy the server offers is `reasoning_effort: 'none'`.
+ * Deleting the field is NOT equivalent — the model reasons by default — so the
+ * fallback must send the offered `none` explicitly.
+ */
+function toolsWithReasoningEffortResponse(): Response {
+	return new Response(
+		JSON.stringify({
+			error: {
+				message:
+					"Function tools with reasoning_effort are not supported for gpt-5.6-sol in /v1/chat/completions. " +
+					"To use function tools, use /v1/responses or set reasoning_effort to 'none'.",
+				type: "invalid_request_error",
+				param: "reasoning_effort",
+			},
+		}),
+		{ status: 400, headers: { "content-type": "application/json" } },
+	);
+}
+
+/**
  * Ninfer-style strict kwargs whitelist: the server rejects the
  * `chat_template_kwargs.reasoning_effort` spelling itself, not the value.
  */
@@ -298,6 +320,38 @@ describe("OpenAI reasoning effort fallback retry", () => {
 
 		expect(result.stopReason).toBe("stop");
 		expect(bodies.map(body => body.reasoning_effort)).toEqual(["xhigh", "max"]);
+	});
+
+	it("retries with reasoning_effort:none when tools rule out every enabled level", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				const body = parseJsonBody(init);
+				bodies.push(body);
+				return bodies.length === 1 ? toolsWithReasoningEffortResponse() : createChatSseResponse();
+			},
+			{ preconnect: fetch.preconnect },
+		);
+
+		const result = await streamOpenAICompletions(
+			createCompletionsModel(),
+			{
+				messages: testContext.messages,
+				tools: [
+					{
+						name: "read",
+						description: "Read a file",
+						parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+					},
+				],
+			},
+			{ apiKey: "test-key", fetch: fetchMock, reasoning: "high" },
+		).result();
+
+		expect(result.stopReason).toBe("stop");
+		// The field must carry the server's offered value, not disappear: an
+		// absent field leaves reasoning on and re-trips the same 400.
+		expect(bodies.map(body => body.reasoning_effort)).toEqual(["high", "none"]);
 	});
 
 	it("retries Responses xhigh as provider max and stores the successful fallback params", async () => {

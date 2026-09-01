@@ -395,6 +395,7 @@ interface SessionManagerStateSnapshot {
 	onDisk: boolean;
 	needsRewrite: boolean;
 	draftOnlySessionCleanupArmed: boolean;
+	loadedExistingSession: boolean;
 	header: SessionHeader;
 	entries: SessionEntry[];
 }
@@ -473,6 +474,9 @@ export class SessionManager {
 	#header!: SessionHeader;
 	/** Config profile identity stamped into new/loaded session headers. */
 	#sessionProfile: string | undefined;
+	#sessionProfileSnapshot: SessionHeader["profileSnapshot"];
+	/** True when current state was loaded from an existing session file. */
+	#loadedExistingSession = false;
 	#titleUpdatedAt = "";
 	#hasTitleSlot = true;
 	#entries: SessionEntry[] = [];
@@ -1090,6 +1094,7 @@ export class SessionManager {
 	}
 
 	#resetToNewSession(options?: NewSessionOptions, forcedSessionFile?: string): string | undefined {
+		this.#loadedExistingSession = false;
 		this.#diskTail = Promise.resolve();
 		this.#clearDiskError();
 		this.#sessionId = mintSessionId();
@@ -1108,6 +1113,7 @@ export class SessionManager {
 			parentSession: options?.parentSession,
 			providerPromptCacheKey: options?.providerPromptCacheKey,
 			profile: this.#sessionProfile,
+			profileSnapshot: this.#sessionProfileSnapshot ? structuredClone(this.#sessionProfileSnapshot) : undefined,
 		};
 		const workspace = normalizeSessionWorkspace({
 			cwd: this.#cwd,
@@ -1150,11 +1156,13 @@ export class SessionManager {
 	#applyEntries(header: SessionHeader, entries: SessionEntry[]): void {
 		this.#header = header;
 		this.#entries = entries;
+		this.#loadedExistingSession = true;
 		this.#sessionId = header.id;
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
 		this.#titleUpdatedAt = header.timestamp;
 		this.#sessionProfile = header.profile;
+		this.#sessionProfileSnapshot = header.profileSnapshot ? structuredClone(header.profileSnapshot) : undefined;
 		this.#index.rebuild(entries);
 	}
 
@@ -1298,6 +1306,7 @@ export class SessionManager {
 			onDisk: this.#fileIsCurrent,
 			needsRewrite: this.#rewriteRequired,
 			draftOnlySessionCleanupArmed: this.#draftOnlySessionCleanupArmed,
+			loadedExistingSession: this.#loadedExistingSession,
 			// Snapshot header + entries by reference: switch/reload replaces the
 			// active header/array wholesale, so rollback needs no deep clone.
 			header: this.#header,
@@ -1338,6 +1347,7 @@ export class SessionManager {
 		this.#forceFileCreation = snapshot.onDisk;
 		this.#draftOnlySessionCleanupArmed = snapshot.draftOnlySessionCleanupArmed;
 		this.#applyEntries(snapshot.header, [...snapshot.entries]);
+		this.#loadedExistingSession = snapshot.loadedExistingSession;
 		this.#additionalDirectories = snapshot.header.additionalDirectories ?? [];
 		this.#sessionName = snapshot.sessionName;
 		this.#titleSource = snapshot.titleSource;
@@ -1450,6 +1460,7 @@ export class SessionManager {
 			parentSession: parentSessionId,
 			providerPromptCacheKey: this.#header.providerPromptCacheKey ?? parentSessionId,
 			profile: this.#sessionProfile,
+			profileSnapshot: this.#sessionProfileSnapshot ? structuredClone(this.#sessionProfileSnapshot) : undefined,
 		};
 		this.#sessionName = this.#header.title;
 		this.#titleSource = this.#header.titleSource;
@@ -1619,7 +1630,14 @@ export class SessionManager {
 		const sessionDir = options?.sessionDir ?? SessionManager.getDefaultSessionDir(this.#cwd, undefined, storage);
 		const manager = new SessionManager(this.#cwd, sessionDir, true, storage);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
+		manager.#sessionProfile = this.#sessionProfile;
+		manager.#sessionProfileSnapshot = this.#sessionProfileSnapshot
+			? structuredClone(this.#sessionProfileSnapshot)
+			: undefined;
 		manager.#resetToNewSession();
+		// A persisted copy is derived session state, not a truly fresh manager.
+		// Missing profile identity must remain unbound on later SDK startup.
+		manager.#loadedExistingSession = true;
 		manager.#sessionName = this.#sessionName;
 		manager.#titleSource = this.#titleSource;
 		manager.#titleUpdatedAt = this.#titleUpdatedAt;
@@ -2479,14 +2497,27 @@ export class SessionManager {
 		return this.#sessionProfile ?? this.#header.profile;
 	}
 
+	getSessionProfileSnapshot(): SessionHeader["profileSnapshot"] {
+		return this.#sessionProfileSnapshot ? structuredClone(this.#sessionProfileSnapshot) : undefined;
+	}
+
+	/** Whether the current header came from an existing persisted session. */
+	hasLoadedExistingSession(): boolean {
+		return this.#loadedExistingSession;
+	}
 	/**
 	 * Stamp the config profile identity onto the current header and any session
 	 * created afterwards. When the session already has an on-disk file the
 	 * header rewrite is persisted so a later resume observes the identity.
 	 */
-	async setSessionProfile(name: string | undefined): Promise<void> {
+	async setSessionProfile(name: string | undefined, snapshot?: SessionHeader["profileSnapshot"]): Promise<void> {
+		const nextSnapshot = name ? (snapshot ? structuredClone(snapshot) : this.#sessionProfileSnapshot) : undefined;
+		if (this.getSessionProfile() === name && Bun.deepEquals(this.#sessionProfileSnapshot, nextSnapshot)) return;
+
 		this.#sessionProfile = name;
+		this.#sessionProfileSnapshot = nextSnapshot;
 		this.#header.profile = name;
+		this.#header.profileSnapshot = nextSnapshot ? structuredClone(nextSnapshot) : undefined;
 		if (this.#persist && this.#sessionFile && this.#shouldHaveSessionFile() && !this.#released) {
 			this.#fileIsCurrent = false;
 			this.#rewriteRequired = true;
@@ -2601,6 +2632,8 @@ export class SessionManager {
 			titleSource: this.#titleSource,
 			parentSession: this.#persist ? sourceSessionFile : undefined,
 			additionalDirectories: this.#additionalDirectories.length > 0 ? [...this.#additionalDirectories] : undefined,
+			profile: this.#sessionProfile,
+			profileSnapshot: this.#sessionProfileSnapshot ? structuredClone(this.#sessionProfileSnapshot) : undefined,
 		};
 
 		const labels: LabelEntry[] = [];
@@ -2712,6 +2745,10 @@ export class SessionManager {
 
 		const sourceHeader = sourceEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		const history = sourceEntries.filter(entry => entry.type !== "session") as SessionEntry[];
+		manager.#sessionProfile = sourceHeader?.profile;
+		manager.#sessionProfileSnapshot = sourceHeader?.profileSnapshot
+			? structuredClone(sourceHeader.profileSnapshot)
+			: undefined;
 		manager.#resetToNewSession(
 			{
 				parentSession: sourceHeader?.id,
@@ -2719,6 +2756,9 @@ export class SessionManager {
 			},
 			options?.sessionFile,
 		);
+		// Forks inherit provenance even when a legacy source had no profile.
+		// Do not let SDK startup stamp an unrelated disk-active profile.
+		manager.#loadedExistingSession = true;
 		manager.#header.title = sourceHeader?.title;
 		manager.#header.titleSource = sourceHeader?.titleSource;
 		manager.#additionalDirectories = (sourceHeader?.additionalDirectories ?? []).filter(d => d !== path.resolve(cwd));

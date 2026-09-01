@@ -91,16 +91,20 @@ must never imply profile ownership.
 
 Contracts:
 
-- New session headers record optional `profile` identity.
-- Resume binds terminal-local `Settings` to the recorded profile before role
-  and model resolution, without changing the durable startup profile marker.
-- Explicit profile add/switch/cycle/rename/delete-fallback re-stamps session
-  identity and applies model, thinking, and advisor state.
-- Legacy headers without identity remain unbound. They do not auto-apply the
-  disk-active profile and cannot persist model/thinking edits into an unrelated
-  profile. An explicit `/profiles switch` establishes ownership.
-- Same-profile edits still synchronize across terminals; different terminal-
-  local profiles remain isolated.
+- New session headers record `profile` identity plus the last model/thinking
+  `profileSnapshot`.
+- Startup resume and in-process session switching bind the target session profile
+  before model restoration and ignore the process/disk active marker.
+- A valid same-name definition supplies synchronized model/thinking updates; a
+  missing or malformed definition restores the header snapshot.
+- Explicit local add/switch/cycle/rename is the only way to change identity.
+  Deletion removes persistence but keeps the current session pinned.
+- Watcher sync, explicit reload, unrelated saves, unavailable models, and late model
+  discovery never change identity.
+- Legacy headers without identity remain unbound until an explicit switch; switching
+  to a legacy session retains and stamps the current terminal profile.
+- Same-profile model/thinking edits synchronize across terminals and update each
+  session header snapshot; different profile names remain isolated.
 
 Primary implementation:
 
@@ -116,8 +120,10 @@ Regression coverage:
 
 - `packages/coding-agent/test/profile-live-sync.test.ts`
 - `packages/coding-agent/test/profiles-multi-instance.test.ts`
-- `packages/coding-agent/test/profiles-process-sync.test.ts`
+- `packages/coding-agent/test/profile-terminal-identity.test.ts` (20 numbered contracts)
+- `packages/coding-agent/test/input-controller-keybindings.test.ts`
 - `packages/coding-agent/test/agent-session-model-persistence.test.ts`
+- `packages/coding-agent/test/profiles-process-sync.test.ts`
 
 ## 4. Runtime model versus configured default
 

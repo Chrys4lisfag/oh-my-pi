@@ -15,6 +15,7 @@ from omp_rpc import (
     parse_notification,
     parse_session_state,
 )
+from omp_rpc.protocol import parse_session_stats
 
 
 class ProtocolParsingTests(unittest.TestCase):
@@ -550,6 +551,144 @@ class ProtocolParsingTests(unittest.TestCase):
 
         self.assertIsInstance(notification, AgentEndEvent)
         self.assertEqual(notification.messages[0]["content"][0]["text"], "hello")
+
+    def test_parse_model_info_tolerates_null_numeric_metadata(self) -> None:
+        # Custom OpenAI-compatible providers serialize unknown limits as null;
+        # `int(None)` used to abort every `get_available_models()` call.
+        state = parse_session_state(
+            {
+                "sessionId": "session-123",
+                "steeringMode": "one-at-a-time",
+                "followUpMode": "one-at-a-time",
+                "interruptMode": "immediate",
+                "model": {
+                    "id": "deepseek-v4-flash",
+                    "name": "DeepSeek V4 Flash",
+                    "api": "openai-completions",
+                    "provider": "apiclaw-biz-vuln",
+                    "baseUrl": "https://example.invalid/v1",
+                    "reasoning": False,
+                    "contextWindow": None,
+                    "maxTokens": None,
+                    "premiumMultiplier": None,
+                    "preferWebsockets": None,
+                    "contextPromotionTarget": None,
+                    "priority": None,
+                    "cost": {
+                        "input": None,
+                        "output": None,
+                        "cacheRead": None,
+                        "cacheWrite": None,
+                    },
+                },
+            }
+        )
+
+        model = state.model
+        assert model is not None
+        self.assertEqual(model.context_window, 0)
+        self.assertEqual(model.max_tokens, 0)
+        self.assertIsNone(model.premium_multiplier)
+        self.assertIsNone(model.prefer_websockets)
+        self.assertIsNone(model.context_promotion_target)
+        self.assertIsNone(model.priority)
+        self.assertEqual(model.cost.input, 0.0)
+        self.assertEqual(model.cost.cache_write, 0.0)
+
+    def test_parse_model_info_keeps_present_numeric_metadata(self) -> None:
+        state = parse_session_state(
+            {
+                "sessionId": "session-123",
+                "steeringMode": "one-at-a-time",
+                "followUpMode": "one-at-a-time",
+                "interruptMode": "immediate",
+                "model": {
+                    "id": "m",
+                    "name": "M",
+                    "api": "openai-completions",
+                    "provider": "p",
+                    "baseUrl": "https://example.invalid/v1",
+                    "reasoning": False,
+                    "contextWindow": 128000,
+                    "maxTokens": 8192,
+                    "premiumMultiplier": 1.5,
+                    "preferWebsockets": True,
+                    "contextPromotionTarget": "p/big",
+                    "priority": 3,
+                    "cost": {"input": 1.5, "output": 2.0, "cacheRead": 0.5, "cacheWrite": 0.25},
+                },
+            }
+        )
+
+        model = state.model
+        assert model is not None
+        self.assertEqual((model.context_window, model.max_tokens), (128000, 8192))
+        self.assertEqual(model.premium_multiplier, 1.5)
+        self.assertTrue(model.prefer_websockets)
+        self.assertEqual(model.context_promotion_target, "p/big")
+        self.assertEqual(model.priority, 3)
+        self.assertEqual(model.cost.output, 2.0)
+
+    def test_parse_session_state_tolerates_null_counters(self) -> None:
+        state = parse_session_state(
+            {
+                "sessionId": "session-123",
+                "steeringMode": "one-at-a-time",
+                "followUpMode": "one-at-a-time",
+                "interruptMode": "immediate",
+                "messageCount": None,
+                "queuedMessageCount": None,
+                "contextUsage": {"tokens": None, "contextWindow": None, "percent": None},
+            }
+        )
+
+        self.assertEqual(state.message_count, 0)
+        self.assertEqual(state.queued_message_count, 0)
+        assert state.context_usage is not None
+        self.assertEqual(state.context_usage.tokens, 0)
+        self.assertEqual(state.context_usage.percent, 0.0)
+
+    def test_parse_session_stats_tolerates_null_totals(self) -> None:
+        stats = parse_session_stats(
+            {
+                "sessionId": "session-123",
+                "userMessages": None,
+                "assistantMessages": 2,
+                "toolCalls": None,
+                "toolResults": None,
+                "totalMessages": None,
+                "tokens": {
+                    "input": None,
+                    "output": 12,
+                    "cacheRead": None,
+                    "cacheWrite": None,
+                    "total": None,
+                },
+                "premiumRequests": None,
+                "cost": None,
+            }
+        )
+
+        self.assertEqual(stats.user_messages, 0)
+        self.assertEqual(stats.assistant_messages, 2)
+        self.assertEqual(stats.tokens.output, 12)
+        self.assertEqual(stats.tokens.total, 0)
+        self.assertEqual(stats.premium_requests, 0)
+        self.assertEqual(stats.cost, 0.0)
+
+    def test_parse_auto_retry_start_tolerates_null_counters(self) -> None:
+        event = parse_notification(
+            {
+                "type": "auto_retry_start",
+                "attempt": None,
+                "maxAttempts": None,
+                "delayMs": None,
+                "errorMessage": "boom",
+            }
+        )
+
+        self.assertEqual((event.attempt, event.max_attempts, event.delay_ms), (0, 0, 0))
+        self.assertEqual(event.error_message, "boom")
 
 
 if __name__ == "__main__":

@@ -47,6 +47,7 @@ import { assistantTurnProducedOutput, isEmptyAssistantStop, isEmptyErrorTurn } f
 import {
 	type ActiveRetryFallbackState,
 	calculateRetryBackoffDelayMs,
+	describeFallbackReason,
 	findRetryFallbackCandidates,
 	formatRetryFallbackSelector,
 	getRetryFallbackChains,
@@ -1547,6 +1548,10 @@ export class TurnRecovery {
 			pinFallback: true,
 			apiKey: fallback.apiKey,
 			signal,
+			reason:
+				health.state === "depleted"
+					? "usage quota depleted on the configured model"
+					: "usage reserve threshold reached on the configured model",
 		});
 	}
 
@@ -1570,7 +1575,7 @@ export class TurnRecovery {
 		role: string,
 		selector: RetryFallbackSelector,
 		currentSelector: string,
-		options?: { pinFallback?: boolean; apiKey?: string; signal?: AbortSignal },
+		options?: { pinFallback?: boolean; apiKey?: string; signal?: AbortSignal; reason?: string },
 	): Promise<boolean> {
 		const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
 		const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
@@ -1641,6 +1646,7 @@ export class TurnRecovery {
 			from: currentSelector,
 			to: selector.raw,
 			role,
+			reason: options?.reason,
 		});
 		return true;
 	}
@@ -1687,7 +1693,12 @@ export class TurnRecovery {
 				if (!this.#host.contextFitsModel(candidate, failedMessage)) continue;
 				const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
 				if (!apiKey) continue;
-				return this.applyRetryFallbackCandidate(role, selector, currentSelector, options);
+				// Name why the switch happened: the failed turn's provider error is
+				// the only thing that explains a fallback to the operator.
+				return this.applyRetryFallbackCandidate(role, selector, currentSelector, {
+					...options,
+					reason: describeFallbackReason(failedMessage.errorMessage),
+				});
 			}
 		}
 
@@ -1796,6 +1807,7 @@ export class TurnRecovery {
 			from: currentSelector,
 			to: baseSelector,
 			role: "fireworks-fast",
+			reason: "Fireworks Fast variant degraded to Standard",
 		});
 		return true;
 	}

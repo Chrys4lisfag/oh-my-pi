@@ -100,6 +100,7 @@ import { resolveCompactionMethodOrder } from "./compaction-methods";
 import type { CustomMessage, CustomMessagePayload } from "./messages";
 import { isAdvisorCard, isTerminalTextAssistantAnswer } from "./queued-messages";
 import {
+	describeFallbackReason,
 	formatRetryFallbackSelector,
 	getRetryFallbackRevertPolicy,
 	parseRetryFallbackSelector,
@@ -1200,9 +1201,17 @@ export class SessionAdvisors {
 				notifyFailure: error => {
 					this.#advisorStatuses.set(slug, { name: advisorName, status: "error", source: config.source });
 					const message = error instanceof Error ? error.message : String(error);
+					// Report the configured model first: a retry fallback or a
+					// context promotion may have swapped `agent.state.model` to a
+					// different provider, and naming only that runtime model reads
+					// as if the advisor were configured for it.
+					const liveModel = formatModelString(advisorAgent.state.model);
+					const configuredModel = formatModelString(advisorModel);
+					const modelLabel =
+						liveModel === configuredModel ? liveModel : `${configuredModel} (active model ${liveModel})`;
 					this.#host.emitNotice(
 						"warning",
-						`Advisor${slug ? ` "${advisorName}"` : ""} unavailable for ${formatModelString(advisorAgent.state.model)}: ${message}`,
+						`Advisor${slug ? ` "${advisorName}"` : ""} unavailable for ${modelLabel}: ${message}`,
 						"advisor",
 					);
 				},
@@ -1650,6 +1659,7 @@ export class SessionAdvisors {
 					from: currentSelector,
 					to: selector.raw,
 					role,
+					reason: describeFallbackReason(message),
 				});
 				return true;
 			}

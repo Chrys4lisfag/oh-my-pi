@@ -141,7 +141,18 @@ export class UiHelpers {
 		// instead of leaving the palette that was active when it was presented.
 		const styleFn = useDim ? (t: string) => theme.fg("dim", t) : undefined;
 
-		if (last && secondLast && last === this.ctx.lastStatusText && secondLast === this.ctx.lastStatusSpacer) {
+		// Reuse only while the previous status pair is still live viewport content.
+		// A status block whose rows already retired into native terminal history is
+		// immutable there: `setText` would update the component with no visible
+		// effect, silently swallowing the new status (e.g. a profile switch right
+		// after a long `/profiles list`). Present a fresh line in that case.
+		if (
+			last &&
+			secondLast &&
+			last === this.ctx.lastStatusText &&
+			secondLast === this.ctx.lastStatusSpacer &&
+			this.ctx.chatContainer.isBlockLive(last)
+		) {
 			this.ctx.lastStatusText.setStyleFn(styleFn);
 			this.ctx.lastStatusText.setText(message);
 			this.ctx.ui.requestRender();

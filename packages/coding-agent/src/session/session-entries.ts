@@ -51,6 +51,11 @@ export interface SessionHeader {
 	 * an unrelated profile.
 	 */
 	profile?: string;
+	/** Last profile model/thinking snapshot, used when the definition is missing on resume. */
+	profileSnapshot?: {
+		modelRoles: Record<string, string>;
+		defaultThinkingLevel: string;
+	};
 }
 
 export interface NewSessionOptions {

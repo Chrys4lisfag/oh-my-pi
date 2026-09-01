@@ -273,6 +273,27 @@ def _optional_float(payload: JsonObject, field: str) -> float | None:
     return float(value)
 
 
+def _int_or(payload: JsonObject, field: str, default: int = 0) -> int:
+    """Integer at `field`, or `default` when absent, null, or non-numeric.
+
+    Providers may serialize optional numeric model/session metadata (for example
+    `maxTokens` on a custom OpenAI-compatible model) as an explicit `null`, and
+    `dict.get(field, 0)` returns that `None` instead of the fallback.
+    """
+    value = payload.get(field)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return int(value)
+
+
+def _float_or(payload: JsonObject, field: str, default: float = 0.0) -> float:
+    """Float at `field`, or `default` when absent, null, or non-numeric."""
+    value = payload.get(field)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return float(value)
+
+
 def _tuple_of_strings(values: object, *, field: str) -> tuple[str, ...] | None:
     if values is None:
         return None
@@ -1298,29 +1319,25 @@ def parse_model_info(payload: JsonObject | None) -> ModelInfo | None:
         input_modalities=_tuple_of_strings(payload.get("input"), field="model.input")
         or (),
         cost=ModelCost(
-            input=float(cost_payload.get("input", 0.0)),
-            output=float(cost_payload.get("output", 0.0)),
-            cache_read=float(cost_payload.get("cacheRead", 0.0)),
-            cache_write=float(cost_payload.get("cacheWrite", 0.0)),
+            input=_float_or(cost_payload, "input"),
+            output=_float_or(cost_payload, "output"),
+            cache_read=_float_or(cost_payload, "cacheRead"),
+            cache_write=_float_or(cost_payload, "cacheWrite"),
         ),
-        context_window=int(payload.get("contextWindow", 0)),
-        max_tokens=int(payload.get("maxTokens", 0)),
+        context_window=_int_or(payload, "contextWindow"),
+        max_tokens=_int_or(payload, "maxTokens"),
         headers=cast(
             dict[str, str] | None,
             _optional_json_object(headers_payload, field="model.headers"),
         ),
-        premium_multiplier=float(payload["premiumMultiplier"])
-        if "premiumMultiplier" in payload
-        else None,
-        prefer_websockets=bool(payload["preferWebsockets"])
-        if "preferWebsockets" in payload
-        else None,
-        context_promotion_target=(
-            str(payload["contextPromotionTarget"])
-            if "contextPromotionTarget" in payload
-            else None
+        premium_multiplier=(
+            None if payload.get("premiumMultiplier") is None else _float_or(payload, "premiumMultiplier")
         ),
-        priority=int(payload["priority"]) if "priority" in payload else None,
+        prefer_websockets=(
+            None if payload.get("preferWebsockets") is None else bool(payload["preferWebsockets"])
+        ),
+        context_promotion_target=_optional_str(payload, "contextPromotionTarget"),
+        priority=None if payload.get("priority") is None else _int_or(payload, "priority"),
         thinking=_parse_thinking_config(thinking_payload),
         compat=_optional_json_object(compat_payload, field="model.compat"),
     )
@@ -1423,8 +1440,8 @@ def parse_session_state(payload: JsonObject) -> SessionState:
         session_id=_require_str(payload, "sessionId"),
         session_name=_optional_str(payload, "sessionName"),
         auto_compaction_enabled=bool(payload.get("autoCompactionEnabled", False)),
-        message_count=int(payload.get("messageCount", 0)),
-        queued_message_count=int(payload.get("queuedMessageCount", 0)),
+        message_count=_int_or(payload, "messageCount"),
+        queued_message_count=_int_or(payload, "queuedMessageCount"),
         todo_phases=parse_todo_phases(
             cast(JsonValue | None, payload.get("todoPhases"))
         ),
@@ -1447,10 +1464,10 @@ def parse_bash_result(payload: JsonObject) -> BashResult:
         exit_code=_optional_int(payload, "exitCode"),
         cancelled=bool(payload.get("cancelled", False)),
         truncated=bool(payload.get("truncated", False)),
-        total_lines=int(payload.get("totalLines", 0)),
-        total_bytes=int(payload.get("totalBytes", 0)),
-        output_lines=int(payload.get("outputLines", 0)),
-        output_bytes=int(payload.get("outputBytes", 0)),
+        total_lines=_int_or(payload, "totalLines"),
+        total_bytes=_int_or(payload, "totalBytes"),
+        output_lines=_int_or(payload, "outputLines"),
+        output_bytes=_int_or(payload, "outputBytes"),
         artifact_id=_optional_str(payload, "artifactId"),
     )
 
@@ -1532,20 +1549,20 @@ def parse_session_stats(payload: JsonObject) -> SessionStats:
     return SessionStats(
         session_file=_optional_str(payload, "sessionFile"),
         session_id=str(payload.get("sessionId", "")),
-        user_messages=int(payload.get("userMessages", 0)),
-        assistant_messages=int(payload.get("assistantMessages", 0)),
-        tool_calls=int(payload.get("toolCalls", 0)),
-        tool_results=int(payload.get("toolResults", 0)),
-        total_messages=int(payload.get("totalMessages", 0)),
+        user_messages=_int_or(payload, "userMessages"),
+        assistant_messages=_int_or(payload, "assistantMessages"),
+        tool_calls=_int_or(payload, "toolCalls"),
+        tool_results=_int_or(payload, "toolResults"),
+        total_messages=_int_or(payload, "totalMessages"),
         tokens=TokenUsage(
-            input=int(tokens_payload.get("input", 0)),
-            output=int(tokens_payload.get("output", 0)),
-            cache_read=int(tokens_payload.get("cacheRead", 0)),
-            cache_write=int(tokens_payload.get("cacheWrite", 0)),
-            total=int(tokens_payload.get("total", 0)),
+            input=_int_or(tokens_payload, "input"),
+            output=_int_or(tokens_payload, "output"),
+            cache_read=_int_or(tokens_payload, "cacheRead"),
+            cache_write=_int_or(tokens_payload, "cacheWrite"),
+            total=_int_or(tokens_payload, "total"),
         ),
-        premium_requests=int(payload.get("premiumRequests", 0)),
-        cost=float(payload.get("cost", 0.0)),
+        premium_requests=_int_or(payload, "premiumRequests"),
+        cost=_float_or(payload, "cost"),
     )
 
 
@@ -1553,9 +1570,9 @@ def parse_context_usage(payload: JsonObject | None) -> ContextUsage | None:
     if payload is None:
         return None
     return ContextUsage(
-        tokens=int(payload.get("tokens", 0)),
-        context_window=int(payload.get("contextWindow", 0)),
-        percent=float(payload.get("percent", 0.0)),
+        tokens=_int_or(payload, "tokens"),
+        context_window=_int_or(payload, "contextWindow"),
+        percent=_float_or(payload, "percent"),
     )
 
 
@@ -1787,15 +1804,15 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
         )
     if event_type == "auto_retry_start":
         return AutoRetryStartEvent(
-            attempt=int(payload.get("attempt", 0)),
-            max_attempts=int(payload.get("maxAttempts", 0)),
-            delay_ms=int(payload.get("delayMs", 0)),
+            attempt=_int_or(payload, "attempt"),
+            max_attempts=_int_or(payload, "maxAttempts"),
+            delay_ms=_int_or(payload, "delayMs"),
             error_message=str(payload.get("errorMessage", "")),
         )
     if event_type == "auto_retry_end":
         return AutoRetryEndEvent(
             success=bool(payload.get("success", False)),
-            attempt=int(payload.get("attempt", 0)),
+            attempt=_int_or(payload, "attempt"),
             final_error=_optional_str(payload, "finalError"),
         )
     if event_type == "retry_fallback_applied":
@@ -1820,8 +1837,8 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
                 parse_todo_item(_clone_json_object(item, field="todo_reminder.todos[]"))
                 for item in cast(list[Any], payload.get("todos") or [])
             ),
-            attempt=int(payload.get("attempt", 0)),
-            max_attempts=int(payload.get("maxAttempts", 0)),
+            attempt=_int_or(payload, "attempt"),
+            max_attempts=_int_or(payload, "maxAttempts"),
         )
     if event_type == "todo_auto_clear":
         return TodoAutoClearEvent()

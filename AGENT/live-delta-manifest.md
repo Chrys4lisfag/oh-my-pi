@@ -26,6 +26,7 @@ never assume commit count alone proves behavior survived.
 | `5708cb1cc` | active, policy     | Default unconfigured native-capable GPT/Codex auto-maintenance to remote-first context-full compaction                     |
 | `696bd711d` | active             | Advisor source provenance and restart-safe per-tool successful/attempted telemetry                                         |
 | `c0d3a3b572` | active, runtime     | Model discovery/cache recovery, profile-bound sessions, advisor/status consistency, tokenizer fallback, try-shake/compact reminder |
+| `a1b534a77e` | active, runtime     | Immutable terminal profile identity with session-header snapshots, single-apply profile switching, live-block status messages, reasoned fallback notices, re-anchored try-shake ladder |
 
 `PI_MCP_TIMING` is a live fork delta carried through merge commit history (reference
 `9a8062a7f`), so it does not appear in the non-merge ledger above.
@@ -61,25 +62,23 @@ at this baseline; it is not a separate fork behavior.
 
 ### Session profile identity and model-state consistency
 
-Session headers record the config profile that owns them. Resume binds the
-terminal-local `Settings` to the recorded profile (never the durable startup
-default), `/profiles` switch/add/delete-fallback/rename and profile cycling
-restamp the identity, and legacy sessions with no recorded profile refuse
-auto-synchronized profile applies until an explicit switch — so persisted
-model/thinking edits can no longer corrupt an unrelated profile or get
-clobbered by the startup default. Prompt preflight and the status-line model
-segment share configured-default availability only for the blocking
-`[unavailable]` state; otherwise the footer renders the live runtime model so
-`smol`/`slow` role cycling remains visible.
+Session headers record profile name plus the last model/thinking snapshot. Startup
+resume and in-process session switching bind that identity before model restoration;
+missing/malformed definitions recover from the header. Disk active markers, root
+projections, reloads, unrelated saves, deletion, invalid models, and late discovery
+never change a running terminal's identity. Only explicit local add/switch/cycle/rename
+does; same-name model/thinking edits still synchronize. Prompt preflight and the
+status-line model segment share configured-default availability only for the blocking
+`[unavailable]` state; otherwise the footer renders the live runtime model.
 
 - `packages/coding-agent/src/session/session-entries.ts`
-  - optional `profile` on `SessionHeader`
+  - `profile` plus `profileSnapshot` on `SessionHeader`
 - `packages/coding-agent/src/session/session-manager.ts`
-  - `getSessionProfile` / `setSessionProfile` identity stamping
+  - name/snapshot identity stamping across new, fork, open, and switch
 - `packages/coding-agent/src/session/agent-session-types.ts`
-  - `sessionProfile` config field (`null` = explicitly unbound legacy)
+  - terminal-local profile binding state
 - `packages/coding-agent/src/session/agent-session.ts`
-  - unbound-legacy sync guard, `bindSessionProfile`, `getConfiguredDefaultModelState`
+  - resume/switch binding, snapshot persistence, `getConfiguredDefaultModelState`
 - `packages/coding-agent/src/modes/components/status-line/segments.ts`
   - live role-runtime display plus configured-default unavailable marker
 - `packages/coding-agent/src/modes/controllers/input-controller.ts`

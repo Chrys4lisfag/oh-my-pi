@@ -76,6 +76,23 @@ export function calculateRetryBackoffDelayMs(baseDelayMs: number, attempt: numbe
 	return cappedDelayMs * jitter;
 }
 
+/** Fallback notices stay one line; the full text remains in the session log. */
+const FALLBACK_REASON_MAX_CHARS = 160;
+
+/**
+ * One-line description of why a fallback fired, for the operator-facing notice.
+ *
+ * A bare `A -> B` line is unactionable: the whole question is which provider
+ * failure caused the switch (auth, quota, rate limit, unsupported parameter).
+ * The provider's own message answers it, so carry a trimmed copy on the event.
+ */
+export function describeFallbackReason(errorMessage: string | undefined): string | undefined {
+	if (typeof errorMessage !== "string") return undefined;
+	const flat = errorMessage.replace(/\s+/g, " ").trim();
+	if (!flat) return undefined;
+	return flat.length <= FALLBACK_REASON_MAX_CHARS ? flat : `${flat.slice(0, FALLBACK_REASON_MAX_CHARS - 1)}…`;
+}
+
 /** Parses a configured retry fallback selector. */
 export function parseRetryFallbackSelector(
 	selector: string,

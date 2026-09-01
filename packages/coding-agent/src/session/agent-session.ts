@@ -106,7 +106,7 @@ import type { ModelRegistry } from "../config/model-registry";
 import type { ResolvedModelRoleValue } from "../config/model-resolver";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import { buildServiceTierByFamily } from "../config/service-tier";
-import type { Settings, SkillsSettings } from "../config/settings";
+import type { Settings, SettingsProfileSnapshot, SkillsSettings } from "../config/settings";
 import {
 	onAppendOnlyModeChanged,
 	onCodeModeChanged,
@@ -503,8 +503,13 @@ export class AgentSession {
 	#unsubscribeModelRoles?: () => void;
 	#unsubscribeSettingsSynchronized?: () => void;
 	#settingsSyncApplyPromise: Promise<void> = Promise.resolve();
+	#profileSnapshotPersistPromise: Promise<void> = Promise.resolve();
 	#synchronizedProfileApplyPending = false;
 	#synchronizedProfileApplyGeneration = 0;
+	/** Prevent explicit profile binds from also scheduling their synchronized echo. */
+	#explicitProfileBindDepth = 0;
+	/** Ownership token for overlapping explicit profile binds. */
+	#explicitProfileBindGeneration = 0;
 	/** Config profile this session is bound to (resume/explicit switch). */
 	#sessionProfile?: string | null;
 	/** Legacy resumed session with no recorded profile: skip auto synchronized applies. */
@@ -1674,7 +1679,13 @@ export class AgentSession {
 		this.#unsubscribeAppendOnly = onAppendOnlyModeChanged(_value => this.#syncAppendOnlyContext(this.model));
 		this.#unsubscribeModelRoles = onModelRolesChanged(() => this.#advisors.onModelRolesChanged());
 		this.#unsubscribeSettingsSynchronized = onSettingsSynchronized((source, changedPaths) => {
-			if (source !== this.settings || this.#agentKind !== "main" || this.#isDisposed) return;
+			if (
+				source !== this.settings ||
+				this.#agentKind !== "main" ||
+				this.#isDisposed ||
+				this.#explicitProfileBindDepth > 0
+			)
+				return;
 			if (
 				!changedPaths.some(
 					settingPath =>
@@ -3824,6 +3835,7 @@ export class AgentSession {
 				from: event.from,
 				to: event.to,
 				role: event.role,
+				reason: event.reason,
 			});
 		} else if (event.type === "retry_fallback_succeeded") {
 			await this.#extensionRunner.emit({
@@ -4641,9 +4653,30 @@ export class AgentSession {
 	async #waitForSynchronizedProfileApply(): Promise<void> {
 		while (true) {
 			const synchronizedApply = this.#settingsSyncApplyPromise;
-			await synchronizedApply;
-			if (synchronizedApply === this.#settingsSyncApplyPromise) return;
+			const profilePersist = this.#profileSnapshotPersistPromise;
+			await Promise.all([synchronizedApply, profilePersist]);
+			if (
+				synchronizedApply === this.#settingsSyncApplyPromise &&
+				profilePersist === this.#profileSnapshotPersistPromise
+			)
+				return;
 		}
+	}
+
+	#queueSessionProfilePersist(profileName: string | undefined, snapshot?: SettingsProfileSnapshot): Promise<void> {
+		const queued = this.#profileSnapshotPersistPromise
+			.catch(() => undefined)
+			.then(() => this.sessionManager.setSessionProfile(profileName, snapshot));
+		this.#profileSnapshotPersistPromise = queued.catch(error =>
+			logger.warn("Failed to persist session profile snapshot", { error: String(error) }),
+		);
+		return queued;
+	}
+
+	#queueProfileSnapshotPersist(): Promise<void> {
+		const profileName = this.getSessionProfileName();
+		if (!profileName) return Promise.resolve();
+		return this.#queueSessionProfilePersist(profileName, this.settings.currentProfileSnapshot());
 	}
 
 	/** Wait for core runtime work without joining synchronized profile work. */
@@ -4657,9 +4690,14 @@ export class AgentSession {
 	async waitForIdle(): Promise<void> {
 		while (true) {
 			const synchronizedApply = this.#settingsSyncApplyPromise;
+			const profilePersist = this.#profileSnapshotPersistPromise;
 			await this.#waitForRuntimeIdle();
-			await synchronizedApply;
-			if (synchronizedApply === this.#settingsSyncApplyPromise) return;
+			await Promise.all([synchronizedApply, profilePersist]);
+			if (
+				synchronizedApply === this.#settingsSyncApplyPromise &&
+				profilePersist === this.#profileSnapshotPersistPromise
+			)
+				return;
 		}
 	}
 	/**
@@ -7341,7 +7379,9 @@ export class AgentSession {
 			persist?: boolean;
 		},
 	): Promise<{ switched: boolean }> {
-		return this.#models.setModel(model, role, options);
+		const result = await this.#models.setModel(model, role, options);
+		if (options?.persist) await this.#queueProfileSnapshotPersist();
+		return result;
 	}
 
 	/** Selects a model for this session without updating persisted model settings. */
@@ -7384,11 +7424,14 @@ export class AgentSession {
 	/** Selects the session thinking level and optionally persists it as the default. */
 	setThinkingLevel(level: ConfiguredThinkingLevel | undefined, persist: boolean = false): void {
 		this.#models.setThinkingLevel(level, persist);
+		if (persist) void this.#queueProfileSnapshotPersist().catch(() => undefined);
 	}
 
 	/** Advances through the thinking selectors supported by the active model. */
 	cycleThinkingLevel(persist: boolean = false): ConfiguredThinkingLevel | undefined {
-		return this.#models.cycleThinkingLevel(persist);
+		const level = this.#models.cycleThinkingLevel(persist);
+		if (persist) void this.#queueProfileSnapshotPersist().catch(() => undefined);
+		return level;
 	}
 
 	/** Reports whether `/fast` is enabled for the active model family. */
@@ -8251,6 +8294,12 @@ export class AgentSession {
 		const previousAutoThinking = this.isAutoThinking;
 		const previousAutoResolvedLevel = this.autoResolvedThinkingLevel();
 		const previousServiceTierByFamily = this.serviceTierByFamily;
+		const previousProfileName = this.getSessionProfileName();
+		const previousProfileSnapshot = this.settings.currentProfileSnapshot();
+		const previousSessionProfile = this.#sessionProfile;
+		const previousSessionProfileUnbound = this.#sessionProfileUnbound;
+		const previousTerminalProfileActivation = this.settings.captureTerminalProfileActivation();
+		const previousSynchronizedApplyPending = this.#synchronizedProfileApplyPending;
 		const previousTools = [...this.agent.state.tools];
 		const previousBaseSystemPrompt = this.#tools.baseSystemPrompt;
 		const previousSystemPrompt = this.agent.state.systemPrompt;
@@ -8281,6 +8330,34 @@ export class AgentSession {
 				await this.#advisors.drainAndDetachRecorders();
 			}
 			await this.sessionManager.setSessionFile(sessionPath);
+			const targetProfileName = this.sessionManager.getSessionProfile();
+			const targetProfileSnapshot = this.sessionManager.getSessionProfileSnapshot();
+			if (targetProfileName) {
+				if (!this.settings.bindSessionToProfile(targetProfileName, targetProfileSnapshot)) {
+					// Never keep the previous session's profile-owned settings under
+					// an invalid target identity. Mark the target unbound before
+					// failing so synchronized listeners cannot apply stale settings.
+					this.#sessionProfile = null;
+					this.#sessionProfileUnbound = true;
+					this.settings.unbindSessionFromProfile();
+					throw new Error(`Session profile "${targetProfileName}" is unavailable or invalid`);
+				}
+				this.#sessionProfile = targetProfileName;
+				this.#sessionProfileUnbound = false;
+			} else if (previousProfileName) {
+				// Legacy target: retain this terminal's current identity rather
+				// than importing any disk active marker, then remember it.
+				this.settings.bindSessionToProfile(previousProfileName, previousProfileSnapshot);
+				this.#sessionProfile = previousProfileName;
+				this.#sessionProfileUnbound = false;
+				await this.sessionManager.setSessionProfile(previousProfileName, previousProfileSnapshot);
+			} else {
+				// No target identity and nothing valid to inherit: make ownership
+				// explicitly unbound rather than leaving ambiguous startup state.
+				this.#sessionProfile = null;
+				this.#sessionProfileUnbound = true;
+				this.settings.unbindSessionFromProfile();
+			}
 			this.#bash.markSessionTransition(bashTransition);
 			if (switchingToDifferentSession) {
 				this.#freshProviderSessionId = undefined;
@@ -8430,6 +8507,18 @@ export class AgentSession {
 			return true;
 		} catch (error) {
 			this.sessionManager.restoreState(previousSessionState);
+			this.#synchronizedProfileApplyGeneration++;
+			this.#synchronizedProfileApplyPending = previousSynchronizedApplyPending;
+			this.#sessionProfile = previousSessionProfile;
+			this.#sessionProfileUnbound = previousSessionProfileUnbound;
+			let profileRollbackError: unknown;
+			try {
+				this.settings.restoreTerminalProfileActivation(previousTerminalProfileActivation);
+			} catch (caught) {
+				// Continue restoring every unrelated switch field before reporting
+				// the profile-specific rollback failure.
+				profileRollbackError = caught;
+			}
 			this.#freshProviderSessionId = previousFreshProviderSessionId;
 			this.#syncAgentSessionId(previousSessionState.sessionId, false);
 			this.#memory.rekeyForCurrentSessionId();
@@ -8485,6 +8574,13 @@ export class AgentSession {
 				});
 			}
 			this.#bash.finishSessionTransition(bashTransition, false);
+			if (profileRollbackError !== undefined) {
+				throw new Error(
+					`${error instanceof Error ? error.message : String(error)} (session profile rollback failed: ${
+						profileRollbackError instanceof Error ? profileRollbackError.message : String(profileRollbackError)
+					})`,
+				);
+			}
 			throw error;
 		}
 	}
@@ -9882,10 +9978,11 @@ export class AgentSession {
 		this.#settingsSyncApplyPromise = this.#settingsSyncApplyPromise
 			.catch(() => undefined)
 			.then(async () => {
-				if (this.#isDisposed) return;
+				if (this.#isDisposed || generation !== this.#synchronizedProfileApplyGeneration) return;
 				// Do not call public waitForIdle() here: it joins this promise and
 				// would therefore wait on itself.
-				await this.applyProfileToSession();
+				await this.#queueProfileSnapshotPersist();
+				await this.applyProfileToSession(() => generation === this.#synchronizedProfileApplyGeneration);
 				if (generation === this.#synchronizedProfileApplyGeneration) {
 					this.#synchronizedProfileApplyPending = Boolean(
 						this.settings.getModelRole("default") && !this.resolveRoleModel("default"),
@@ -9893,6 +9990,9 @@ export class AgentSession {
 				}
 			})
 			.catch(error => {
+				if (generation === this.#synchronizedProfileApplyGeneration) {
+					this.#synchronizedProfileApplyPending = true;
+				}
 				// Keep the snapshot pending. A later model-registry update retries
 				// dynamic providers that were unavailable during this attempt.
 				logger.warn("Failed to apply synchronized profile settings", {
@@ -9902,7 +10002,7 @@ export class AgentSession {
 			});
 	}
 
-	async applyProfileToSession(): Promise<void> {
+	async applyProfileToSession(isCurrent: () => boolean = () => true): Promise<void> {
 		if (this.#isDisposed) return;
 		const model = this.resolveRoleModel("default");
 		const previousModel = this.model;
@@ -9918,6 +10018,7 @@ export class AgentSession {
 		try {
 			if (model && (!this.model || !modelsAreEqual(this.model, model))) {
 				await this.setModel(model);
+				if (!isCurrent()) return;
 				if (this.#isDisposed) return;
 			}
 			this.setThinkingLevel(parseConfiguredThinkingLevel(this.settings.get("defaultThinkingLevel")));
@@ -9931,6 +10032,7 @@ export class AgentSession {
 				}
 			}
 		} catch (error) {
+			if (!isCurrent()) throw error;
 			if (this.#isDisposed) return;
 			try {
 				if (previousModel && (!this.model || !modelsAreEqual(this.model, previousModel))) {
@@ -9974,12 +10076,87 @@ export class AgentSession {
 	 * Returns false when `name` does not denote a valid profile.
 	 */
 	async bindSessionProfile(name: string): Promise<boolean> {
-		if (!this.settings.bindSessionToProfile(name)) return false;
+		const previousSessionProfile = this.#sessionProfile;
+		const previousSessionProfileUnbound = this.#sessionProfileUnbound;
+		const previousHeaderProfile = this.sessionManager.getSessionProfile();
+		const previousHeaderSnapshot = this.sessionManager.getSessionProfileSnapshot();
+		const previousSynchronizedApplyPending = this.#synchronizedProfileApplyPending;
+		const previousTerminalProfileActivation = this.settings.captureTerminalProfileActivation();
+		const bindGeneration = ++this.#explicitProfileBindGeneration;
+
+		// Invalidate the synchronized apply queued by activateProfile(). This bind
+		// owns the single live apply for an explicit user switch.
+		this.#synchronizedProfileApplyGeneration++;
+		this.#explicitProfileBindDepth++;
+		let bound: boolean;
+		try {
+			bound = this.settings.bindSessionToProfile(name);
+		} finally {
+			this.#explicitProfileBindDepth--;
+		}
+		if (!bound) return false;
+		const bindSettled = Promise.withResolvers<void>();
+		const previousProfileApply = this.#settingsSyncApplyPromise;
+		this.#settingsSyncApplyPromise = Promise.all([
+			previousProfileApply.catch(() => undefined),
+			bindSettled.promise,
+		]).then(() => undefined);
 		this.#sessionProfile = name;
 		this.#sessionProfileUnbound = false;
-		await this.sessionManager.setSessionProfile(name);
-		await this.applyProfileToSession();
-		return true;
+		// Arm discovery retry before the first await. A registry refresh can land
+		// while header persistence or the direct live apply is in flight.
+		this.#synchronizedProfileApplyPending = Boolean(
+			this.settings.getModelRole("default") && !this.resolveRoleModel("default"),
+		);
+
+		try {
+			await this.#queueProfileSnapshotPersist();
+			await previousProfileApply.catch(() => undefined);
+			if (bindGeneration !== this.#explicitProfileBindGeneration) return true;
+			await this.applyProfileToSession(() => bindGeneration === this.#explicitProfileBindGeneration);
+			if (bindGeneration !== this.#explicitProfileBindGeneration) {
+				this.#queueSynchronizedProfileApply();
+				return true;
+			}
+			// An unavailable dynamic model is not an apply error: keep the bind,
+			// block prompt dispatch through configured-model validation, and retry
+			// when the model registry announces a refreshed catalog.
+			this.#synchronizedProfileApplyPending = Boolean(
+				this.settings.getModelRole("default") && !this.resolveRoleModel("default"),
+			);
+			return true;
+		} catch (error) {
+			if (bindGeneration !== this.#explicitProfileBindGeneration) {
+				this.#queueSynchronizedProfileApply();
+				throw error;
+			}
+			// Invalidate any apply queued by the failed Settings notification before
+			// restoring ownership. A bound restore queues a fresh apply; an unbound
+			// restore deliberately leaves the previously captured pending state.
+			this.#synchronizedProfileApplyGeneration++;
+			this.#synchronizedProfileApplyPending = previousSynchronizedApplyPending;
+			this.#sessionProfile = previousSessionProfile;
+			this.#sessionProfileUnbound = previousSessionProfileUnbound;
+
+			let rollbackError: unknown;
+			try {
+				this.settings.restoreTerminalProfileActivation(previousTerminalProfileActivation);
+			} catch (caught) {
+				rollbackError = caught;
+			}
+			await this.#queueSessionProfilePersist(previousHeaderProfile, previousHeaderSnapshot);
+
+			if (rollbackError !== undefined) {
+				throw new Error(
+					`${error instanceof Error ? error.message : String(error)} (profile binding rollback failed: ${
+						rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
+					})`,
+				);
+			}
+			throw error;
+		} finally {
+			bindSettled.resolve();
+		}
 	}
 
 	/**

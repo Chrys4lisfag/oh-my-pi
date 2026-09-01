@@ -196,7 +196,23 @@ Provider defaults vs per-model overrides:
 - `modelOverrides` can override model metadata (`name`, `reasoning`, `thinking`, `input`, `imageInputDecoder`,
   `tokenizer`, `supportsTools`, `cost`, `premiumMultiplier`, `contextWindow`, `maxTokens`,
   `omitMaxOutputTokens`, `headers`, `compat`, `contextPromotionTarget`, `compactionModel`, and
-  `remoteCompaction`).
+  `remoteCompaction`). It cannot change `api`; use a `models:` entry for that.
+- A `models:` entry whose `id` matches a discovered/bundled model replaces only the fields it states,
+  so re-routing one model onto another wire API needs nothing else — context window, cost, name,
+  modality, and thinking metadata stay inherited from discovery:
+
+  ```yaml
+  providers:
+    my-proxy:
+      baseUrl: https://proxy.example.com/v1
+      api: openai-completions
+      discovery:
+        type: openai-models-list
+      models:
+        - id: "openai/gpt-5.6-sol"
+          api: openai-responses
+  ```
+
 - `compat` is deep-merged for nested routing blocks (`openRouterRouting`, `vercelGatewayRouting`,
   `extraBody`, and `whenThinking`).
 

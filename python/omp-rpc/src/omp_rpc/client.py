@@ -1188,6 +1188,11 @@ class RpcClient:
         streaming_behavior: StreamingBehavior | None = None,
         timeout: float | None = None,
     ) -> PromptTurn:
+        """Send `message` and return the finished turn.
+
+        `timeout` is seconds to wait for `agent_end`; `None` (default) waits as
+        long as the turn runs.
+        """
         operation = "prompt_and_wait"
         self._prompt_lifecycle.acquire(operation)
         try:
@@ -1329,7 +1334,10 @@ class RpcClient:
         start_async_error_index: int,
         timeout: float | None = None,
     ) -> tuple[RpcAgentEvent, ...]:
-        deadline = time.monotonic() + (timeout if timeout is not None else 60.0)
+        # `timeout=None` means "wait for the turn to end", however long that
+        # takes: agent turns legitimately run for many minutes. A bounded
+        # default here used to abort long runs with RpcTimeoutError.
+        deadline = None if timeout is None else time.monotonic() + timeout
         with self._event_condition:
             while True:
                 if self._closed_error is not None:
@@ -1363,6 +1371,11 @@ class RpcClient:
                     )
                     return events
 
+                if deadline is None:
+                    # Bounded sleep so a closed process / async error is still
+                    # observed promptly even if no notify reaches this waiter.
+                    self._event_condition.wait(1.0)
+                    continue
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise RpcTimeoutError(

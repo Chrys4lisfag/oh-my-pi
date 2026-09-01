@@ -40,9 +40,9 @@ Behavior that must survive:
    overwrite the saved snapshot from potentially dirty live settings.
 5. Cycling sorts names lexically, wraps, and requires at least two profiles. If the
    active name is absent, cycling starts with the first sorted profile.
-6. Deleting the active profile selects the first lexically sorted valid remaining
-   profile and applies its exact snapshot. If none remains, it clears
-   `profiles.active` and retires profile-owned runtime overrides.
+6. Deleting the active profile removes only its persisted definition. The running
+   terminal/session remains pinned to the same name and last snapshot until an
+   explicit local switch. No valid, malformed, or lexical sibling is selected.
 
 `asSnapshot` validates that `modelRoles` is an object,
 `defaultThinkingLevel` is a string, and every role value is a string. Public
@@ -52,21 +52,20 @@ validation should be a deliberate change with migration coverage.
 ### Multi-instance persistence
 
 **Problem.** Multiple processes cache `config.yml`. Config-file locking prevented
-file corruption but did not notify peers, stop stale snapshots from replacing fresh
-ones, or recover a running terminal whose selected profile was deleted. Naively
-applying `profiles.active` from disk also caused a switch in one terminal to
-force-switch every other terminal.
+file corruption but did not notify peers or stop stale snapshots from replacing fresh
+ones. Earlier repairs still allowed disk `profiles.active`, profile deletion, malformed
+definitions, reload, or save-time fallback reconciliation to silently switch a running
+terminal.
 
 **Contract.** Profile mutations persist per profile name, not by replacing the whole
-map. Persistent `Settings` instances poll `config.yml` without holding filesystem
-watch handles and merge fresh profile definitions. Each running terminal keeps its
-locally active profile. A switch only changes that terminal; `profiles.active` on disk
-is a startup default for future sessions. Persisted model-role or thinking edits update
-the locally active profile snapshot and propagate to every terminal using that same
-profile, while terminals using other profiles retain their own snapshots. Explicit
-runtime overrides that superseded profile ownership remain terminal-local. If a
-terminal's local profile is deleted, only terminals using that profile switch to the
-first valid lexical fallback.
+map. Persistent `Settings` instances poll `config.yml` and merge fresh definitions.
+Each running terminal/session owns an immutable local profile identity. Only an
+explicit local add/switch/cycle/rename command may change it. `profiles.active` on disk
+is a startup default for future sessions and is never imported into a running one.
+Persisted model-role or thinking edits synchronize to every terminal using that SAME
+named profile; terminals using other profiles retain their own snapshots. If the
+selected definition is deleted or malformed, the terminal keeps its last valid
+session-local snapshot and name rather than selecting a fallback.
 Implementation in `packages/coding-agent/src/config/settings.ts`:
 
 - per-profile mutation tracking for create, whole-snapshot update, rename, and deletion tombstones
@@ -77,25 +76,21 @@ Implementation in `packages/coding-agent/src/config/settings.ts`:
 - save path re-reads the latest on-disk config under the existing lock and applies
   only touched names
 - external synchronization ignores another terminal's `profiles.active` and root live
-  projection, but adopts changed model/thinking snapshots for the terminal's own active
-  profile
-- persisted live model/thinking edits are written into the active profile item; terminals
-  on different profiles and explicit runtime override slots remain isolated
-- durable root `modelRoles`/thinking always project durable `profiles.active`, so editing a
-  different terminal-local profile cannot corrupt the next session's startup state
-- activation resolves the freshest target snapshot under lock and reapplies that snapshot
-  to the activating terminal; add, active rename, and rollback retag runtime ownership
-  synchronously before another edit can be attributed
-- a later unrelated save writes against the freshest disk state, then restores that
-  terminal's valid local profile/model/thinking in memory instead of importing the
-  startup default it preserved on disk
-- explicit `reloadFromDisk()` adopts and reconciles the complete persisted profile
-  state and emits synchronized-setting notifications; watcher-driven `syncFromDisk()`
-  retains the local-profile isolation rule above
-- deleting a locally active profile reconciles that terminal to the first valid
-  lexical fallback and applies its exact model roles and thinking level
-- stale clients preserve untouched fresh profile definitions and cannot resurrect
-  deleted profiles
+  projection, but adopts changed model/thinking snapshots only for the same pinned name
+- deleted/malformed selected definitions are restored in memory from the last local
+  snapshot; they are not silently recreated on disk
+- persisted live model/thinking edits are written into the locally pinned profile item;
+  terminals on different names and explicit runtime override slots remain isolated
+- durable root `modelRoles`/thinking project durable `profiles.active` only for future
+  sessions; this projection never changes a running terminal
+- activation resolves the freshest target snapshot under lock and applies it only to
+  the initiating terminal; add, active rename, and rollback retag runtime ownership
+- unrelated saves restore the terminal's pinned identity/model/thinking in memory
+  instead of importing the startup default
+- both `reloadFromDisk()` and watcher `syncFromDisk()` preserve local identity while
+  still synchronizing same-name model/thinking edits
+- stale clients preserve untouched fresh profile definitions and cannot resurrect a
+  deleted definition merely because they retain a session-local copy
 
 All profile-domain mutations must use the per-key methods. Do not reintroduce
 `settings.set("profiles.items", wholeMap)` or write a locally cached target snapshot
@@ -132,42 +127,41 @@ A frequent merge failure is preserving the registry entry but losing the
 
 ### Live session and advisor synchronization
 
-Cross-process profile definition changes update cached profile lists, but do not apply
-another terminal's active selection to a live session. Settings synchronization queues
-`AgentSession.applyProfileToSession()` only when effective local profile-controlled
-settings change, such as deleted-profile fallback; command switch and cycle apply
-their own local selection directly.
+Cross-process profile-definition changes update cached lists but never import another
+terminal's active selection. Settings synchronization queues
+`AgentSession.applyProfileToSession()` only when the pinned profile's effective
+model/thinking changes. Command switch and cycle pass the session's own `Settings`
+instance (never the process-global singleton), apply the selection directly, and report
+that exact result.
+
+Session headers persist both profile name and last model/thinking snapshot. Startup
+resume and in-process session switching bind the target session's profile before model
+restoration. A valid current definition supplies synchronized models; a missing or
+malformed definition falls back to the header snapshot. Unavailable models block
+prompt dispatch but never change profile identity.
 
 Implementation:
 
+- `packages/coding-agent/src/session/session-entries.ts`
+  - `SessionHeader.profile` and `profileSnapshot`
+- `packages/coding-agent/src/session/session-manager.ts`
+  - profile name/snapshot propagation through new/fork/open/switch
 - `packages/coding-agent/src/session/agent-session.ts`
-  - `applyProfileToSession`: resolve `default`, set model when resolvable, set thinking
-    level, then `refreshAdvisors` (or stop advisors if advisor model is unavailable);
-    unavailable default models do not block profile selection, but prompt submission
-    is blocked until a working model is selected or discovered
-  - `ensureAdvisorsBuilt`: idempotently build a missing advisor after late discovery
-  - constructor subscription and dispose cleanup
-  - `setAdvisorEnabled` writes a runtime settings override so spawned subagents inherit
-    the live toggle
+  - session switch/resume binding, snapshot updates after persisted model/thinking edits,
+    `applyProfileToSession`, and late-discovery retry without identity mutation
 - `packages/coding-agent/src/config/model-registry.ts`
-  - `#modelsUpdatedListeners`
-  - `onModelsUpdated`
-  - `#emitModelsUpdated` after runtime discovery settles
-
-Late provider discovery is important: the session may exist before Ollama, LiteLLM,
-or extension models arrive. A synchronized apply with an unresolved default model
-remains pending, and the registry event retries it after the canonical model list is
-finalized. Prompt dispatch and public `waitForIdle()` drain queued synchronized profile
-work. Disposal also drains an in-flight apply, whose post-await thinking/advisor and
-rollback mutations stop once teardown begins.
+  - `onModelsUpdated` retries unresolved models only
 
 Tests:
 
+- `packages/coding-agent/test/profile-terminal-identity.test.ts` (20 numbered contracts)
 - `packages/coding-agent/test/profiles.test.ts`
 - `packages/coding-agent/test/profiles-multi-instance.test.ts`
+- `packages/coding-agent/test/profiles-process-sync.test.ts`
 - `packages/coding-agent/test/profile-live-sync.test.ts`
+- `packages/coding-agent/test/input-controller-keybindings.test.ts`
+- `packages/coding-agent/test/agent-session-model-persistence.test.ts`
 - `packages/coding-agent/test/agent-session-advisor-model-sync.test.ts`
-- `packages/coding-agent/test/model-registry-models-updated.test.ts`
 
 ## 2. `/accounts` routing control
 

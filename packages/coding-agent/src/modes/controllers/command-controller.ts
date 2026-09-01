@@ -1180,7 +1180,7 @@ export class CommandController {
 		const sub = parts[0]?.toLowerCase() ?? "list";
 
 		if (sub === "list" || !parts.length) {
-			const profiles = listProfiles();
+			const profiles = listProfiles(this.ctx.settings);
 			if (profiles.length === 0) {
 				this.ctx.showStatus("No profiles saved. Use /profiles add <name> to create one.");
 				return;
@@ -1206,7 +1206,7 @@ export class CommandController {
 				return;
 			}
 			try {
-				addProfile(name);
+				addProfile(name, undefined, this.ctx.settings);
 				await this.#applyProfileModelToSession(name);
 				this.ctx.statusLine.invalidate();
 				this.ctx.showStatus(`Profile "${name}" created and activated.`);
@@ -1222,15 +1222,11 @@ export class CommandController {
 				this.ctx.showStatus("Usage: /profiles switch <name>");
 				return;
 			}
-			const previousActivation = captureProfileActivationState();
+			const previousActivation = captureProfileActivationState(this.ctx.settings);
 			let activationStarted = false;
 			try {
-				switchProfile(name);
+				switchProfile(name, this.ctx.settings);
 				activationStarted = true;
-				await this.ctx.settings.flush();
-				if (getActiveProfileName() !== name)
-					throw new Error(`Profile "${name}" was deleted by another omp instance`);
-				await this.#applyProfileModelToSession(name);
 				this.ctx.statusLine.invalidate();
 				this.ctx.updateEditorBorderColor();
 				const configuredDefault = this.ctx.settings.getModelRole("default");
@@ -1241,13 +1237,13 @@ export class CommandController {
 				} else {
 					this.ctx.showStatus(`Switched to profile "${name}".`);
 				}
+				await this.#applyProfileModelToSession(name);
 			} catch (err) {
-				if (activationStarted) {
+				if (activationStarted && getActiveProfileName(this.ctx.settings) === name) {
 					try {
-						restoreProfileActivation(previousActivation);
-						await this.ctx.settings.flush();
+						restoreProfileActivation(previousActivation, this.ctx.settings);
 					} catch (rollbackError) {
-						logger.warn("Failed to persist profile activation rollback", { error: String(rollbackError) });
+						logger.warn("Failed to restore profile activation", { error: String(rollbackError) });
 					}
 				}
 				this.ctx.statusLine.invalidate();
@@ -1264,24 +1260,14 @@ export class CommandController {
 				return;
 			}
 			try {
-				const result = deleteProfile(name);
+				const wasActive = getActiveProfileName(this.ctx.settings) === name;
+				deleteProfile(name, this.ctx.settings);
 				await this.ctx.settings.flush();
-				if (result.activated) {
-					if (getActiveProfileName() !== result.activated.name) {
-						throw new Error(`Fallback profile "${result.activated.name}" was deleted by another omp instance`);
-					}
-					await this.#applyProfileModelToSession(result.activated.name);
-				}
 				this.ctx.statusLine.invalidate();
 				this.ctx.updateEditorBorderColor();
-				const configuredDefault = this.ctx.settings.getModelRole("default");
-				const modelWarning =
-					result.activated && configuredDefault && !this.ctx.session.resolveRoleModel("default")
-						? ` (default model "${configuredDefault}" is currently unavailable)`
-						: "";
 				this.ctx.showStatus(
-					result.activated
-						? `Profile "${name}" deleted. Switched to "${result.activated.name}"${modelWarning}.`
+					wasActive
+						? `Profile "${name}" deleted from saved profiles. This session remains bound to "${name}" until you explicitly switch.`
 						: `Profile "${name}" deleted.`,
 				);
 			} catch (err) {
@@ -1300,9 +1286,9 @@ export class CommandController {
 				return;
 			}
 			try {
-				renameProfile(oldName, newName);
+				renameProfile(oldName, newName, this.ctx.settings);
 				await this.ctx.settings.flush();
-				const names = new Set(listProfiles().map(profile => profile.name));
+				const names = new Set(listProfiles(this.ctx.settings).map(profile => profile.name));
 				if (names.has(oldName) || !names.has(newName)) {
 					throw new Error(`Profile rename "${oldName}" to "${newName}" conflicted with another omp instance`);
 				}
@@ -1319,8 +1305,8 @@ export class CommandController {
 
 		if (sub === "save") {
 			try {
-				saveActiveProfile();
-				const active = getActiveProfileName();
+				saveActiveProfile(this.ctx.settings);
+				const active = getActiveProfileName(this.ctx.settings);
 				this.ctx.showStatus(`Profile "${active}" updated with current config.`);
 			} catch (err) {
 				this.ctx.showError(err instanceof Error ? err.message : String(err));

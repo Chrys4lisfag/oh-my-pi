@@ -480,7 +480,7 @@ describe("AgentSession advisor + profile model sync", () => {
 				expect(session.thinkingLevel).toBe(Effort.High);
 			});
 
-			it("deleting the selected profile switches the live model to its deterministic fallback", async () => {
+			it("deleting the selected profile keeps the live session pinned", async () => {
 				resetSettingsForTest();
 				await Settings.init({ inMemory: true });
 				const settings = Settings.instance;
@@ -496,6 +496,7 @@ describe("AgentSession advisor + profile model sync", () => {
 				});
 				settings.set("profiles.active", "selected");
 				settings.set("modelRoles", { default: `${PRIMARY_PROVIDER}/${PRIMARY_MODEL_ID}` });
+				settings.set("defaultThinkingLevel", Effort.Medium);
 				const { session } = await createHarness({
 					settingsOverrides: {},
 					credentialedProviders: [PRIMARY_PROVIDER],
@@ -503,13 +504,13 @@ describe("AgentSession advisor + profile model sync", () => {
 				});
 
 				const result = deleteProfile("selected");
-				expect(result.activated?.name).toBe("fallback");
+				expect(result.activated).toBeUndefined();
 				await session.applyProfileToSession();
 
-				expect(getActiveProfileName()).toBe("fallback");
+				expect(getActiveProfileName()).toBe("selected");
 				expect(session.model?.provider).toBe(PRIMARY_PROVIDER);
-				expect(session.model?.id).toBe(SWAP_MODEL_ID);
-				expect(session.thinkingLevel).toBe(Effort.High);
+				expect(session.model?.id).toBe(PRIMARY_MODEL_ID);
+				expect(session.thinkingLevel).toBe(Effort.Medium);
 			});
 		});
 	});

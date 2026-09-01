@@ -1260,14 +1260,35 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 async function createAgentSessionScoped(options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> {
 	const cwd = options.cwd ?? getProjectDir();
 	const agentDir = options.agentDir ?? getAgentDir();
+	const settings = await (options.settings ??
+		options.settingsManager ??
+		logger.time("settings", Settings.init, { cwd, agentDir }));
+	const terminalProfileActivation = settings.captureTerminalProfileActivation();
+	try {
+		return await createAgentSessionScopedWithSettings(options, settings);
+	} catch (error) {
+		try {
+			settings.restoreTerminalProfileActivation(terminalProfileActivation);
+		} catch (rollbackError) {
+			logger.warn("Failed to restore Settings profile activation after startup error", {
+				error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+			});
+		}
+		throw error;
+	}
+}
+
+async function createAgentSessionScopedWithSettings(
+	options: CreateAgentSessionOptions,
+	settings: Settings,
+): Promise<CreateAgentSessionResult> {
+	const cwd = options.cwd ?? getProjectDir();
+	const agentDir = options.agentDir ?? getAgentDir();
 	const eventBus = options.eventBus ?? new EventBus();
 
 	registerSshCleanup();
 	registerEvalCleanup();
 
-	const settings = await (options.settings ??
-		options.settingsManager ??
-		logger.time("settings", Settings.init, { cwd, agentDir }));
 	logger.time("initializeWithSettings", initializeWithSettings, settings);
 
 	// Pin authStorage to modelRegistry.authStorage: ModelRegistry.getApiKey() routes refresh
@@ -1448,22 +1469,26 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	// unbound: auto-applying the disk-active profile would hijack the session's
 	// model, and persisted edits would corrupt an unrelated profile.
 	const sessionHeaderProfile = sessionManager.getHeader()?.profile;
-	const sessionProfile: string | null | undefined = hasExistingSession
-		? typeof sessionHeaderProfile === "string" && sessionHeaderProfile.length > 0
-			? settings.bindSessionToProfile(sessionHeaderProfile)
-				? sessionHeaderProfile
-				: null
+	const sessionHeaderProfileSnapshot = sessionManager.getHeader()?.profileSnapshot;
+	const hasHeaderProfile = typeof sessionHeaderProfile === "string" && sessionHeaderProfile.length > 0;
+	const resumedSessionManager = sessionManager.hasLoadedExistingSession();
+	const sessionProfile: string | null | undefined = hasHeaderProfile
+		? settings.bindSessionToProfile(sessionHeaderProfile, sessionHeaderProfileSnapshot)
+			? sessionHeaderProfile
 			: null
-		: undefined;
+		: resumedSessionManager
+			? null
+			: undefined;
 
 	// Stamp the active config profile onto a brand-new session's header so a
 	// future resume can bind to the same profile. Legacy resumed sessions are
 	// deliberately left unbound above; stamping them here would attribute the
 	// session (and its persisted edits) to whichever profile is the startup
-	// default this process happened to load.
-	if (!hasExistingSession && !sessionManager.getSessionProfile()) {
+	if (!resumedSessionManager && !sessionManager.getSessionProfile()) {
 		const stampProfile = settings.activeProfileName();
-		if (stampProfile) await sessionManager.setSessionProfile(stampProfile);
+		if (stampProfile) {
+			await sessionManager.setSessionProfile(stampProfile, settings.currentProfileSnapshot());
+		}
 	}
 	if (sessionProfile === null) {
 		// With no recorded identity, retire profile ownership entirely so a

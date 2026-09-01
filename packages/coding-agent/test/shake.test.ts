@@ -483,19 +483,20 @@ describe("AgentSession shake", () => {
 				"elide",
 				expect.objectContaining({ config: expect.objectContaining({ minSavings: 4_000 }) }),
 			);
-			expect(session.getNextTryShakeCheckpointTokens()).toBe(425_000);
+			// The ladder re-anchors to post-shake occupancy (275k trigger − 20k
+			// freed), so the next checkpoint asks for one step of NEW growth.
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(405_000);
 
-			// A successful shake may drop live usage below 275k; the checkpoint
-			// remains consumed and cannot spam on a second crossing.
+			// Still no re-fire until that step of fresh context arrives.
 			await emitContextTokens(300_000);
-			await emitContextTokens(424_999);
+			await emitContextTokens(404_999);
 			expect(shakeSpy).toHaveBeenCalledTimes(1);
-			await emitContextTokens(425_000);
+			await emitContextTokens(405_000);
 			expect(shakeSpy).toHaveBeenCalledTimes(2);
-			expect(session.getNextTryShakeCheckpointTokens()).toBe(575_000);
-			await emitContextTokens(425_000);
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(535_000);
+			await emitContextTokens(405_000);
 			expect(shakeSpy).toHaveBeenCalledTimes(2);
-			await emitContextTokens(575_000);
+			await emitContextTokens(535_000);
 			expect(shakeSpy).toHaveBeenCalledTimes(3);
 		});
 
@@ -553,16 +554,78 @@ describe("AgentSession shake", () => {
 				.mockResolvedValue({ mode: "elide", toolResultsDropped: 1, blocksDropped: 0, tokensFreed: 20_000 });
 
 			await emitContextTokens(275_000);
-			await emitContextTokens(425_000);
+			await emitContextTokens(405_000);
 			expect(shakeSpy).toHaveBeenCalledTimes(2);
-			expect(session.getNextTryShakeCheckpointTokens()).toBe(575_000);
+			// Anchor sits at the last post-shake occupancy (405k − 20k).
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(535_000);
 			session.setTryShakeCheckpointStepTokens(100_000);
-			expect(session.getNextTryShakeCheckpointTokens()).toBe(525_000);
-			await emitContextTokens(524_999);
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(485_000);
+			await emitContextTokens(484_999);
 			expect(shakeSpy).toHaveBeenCalledTimes(2);
-			await emitContextTokens(525_000);
+			await emitContextTokens(485_000);
 			expect(shakeSpy).toHaveBeenCalledTimes(3);
-			expect(session.getNextTryShakeCheckpointTokens()).toBe(625_000);
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(565_000);
+		});
+
+		it("re-anchors the ladder to post-shake occupancy so a big shake earns an earlier checkpoint", async () => {
+			// The absolute ladder punished a productive shake: 700k → 425k still had
+			// to wait for 850k (425k of regrowth). Anchoring on occupancy asks for
+			// one step of new context instead.
+			useMillionContextModel();
+			const shakeSpy = vi
+				.spyOn(session, "shake")
+				.mockResolvedValue({ mode: "elide", toolResultsDropped: 4, blocksDropped: 0, tokensFreed: 275_000 });
+
+			await emitContextTokens(700_000);
+			expect(shakeSpy).toHaveBeenCalledTimes(1);
+			// 700k trigger − 275k freed = 425k occupancy, + 150k step.
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(575_000);
+			await emitContextTokens(574_999);
+			expect(shakeSpy).toHaveBeenCalledTimes(1);
+			await emitContextTokens(575_000);
+			expect(shakeSpy).toHaveBeenCalledTimes(2);
+		});
+
+		it("keeps the absolute ladder when a shake frees nothing", async () => {
+			useMillionContextModel();
+			const shakeSpy = vi
+				.spyOn(session, "shake")
+				.mockResolvedValue({ mode: "elide", toolResultsDropped: 0, blocksDropped: 0, tokensFreed: 0 });
+
+			await emitContextTokens(700_000);
+			expect(shakeSpy).toHaveBeenCalledTimes(1);
+			// Nothing was reclaimed, so the checkpoint stays where it was consumed.
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(725_000);
+		});
+
+		it("never schedules the next checkpoint at or below current occupancy", async () => {
+			// A shake that frees more than the whole step must still leave one full
+			// step of headroom — otherwise the next agent_end would refire forever.
+			useMillionContextModel();
+			session.setTryShakeCheckpointStepTokens(50_000);
+			const shakeSpy = vi
+				.spyOn(session, "shake")
+				.mockResolvedValue({ mode: "elide", toolResultsDropped: 9, blocksDropped: 0, tokensFreed: 600_000 });
+
+			await emitContextTokens(650_000);
+			expect(shakeSpy).toHaveBeenCalledTimes(1);
+			// Occupancy 50k is below the first checkpoint, so the floor holds it there.
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(275_000);
+			await emitContextTokens(274_999);
+			expect(shakeSpy).toHaveBeenCalledTimes(1);
+		});
+
+		it("re-anchors from the crossed checkpoint after a late first check", async () => {
+			useMillionContextModel();
+			const shakeSpy = vi
+				.spyOn(session, "shake")
+				.mockResolvedValue({ mode: "elide", toolResultsDropped: 2, blocksDropped: 0, tokensFreed: 100_000 });
+
+			// 760k consumes every interval up to 725k in one pass; occupancy is
+			// measured off the trigger the provider billed.
+			await emitContextTokens(760_000);
+			expect(shakeSpy).toHaveBeenCalledTimes(1);
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(810_000);
 		});
 
 		it("requires both try-shake enablement and a million-token model", async () => {
@@ -601,7 +664,7 @@ describe("AgentSession shake", () => {
 				tokensFreed: 20_000,
 			});
 			await emitContextTokens(275_000);
-			expect(session.getNextTryShakeCheckpointTokens()).toBe(425_000);
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(405_000);
 
 			expect(await session.newSession()).toBe(true);
 			const current = session.agent.state.model;
@@ -619,7 +682,7 @@ describe("AgentSession shake", () => {
 				tokensFreed: 20_000,
 			});
 			await emitContextTokens(275_000);
-			expect(session.getNextTryShakeCheckpointTokens()).toBe(475_000);
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(455_000);
 
 			expect(await session.resetSessionContext()).toBeDefined();
 			const current = session.agent.state.model;
@@ -709,14 +772,17 @@ describe("AgentSession shake", () => {
 			const second = emitContextTokens(425_000);
 			await scheduler.wait(20);
 			expect(shakeSpy).toHaveBeenCalledTimes(1);
+			// Pre-await guard: the crossed checkpoint is recorded before the shake
+			// settles, so a concurrent route cannot fire a second pass.
 			expect(session.getNextTryShakeCheckpointTokens()).toBe(425_000);
 			releaseFirst.resolve();
 			await Promise.all([first, second]);
 			expect(shakeSpy).toHaveBeenCalledTimes(1);
-			expect(session.getNextTryShakeCheckpointTokens()).toBe(425_000);
+			// Once it settles, the anchor drops to post-shake occupancy.
+			expect(session.getNextTryShakeCheckpointTokens()).toBe(405_000);
 
 			shakeSpy.mockResolvedValue({ mode: "elide", toolResultsDropped: 1, blocksDropped: 0, tokensFreed: 20_000 });
-			await emitContextTokens(425_000);
+			await emitContextTokens(405_000);
 			expect(shakeSpy).toHaveBeenCalledTimes(2);
 		});
 
