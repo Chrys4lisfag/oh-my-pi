@@ -26,7 +26,7 @@ never assume commit count alone proves behavior survived.
 | `5708cb1cc` | active, policy     | Default unconfigured native-capable GPT/Codex auto-maintenance to remote-first context-full compaction                     |
 | `696bd711d` | active             | Advisor source provenance and restart-safe per-tool successful/attempted telemetry                                         |
 | `c0d3a3b572` | active, runtime     | Model discovery/cache recovery, profile-bound sessions, advisor/status consistency, tokenizer fallback, try-shake/compact reminder |
-| `a1b534a77e` | active, runtime     | Immutable terminal profile identity with session-header snapshots, single-apply profile switching, live-block status messages, reasoned fallback notices, re-anchored try-shake ladder |
+| `fd1710f3e4` | active, runtime     | Immutable terminal profile identity with session-header snapshots, single-apply profile switching, live-block status messages, reasoned fallback notices, re-anchored try-shake ladder |
 
 `PI_MCP_TIMING` is a live fork delta carried through merge commit history (reference
 `9a8062a7f`), so it does not appear in the non-merge ledger above.
