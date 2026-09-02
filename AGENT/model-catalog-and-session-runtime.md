@@ -231,7 +231,9 @@ cd packages/coding-agent && bun test \
 cd packages/coding-agent && bun run check:types
 ```
 
-Also run Biome on changed files and `git diff --check`. On Windows,
-`profile-cli.test.ts` has a pre-existing environment-specific issue because its
-child process overrides `HOME` while `os.homedir()` resolves `USERPROFILE`; do
-not misattribute that failure to these model/profile changes.
+Also run the repo linter/formatter on changed files (`bunx oxlint <paths>` and
+`bunx oxfmt <paths>`; Biome was removed upstream in v18.1.x) plus
+`git diff --check`. On Windows, `profile-cli.test.ts` has a pre-existing
+environment-specific issue because its child process overrides `HOME` while
+`os.homedir()` resolves `USERPROFILE`; do not misattribute that failure to
+these model/profile changes.

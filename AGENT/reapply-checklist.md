@@ -173,6 +173,71 @@ dispatcher. Do not restore the retired `compaction.strategy`,
 `compaction.remoteEnabled`, or `resolveAutoCompactionAction` compatibility layer;
 v17.4's remote-first default order supersedes it.
 
+### `packages/agent/src/tokenizer.ts`
+
+Take upstream wholesale. Upstream's local `countTokensNat` wrapper absorbs the
+stale-addon `Encoding` rejection and returns `exact: false`, which supersedes the
+fork's injected `NativeTokenCounter` and `isUnsupportedNativeEncodingError`. Delete
+both rather than reviving the constructor parameter, and expect strict mode to
+degrade to the byte bound instead of throwing.
+
+### `packages/catalog/src/compat/openai.ts` and `compat/resolve.ts`
+
+Take upstream wholesale. Host-keyed thinking dialects (including the fork's Venice
+Qwen `enable_thinking` carve-out) now live in the compiled KDL compat rules behind
+`resolveModelPolicy`; `buildOpenAICompat` no longer exists. Port any test that
+imported it to `resolveModelPolicy(spec).compat`.
+
+### `packages/catalog/src/model-manager.ts`
+
+Union the result shape: fork `fetched` (remote attempt made this cycle) plus
+upstream `source`/`updatedAt`. Every return path must set all three; the cache
+fast path is `fetched: false`.
+
+### `packages/coding-agent/src/config/model-discovery.ts` and `model-provider-discovery.ts`
+
+Compose, never choose: the discovery source URL is `discovery.baseUrl ?? baseUrl`,
+then upstream `injectV1` decides whether `/v1` is injected, and the inference URL
+stays the provider's own. Discovery state keeps fork `attemptedAt` next to upstream
+`source`.
+
+### `packages/coding-agent/src/config/models-config-schema-bundle.ts`
+
+Union the `discovery` schema keys (`baseUrl`, `auth`, `injectV1`) and keep every
+side's `narrow` validation branch; each key has its own type/scope error message.
+
+### `packages/coding-agent/src/modes/components/model-hub.ts`
+
+Keep the fork's offline-first hydration (`awaitBackgroundRefresh` →
+`refresh("offline")` → sync → `#reprobeHiddenOptionalProviders`) over upstream's
+bare `refresh("online")`, plus the hidden/re-probed provider sets and
+`#initialRegistrySync`. Zero-model recovery depends on the re-probe running after
+hydration settles.
+
+### `packages/coding-agent/src/modes/components/transcript-container.ts`
+
+Union: upstream `resetStableEmission` and the fork's `isBlockLive`, with
+`canRemoveBlock` delegating to `isBlockLive`. `showStatus` may only mutate a live
+block, so losing `isBlockLive` silently drops status messages into scrollback.
+
+### `packages/coding-agent/src/sdk.ts` and `session/agent-session-types.ts`
+
+Union imports and option fields. Fork side: `loadAdvisorTranscriptToolStats`,
+`sessionProfile?: string | null` (with its `null` = legacy-unbound semantics).
+Upstream side: advisor memory prompt helper and the extension-root/prepared-extension
+forwarding options.
+
+### `packages/coding-agent/src/session/session-manager.ts`
+
+Union the rollback snapshot: fork `loadedExistingSession` and profile
+name/snapshot alongside upstream `fallbackRuntimeOnly`, and take upstream's
+`structuredClone(this.#header)` (moveTo mutates the header in place).
+
+### Fork test files that conflict (`advisor-toggle`, `input-controller-keybindings`, …)
+
+Both sides' tests are additive: keep every `it` block and merge the import lists.
+A pick-a-side resolution here silently deletes contract coverage.
+
 ### Generated-file delete/modify conflicts
 
 Accept upstream deletion when the source subsystem is gone. Regenerate from live
@@ -211,6 +276,18 @@ git grep -n "advisor.memoryReminderInterval"
 git grep -n "Memory reminder injections"
 git grep -n "setTryShakeEnabled"
 git grep -n 'name: "tryshake"'
+git grep -n "isBlockLive" packages/coding-agent/src/modes/components/transcript-container.ts packages/coding-agent/src/modes/utils/ui-helpers.ts
+git grep -n "sessionProfile" packages/coding-agent/src/sdk.ts packages/coding-agent/src/session/agent-session-types.ts
+git grep -n "profileSnapshot\|loadedExistingSession" packages/coding-agent/src/session/session-manager.ts
+git grep -n "bindSessionToProfile\|captureTerminalProfileActivation" packages/coding-agent/src/config/settings.ts
+git grep -n "shouldWrite = true" packages/coding-agent/src/config/settings.ts
+git grep -n "reprobeHiddenOptionalProviders\|initialRegistrySync" packages/coding-agent/src/modes/components/model-hub.ts
+git grep -n "discovery.baseUrl\|injectV1" packages/coding-agent/src/config/model-discovery.ts packages/coding-agent/src/config/models-config-schema-bundle.ts
+git grep -n "attemptedAt" packages/coding-agent/src/config/model-provider-discovery.ts
+git grep -n "fetched" packages/catalog/src/model-manager.ts
+git grep -n "auth-none\|openai-models-list-bare-context" packages/coding-agent/src/config/model-registry.ts
+git grep -n "describeFallbackReason" packages/coding-agent/src/session/retry-fallback-chains.ts
+git grep -n "reanchorTryShakeCheckpoint" packages/coding-agent/src/session/session-maintenance.ts
 ```
 
 Interpret the `resource.?exhausted` result carefully: the fork contract requires that
@@ -258,9 +335,12 @@ expand a file argument into a large test bucket.
 (cd packages/utils && bun test test/postmortem-epipe.test.ts)
 ```
 
-Then run targeted Biome/type checks for touched packages. If upstream itself currently
-fails a package type-check, record the exact external/upstream diagnostics separately
-from fork regressions; do not hide fork-specific errors among them.
+Then run targeted lint/format/type checks for touched packages: `bunx oxlint <paths>`,
+`bunx oxfmt <paths>`, and each package's `bun run check:types` (tsgo). Biome was
+removed upstream in v18.1.x — do not reach for `bunx biome check`, which now reports
+rules the repo no longer enforces. If upstream itself currently fails a package
+type-check, record the exact external/upstream diagnostics separately from fork
+regressions; do not hide fork-specific errors among them.
 
 ## F. Manual contracts still lacking tests
 
