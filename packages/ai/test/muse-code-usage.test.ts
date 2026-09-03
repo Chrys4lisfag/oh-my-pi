@@ -7,12 +7,12 @@ import { museCodeUsageProvider } from "@oh-my-pi/pi-ai/usage/muse-code";
 const credential = {
 	type: "oauth" as const,
 	accessToken: JSON.stringify({ oauthAccessToken: "meta-account-access", apiKey: "LLM|subscription-key" }),
-	expiresAt: Date.now() + 60_000,
+	expiresAt: Date.now() - 60_000,
 	email: "stored@example.com",
 };
 
 describe("Muse Code subscription usage", () => {
-	test("maps rolling and weekly plan quota without leaking the inference key", async () => {
+	test("maps quota from a durable key even when legacy metadata marks the account token expired", async () => {
 		let authorization = "";
 		let requestBody: RequestInit["body"];
 		const fetchImpl: FetchImpl = (_input, init) => {

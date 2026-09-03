@@ -119,7 +119,6 @@ export const museCodeUsageProvider: UsageProvider = {
 		if (params.provider !== PROVIDER || params.credential.type !== "oauth") return null;
 		const encodedCredential = params.credential.accessToken?.trim();
 		if (!encodedCredential) return null;
-		if (params.credential.expiresAt !== undefined && params.credential.expiresAt <= Date.now()) return null;
 		const { oauthAccessToken } = parseMuseCodeCredential(encodedCredential);
 
 		let payload: MuseCodeKeyResponse;

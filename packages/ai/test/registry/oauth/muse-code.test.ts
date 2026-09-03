@@ -113,9 +113,8 @@ afterEach(() => {
 });
 
 describe("Muse Code OAuth", () => {
-	test("accepts Meta's expiry-less device token response and mints the subscription key", async () => {
+	test("treats Meta's expiry-less device token as a durable minted subscription key", async () => {
 		const { fetch: fetchImpl, requests } = createMuseLoginFetch();
-		const startedAt = Date.now();
 		const authEvents: Array<{ url: string; instructions: string }> = [];
 		const credentials = await loginMuse(fetchImpl, (url, instructions) => authEvents.push({ url, instructions }));
 
@@ -145,22 +144,15 @@ describe("Muse Code OAuth", () => {
 			accountId: "meta-account-1",
 			email: "muse@example.com",
 		});
-		expect(credentials.expires).toBeGreaterThanOrEqual(startedAt + 3_600_000);
-		expect(credentials.expires).toBeLessThanOrEqual(Date.now() + 3_600_000);
+		expect(credentials.expires).toBe(8.64e15);
 		expect(parseMuseCodeCredential(credentials.access)).toEqual({
 			oauthAccessToken: "meta-account-access",
 			apiKey: "LLM|subscription-key",
 		});
 	});
 
-	test("honors expires_in when Meta includes it", async () => {
-		const { fetch: fetchImpl } = createMuseLoginFetch({
-			tokens: [{ body: { ...ACCOUNT_TOKEN, expires_in: 7_200 } }],
-		});
-		const startedAt = Date.now();
-		const credentials = await loginMuse(fetchImpl);
-		expect(credentials.expires).toBeGreaterThanOrEqual(startedAt + 7_200_000);
-		expect(credentials.expires).toBeLessThanOrEqual(Date.now() + 7_200_000);
+	test("does not register Meta's unsupported refresh-token grant", () => {
+		expect(getProviderDefinition("muse-code")?.refreshToken).toBeUndefined();
 	});
 
 	test("falls back to verification_uri when verification_uri_complete is absent", async () => {
@@ -197,59 +189,6 @@ describe("Muse Code OAuth", () => {
 		});
 		await expect(loginMuse(fetchImpl)).rejects.toThrow(message);
 		expect(requests.map(request => request.url)).toEqual([DEVICE_URL, TOKEN_URL]);
-	});
-
-	test("versions refresh requests and performs a non-onboarding key lookup", async () => {
-		const { fetch: fetchImpl, requests } = createMuseLoginFetch();
-		vi.spyOn(globalThis, "fetch").mockImplementation(fetchImpl as typeof fetch);
-		const provider = getProviderDefinition("muse-code");
-		if (!provider?.refreshToken) throw new Error("Muse Code refresh is not registered");
-		const refreshed = await provider.refreshToken({
-			access: JSON.stringify({ oauthAccessToken: "old-account-access", apiKey: "LLM|old-key" }),
-			refresh: "meta-refresh",
-			expires: 0,
-			accountId: "meta-account-1",
-			email: "muse@example.com",
-		});
-
-		expect(requests.map(request => request.url)).toEqual([TOKEN_URL, KEY_URL]);
-		const token = requestAt(requests, 0);
-		expect(headerValue(token, "x-api-version")).toBe("1.0.0");
-		const refresh = formBody(token);
-		expect(refresh.get("grant_type")).toBe("refresh_token");
-		expect(refresh.get("refresh_token")).toBe("meta-refresh");
-		const key = requestAt(requests, 1);
-		expect(headerValue(key, "Authorization")).toBe("Bearer meta-account-access");
-		expect(jsonBody(key)).toEqual({});
-		expect(parseMuseCodeCredential(refreshed.access).apiKey).toBe("LLM|subscription-key");
-	});
-
-	test("retains the minted key when refresh succeeds but the key endpoint is transiently unavailable", async () => {
-		const storedAccess = JSON.stringify({ oauthAccessToken: "old-account-access", apiKey: "LLM|existing-key" });
-		const refreshed = await attachMuseCodeApiKey(
-			{ access: "new-account-access", refresh: "rotated-refresh", expires: Date.now() + 3_600_000 },
-			{
-				provider: "muse-code",
-				phase: "refresh",
-				raw: {},
-				fetch: Object.assign(() => Promise.resolve(Response.json({ error: "temporary" }, { status: 503 })), {
-					preconnect: fetch.preconnect,
-				}),
-				stored: {
-					access: storedAccess,
-					refresh: "old-refresh",
-					expires: 0,
-					accountId: "meta-account-1",
-					email: "muse@example.com",
-				},
-			},
-		);
-
-		expect(parseMuseCodeCredential(refreshed.access)).toEqual({
-			oauthAccessToken: "new-account-access",
-			apiKey: "LLM|existing-key",
-		});
-		expect(refreshed).toMatchObject({ accountId: "meta-account-1", email: "muse@example.com" });
 	});
 
 	test("classifies a subscription payment action as an entitlement failure", async () => {

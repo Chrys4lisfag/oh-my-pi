@@ -16331,6 +16331,7 @@
 				"id": "muse-code",
 				"apiKeyFormat": "bearer",
 				"name": "Muse Code (Subscription)",
+				"expiry": "jwt-or-never",
 				"login": {
 					"kind": "device-code",
 					"scopes": [],
@@ -16380,43 +16381,12 @@
 							"path": "refresh_token"
 						},
 						"expires": {
-							"mode": "seconds",
-							"path": "expires_in",
-							"skewMs": 0,
-							"fallbackMs": 3600000
+							"mode": "never"
 						}
 					}
 				},
 				"refresh": {
-					"kind": "request",
-					"require": [],
-					"token": {
-						"url": {
-							"value": "https://auth.meta.com/oidc/device/token/"
-						},
-						"body": "form",
-						"standard": true,
-						"params": {},
-						"headers": {
-							"Accept": "application/json",
-							"x-api-version": "1.0.0"
-						}
-					},
-					"afterRefresh": "muse-code-key",
-					"credential": {
-						"access": {
-							"path": "access_token"
-						},
-						"refresh": {
-							"path": "refresh_token"
-						},
-						"expires": {
-							"mode": "seconds",
-							"path": "expires_in",
-							"skewMs": 0,
-							"fallbackMs": 3600000
-						}
-					}
+					"kind": "none"
 				}
 			},
 			{

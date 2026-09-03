@@ -116,41 +116,16 @@ export async function requestMuseCodeKey(
 	return parsed;
 }
 
-function isTransientKeyExchangeFailure(error: unknown, signal?: AbortSignal): boolean {
-	if (signal?.aborted) return false;
-	if (error instanceof AIError.OAuthError) {
-		return AIError.isTransientStatus(error.status) || error.status === 401 || error.status === 403;
-	}
-	return (
-		error instanceof TypeError ||
-		(error instanceof DOMException && (error.name === "TimeoutError" || error.name === "AbortError"))
-	);
-}
-
 /** Exchange Meta account access for the Model API key authorized by a Muse subscription. */
 export const attachMuseCodeApiKey: AfterExchangeHook = async (
 	credentials: OAuthCredentials,
 	context: ExchangeContext,
 ): Promise<OAuthCredentials> => {
-	let payload: MuseCodeKeyResponse;
-	try {
-		payload = await requestMuseCodeKey(credentials.access, {
-			fetch: context.fetch,
-			signal: context.signal,
-			onboard: context.phase === "login",
-		});
-	} catch (error) {
-		if (context.phase !== "refresh" || !context.stored || !isTransientKeyExchangeFailure(error, context.signal)) {
-			throw error;
-		}
-		const stored = parseMuseCodeCredential(context.stored.access);
-		return {
-			...credentials,
-			access: encodeMuseCodeCredential(credentials.access, stored.apiKey),
-			accountId: context.stored.accountId,
-			email: context.stored.email,
-		};
-	}
+	const payload = await requestMuseCodeKey(credentials.access, {
+		fetch: context.fetch,
+		signal: context.signal,
+		onboard: true,
+	});
 	if (payload.is_subs_active === false) {
 		throw new AIError.OAuthError("invalid_grant: Muse Code subscription is inactive", {
 			kind: "token-exchange",
@@ -172,8 +147,8 @@ export const attachMuseCodeApiKey: AfterExchangeHook = async (
 			provider: PROVIDER,
 		});
 	}
-	const email = payload.user_email?.trim().toLowerCase() || context.stored?.email;
-	const accountId = payload.user_id?.trim() || context.stored?.accountId || email;
+	const email = payload.user_email?.trim().toLowerCase();
+	const accountId = payload.user_id?.trim() || email;
 	if (!accountId) {
 		throw new AIError.OAuthError("Muse Code key response is missing a stable account identity", {
 			kind: "validation",
