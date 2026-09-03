@@ -45,6 +45,7 @@
 		"auth/minimax.kdl",
 		"auth/mistral.kdl",
 		"auth/moonshot.kdl",
+		"auth/muse-code.kdl",
 		"auth/nanogpt.kdl",
 		"auth/novita.kdl",
 		"auth/nvidia.kdl",
@@ -138,6 +139,7 @@
 		"providers/minimax.kdl",
 		"providers/mistral.kdl",
 		"providers/moonshot.kdl",
+		"providers/muse-code.kdl",
 		"providers/nanogpt.kdl",
 		"providers/novita.kdl",
 		"providers/nvidia.kdl",
@@ -9528,6 +9530,33 @@
 				}
 			},
 			{
+				"source": "providers/muse-code.kdl:6",
+				"class": "unknown",
+				"providers": [
+					"muse-code"
+				],
+				"thinking": {
+					"efforts": [
+						"minimal",
+						"low",
+						"medium",
+						"high",
+						"xhigh"
+					],
+					"mode": "effort"
+				}
+			},
+			{
+				"source": "providers/muse-code.kdl:3",
+				"providers": [
+					"muse-code"
+				],
+				"wire": {
+					"includeEncryptedReasoning": true,
+					"supportsReasoningEffort": true
+				}
+			},
+			{
 				"source": "providers/nanogpt.kdl:5",
 				"providers": [
 					"nanogpt"
@@ -16284,6 +16313,91 @@
 						"kind": "models-endpoint",
 						"label": "deepseek",
 						"url": "https://api.deepseek.com/v1/models"
+					}
+				}
+			},
+			{
+				"id": "muse-code",
+				"apiKeyFormat": "bearer",
+				"name": "Muse Code (Subscription)",
+				"login": {
+					"kind": "device-code",
+					"scopes": [],
+					"scopeSeparator": " ",
+					"clientId": {
+						"value": "1031625952748946"
+					},
+					"device": {
+						"url": {
+							"value": "https://auth.meta.com/oidc/device/authorization/"
+						},
+						"body": "form",
+						"standard": true,
+						"params": {},
+						"headers": {
+							"Accept": "application/json"
+						}
+					},
+					"token": {
+						"url": {
+							"value": "https://auth.meta.com/oidc/device/token/"
+						},
+						"body": "form",
+						"standard": true,
+						"params": {},
+						"headers": {
+							"Accept": "application/json"
+						}
+					},
+					"response": {
+						"userCode": "user_code",
+						"deviceCode": "device_code",
+						"verificationUri": "verification_uri",
+						"verificationUriComplete": "verification_uri_complete",
+						"interval": "interval",
+						"expiresIn": "expires_in"
+					},
+					"instructions": "Enter code: {user_code}",
+					"afterExchange": "muse-code-key",
+					"credential": {
+						"access": {
+							"path": "access_token"
+						},
+						"refresh": {
+							"path": "refresh_token"
+						},
+						"expires": {
+							"mode": "seconds",
+							"path": "expires_in",
+							"skewMs": 300000
+						}
+					}
+				},
+				"refresh": {
+					"kind": "request",
+					"require": [],
+					"afterRefresh": "muse-code-key",
+					"token": {
+						"url": {
+							"value": "https://auth.meta.com/oidc/device/token/"
+						},
+						"body": "form",
+						"standard": true,
+						"params": {},
+						"headers": {}
+					},
+					"credential": {
+						"access": {
+							"path": "access_token"
+						},
+						"refresh": {
+							"path": "refresh_token"
+						},
+						"expires": {
+							"mode": "seconds",
+							"path": "expires_in",
+							"skewMs": 300000
+						}
 					}
 				}
 			},

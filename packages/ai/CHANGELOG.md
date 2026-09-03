@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added Muse Code subscription sign-in, credential refresh, inference, and quota reporting in `/usage`.
+
 ## [18.1.6] - 2026-09-03
 
 ### Breaking Changes

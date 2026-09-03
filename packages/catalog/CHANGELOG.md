@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added Muse Code as a provider with Muse Spark models and live account-scoped discovery.
+
 ## [18.1.6] - 2026-09-03
 
 ### Added

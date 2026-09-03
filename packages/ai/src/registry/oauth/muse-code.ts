@@ -1,0 +1,174 @@
+import { type } from "@oh-my-pi/omptype";
+import * as AIError from "../../error";
+import type { AfterExchangeHook, ExchangeContext } from "../hooks/types";
+import type { FetchImpl } from "../../types";
+import type { OAuthCredentials } from "./types";
+
+const PROVIDER = "muse-code";
+const MUSE_KEY_URL = "https://api.meta.ai/muse-code/key";
+const API_VERSION = "1.0.0";
+const REQUEST_TIMEOUT_MS = 20_000;
+
+const subscriptionWindowSchema = type({
+	"used_percent?": "number",
+	"resets_at?": "string | number",
+	"window_duration_mins?": "number",
+});
+
+const subscriptionUsageSchema = type({
+	"window?": subscriptionWindowSchema.or("null"),
+	"weekly?": subscriptionWindowSchema.or("null"),
+});
+
+const museCodeKeyResponseSchema = type({
+	"api_key?": "string",
+	"require_payment_action_url?": "string",
+	"require_payment?": "boolean",
+	"action_url?": "string",
+	"user_email?": "string",
+	"user_id?": "string",
+	"is_subs_active?": "boolean",
+	"subs_tier_id?": "string",
+	"subs_tier_name?": "string",
+	"subs_usage?": subscriptionUsageSchema.or("null"),
+});
+export type MuseCodeKeyResponse = typeof museCodeKeyResponseSchema.infer;
+
+const museCodeCredentialSchema = type({
+	oauthAccessToken: "string",
+	apiKey: "string",
+});
+export type MuseCodeCredential = typeof museCodeCredentialSchema.infer;
+
+function requestSignal(signal?: AbortSignal): AbortSignal {
+	const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+	return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+export function parseMuseCodeCredential(value: string): MuseCodeCredential {
+	let payload: unknown;
+	try {
+		payload = JSON.parse(value);
+	} catch (cause) {
+		throw new AIError.ConfigurationError("Muse Code credential is invalid; sign in again", { cause });
+	}
+	const parsed = museCodeCredentialSchema(payload);
+	if (parsed instanceof type.errors || !parsed.oauthAccessToken.trim() || !parsed.apiKey.trim()) {
+		throw new AIError.ConfigurationError("Muse Code credential is invalid; sign in again");
+	}
+	return parsed;
+}
+
+function encodeMuseCodeCredential(oauthAccessToken: string, apiKey: string): string {
+	return JSON.stringify({ oauthAccessToken, apiKey });
+}
+
+async function readJson(response: Response): Promise<unknown> {
+	try {
+		return await response.json();
+	} catch (cause) {
+		throw new AIError.OAuthError("Muse Code key exchange returned invalid JSON", {
+			kind: "validation",
+			provider: PROVIDER,
+			status: response.status,
+			cause,
+		});
+	}
+}
+
+export async function requestMuseCodeKey(
+	accessToken: string,
+	fetchImpl: FetchImpl = fetch,
+	signal?: AbortSignal,
+): Promise<MuseCodeKeyResponse> {
+	const response = await fetchImpl(MUSE_KEY_URL, {
+		method: "POST",
+		headers: {
+			Accept: "application/json",
+			Authorization: `Bearer ${accessToken}`,
+			"Content-Type": "application/json",
+			"x-api-version": API_VERSION,
+		},
+		body: "{}",
+		redirect: "error",
+		signal: requestSignal(signal),
+	});
+	const payload = await readJson(response);
+	if (!response.ok) {
+		throw new AIError.OAuthError(`Muse Code key exchange failed: ${response.status}`, {
+			kind: "token-exchange",
+			provider: PROVIDER,
+			status: response.status,
+		});
+	}
+	const parsed = museCodeKeyResponseSchema(payload);
+	if (parsed instanceof type.errors) {
+		throw new AIError.OAuthError(`Invalid Muse Code key response: ${parsed.summary}`, {
+			kind: "validation",
+			provider: PROVIDER,
+		});
+	}
+	return parsed;
+}
+
+function isTransientKeyExchangeFailure(error: unknown, signal?: AbortSignal): boolean {
+	if (signal?.aborted) return false;
+	if (error instanceof AIError.OAuthError) {
+		return AIError.isTransientStatus(error.status) || error.status === 401 || error.status === 403;
+	}
+	return (
+		error instanceof TypeError ||
+		(error instanceof DOMException && (error.name === "TimeoutError" || error.name === "AbortError"))
+	);
+}
+
+/** Exchange Meta account access for the Model API key authorized by a Muse subscription. */
+export const attachMuseCodeApiKey: AfterExchangeHook = async (
+	credentials: OAuthCredentials,
+	context: ExchangeContext,
+): Promise<OAuthCredentials> => {
+	let payload: MuseCodeKeyResponse;
+	try {
+		payload = await requestMuseCodeKey(credentials.access, context.fetch, context.signal);
+	} catch (error) {
+		if (context.phase !== "refresh" || !context.stored || !isTransientKeyExchangeFailure(error, context.signal)) {
+			throw error;
+		}
+		const stored = parseMuseCodeCredential(context.stored.access);
+		return {
+			...credentials,
+			access: encodeMuseCodeCredential(credentials.access, stored.apiKey),
+			accountId: context.stored.accountId,
+			email: context.stored.email,
+		};
+	}
+	if (payload.is_subs_active === false) {
+		throw new AIError.OAuthError("invalid_grant: Muse Code subscription is inactive", {
+			kind: "token-exchange",
+			provider: PROVIDER,
+			status: 403,
+		});
+	}
+	const apiKey = payload.api_key?.trim() || "";
+	if (!apiKey) {
+		const actionUrl = payload.action_url?.trim() || payload.require_payment_action_url?.trim();
+		throw new AIError.OAuthError(
+			actionUrl ? `Muse Code account setup is required: ${actionUrl}` : "Muse Code key response is missing api_key",
+			{ kind: "validation", provider: PROVIDER },
+		);
+	}
+	const email = payload.user_email?.trim().toLowerCase() || context.stored?.email;
+	const accountId = payload.user_id?.trim() || context.stored?.accountId || email;
+	if (!accountId) {
+		throw new AIError.OAuthError("Muse Code key response is missing a stable account identity", {
+			kind: "validation",
+			provider: PROVIDER,
+		});
+	}
+	return {
+		...credentials,
+		access: encodeMuseCodeCredential(credentials.access, apiKey),
+		accountId,
+		email,
+	};
+};

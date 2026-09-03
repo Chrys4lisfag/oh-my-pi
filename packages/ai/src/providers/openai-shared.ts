@@ -1238,12 +1238,12 @@ export function resolveOpenAICompletionsOutputClamp(
 /**
  * Provider-specific Responses API output clamp.
  *
- * Meta documents a 131,072-token output limit for Muse Spark 1.1, so native
- * Meta requests may use the model's full advertised cap instead of the
- * conservative 64k OpenAI-compatible default.
+ * Meta documents a 131,072-token output limit for Muse Spark, so direct Model
+ * API and Muse Code requests may use the model's full advertised cap instead
+ * of the conservative 64k OpenAI-compatible default.
  */
 export function resolveOpenAIResponsesOutputClamp(model: Pick<Model, "provider" | "maxTokens">): number | undefined {
-	if (model.provider === "meta") {
+	if (model.provider === "meta" || model.provider === "muse-code") {
 		return model.maxTokens ?? OPENAI_MAX_OUTPUT_TOKENS;
 	}
 	return undefined;

@@ -1,8 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { CATALOG_PROVIDERS } from "@oh-my-pi/pi-catalog/provider-models/descriptors";
-import { META_MUSE_STATIC_MODELS, metaModelManagerOptions } from "@oh-my-pi/pi-catalog/provider-models/openai-compat";
-import type { ThinkingConfig } from "@oh-my-pi/pi-catalog/types";
+import {
+	META_MUSE_STATIC_MODELS,
+	MUSE_CODE_STATIC_MODELS,
+	metaModelManagerOptions,
+	museCodeModelManagerOptions,
+} from "@oh-my-pi/pi-catalog/provider-models/openai-compat";
+import type { FetchImpl, ThinkingConfig } from "@oh-my-pi/pi-catalog/types";
 
 const MUSE_SPARK_THINKING: ThinkingConfig = {
 	mode: "effort",
@@ -102,6 +107,51 @@ describe("Meta Model API provider", () => {
 	});
 
 	test("prefers Meta's documented key name while accepting the provider-specific alias", () => {
+		const descriptor = CATALOG_PROVIDERS.find(provider => provider.id === "meta");
+		expect(descriptor).toMatchObject({
+			defaultModel: "muse-spark-1.1",
+			envVars: ["MODEL_API_KEY", "META_API_KEY"],
+			catalogDiscovery: { label: "Meta Model API" },
+		});
+	});
+});
+
+describe("Muse Code subscription provider", () => {
+	test("exposes a distinct provider with subscription-scoped Muse models", async () => {
+		const descriptor = CATALOG_PROVIDERS.find(provider => provider.id === "muse-code");
+		expect(descriptor).toMatchObject({
+			defaultModel: "muse-spark-1.3",
+			dynamicModelsAuthoritative: true,
+		});
+		expect(descriptor).not.toHaveProperty("envVars");
+
+		let requestHeaders = new Headers();
+		const fetchModels: FetchImpl = async (_input, init) => {
+			requestHeaders = new Headers(init?.headers);
+			return modelListResponse(["muse-spark-1.3"]);
+		};
+		const options = museCodeModelManagerOptions({
+			apiKey: "LLM|subscription-key",
+			fetch: fetchModels,
+		});
+		expect(options.providerId).toBe("muse-code");
+		expect(options.staticModels).toEqual(MUSE_CODE_STATIC_MODELS);
+		expect(MUSE_CODE_STATIC_MODELS.every(model => model.provider === "muse-code")).toBe(true);
+		const discovered = await options.fetchDynamicModels?.();
+		expect(requestHeaders.get("Authorization")).toBe("Bearer LLM|subscription-key");
+		expect(requestHeaders.get("x-api-version")).toBe("1.0.0");
+		expect(discovered).toEqual([
+			expect.objectContaining({
+				id: "muse-spark-1.3",
+				provider: "muse-code",
+				reasoning: true,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				maxTokens: 131_072,
+			}),
+		]);
+	});
+
+	test("leaves the existing Meta Model API descriptor API-key-only", () => {
 		const descriptor = CATALOG_PROVIDERS.find(provider => provider.id === "meta");
 		expect(descriptor).toMatchObject({
 			defaultModel: "muse-spark-1.1",

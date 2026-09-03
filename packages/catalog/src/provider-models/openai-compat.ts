@@ -4572,6 +4572,51 @@ export function metaModelManagerOptions(config?: MetaModelManagerConfig): ModelM
 	};
 }
 
+/** Muse Code is subscription-backed, so its model rows never accrue token charges. */
+export const MUSE_CODE_STATIC_MODELS: readonly ModelSpec<"openai-responses">[] = META_MUSE_STATIC_MODELS.map(model => ({
+	...model,
+	provider: "muse-code",
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+}));
+
+const MUSE_CODE_MODEL_BY_ID: Partial<Record<string, ModelSpec<"openai-responses">>> = Object.fromEntries(
+	MUSE_CODE_STATIC_MODELS.map(model => [model.id, model]),
+);
+
+function museCodeLineageSpec(id: string): ModelSpec<"openai-responses"> | undefined {
+	const model = museSparkLineageSpec(id);
+	return model
+		? { ...model, provider: "muse-code", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }
+		: undefined;
+}
+
+export function museCodeModelManagerOptions(config?: MetaModelManagerConfig): ModelManagerOptions<"openai-responses"> {
+	const apiKey = config?.apiKey;
+	const baseUrl = config?.baseUrl ?? META_MODEL_API_BASE_URL;
+	return {
+		providerId: "muse-code",
+		staticModels: MUSE_CODE_STATIC_MODELS,
+		...(apiKey && {
+			fetchDynamicModels: () =>
+				fetchOpenAICompatibleModels({
+					api: "openai-responses",
+					provider: "muse-code",
+					baseUrl,
+					apiKey,
+					headers: { "x-api-version": "1.0.0" },
+					fetch: config?.fetch,
+					filterModel: (_entry, model) => !isExcludedModel("muse-code", model.id),
+					mapModel: (entry, defaults) =>
+						mapWithBundledReference(
+							entry,
+							defaults,
+							MUSE_CODE_MODEL_BY_ID[defaults.id] ?? museCodeLineageSpec(defaults.id),
+						),
+				}),
+		}),
+	};
+}
+
 // ---------------------------------------------------------------------------
 // 16. Moonshot
 // ---------------------------------------------------------------------------
