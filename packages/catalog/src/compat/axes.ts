@@ -128,6 +128,7 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"strict-responses-pairing": wire("strictResponsesPairing", ["openai-responses"]),
 	"requires-reasoning-off-juice-instruction": wire("requiresReasoningOffJuiceInstruction", ["openai-responses"]),
 	"supports-all-turns-reasoning-context": wire("supportsAllTurnsReasoningContext", ["openai-responses"]),
+	"supports-configuration-update": wire("supportsConfigurationUpdate", ["openai-responses"]),
 	"strip-deepseek-special-tokens": wire("stripDeepseekSpecialTokens", OAI),
 	"stream-markup-healing-pattern": wire("streamMarkupHealingPattern", OAI, "scalar", [
 		"kimi",
@@ -217,6 +218,9 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"flash-stream-leak-workaround": wire("flashStreamLeakWorkaround", ["google"]),
 	"multimodal-function-response": wire("multimodalFunctionResponse", ["google"]),
 	"requires-skip-thought-signature": wire("requiresSkipThoughtSignature", ["google"]),
+	"requires-skip-thought-signature-on-first-function-call": wire("requiresSkipThoughtSignatureOnFirstFunctionCall", [
+		"google",
+	]),
 	"supports-function-part-id": wire("supportsFunctionPartId", ["google"]),
 
 	// ── wire: shared across surfaces ──
@@ -262,6 +266,11 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"limits-patch": { key: "limitsPatch", set: "catalog", shape: "object" },
 	"long-context-cost": { key: "longContext", set: "catalog", shape: "object" },
 	"long-usage-limit-fallback": { key: "longUsageLimitFallback", set: "catalog", shape: "scalar" },
+	"requires-cursor-tool-schema-projection": {
+		key: "requiresCursorToolSchemaProjection",
+		set: "catalog",
+		shape: "scalar",
+	},
 	priority: { key: "priority", set: "catalog", shape: "scalar" },
 	"service-tier-cost": { key: "serviceTierCost", set: "catalog", shape: "object" },
 };

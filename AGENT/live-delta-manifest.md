@@ -1,7 +1,7 @@
 # Live fork delta manifest
 
-This manifest classifies fork content through `fd1710f3e4`, reconciled against
-upstream parent `530664c8f5` (v18.1.2). Refresh it after every upstream merge;
+This manifest classifies fork content through `5546fc43d7`, reconciled against
+upstream parent `596f2da710` (v18.1.8). Refresh it after every upstream merge;
 never assume commit count alone proves behavior survived.
 
 ### Contracts upstream has absorbed (do not reapply)
@@ -26,6 +26,17 @@ never assume commit count alone proves behavior survived.
   injection, and the cache namespace carries endpoint, auth, and bare suffixes.
 - `ModelResolutionResult` carries fork `fetched` alongside upstream
   `source`/`updatedAt`; discovery state keeps `attemptedAt` next to `source`.
+- `ModelRegistry.#refreshDiscovered` tail: upstream's `#withCatalogMetrics`
+  wraps the projection, and the fork's `#emitModelsUpdated()` must still fire
+  after it — the advisor retry for late dynamic providers depends on that
+  notification.
+- `packages/ai/src/index.ts` no longer barrel-exports `utils/retry`
+  (deleted upstream) or `utils/retry-after` (internal to `oneshot-retry`); the
+  fork had both and neither is imported from the package root.
+- `SessionMaintenance` field/method blocks are append-only seams: upstream's
+  `#incompleteRecoveryAttempts` / `resetForNewPrompt` land next to the fork's
+  try-shake checkpoint state and `#reanchorTryShakeCheckpoint`. A `@both`-style
+  union must re-add the closing brace of whichever method the marker split.
 
 ## Fork commit ledger
 
@@ -49,6 +60,7 @@ never assume commit count alone proves behavior survived.
 | `5708cb1cc` | active, policy     | Default unconfigured native-capable GPT/Codex auto-maintenance to remote-first context-full compaction                     |
 | `696bd711d` | active             | Advisor source provenance and restart-safe per-tool successful/attempted telemetry                                         |
 | `c0d3a3b572` | active, runtime     | Model discovery/cache recovery, profile-bound sessions, advisor/status consistency, tokenizer fallback, try-shake/compact reminder |
+| `5546fc43d7` | active, runtime     | Compaction rotates models on spend caps/transients, `retry.fallbackChains` as compaction candidates, budget wording as usage limit, hub reorder-key hint |
 | `fd1710f3e4` | active, runtime     | Immutable terminal profile identity with session-header snapshots, single-apply profile switching, live-block status messages, reasoned fallback notices, re-anchored try-shake ladder |
 
 `PI_MCP_TIMING` is a live fork delta carried through merge commit history (reference

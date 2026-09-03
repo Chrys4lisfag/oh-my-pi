@@ -545,6 +545,19 @@ describe("isUsageLimitOutcome", () => {
 		expect(isUsageLimitOutcome(429, message)).toBe(true);
 	});
 
+	it("rotates on Anthropic 402 in-flight credit exhaustion instead of surfacing the retry hint", () => {
+		const message =
+			"402 This request would exceed your available credits given your current in-flight requests. Retry after in-flight requests settle, or add credits. retry-after-ms=120000";
+		expect(parseRateLimitReason(message)).toBe("QUOTA_EXHAUSTED");
+		expect(is402BillingCapBody(message)).toBe(true);
+		expect(isUsageLimitOutcome(402, message)).toBe(true);
+		expect(isUsageLimit(message)).toBe(true);
+		// OpenRouter's prepaid wording is the same account-local cap.
+		expect(
+			isUsageLimitOutcome(402, "Insufficient credits. Add more using https://openrouter.ai/settings/credits"),
+		).toBe(true);
+	});
+
 	it("rotates only account-scoped cap 403s and statusless trailers", () => {
 		const devinTrailer =
 			"Devin stream error permission_denied: Reached overall message rate limit. Please try again later. Your limit will reset in 13 minutes.";
