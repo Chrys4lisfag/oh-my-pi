@@ -9272,7 +9272,7 @@
 				}
 			},
 			{
-				"source": "providers/meta.kdl:6",
+				"source": "providers/meta.kdl:7",
 				"class": "unknown",
 				"providers": [
 					"meta"
@@ -9295,7 +9295,8 @@
 				],
 				"wire": {
 					"includeEncryptedReasoning": true,
-					"supportsReasoningEffort": true
+					"supportsReasoningEffort": true,
+					"clampOutputToModelMax": true
 				}
 			},
 			{
@@ -9530,7 +9531,7 @@
 				}
 			},
 			{
-				"source": "providers/muse-code.kdl:6",
+				"source": "providers/muse-code.kdl:7",
 				"class": "unknown",
 				"providers": [
 					"muse-code"
@@ -9553,7 +9554,8 @@
 				],
 				"wire": {
 					"includeEncryptedReasoning": true,
-					"supportsReasoningEffort": true
+					"supportsReasoningEffort": true,
+					"clampOutputToModelMax": true
 				}
 			},
 			{

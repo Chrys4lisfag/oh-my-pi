@@ -1238,12 +1238,13 @@ export function resolveOpenAICompletionsOutputClamp(
 /**
  * Provider-specific Responses API output clamp.
  *
- * Meta documents a 131,072-token output limit for Muse Spark, so direct Model
- * API and Muse Code requests may use the model's full advertised cap instead
- * of the conservative 64k OpenAI-compatible default.
+ * Models whose compiled provider policy opts in may use their full advertised
+ * output cap instead of the conservative 64k OpenAI-compatible default.
  */
-export function resolveOpenAIResponsesOutputClamp(model: Pick<Model, "provider" | "maxTokens">): number | undefined {
-	if (model.provider === "meta" || model.provider === "muse-code") {
+export function resolveOpenAIResponsesOutputClamp(
+	model: Pick<Model, "maxTokens"> & { compat: Pick<ResolvedOpenAISharedCompat, "clampOutputToModelMax"> },
+): number | undefined {
+	if (model.compat.clampOutputToModelMax) {
 		return model.maxTokens ?? OPENAI_MAX_OUTPUT_TOKENS;
 	}
 	return undefined;
@@ -3557,7 +3558,10 @@ export function applyCommonResponsesSamplingParams<P extends CommonResponsesPara
 	params: P,
 	options: CommonSamplingOptions | undefined,
 	model: Pick<Model, "provider" | "api" | "id" | "omitMaxOutputTokens" | "maxTokens" | "identity"> & {
-		compat: Pick<ResolvedOpenAISharedCompat, "supportsSamplingParams" | "supportsPenaltyAndStopParams">;
+		compat: Pick<
+			ResolvedOpenAISharedCompat,
+			"supportsSamplingParams" | "supportsPenaltyAndStopParams" | "clampOutputToModelMax"
+		>;
 	},
 ): void {
 	if (options?.maxTokens && !model.omitMaxOutputTokens) {

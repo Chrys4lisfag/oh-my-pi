@@ -4588,29 +4588,24 @@ function museCodeLineageSpec(id: string): ModelSpec<"openai-responses"> | undefi
 }
 
 export function museCodeModelManagerOptions(config?: MetaModelManagerConfig): ModelManagerOptions<"openai-responses"> {
-	const apiKey = config?.apiKey;
-	const baseUrl = config?.baseUrl ?? META_MODEL_API_BASE_URL;
 	return {
-		providerId: "muse-code",
-		staticModels: MUSE_CODE_STATIC_MODELS,
-		...(apiKey && {
-			fetchDynamicModels: () =>
-				fetchOpenAICompatibleModels({
-					api: "openai-responses",
-					provider: "muse-code",
-					baseUrl,
-					apiKey,
-					headers: { "x-api-version": "1.0.0" },
-					fetch: config?.fetch,
-					filterModel: (_entry, model) => !isExcludedModel("muse-code", model.id),
-					mapModel: (entry, defaults) =>
-						mapWithBundledReference(
-							entry,
-							defaults,
-							MUSE_CODE_MODEL_BY_ID[defaults.id] ?? museCodeLineageSpec(defaults.id),
-						),
-				}),
+		...createOpenAICompatibleModelManagerOptions({
+			api: "openai-responses",
+			providerId: "muse-code",
+			defaultBaseUrl: META_MODEL_API_BASE_URL,
+			config,
+			headers: { "x-api-version": "1.0.0" },
+			dynamicModelsAuthoritative: true,
+			requireApiKey: true,
+			filterModel: (_entry, model) => !isExcludedModel("muse-code", model.id),
+			mapModel: (entry, defaults, reference) =>
+				mapWithBundledReference(
+					entry,
+					defaults,
+					reference ?? MUSE_CODE_MODEL_BY_ID[defaults.id] ?? museCodeLineageSpec(defaults.id),
+				),
 		}),
+		staticModels: MUSE_CODE_STATIC_MODELS,
 	};
 }
 

@@ -135,6 +135,7 @@ describe("Muse Code subscription provider", () => {
 			fetch: fetchModels,
 		});
 		expect(options.providerId).toBe("muse-code");
+		expect(options.dynamicModelsAuthoritative).toBe(true);
 		expect(options.staticModels).toEqual(MUSE_CODE_STATIC_MODELS);
 		expect(MUSE_CODE_STATIC_MODELS.every(model => model.provider === "muse-code")).toBe(true);
 		const discovered = await options.fetchDynamicModels?.();
