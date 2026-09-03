@@ -186,6 +186,31 @@ describe("Muse Code OAuth", () => {
 		expect(requests.map(request => request.url)).toEqual([DEVICE_URL, TOKEN_URL]);
 	});
 
+	test("versions refresh requests and performs a non-onboarding key lookup", async () => {
+		const { fetch: fetchImpl, requests } = createMuseLoginFetch();
+		vi.spyOn(globalThis, "fetch").mockImplementation(fetchImpl as typeof fetch);
+		const provider = getProviderDefinition("muse-code");
+		if (!provider?.refreshToken) throw new Error("Muse Code refresh is not registered");
+		const refreshed = await provider.refreshToken({
+			access: JSON.stringify({ oauthAccessToken: "old-account-access", apiKey: "LLM|old-key" }),
+			refresh: "meta-refresh",
+			expires: 0,
+			accountId: "meta-account-1",
+			email: "muse@example.com",
+		});
+
+		expect(requests.map(request => request.url)).toEqual([TOKEN_URL, KEY_URL]);
+		const token = requestAt(requests, 0);
+		expect(headerValue(token, "x-api-version")).toBe("1.0.0");
+		const refresh = formBody(token);
+		expect(refresh.get("grant_type")).toBe("refresh_token");
+		expect(refresh.get("refresh_token")).toBe("meta-refresh");
+		const key = requestAt(requests, 1);
+		expect(headerValue(key, "Authorization")).toBe("Bearer meta-account-access");
+		expect(jsonBody(key)).toEqual({});
+		expect(parseMuseCodeCredential(refreshed.access).apiKey).toBe("LLM|subscription-key");
+	});
+
 	test("retains the minted key when refresh succeeds but the key endpoint is transiently unavailable", async () => {
 		const storedAccess = JSON.stringify({ oauthAccessToken: "old-account-access", apiKey: "LLM|existing-key" });
 		const refreshed = await attachMuseCodeApiKey(

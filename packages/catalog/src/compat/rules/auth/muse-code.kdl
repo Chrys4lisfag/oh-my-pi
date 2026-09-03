@@ -19,6 +19,12 @@ auth "muse-code" {
 		after-exchange hook="muse-code-key"
 	}
 	refresh {
+		token url="https://auth.meta.com/oidc/device/token/" {
+			headers {
+				Accept "application/json"
+				"x-api-version" "1.0.0"
+			}
+		}
 		after-refresh hook="muse-code-key"
 	}
 }

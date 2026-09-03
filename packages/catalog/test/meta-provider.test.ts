@@ -128,7 +128,7 @@ describe("Muse Code subscription provider", () => {
 		let requestHeaders = new Headers();
 		const fetchModels: FetchImpl = async (_input, init) => {
 			requestHeaders = new Headers(init?.headers);
-			return modelListResponse(["muse-spark-1.3"]);
+			return modelListResponse(["muse-spark-1.3", "muse-image-1.0", "muse-voice-1.0"]);
 		};
 		const options = museCodeModelManagerOptions({
 			apiKey: "LLM|subscription-key",

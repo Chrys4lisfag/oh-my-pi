@@ -14707,6 +14707,15 @@
 				}
 			},
 			{
+				"provider": "muse-code",
+				"match": {
+					"prefix": [
+						"muse-image-",
+						"muse-voice-"
+					]
+				}
+			},
+			{
 				"provider": "nanogpt",
 				"match": {
 					"substring": [
@@ -16380,7 +16389,6 @@
 				"refresh": {
 					"kind": "request",
 					"require": [],
-					"afterRefresh": "muse-code-key",
 					"token": {
 						"url": {
 							"value": "https://auth.meta.com/oidc/device/token/"
@@ -16388,8 +16396,12 @@
 						"body": "form",
 						"standard": true,
 						"params": {},
-						"headers": {}
+						"headers": {
+							"Accept": "application/json",
+							"x-api-version": "1.0.0"
+						}
 					},
+					"afterRefresh": "muse-code-key",
 					"credential": {
 						"access": {
 							"path": "access_token"
