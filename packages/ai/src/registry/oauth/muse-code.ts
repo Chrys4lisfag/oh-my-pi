@@ -39,6 +39,12 @@ const museCodeCredentialSchema = type({
 	apiKey: "string",
 });
 export type MuseCodeCredential = typeof museCodeCredentialSchema.infer;
+export interface MuseCodeKeyRequestOptions {
+	fetch?: FetchImpl;
+	signal?: AbortSignal;
+	/** Ask Meta to onboard the account during an interactive login exchange. */
+	onboard?: boolean;
+}
 
 function requestSignal(signal?: AbortSignal): AbortSignal {
 	const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
@@ -78,10 +84,9 @@ async function readJson(response: Response): Promise<unknown> {
 
 export async function requestMuseCodeKey(
 	accessToken: string,
-	fetchImpl: FetchImpl = fetch,
-	signal?: AbortSignal,
+	options: MuseCodeKeyRequestOptions = {},
 ): Promise<MuseCodeKeyResponse> {
-	const response = await fetchImpl(MUSE_KEY_URL, {
+	const response = await (options.fetch ?? fetch)(MUSE_KEY_URL, {
 		method: "POST",
 		headers: {
 			Accept: "application/json",
@@ -89,9 +94,9 @@ export async function requestMuseCodeKey(
 			"Content-Type": "application/json",
 			"x-api-version": API_VERSION,
 		},
-		body: "{}",
+		body: JSON.stringify(options.onboard ? { onboard: true } : {}),
 		redirect: "error",
-		signal: requestSignal(signal),
+		signal: requestSignal(options.signal),
 	});
 	const payload = await readJson(response);
 	if (!response.ok) {
@@ -129,7 +134,11 @@ export const attachMuseCodeApiKey: AfterExchangeHook = async (
 ): Promise<OAuthCredentials> => {
 	let payload: MuseCodeKeyResponse;
 	try {
-		payload = await requestMuseCodeKey(credentials.access, context.fetch, context.signal);
+		payload = await requestMuseCodeKey(credentials.access, {
+			fetch: context.fetch,
+			signal: context.signal,
+			onboard: context.phase === "login",
+		});
 	} catch (error) {
 		if (context.phase !== "refresh" || !context.stored || !isTransientKeyExchangeFailure(error, context.signal)) {
 			throw error;
@@ -152,10 +161,16 @@ export const attachMuseCodeApiKey: AfterExchangeHook = async (
 	const apiKey = payload.api_key?.trim() || "";
 	if (!apiKey) {
 		const actionUrl = payload.action_url?.trim() || payload.require_payment_action_url?.trim();
-		throw new AIError.OAuthError(
-			actionUrl ? `Muse Code account setup is required: ${actionUrl}` : "Muse Code key response is missing api_key",
-			{ kind: "validation", provider: PROVIDER },
-		);
+		if (payload.require_payment === true || actionUrl) {
+			throw new AIError.OAuthError(
+				actionUrl ? `Muse Code subscription is required: ${actionUrl}` : "Muse Code subscription is required",
+				{ kind: "entitlement", provider: PROVIDER },
+			);
+		}
+		throw new AIError.OAuthError("Muse Code key response is missing api_key", {
+			kind: "validation",
+			provider: PROVIDER,
+		});
 	}
 	const email = payload.user_email?.trim().toLowerCase() || context.stored?.email;
 	const accountId = payload.user_id?.trim() || context.stored?.accountId || email;

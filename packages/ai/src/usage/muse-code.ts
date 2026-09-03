@@ -124,7 +124,7 @@ export const museCodeUsageProvider: UsageProvider = {
 
 		let payload: MuseCodeKeyResponse;
 		try {
-			payload = await requestMuseCodeKey(oauthAccessToken, ctx.fetch, params.signal);
+			payload = await requestMuseCodeKey(oauthAccessToken, { fetch: ctx.fetch, signal: params.signal });
 		} catch (error) {
 			if (error instanceof AIError.OAuthError && (error.status === 401 || error.status === 403)) {
 				throw new AIError.ProviderHttpError(error.message, error.status, { cause: error });

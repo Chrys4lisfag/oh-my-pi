@@ -5,11 +5,13 @@ auth "muse-code" {
 		device url="https://auth.meta.com/oidc/device/authorization/" {
 			headers {
 				Accept "application/json"
+				"x-api-version" "1.0.0"
 			}
 		}
 		token url="https://auth.meta.com/oidc/device/token/" {
 			headers {
 				Accept "application/json"
+				"x-api-version" "1.0.0"
 			}
 		}
 		response user-code="user_code" device-code="device_code" verification-uri="verification_uri" verification-uri-complete="verification_uri_complete" interval="interval" expires-in="expires_in"

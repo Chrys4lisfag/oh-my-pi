@@ -14,8 +14,10 @@ const credential = {
 describe("Muse Code subscription usage", () => {
 	test("maps rolling and weekly plan quota without leaking the inference key", async () => {
 		let authorization = "";
+		let requestBody: RequestInit["body"];
 		const fetchImpl: FetchImpl = (_input, init) => {
 			authorization = new Headers(init?.headers).get("Authorization") ?? "";
+			requestBody = init?.body;
 			return Promise.resolve(
 				Response.json({
 					api_key: "LLM|subscription-key",
@@ -36,6 +38,7 @@ describe("Muse Code subscription usage", () => {
 		);
 
 		expect(authorization).toBe("Bearer meta-account-access");
+		expect(requestBody).toBe("{}");
 		expect(report?.provider).toBe("muse-code");
 		expect(report?.metadata).toMatchObject({ email: "muse@example.com", tier: "Power Usage" });
 		expect(report?.raw).not.toHaveProperty("api_key");

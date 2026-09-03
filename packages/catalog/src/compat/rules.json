@@ -16337,7 +16337,8 @@
 						"standard": true,
 						"params": {},
 						"headers": {
-							"Accept": "application/json"
+							"Accept": "application/json",
+							"x-api-version": "1.0.0"
 						}
 					},
 					"token": {
@@ -16348,7 +16349,8 @@
 						"standard": true,
 						"params": {},
 						"headers": {
-							"Accept": "application/json"
+							"Accept": "application/json",
+							"x-api-version": "1.0.0"
 						}
 					},
 					"response": {
