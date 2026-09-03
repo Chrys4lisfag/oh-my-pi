@@ -57,6 +57,28 @@ describe("Muse Code provider", () => {
 		}
 	});
 
+	test("accepts stale stored expiry for Muse device credentials without refresh", async () => {
+		const storage = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")), {
+			usageProviderResolver: () => undefined,
+		});
+		try {
+			await storage.reload();
+			await storage.set("muse-code", [
+				{
+					type: "oauth",
+					access: encodedMuseCredential,
+					refresh: "",
+					expires: Date.now() - 60_000,
+					accountId: "meta-account-1",
+				},
+			]);
+
+			expect(await storage.getApiKey("muse-code", "stale-expiry-session")).toBe(encodedMuseCredential);
+		} finally {
+			storage.close();
+		}
+	});
+
 	test("keeps the existing Meta Model API login distinct", () => {
 		expect(getProviderDefinition("meta")).toMatchObject({ id: "meta", name: "Meta Model API" });
 		expect(getProviderDefinition("muse-code")).toMatchObject({
