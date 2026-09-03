@@ -4572,11 +4572,10 @@ export function metaModelManagerOptions(config?: MetaModelManagerConfig): ModelM
 	};
 }
 
-/** Muse Code is subscription-backed, so its model rows never accrue token charges. */
+/** Muse Code shares Meta Model API's model capabilities and equivalent token pricing. */
 export const MUSE_CODE_STATIC_MODELS: readonly ModelSpec<"openai-responses">[] = META_MUSE_STATIC_MODELS.map(model => ({
 	...model,
 	provider: "muse-code",
-	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 }));
 
 const MUSE_CODE_MODEL_BY_ID: Partial<Record<string, ModelSpec<"openai-responses">>> = Object.fromEntries(
@@ -4585,9 +4584,7 @@ const MUSE_CODE_MODEL_BY_ID: Partial<Record<string, ModelSpec<"openai-responses"
 
 function museCodeLineageSpec(id: string): ModelSpec<"openai-responses"> | undefined {
 	const model = museSparkLineageSpec(id);
-	return model
-		? { ...model, provider: "muse-code", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }
-		: undefined;
+	return model ? { ...model, provider: "muse-code" } : undefined;
 }
 
 export function museCodeModelManagerOptions(config?: MetaModelManagerConfig): ModelManagerOptions<"openai-responses"> {
