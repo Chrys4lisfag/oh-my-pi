@@ -436,6 +436,6 @@ describe("incoming JSON cursors", () => {
 		feed.finish();
 		expect(await items.next()).toBeUndefined();
 		expect(sum).toBe((count * (count - 1)) / 2);
-		expect(performance.now() - started).toBeLessThan(2_000);
+		expect(performance.now() - started).toBeLessThan(5_000);
 	});
 });

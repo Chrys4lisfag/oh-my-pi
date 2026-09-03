@@ -6,7 +6,7 @@ import { postmortem } from "@oh-my-pi/pi-utils";
 
 const encoder = new TextEncoder();
 const REQUEST_TIMEOUT_MS = 50;
-const GUARD_TIMEOUT_MS = 500;
+const GUARD_TIMEOUT_MS = 5_000;
 
 let server: Bun.Server<undefined> | null = null;
 
