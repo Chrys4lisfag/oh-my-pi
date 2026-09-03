@@ -359,6 +359,50 @@ describe("ModelHub", () => {
 		});
 	});
 
+	describe("fallback chain reordering", () => {
+		test("[ and ] move a fallback row within its chain, and the hint names those keys", () => {
+			// The footer used to read "[/] reorder", which people press as "/" —
+			// a key this view binds to nothing, so reordering looked broken.
+			const first = makeModel("test", "fallback-one");
+			const second = makeModel("test", "fallback-two");
+			const settings = Settings.isolated({});
+			settings.override("retry.fallbackChains", {
+				default: ["test/fallback-one", "test/fallback-two"],
+			});
+			const { hub, onFallbackChainChange } = createHub({
+				models: [first, second],
+				scoped: true,
+				settings,
+			});
+			installTestTheme();
+
+			hub.handleInput(UP); // All models → Roles
+			hub.handleInput("\n"); // dive into rows
+
+			// Walk down to the first fallback row of the default chain.
+			let guard = 0;
+			const onFallbackRow = () =>
+				footerLine(hub.render(220)).includes("Enter replace") && footerLine(hub.render(220)).includes("reorder");
+			while (!onFallbackRow() && guard++ < 12) hub.handleInput(DOWN);
+			expect(onFallbackRow()).toBe(true);
+
+			const hint = footerLine(hub.render(220));
+			expect(hint).toContain("[ or ] reorder");
+			expect(hint).not.toContain("[/]");
+
+			// "/" is bound to nothing here: pressing it must not be the
+			// documented way to reorder (this is what the user reported).
+			hub.handleInput("/");
+			expect(onFallbackChainChange).not.toHaveBeenCalled();
+
+			hub.handleInput("]");
+			expect(onFallbackChainChange).toHaveBeenLastCalledWith("default", ["test/fallback-two", "test/fallback-one"]);
+
+			hub.handleInput("[");
+			expect(onFallbackChainChange).toHaveBeenLastCalledWith("default", ["test/fallback-one", "test/fallback-two"]);
+		});
+	});
+
 	describe("quick-switch cycle and custom roles", () => {
 		test("c toggles cycle membership, [ reorders, and the preview tracks the order", () => {
 			const model = makeModel("test", "cycle-model");

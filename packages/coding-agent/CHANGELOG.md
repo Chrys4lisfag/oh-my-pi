@@ -9,6 +9,8 @@
 
 ### Fixed
 
+- Fixed compaction ending at the first exhausted provider instead of falling back. A summary rejected with a spend cap or rate limit (`429 ExceededBudget`, `budget_exceeded`) now advances to the next candidate; candidates include the models named by `retry.fallbackChains`, not just role assignments; and the final error reports the provider failure rather than a misleading credentials message. Spend-cap wording is also classified as a usage limit so it earns the quota cooldown instead of being retried against the same key.
+- Fixed the model hub's fallback/role footer advertising `[/] reorder`, which reads as the `/` key (bound to nothing there); the hint now names the `[` and `]` keys that actually move a row within its chain or cycle.
 - Fixed authenticated discovery-only LiteLLM providers routing inference to the localhost default instead of their configured discovery URL, and stopped unfetched empty retry caches from being reported as successful authoritative discovery.
 - Fixed resumed and switched sessions importing the wrong active profile: headers now persist profile name plus model/thinking snapshot, resume binds that identity before model restoration, missing/malformed definitions recover from the session snapshot, and legacy targets retain the terminal's current identity.
 - Fixed status-line model mismatches in both directions: role cycling now continues to show the live `smol`/`slow` runtime model instead of replacing it with the resolved default, while an unavailable configured default still renders its selector with `[unavailable]` and matches prompt preflight.

@@ -50,6 +50,7 @@ import {
 import type { ProtectedToolMatcher } from "@oh-my-pi/pi-agent-core/compaction/tool-protection";
 import type { AssistantMessage, CodexCompactionContext, Message, Model, ProviderSessionState } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { formatModelStringWithRouting } from "../config/model-resolver";
 import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { logger, Snowflake } from "@oh-my-pi/pi-utils";
@@ -259,6 +260,13 @@ export interface SessionMaintenanceHost {
 	sideStreamFn: StreamFn;
 	providerSessionState: Map<string, ProviderSessionState>;
 	preferWebsockets: boolean | undefined;
+	/**
+	 * Models the configured `retry.fallbackChains` would move a failing turn
+	 * to, in chain order and minus cooling-down selectors. Compaction consults
+	 * these after role assignments: a session whose roles all resolve to one
+	 * exhausted provider otherwise has no candidate left.
+	 */
+	retryFallbackChainModels?(currentSelector: string, currentModel?: Model | null): Model[];
 	model(): Model | undefined;
 	thinkingLevel(): ThinkingLevel | undefined;
 	isDisposed(): boolean;
@@ -2340,6 +2348,15 @@ export class SessionMaintenance {
 				resolveRoleModelFull(this.#host.settings, role, availableModels, preferredModel ?? undefined).model,
 			);
 		}
+		// The user's explicit "when this model fails, use these" list. Roles can
+		// all point at the same provider, so without this a provider-level
+		// failure (quota, budget, outage) leaves summarization with nowhere to go.
+		if (preferredModel && this.#host.retryFallbackChainModels) {
+			const selector = formatModelStringWithRouting(preferredModel);
+			for (const model of this.#host.retryFallbackChainModels(selector, preferredModel)) {
+				addCandidate(model);
+			}
+		}
 
 		const sortedByContext = [...availableModels].sort((a, b) => (b.contextWindow ?? 0) - (a.contextWindow ?? 0));
 		for (const model of sortedByContext) {
@@ -2376,8 +2393,11 @@ export class SessionMaintenance {
 			precomputedCandidates ?? this.#getCompactionModelCandidates(this.#host.modelRegistry.getAvailable());
 		const telemetry = resolveTelemetry(this.#host.agent.telemetry, this.#host.sessionId());
 		let nativeCompactionFailure: { error: NativeCompactionError; provider: string } | undefined;
+		let exhaustedFailure: unknown;
 
-		for (const candidate of candidates) {
+		for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
+			const candidate = candidates[candidateIndex];
+			const hasMoreCandidates = candidateIndex < candidates.length - 1;
 			const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
 			if (!apiKey) continue;
 			if (
@@ -2427,8 +2447,31 @@ export class SessionMaintenance {
 			} catch (error) {
 				const id = AIError.classify(error instanceof NativeCompactionError ? error.cause : error, candidate.api);
 				if (AIError.is(id, AIError.Flag.AuthFailed)) continue;
+				// A quota/budget/plan-limit rejection is credential-local and does
+				// not heal by retrying the same model, so it must advance to the
+				// next candidate exactly like an auth failure. Rethrowing here was
+				// the bug behind "Compaction failed: Short summary failed: 429
+				// ExceededBudget …" on a session that had fallbacks configured:
+				// the first exhausted provider ended compaction outright.
+				// Native (provider-side) compaction keeps its own precedence: the
+				// caller must see the native failure so it does not silently
+				// cross to a provider whose native path cannot accept this
+				// history. Checked before the limit/transient arms below.
 				if (error instanceof NativeCompactionError) {
 					nativeCompactionFailure ??= { error, provider: candidate.provider };
+					continue;
+				}
+				if (AIError.is(id, AIError.Flag.UsageLimit)) {
+					exhaustedFailure ??= error;
+					continue;
+				}
+				// Rate limits and provider blips: summarization is a single
+				// side request with no retry loop of its own on this path, so
+				// switching to the next candidate beats failing the compaction.
+				// The last candidate still throws, so a single-model session
+				// keeps reporting the real provider error.
+				if (AIError.is(id, AIError.Flag.Transient) && hasMoreCandidates) {
+					exhaustedFailure ??= error;
 					continue;
 				}
 				throw error;
@@ -2436,6 +2479,10 @@ export class SessionMaintenance {
 		}
 
 		if (nativeCompactionFailure) throw nativeCompactionFailure.error;
+		// Report what actually stopped us. `#buildCompactionAuthError` talks about
+		// credentials, which is wrong (and misleading) when every candidate was
+		// authenticated but out of budget.
+		if (exhaustedFailure) throw exhaustedFailure;
 		throw this.#buildCompactionAuthError();
 	}
 

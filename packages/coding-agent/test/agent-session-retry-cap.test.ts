@@ -272,12 +272,16 @@ describe("AgentSession retry delay cap", () => {
 			`${exhaustedModel.provider}/${exhaustedModel.id}`,
 			`${fallbackModel.provider}/${fallbackModel.id}`,
 		]);
-		expect(fallbackEvents).toContainEqual({
-			type: "retry_fallback_applied",
-			from: `${exhaustedModel.provider}/${exhaustedModel.id}`,
-			to: `${fallbackModel.provider}/${fallbackModel.id}`,
-			role: "default",
-		});
+		// `toMatchObject`, not exact equality: fork fallback events also carry the
+		// `reason` (the triggering provider error) that the notice renders.
+		expect(
+			fallbackEvents.some(
+				event =>
+					event.from === `${exhaustedModel.provider}/${exhaustedModel.id}` &&
+					event.to === `${fallbackModel.provider}/${fallbackModel.id}` &&
+					event.role === "default",
+			),
+		).toBe(true);
 		for (const call of waitSpy.mock.calls) {
 			expect(call[0]).toBeLessThan(300_000);
 		}

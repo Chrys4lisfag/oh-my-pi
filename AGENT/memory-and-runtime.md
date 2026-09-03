@@ -404,6 +404,33 @@ recursion, while `skipElideRescue` prevents the fallback path from running anoth
 elide shake. If maintenance still cannot create headroom, existing dead-end
 continuation blocking stops repeated low-token shake/compact cycles.
 
+### Compaction model fallback
+
+Summarization is a model call and fails like one, so it rotates instead of
+ending the compaction. Candidates come from
+`resolveCompactionModelCandidates`: the configured compaction target, the
+current model, every `modelRoles.*` assignment, then the models named by
+`retry.fallbackChains` (chain order, minus cooling-down selectors), then the
+largest-context model not yet tried. Chains are included because roles can all
+resolve to one provider — a provider-level outage otherwise leaves
+summarization with nowhere to go.
+
+In `#compactWithFallbackModel` the per-candidate catch advances on
+`AuthFailed`, on `UsageLimit`, and on `Transient` while another candidate
+remains; native (provider-side) compaction failures keep their existing
+precedence so a native attempt is never silently carried to a provider whose
+native path cannot accept the history. The last candidate still throws, so a
+single-model session reports the real provider error, and the tail rethrows the
+remembered provider failure rather than `#buildCompactionAuthError` — a spend
+cap must not be reported as missing credentials. Method-order fall-through is
+the outer loop: a provider-pinned `remote` attempt that fails escapes to the
+next configured method, whose candidate list is unfiltered.
+
+Spend caps are usage limits, not transient blips: `USAGE_LIMIT_PATTERN`
+matches `exceededbudget`, `budget_exceeded` and `over budget` so a
+LiteLLM-style `429 ExceededBudget` earns the 30-minute quota cooldown instead
+of being retried against the same exhausted key.
+
 Implementation:
 
 - `packages/coding-agent/src/session/agent-session.ts`

@@ -81,6 +81,12 @@ be adopted without silently losing fork features.
     and session headers restore name plus snapshot before model restoration.
 19. `/advisor configure` offers only live canonical registry models, and model-specific
     native token counting falls back only for a proven stale-addon encoding mismatch.
+20. Compaction summarization rotates models like a turn does: candidates include
+    `retry.fallbackChains`, a usage limit or (with candidates left) a transient
+    error advances to the next candidate, and the final throw reports the real
+    provider failure instead of a credentials error. Spend-cap wording
+    (`ExceededBudget`, `budget_exceeded`, `over budget`) classifies as a usage
+    limit so it earns the quota cooldown.
 
 ## Important memory corrections
 

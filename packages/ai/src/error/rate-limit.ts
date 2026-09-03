@@ -297,9 +297,14 @@ export function calculateRateLimitBackoffMs(reason: RateLimitReason): number {
  * configured `retry.incrementalBackoffMs` schedule applies. (Upstream includes
  * `resource.?exhausted` here; we intentionally drop it while keeping the rest
  * of upstream's expanded pattern set.)
+ *
+ * `ExceededBudget` / `budget_exceeded` / `over budget` ARE included: a spend
+ * cap is a persistent credential-level limit (LiteLLM-style gateways report it
+ * as HTTP 429, which would otherwise be read as a transient rate limit and
+ * retried against the same exhausted key forever).
  */
 const USAGE_LIMIT_PATTERN =
-	/usage.?limit|usage_limit_reached|usage_not_included|limit_reached|quota.?(?:exceeded|reached|insufficient)|额度不足|额度耗尽|exhausted your capacity|quota will reset|insufficient.?(?:balance|quota)|balance.?exhausted|run out of credits|out of credits|spending[- _]?limit|personal-team-blocked|clinepass limit|free limit reached on model/i;
+	/usage.?limit|usage_limit_reached|usage_not_included|limit_reached|quota.?(?:exceeded|reached|insufficient)|额度不足|额度耗尽|exhausted your capacity|quota will reset|insufficient.?(?:balance|quota)|balance.?exhausted|run out of credits|out of credits|spending[- _]?limit|personal-team-blocked|clinepass limit|free limit reached on model|exceededbudget|budget_exceeded|over budget/i;
 
 /**
  * HTTP status codes that, absent richer body classification, represent an

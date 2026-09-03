@@ -233,6 +233,15 @@ Union the rollback snapshot: fork `loadedExistingSession` and profile
 name/snapshot alongside upstream `fallbackRuntimeOnly`, and take upstream's
 `structuredClone(this.#header)` (moveTo mutates the header in place).
 
+### `packages/coding-agent/src/session/session-maintenance.ts` (compaction fallback)
+
+Keep upstream's candidate loop and native-failure precedence. Reapply on top:
+`retry.fallbackChains` models appended to `resolveCompactionModelCandidates`,
+and the `#compactWithFallbackModel` catch arms that advance on `UsageLimit`
+(always) and `Transient` (only while another candidate remains), plus the tail
+that rethrows the remembered provider error instead of the credentials message.
+Never reorder those arms ahead of the `NativeCompactionError` branch.
+
 ### Fork test files that conflict (`advisor-toggle`, `input-controller-keybindings`, …)
 
 Both sides' tests are additive: keep every `it` block and merge the import lists.
@@ -288,6 +297,10 @@ git grep -n "fetched" packages/catalog/src/model-manager.ts
 git grep -n "auth-none\|openai-models-list-bare-context" packages/coding-agent/src/config/model-registry.ts
 git grep -n "describeFallbackReason" packages/coding-agent/src/session/retry-fallback-chains.ts
 git grep -n "reanchorTryShakeCheckpoint" packages/coding-agent/src/session/session-maintenance.ts
+git grep -n "retryFallbackChainModels" packages/coding-agent/src/session
+git grep -n "exhaustedFailure" packages/coding-agent/src/session/session-maintenance.ts
+git grep -n "exceededbudget" packages/ai/src/error/rate-limit.ts
+git grep -n "or \] reorder" packages/coding-agent/src/modes/components/model-hub.ts
 ```
 
 Interpret the `resource.?exhausted` result carefully: the fork contract requires that

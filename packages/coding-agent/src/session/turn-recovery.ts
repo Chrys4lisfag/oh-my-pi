@@ -1785,6 +1785,34 @@ export class TurnRecovery {
 		return true;
 	}
 
+	/**
+	 * Models reachable through the configured retry fallback chains, in chain
+	 * order, skipping suppressed (cooling-down) selectors.
+	 *
+	 * Compaction needs this: its own candidate list is built from role
+	 * assignments only, so a session whose roles all point at one exhausted
+	 * provider had nowhere to go — `retry.fallbackChains` expresses exactly
+	 * "when this model fails, use these", and summarization is a model failure
+	 * like any other.
+	 */
+	retryFallbackChainModels(currentSelector: string, currentModel?: Model | null): Model[] {
+		const models: Model[] = [];
+		const seen = new Set<string>();
+		for (const role of this.retryFallbackChainKeys(currentSelector, currentModel)) {
+			for (const selector of this.findRetryFallbackCandidates(role, currentSelector, currentModel)) {
+				if (this.isRetryFallbackSelectorSuppressed(selector)) continue;
+				const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
+				const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
+				if (!candidate) continue;
+				const key = `${candidate.provider}/${candidate.id}`;
+				if (seen.has(key)) continue;
+				seen.add(key);
+				models.push(candidate);
+			}
+		}
+		return models;
+	}
+
 	async #tryRetryModelFallback(
 		currentSelector: string,
 		failedMessage: AssistantMessage,

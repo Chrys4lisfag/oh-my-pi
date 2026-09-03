@@ -396,12 +396,20 @@ describe("isUsageLimit", () => {
 	});
 
 	it("detects structured provider usage codes without quota wording", () => {
-		expect(isUsageLimit(new ProviderHttpError("Generic provider failure", 429, { code: "insufficient_quota" }))).toBe(
-			true,
-		);
-		expect(isUsageLimit(new ProviderHttpError("Generic provider failure", 429, { code: "rate_limit_error" }))).toBe(
-			false,
-		);
+		expect(
+			isUsageLimit(
+				new ProviderHttpError("Generic provider failure", 429, {
+					code: "insufficient_quota",
+				}),
+			),
+		).toBe(true);
+		expect(
+			isUsageLimit(
+				new ProviderHttpError("Generic provider failure", 429, {
+					code: "rate_limit_error",
+				}),
+			),
+		).toBe(false);
 		expect(isUsageLimit(new ProviderHttpError("Payment Required", 402))).toBe(true);
 		expect(isUsageLimit(new ProviderHttpError("A subscription is required for this endpoint", 402))).toBe(false);
 	});
@@ -580,16 +588,19 @@ describe("isUsageLimitOutcome", () => {
 		expect(isUsageLimitOutcome(500, "Payment Required")).toBe(false);
 		expect(isUsageLimitOutcome(403, "Payment Required")).toBe(false);
 		expect(isUsageLimitOutcome(400, "Payment Required")).toBe(false);
-		for (const body of [
-			"usage_limit_reached",
-			"resource_exhausted",
-			"usage_not_included",
-			"limit_reached",
-			"personal-team-blocked",
-		]) {
+		for (const body of ["usage_limit_reached", "usage_not_included", "limit_reached", "personal-team-blocked"]) {
 			expect(isUsageLimitOutcome(402, body)).toBe(true);
 			expect(isUsageLimit(new ProviderHttpError(body, 402))).toBe(true);
 		}
+		// Fork divergence: `resource_exhausted` is Google's transient capacity
+		// signal, deliberately absent from USAGE_LIMIT_PATTERN so it stays in the
+		// provider backoff layer instead of rotating (and burning) healthy
+		// sibling credentials. A body that names it is therefore NOT opaque and
+		// NOT a usage limit at any status — only a body-less 402 still rotates
+		// on status alone (asserted above).
+		expect(isUsageLimitOutcome(402, "resource_exhausted")).toBe(false);
+		expect(isUsageLimitOutcome(429, "resource_exhausted")).toBe(false);
+		expect(isUsageLimit(new ProviderHttpError("resource_exhausted", 402))).toBe(false);
 		expect(isUsageLimit(new ProviderHttpError("HTTP 402", 402))).toBe(true);
 		expect(isUsageLimit(new ProviderHttpError("402 status code (no body)", 402))).toBe(true);
 		expect(isUsageLimit(new ProviderHttpError("", 402))).toBe(true);
