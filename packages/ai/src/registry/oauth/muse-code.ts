@@ -24,7 +24,7 @@ const museCodeKeyResponseSchema = type({
 	"api_key?": "string",
 	"require_payment_action_url?": "string",
 	"require_payment?": "boolean",
-	"action_url?": "string",
+	"action_url?": "string | null",
 	"user_email?": "string",
 	"user_id?": "string",
 	"is_subs_active?": "boolean",

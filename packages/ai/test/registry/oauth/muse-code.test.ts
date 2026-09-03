@@ -20,7 +20,6 @@ const DEVICE_AUTHORIZATION = {
 const ACCOUNT_TOKEN = {
 	access_token: "meta-account-access",
 	refresh_token: "meta-refresh",
-	expires_in: 3600,
 };
 
 const SUBSCRIPTION_KEY = {
@@ -28,6 +27,7 @@ const SUBSCRIPTION_KEY = {
 	user_email: "Muse@Example.com",
 	user_id: "meta-account-1",
 	is_subs_active: true,
+	action_url: null,
 };
 
 interface RecordedRequest {
@@ -113,8 +113,9 @@ afterEach(() => {
 });
 
 describe("Muse Code OAuth", () => {
-	test("uses Meta's verified device and key-mint wire contract", async () => {
+	test("accepts Meta's expiry-less device token response and mints the subscription key", async () => {
 		const { fetch: fetchImpl, requests } = createMuseLoginFetch();
+		const startedAt = Date.now();
 		const authEvents: Array<{ url: string; instructions: string }> = [];
 		const credentials = await loginMuse(fetchImpl, (url, instructions) => authEvents.push({ url, instructions }));
 
@@ -144,10 +145,22 @@ describe("Muse Code OAuth", () => {
 			accountId: "meta-account-1",
 			email: "muse@example.com",
 		});
+		expect(credentials.expires).toBeGreaterThanOrEqual(startedAt + 3_600_000);
+		expect(credentials.expires).toBeLessThanOrEqual(Date.now() + 3_600_000);
 		expect(parseMuseCodeCredential(credentials.access)).toEqual({
 			oauthAccessToken: "meta-account-access",
 			apiKey: "LLM|subscription-key",
 		});
+	});
+
+	test("honors expires_in when Meta includes it", async () => {
+		const { fetch: fetchImpl } = createMuseLoginFetch({
+			tokens: [{ body: { ...ACCOUNT_TOKEN, expires_in: 7_200 } }],
+		});
+		const startedAt = Date.now();
+		const credentials = await loginMuse(fetchImpl);
+		expect(credentials.expires).toBeGreaterThanOrEqual(startedAt + 7_200_000);
+		expect(credentials.expires).toBeLessThanOrEqual(Date.now() + 7_200_000);
 	});
 
 	test("falls back to verification_uri when verification_uri_complete is absent", async () => {
