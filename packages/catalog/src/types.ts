@@ -1203,6 +1203,13 @@ export interface Model<TApi extends Api = Api> {
 	 */
 	applyPatchToolType?: "freeform" | "function";
 	/**
+	 * Edit-tool description density for this model. `"compact"` selects the
+	 * terse mode prompt (all operations and invariants preserved) for hosts
+	 * where per-request prompt bytes are the dominant cost. Generated catalog
+	 * policy sets it; the edit tool falls back to the full prompt when unset.
+	 */
+	editPromptVariant?: "full" | "compact";
+	/**
 	 * Force OAuth-style request shaping for providers whose API key prefix doesn't
 	 * match an OAuth token (e.g. routing Anthropic traffic through a proxy that
 	 * expects Claude Code framing). When true, the streaming layer sets

@@ -56,6 +56,16 @@ pub const fn description(mode: EditMode) -> &'static str {
 	}
 }
 
+/// Compact prompt variant for hosts that bill per request byte or train on a
+/// terser contract. `None` when the mode has no compact rendering; callers
+/// fall back to [`description`].
+pub const fn description_compact(mode: EditMode) -> Option<&'static str> {
+	match mode {
+		EditMode::Hashline => Some(include_str!("../prompts/hashline_compact.md")),
+		EditMode::Replace | EditMode::Patch | EditMode::ApplyPatch | EditMode::Sloppy => None,
+	}
+}
+
 /// Lark grammar for modes that expose a custom (non-JSON) wire format.
 pub const fn grammar(mode: EditMode) -> Option<&'static str> {
 	match mode {

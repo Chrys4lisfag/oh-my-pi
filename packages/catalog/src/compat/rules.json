@@ -9570,7 +9570,7 @@
 				}
 			},
 			{
-				"source": "providers/muse-code.kdl:7",
+				"source": "providers/muse-code.kdl:12",
 				"class": "unknown",
 				"providers": [
 					"muse-code"
@@ -9595,6 +9595,10 @@
 					"includeEncryptedReasoning": true,
 					"supportsReasoningEffort": true,
 					"clampOutputToModelMax": true
+				},
+				"catalog": {
+					"editPromptVariant": "compact",
+					"applyPatchToolType": "freeform"
 				}
 			},
 			{
