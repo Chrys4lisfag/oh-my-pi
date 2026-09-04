@@ -761,10 +761,11 @@ export { isDefinitiveOAuthFailure } from "./error/auth-classify";
  * the usage report reveals. Callers that wait the account out (instead of
  * rotating) must sleep until this, not the error-text hint alone.
  *
- * `reportResetAtMs` (epoch ms) is present only when the usage report extended
- * the block past the caller's hint. It lets callers distinguish an
- * authoritative report window (safe to sleep on without an error-text hint)
- * from the heuristic fallback (never safe to sleep on alone).
+ * `reportResetAtMs` (epoch ms) is present only when the usage report is a
+ * complete authority for the wait: every exhausted window carries a future
+ * reset, so sleeping until the latest one can actually clear the account. A
+ * permanent cap alongside a timed window (or no report at all) leaves it
+ * unset, and the heuristic fallback alone must never authorize a wait.
  */
 export interface UsageLimitMarkResult {
 	switched: boolean;
@@ -4686,10 +4687,12 @@ export class AuthStorage {
 		const now = Date.now();
 		let blockedUntil = now + (options?.retryAfterMs ?? AuthStorage.#defaultBackoffMs);
 
-		// Epoch ms of the usage-report-derived reset when the report extends
-		// the block past the caller's hint. Set only on extension so callers
-		// can tell an authoritative report window apart from the heuristic
-		// fallback they must not sleep on.
+		// Epoch ms of the usage-report-derived reset. Authoritative only when
+		// EVERY exhausted window carries a future reset: a permanent cap
+		// alongside a timed window must not authorize a wait that can never
+		// clear it, and a bare heuristic must not sleep alone. Set
+		// independently of whether the report extends the hint so a shorter
+		// authoritative window still counts as provider timing.
 		let reportResetAtMs: number | undefined;
 		if (target && routing.strategy) {
 			const report = await raceUsageWithSignal(
@@ -4702,7 +4705,14 @@ export class AuthStorage {
 					const resetAtMs = this.#getUsageResetAtMs(scopedLimits, Date.now());
 					if (resetAtMs && resetAtMs > blockedUntil) {
 						blockedUntil = resetAtMs;
-						reportResetAtMs = resetAtMs;
+					}
+					const nowMs = Date.now();
+					const exhaustedLimits = scopedLimits.filter(limit => this.#isUsageLimitExhausted(limit));
+					const futureResets = exhaustedLimits
+						.map(limit => this.#resolveWindowResetAt(limit.window))
+						.filter((reset): reset is number => reset !== undefined && reset > nowMs);
+					if (exhaustedLimits.length > 0 && futureResets.length === exhaustedLimits.length) {
+						reportResetAtMs = Math.max(...futureResets);
 					}
 				}
 			}

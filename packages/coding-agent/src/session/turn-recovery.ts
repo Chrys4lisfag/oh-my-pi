@@ -2408,13 +2408,13 @@ export class TurnRecovery {
 		// reset (Flag.UsageLimit — 5h/weekly quota windows, CN 使用上限, spend
 		// caps, … on any provider) sleep past the cap. Gated on authoritative
 		// provider timing: either a parsed reset hint from the error text, or
-		// a usage-report window that extends past the hint (or stands alone
-		// when the text carries none). Usage-limit errors with neither fall
-		// back to the 30-minute QUOTA_EXHAUSTED heuristic, and sleeping on
-		// that for a permanent error (402 balance, dead spend cap) would hold
-		// the session through repeated heuristic sleeps instead of surfacing
-		// it. Bounded by the stated wait so an unrelated large backoff cannot
-		// sneak through.
+		// a complete usage-report window (every exhausted limit carries a
+		// future reset). Usage-limit errors with neither fall back to the
+		// 30-minute QUOTA_EXHAUSTED heuristic, and sleeping on that for a
+		// permanent error (402 balance, dead spend cap) would hold the session
+		// through repeated heuristic sleeps instead of surfacing it. Bounded
+		// by the stated wait so an unrelated large backoff cannot sneak
+		// through.
 		const maxDelayMs = retrySettings.maxDelayMs;
 		const waitForUsageReset =
 			retrySettings.waitForUsageReset === true &&

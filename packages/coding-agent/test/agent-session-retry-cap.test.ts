@@ -537,12 +537,26 @@ describe("AgentSession retry delay cap", () => {
 	});
 
 	/**
-	 * Isolated AuthStorage whose opencode-go usage endpoint reports an
-	 * exhausted weekly window resetting at `weeklyResetIso`. Lets recovery
-	 * tests drive the report-derived unblock deadline without network
-	 * access. The caller owns closing the storage.
+	 * Isolated AuthStorage whose opencode-go usage endpoint reports the given
+	 * rolling/weekly windows. Lets recovery tests drive report-derived
+	 * unblock deadlines without network access. A past `resetsAtIso` models
+	 * an exhausted window with no future reset (e.g. a permanent cap). The
+	 * caller owns closing the storage.
 	 */
-	async function createWeeklyExhaustedOpencodeStorage(weeklyResetIso: string): Promise<AuthStorage> {
+	interface OpencodeWindowSpec {
+		status: "ok" | "rate-limited";
+		percent: number;
+		resetsAtIso: string;
+	}
+	async function createOpencodeStorageWithUsage(
+		rolling: OpencodeWindowSpec,
+		weekly: OpencodeWindowSpec,
+	): Promise<AuthStorage> {
+		const windowPayload = (spec: OpencodeWindowSpec): Record<string, unknown> => ({
+			status: spec.status,
+			percent: spec.percent,
+			resetsAt: spec.resetsAtIso,
+		});
 		const localStore = new SqliteAuthCredentialStore(new Database(":memory:"));
 		const localStorage = new AuthStorage(localStore, {
 			usageProviderResolver: provider => (provider === "opencode-go" ? opencodeGoUsageProvider : undefined),
@@ -550,8 +564,8 @@ describe("AgentSession retry delay cap", () => {
 				new Response(
 					JSON.stringify({
 						usage: {
-							rolling: { status: "ok", percent: 12, resetsAt: new Date(Date.now() + 300_000).toISOString() },
-							weekly: { status: "rate-limited", percent: 100, resetsAt: weeklyResetIso },
+							rolling: windowPayload(rolling),
+							weekly: windowPayload(weekly),
 							monthly: {
 								status: "ok",
 								percent: 8,
@@ -578,8 +592,10 @@ describe("AgentSession retry delay cap", () => {
 			throw new Error("Expected bundled OpenCode Go test model to exist");
 		}
 
-		const weeklyResetIso = new Date(Date.now() + 7_200_000).toISOString();
-		const localStorage = await createWeeklyExhaustedOpencodeStorage(weeklyResetIso);
+		const localStorage = await createOpencodeStorageWithUsage(
+			{ status: "ok", percent: 12, resetsAtIso: new Date(Date.now() + 300_000).toISOString() },
+			{ status: "rate-limited", percent: 100, resetsAtIso: new Date(Date.now() + 7_200_000).toISOString() },
+		);
 		try {
 			const localRegistry = new ModelRegistry(localStorage, path.join(tempDir.path(), "models.yml"));
 
@@ -660,8 +676,10 @@ describe("AgentSession retry delay cap", () => {
 			throw new Error("Expected bundled OpenCode Go test model to exist");
 		}
 
-		const weeklyResetIso = new Date(Date.now() + 7_200_000).toISOString();
-		const localStorage = await createWeeklyExhaustedOpencodeStorage(weeklyResetIso);
+		const localStorage = await createOpencodeStorageWithUsage(
+			{ status: "ok", percent: 12, resetsAtIso: new Date(Date.now() + 300_000).toISOString() },
+			{ status: "rate-limited", percent: 100, resetsAtIso: new Date(Date.now() + 7_200_000).toISOString() },
+		);
 		try {
 			const localRegistry = new ModelRegistry(localStorage, path.join(tempDir.path(), "models.yml"));
 
@@ -725,6 +743,164 @@ describe("AgentSession retry delay cap", () => {
 			expect(retryEndEvents).toHaveLength(1);
 			expect(retryEndEvents[0]).toMatchObject({ success: true });
 			expect(lastAssistant(session).stopReason).toBe("stop");
+			expect(session.isRetrying).toBe(false);
+		} finally {
+			localStorage.close();
+		}
+	});
+
+	it("sleeps on a shorter authoritative report reset with no error-text hint", async () => {
+		// Contract: report authoritativeness does not depend on outlasting
+		// the heuristic — a complete report window resetting sooner than the
+		// 30-minute QUOTA_EXHAUSTED fallback still authorizes the opt-in wait.
+		const exhaustedModel = getBundledModel("opencode-go", "deepseek-v4-flash");
+		if (!exhaustedModel) {
+			throw new Error("Expected bundled OpenCode Go test model to exist");
+		}
+
+		const localStorage = await createOpencodeStorageWithUsage(
+			{ status: "ok", percent: 12, resetsAtIso: new Date(Date.now() + 300_000).toISOString() },
+			{ status: "rate-limited", percent: 100, resetsAtIso: new Date(Date.now() + 300_000).toISOString() },
+		);
+		try {
+			const localRegistry = new ModelRegistry(localStorage, path.join(tempDir.path(), "models.yml"));
+
+			const mock = createMockModel({
+				responses: [
+					{ throw: "429 quota exceeded for this account" },
+					{ content: ["recovered after short reported reset"], stopReason: "stop" },
+				],
+			});
+			const requestedModels: string[] = [];
+			const agent = new Agent({
+				getApiKey: model => localRegistry.resolver(model, agent.sessionId),
+				initialState: {
+					model: exhaustedModel,
+					systemPrompt: ["Test"],
+					tools: [],
+					messages: [],
+				},
+				streamFn: (requestedModel, context, options) => {
+					requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+					return mock.stream(requestedModel, context, options);
+				},
+			});
+
+			const settings = Settings.isolated({
+				"compaction.enabled": false,
+				"retry.baseDelayMs": 5,
+				"retry.maxDelayMs": 100,
+				"retry.maxRetries": 2,
+				"retry.modelFallback": false,
+				"retry.waitForUsageReset": true,
+			});
+			settings.setModelRole("default", `${exhaustedModel.provider}/${exhaustedModel.id}`);
+
+			session = new AgentSession({
+				agent,
+				sessionManager: SessionManager.inMemory(),
+				settings,
+				modelRegistry: localRegistry,
+			});
+
+			const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const retryStartEvents: AutoRetryStartEvent[] = [];
+			const retryEndEvents: AutoRetryEndEvent[] = [];
+			session.subscribe(event => {
+				if (event.type === "auto_retry_start") retryStartEvents.push(event);
+				if (event.type === "auto_retry_end") retryEndEvents.push(event);
+			});
+
+			await session.prompt("Trigger hintless usage limit with a short reported reset");
+			await session.waitForIdle();
+
+			expect(retryStartEvents).toHaveLength(1);
+			expect(waitSpy.mock.calls.some(call => (call[0] as number) > 100)).toBe(true);
+			expect(requestedModels).toEqual([
+				`${exhaustedModel.provider}/${exhaustedModel.id}`,
+				`${exhaustedModel.provider}/${exhaustedModel.id}`,
+			]);
+			expect(retryEndEvents).toHaveLength(1);
+			expect(retryEndEvents[0]).toMatchObject({ success: true });
+			expect(lastAssistant(session).stopReason).toBe("stop");
+			expect(session.isRetrying).toBe(false);
+		} finally {
+			localStorage.close();
+		}
+	});
+
+	it("fails fast when a co-exhausted window has no future reset despite a timed one", async () => {
+		// Contract: a report is authoritative only when EVERY exhausted
+		// window carries a future reset. Here the rolling window resets in
+		// ~2h but the weekly window is spent with a stale timestamp
+		// (permanent-cap shape), so the opt-in must fail fast instead of
+		// parking until a reset that cannot clear the account.
+		const exhaustedModel = getBundledModel("opencode-go", "deepseek-v4-flash");
+		if (!exhaustedModel) {
+			throw new Error("Expected bundled OpenCode Go test model to exist");
+		}
+
+		const localStorage = await createOpencodeStorageWithUsage(
+			{ status: "rate-limited", percent: 100, resetsAtIso: new Date(Date.now() + 7_200_000).toISOString() },
+			{ status: "rate-limited", percent: 100, resetsAtIso: new Date(Date.now() - 3_600_000).toISOString() },
+		);
+		try {
+			const localRegistry = new ModelRegistry(localStorage, path.join(tempDir.path(), "models.yml"));
+
+			const mock = createMockModel({ handler: () => ({ throw: "429 quota exceeded for this account" }) });
+			const requestedModels: string[] = [];
+			const agent = new Agent({
+				getApiKey: model => localRegistry.resolver(model, agent.sessionId),
+				initialState: {
+					model: exhaustedModel,
+					systemPrompt: ["Test"],
+					tools: [],
+					messages: [],
+				},
+				streamFn: (requestedModel, context, options) => {
+					requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+					return mock.stream(requestedModel, context, options);
+				},
+			});
+
+			const settings = Settings.isolated({
+				"compaction.enabled": false,
+				"retry.baseDelayMs": 5,
+				"retry.maxDelayMs": 100,
+				"retry.modelFallback": false,
+				"retry.waitForUsageReset": true,
+			});
+			settings.setModelRole("default", `${exhaustedModel.provider}/${exhaustedModel.id}`);
+
+			session = new AgentSession({
+				agent,
+				sessionManager: SessionManager.inMemory(),
+				settings,
+				modelRegistry: localRegistry,
+			});
+
+			const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const retryStartEvents: AutoRetryStartEvent[] = [];
+			const retryEndEvents: AutoRetryEndEvent[] = [];
+			session.subscribe(event => {
+				if (event.type === "auto_retry_start") retryStartEvents.push(event);
+				if (event.type === "auto_retry_end") retryEndEvents.push(event);
+			});
+
+			await session.prompt("Trigger hintless usage limit with a permanently capped window");
+			await session.waitForIdle();
+
+			expect(requestedModels).toEqual([`${exhaustedModel.provider}/${exhaustedModel.id}`]);
+			expect(retryStartEvents).toHaveLength(0);
+			expect(retryEndEvents).toHaveLength(1);
+			expect(retryEndEvents[0]).toMatchObject({ success: false });
+			expect(retryEndEvents[0].finalError).toContain("exceeds retry.maxDelayMs");
+			for (const call of waitSpy.mock.calls) {
+				expect(call[0]).toBeLessThanOrEqual(100);
+			}
+			const last = lastAssistant(session);
+			expect(last.stopReason).toBe("error");
+			expect(last.errorMessage).toContain("quota exceeded");
 			expect(session.isRetrying).toBe(false);
 		} finally {
 			localStorage.close();
