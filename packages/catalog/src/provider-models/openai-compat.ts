@@ -4367,7 +4367,7 @@ const META_MUSE_SPARK_COST = { input: 1.25, output: 4.25, cacheRead: 0.15, cache
 const META_MUSE_SPARK_CONTRIBUTOR_COST = { input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 } as const;
 const META_MUSE_SPARK_THINKING: ThinkingConfig = {
 	mode: "effort",
-	efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
+	efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max],
 };
 
 function museSparkSpec(revision: string, tier: "standard" | "contributor"): ModelSpec<"openai-responses"> {

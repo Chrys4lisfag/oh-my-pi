@@ -5690,6 +5690,10 @@
 				"models": [
 					{
 						"kind": "exact",
+						"value": "muse-spark-1.1"
+					},
+					{
+						"kind": "exact",
 						"value": "muse-spark-1.2"
 					},
 					{
@@ -5711,7 +5715,8 @@
 						"low",
 						"medium",
 						"high",
-						"xhigh"
+						"xhigh",
+						"max"
 					],
 					"mode": "effort"
 				}
@@ -9322,7 +9327,8 @@
 						"low",
 						"medium",
 						"high",
-						"xhigh"
+						"xhigh",
+						"max"
 					],
 					"mode": "effort"
 				}
@@ -9581,7 +9587,8 @@
 						"low",
 						"medium",
 						"high",
-						"xhigh"
+						"xhigh",
+						"max"
 					],
 					"mode": "effort"
 				}

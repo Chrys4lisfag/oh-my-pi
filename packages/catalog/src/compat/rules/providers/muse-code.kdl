@@ -10,7 +10,7 @@ provider "muse-code" {
 	edit-prompt-variant "compact"
 	apply-patch-tool-type "freeform"
 	class "unknown" {
-		thinking-efforts "minimal" "low" "medium" "high" "xhigh"
+		thinking-efforts "minimal" "low" "medium" "high" "xhigh" "max"
 		thinking-mode "effort"
 	}
 }

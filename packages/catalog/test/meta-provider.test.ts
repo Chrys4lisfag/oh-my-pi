@@ -13,7 +13,7 @@ import type { FetchImpl, ThinkingConfig } from "@oh-my-pi/pi-catalog/types";
 
 const MUSE_SPARK_THINKING: ThinkingConfig = {
 	mode: "effort",
-	efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
+	efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max],
 };
 
 function modelListResponse(ids: readonly string[]): Response {

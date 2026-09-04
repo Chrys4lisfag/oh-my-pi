@@ -139920,7 +139920,8 @@
 					"low",
 					"medium",
 					"high",
-					"xhigh"
+					"xhigh",
+					"max"
 				]
 			},
 			"compat": {
@@ -140016,7 +140017,8 @@
 					"low",
 					"medium",
 					"high",
-					"xhigh"
+					"xhigh",
+					"max"
 				]
 			},
 			"compat": {
@@ -140112,7 +140114,8 @@
 					"low",
 					"medium",
 					"high",
-					"xhigh"
+					"xhigh",
+					"max"
 				]
 			},
 			"compat": {
@@ -140208,7 +140211,8 @@
 					"low",
 					"medium",
 					"high",
-					"xhigh"
+					"xhigh",
+					"max"
 				]
 			},
 			"compat": {
@@ -140304,7 +140308,8 @@
 					"low",
 					"medium",
 					"high",
-					"xhigh"
+					"xhigh",
+					"max"
 				]
 			},
 			"compat": {
@@ -147139,7 +147144,8 @@
 					"low",
 					"medium",
 					"high",
-					"xhigh"
+					"xhigh",
+					"max"
 				]
 			},
 			"compat": {
@@ -147152,6 +147158,7 @@
 				"supportsImageDetailOriginal": true,
 				"supportsReasoningSummary": true,
 				"supportsAllTurnsReasoningContext": false,
+				"supportsConfigurationUpdate": false,
 				"requiresReasoningOffJuiceInstruction": false,
 				"stripImageInput": false,
 				"reasoningEffortMap": {},
@@ -147236,7 +147243,8 @@
 					"low",
 					"medium",
 					"high",
-					"xhigh"
+					"xhigh",
+					"max"
 				]
 			},
 			"compat": {
@@ -147249,6 +147257,7 @@
 				"supportsImageDetailOriginal": true,
 				"supportsReasoningSummary": true,
 				"supportsAllTurnsReasoningContext": false,
+				"supportsConfigurationUpdate": false,
 				"requiresReasoningOffJuiceInstruction": false,
 				"stripImageInput": false,
 				"reasoningEffortMap": {},
@@ -147333,7 +147342,8 @@
 					"low",
 					"medium",
 					"high",
-					"xhigh"
+					"xhigh",
+					"max"
 				]
 			},
 			"compat": {
@@ -147346,6 +147356,7 @@
 				"supportsImageDetailOriginal": true,
 				"supportsReasoningSummary": true,
 				"supportsAllTurnsReasoningContext": false,
+				"supportsConfigurationUpdate": false,
 				"requiresReasoningOffJuiceInstruction": false,
 				"stripImageInput": false,
 				"reasoningEffortMap": {},
@@ -147430,7 +147441,8 @@
 					"low",
 					"medium",
 					"high",
-					"xhigh"
+					"xhigh",
+					"max"
 				]
 			},
 			"compat": {
@@ -147443,6 +147455,7 @@
 				"supportsImageDetailOriginal": true,
 				"supportsReasoningSummary": true,
 				"supportsAllTurnsReasoningContext": false,
+				"supportsConfigurationUpdate": false,
 				"requiresReasoningOffJuiceInstruction": false,
 				"stripImageInput": false,
 				"reasoningEffortMap": {},
@@ -147527,7 +147540,8 @@
 					"low",
 					"medium",
 					"high",
-					"xhigh"
+					"xhigh",
+					"max"
 				]
 			},
 			"compat": {
@@ -147540,6 +147554,7 @@
 				"supportsImageDetailOriginal": true,
 				"supportsReasoningSummary": true,
 				"supportsAllTurnsReasoningContext": false,
+				"supportsConfigurationUpdate": false,
 				"requiresReasoningOffJuiceInstruction": false,
 				"stripImageInput": false,
 				"reasoningEffortMap": {},
@@ -264985,7 +265000,8 @@
 					"low",
 					"medium",
 					"high",
-					"xhigh"
+					"xhigh",
+					"max"
 				]
 			},
 			"identity": {
@@ -265076,7 +265092,8 @@
 					"low",
 					"medium",
 					"high",
-					"xhigh"
+					"xhigh",
+					"max"
 				]
 			},
 			"identity": {
@@ -274021,7 +274038,8 @@
 					"low",
 					"medium",
 					"high",
-					"xhigh"
+					"xhigh",
+					"max"
 				]
 			},
 			"identity": {
