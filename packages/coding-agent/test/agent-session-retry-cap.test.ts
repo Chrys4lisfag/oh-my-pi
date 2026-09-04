@@ -191,16 +191,19 @@ describe("AgentSession retry delay cap", () => {
 	it("waits past retry.maxDelayMs for a usage-limit reset when retry.waitForUsageReset is set", async () => {
 		// Contract: with the opt-in set, a provider-stated usage-limit reset
 		// sleeps until the reset instead of failing fast. Uses the reported
-		// ZAI shape (Zhipu 5h 使用上限, single credential so no rotation can
-		// save it); the bypass keys off Flag.UsageLimit, so every provider
-		// whose exhaustion classifies as a usage limit is covered.
+		// ZAI shape (Zhipu 5h 使用上限 with an absolute reset timestamp,
+		// single credential so no rotation can save it); the bypass keys off
+		// Flag.UsageLimit, so every provider whose exhaustion classifies as
+		// a usage limit is covered.
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) {
 			throw new Error("Expected bundled Anthropic test model to exist");
 		}
 
-		const usageLimitError =
-			"429 已达到 5 小时的使用上限。您的限额将在 2030-01-01 00:00:00 重置。 retry-after-ms=7200000";
+		// Reset two hours out, formatted like the provider timestamp (parsed
+		// as UTC, so toISOString stays exact); bounds below absorb test time.
+		const resetStamp = new Date(Date.now() + 7_200_000).toISOString().slice(0, 19).replace("T", " ");
+		const usageLimitError = `429 已达到 5 小时的使用上限。您的限额将在 ${resetStamp} 重置。`;
 
 		const mock = createMockModel({
 			responses: [{ throw: usageLimitError }, { content: ["recovered after usage reset"], stopReason: "stop" }],
@@ -247,12 +250,12 @@ describe("AgentSession retry delay cap", () => {
 
 		await session.prompt("Trigger long usage-limit reset with waitForUsageReset");
 		await session.waitForIdle();
-
 		// The multi-hour provider-stated wait runs instead of failing fast,
 		// then the retry succeeds on the same credential.
 		expect(retryStartEvents).toHaveLength(1);
-		expect(retryStartEvents[0].delayMs).toBe(7_200_000);
-		expect(waitSpy.mock.calls.some(call => call[0] === 7_200_000)).toBe(true);
+		expect(retryStartEvents[0].delayMs).toBeGreaterThan(7_000_000);
+		expect(retryStartEvents[0].delayMs).toBeLessThanOrEqual(7_200_000);
+		expect(waitSpy.mock.calls.some(call => (call[0] as number) > 7_000_000)).toBe(true);
 		expect(requestedModels).toEqual([`${model.provider}/${model.id}`, `${model.provider}/${model.id}`]);
 		expect(retryEndEvents).toHaveLength(1);
 		expect(retryEndEvents[0]).toMatchObject({ success: true });
@@ -268,8 +271,8 @@ describe("AgentSession retry delay cap", () => {
 			throw new Error("Expected bundled Anthropic test model to exist");
 		}
 
-		const usageLimitError =
-			"429 已达到 5 小时的使用上限。您的限额将在 2030-01-01 00:00:00 重置。 retry-after-ms=7200000";
+		const resetStamp = new Date(Date.now() + 7_200_000).toISOString().slice(0, 19).replace("T", " ");
+		const usageLimitError = `429 已达到 5 小时的使用上限。您的限额将在 ${resetStamp} 重置。`;
 
 		const mock = createMockModel({ handler: () => ({ throw: usageLimitError }) });
 		const requestedModels: string[] = [];
@@ -529,6 +532,74 @@ describe("AgentSession retry delay cap", () => {
 		for (const wait of waits) {
 			expect(wait).toBeLessThanOrEqual(2_147_483_647);
 		}
+		expect(requestedModels).toEqual([`${model.provider}/${model.id}`, `${model.provider}/${model.id}`]);
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({ success: true });
+		expect(lastAssistant(session).stopReason).toBe("stop");
+		expect(session.isRetrying).toBe(false);
+	});
+
+	it("honors the account reset over a shorter appended retry hint when retry.waitForUsageReset is set", async () => {
+		// Contract: a usage-limit message carrying both an account reset and
+		// a shorter appended `retry-after-ms` (header timing folded into the
+		// message) must sleep until the account reset — waking on the short
+		// hint would retry a still-blocked credential and burn the budget.
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) {
+			throw new Error("Expected bundled Anthropic test model to exist");
+		}
+
+		const dualSignalError = "429 quota exceeded. Your limit will reset in 13 minutes. retry-after-ms=5000";
+
+		const mock = createMockModel({
+			responses: [{ throw: dualSignalError }, { content: ["recovered after account reset"], stopReason: "stop" }],
+		});
+		const requestedModels: string[] = [];
+		const agent = new Agent({
+			getApiKey: requestedModel => `${requestedModel.provider}-test-key`,
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: (requestedModel, context, options) => {
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				return mock.stream(requestedModel, context, options);
+			},
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxDelayMs": 100,
+			"retry.maxRetries": 2,
+			"retry.modelFallback": false,
+			"retry.waitForUsageReset": true,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const retryStartEvents: AutoRetryStartEvent[] = [];
+		const retryEndEvents: AutoRetryEndEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") retryStartEvents.push(event);
+			if (event.type === "auto_retry_end") retryEndEvents.push(event);
+		});
+
+		await session.prompt("Trigger dual-signal usage-limit error with the opt-in set");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryStartEvents[0].delayMs).toBe(13 * 60_000);
+		expect(waitSpy.mock.calls.some(call => call[0] === 13 * 60_000)).toBe(true);
 		expect(requestedModels).toEqual([`${model.provider}/${model.id}`, `${model.provider}/${model.id}`]);
 		expect(retryEndEvents).toHaveLength(1);
 		expect(retryEndEvents[0]).toMatchObject({ success: true });

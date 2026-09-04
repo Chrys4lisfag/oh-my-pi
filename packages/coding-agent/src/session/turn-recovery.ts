@@ -2067,6 +2067,17 @@ export class TurnRecovery {
 
 	#parseRetryAfterMsFromError(errorMessage: string): number | undefined {
 		const now = Date.now();
+		// Centralized parser first: it gives account-reset signals ("will
+		// reset in …", absolute reset timestamps) precedence over a shorter
+		// appended `retry-after-ms` suffix (header timing folded into the
+		// message by formatErrorMessageWithRetryAfter). Reading the suffix
+		// first would wake before the quota resets and burn the retry budget
+		// on a still-blocked credential.
+		const retryHintMs = extractRetryHint(undefined, errorMessage);
+		if (retryHintMs !== undefined) {
+			return retryHintMs;
+		}
+
 		const retryAfterMsMatch = /retry-after-ms\s*[:=]\s*(\d+)/i.exec(errorMessage);
 		if (retryAfterMsMatch) {
 			return Math.max(0, Number(retryAfterMsMatch[1]));
@@ -2083,11 +2094,6 @@ export class TurnRecovery {
 			if (!Number.isNaN(dateMs)) {
 				return Math.max(0, dateMs - now);
 			}
-		}
-
-		const retryHintMs = extractRetryHint(undefined, errorMessage);
-		if (retryHintMs !== undefined) {
-			return retryHintMs;
 		}
 
 		const resetMsMatch = /x-ratelimit-reset-ms\s*[:=]\s*(\d+)/i.exec(errorMessage);
