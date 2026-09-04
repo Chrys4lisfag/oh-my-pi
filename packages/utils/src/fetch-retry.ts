@@ -38,7 +38,9 @@ const RETRY_AFTER_MS_BODY_PATTERN = /\bretry-after-ms=([0-9]+)\b/i;
  *  - `retry-after-ms=98497000`
  *  - `Your limit will reset at 2026-09-01 09:44:51` / `将在 2026-09-01 09:44:51 重置`
  *
- * Returns `undefined` if no signal is found.
+ * Returns `undefined` if no signal is found, or `0` when the provider
+ * explicitly asks for an immediate retry (`retry-after…=0`, or an absolute
+ * reset timestamp that has already elapsed).
  */
 export function extractRetryHint(source: Response | Headers | null | undefined, body?: string): number | undefined {
 	const headers = source instanceof Headers ? source : (source?.headers ?? undefined);
@@ -89,8 +91,20 @@ export function extractRetryHint(source: Response | Headers | null | undefined, 
 	// pi-ai). Honor the longest: retrying before either window clears
 	// re-hits a still-blocked credential and burns the retry budget.
 	let longestMs: number | undefined;
+	// A parsed-but-non-positive signal is a provider "retry now": an explicit
+	// `retry-after…=0` or an absolute reset that already elapsed. It must
+	// survive as 0 rather than collapse into "no hint found" — consumers
+	// substitute a heuristic wait (30-minute quota guess, default backoff)
+	// when the parse returns undefined, which would sleep a session the
+	// provider told to retry immediately.
+	let retryNow = false;
 	const consider = (ms: number | undefined): void => {
 		if (ms !== undefined && ms > 0 && (longestMs === undefined || ms > longestMs)) longestMs = ms;
+	};
+	const considerClamped = (ms: number | undefined): void => {
+		if (ms === undefined) return;
+		if (ms > 0) consider(ms);
+		else retryNow = true;
 	};
 
 	const quotaMatch = QUOTA_RESET_PATTERN.exec(body);
@@ -127,7 +141,7 @@ export function extractRetryHint(source: Response | Headers | null | undefined, 
 	const retryAfterMsMatch = RETRY_AFTER_MS_BODY_PATTERN.exec(body);
 	if (retryAfterMsMatch?.[1]) {
 		const ms = Number(retryAfterMsMatch[1]);
-		if (Number.isFinite(ms)) consider(ms);
+		if (Number.isFinite(ms)) considerClamped(ms);
 	}
 
 	for (const pattern of [PLEASE_RETRY_PATTERN, RETRY_DELAY_FIELD_PATTERN, TRY_AGAIN_PATTERN]) {
@@ -144,16 +158,18 @@ export function extractRetryHint(source: Response | Headers | null | undefined, 
 	// Legacy text forms (also honored by older local parsers): a plain
 	// `retry-after` delta in seconds or as an HTTP date, and
 	// `x-ratelimit-reset[-ms]` counters. They compete in the same maximum —
-	// a longer legacy hint must not lose to a shorter reset phrase.
+	// a longer legacy hint must not lose to a shorter reset phrase. Their
+	// non-positive readings (explicit zero, elapsed epoch/date) are the
+	// clamped retry-now signals above.
 	const retryAfterMatch = /retry-after\s*[:=]\s*([^\s,;]+)/i.exec(body);
 	if (retryAfterMatch) {
 		const value = retryAfterMatch[1]!;
 		const seconds = Number(value);
 		if (Number.isFinite(seconds)) {
-			consider(seconds * 1000);
+			considerClamped(seconds * 1000);
 		} else {
 			const dateMs = Date.parse(value);
-			if (!Number.isNaN(dateMs)) consider(dateMs - Date.now());
+			if (!Number.isNaN(dateMs)) considerClamped(dateMs - Date.now());
 		}
 	}
 
@@ -161,7 +177,7 @@ export function extractRetryHint(source: Response | Headers | null | undefined, 
 	if (resetMsMatch) {
 		const resetMs = Number(resetMsMatch[1]);
 		if (!Number.isNaN(resetMs)) {
-			consider(resetMs > 1_000_000_000_000 ? resetMs - Date.now() : resetMs);
+			considerClamped(resetMs > 1_000_000_000_000 ? resetMs - Date.now() : resetMs);
 		}
 	}
 
@@ -169,10 +185,10 @@ export function extractRetryHint(source: Response | Headers | null | undefined, 
 	if (resetMatch) {
 		const resetSeconds = Number(resetMatch[1]);
 		if (!Number.isNaN(resetSeconds)) {
-			consider(resetSeconds > 1_000_000_000 ? resetSeconds * 1000 - Date.now() : resetSeconds * 1000);
+			considerClamped(resetSeconds > 1_000_000_000 ? resetSeconds * 1000 - Date.now() : resetSeconds * 1000);
 		}
 	}
-	return longestMs;
+	return longestMs ?? (retryNow ? 0 : undefined);
 }
 
 function unitToMs(unit: string): number | undefined {

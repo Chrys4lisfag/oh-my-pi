@@ -468,6 +468,79 @@ describe("AgentSession retry delay cap", () => {
 		expect(session.isRetrying).toBe(false);
 	});
 
+	it("retries promptly on a zero-valued usage-limit retry hint when retry.waitForUsageReset is set", async () => {
+		// Contract: an explicit `retry-after-ms=0` is a provider "retry now"
+		// signal. It must not collapse into "no hint" — that would substitute
+		// the 30-minute QUOTA_EXHAUSTED heuristic, which (lacking parsed
+		// provider timing) cannot authorize the opt-in and would trip
+		// retry.maxDelayMs, surfacing the error instead of retrying as asked.
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) {
+			throw new Error("Expected bundled Anthropic test model to exist");
+		}
+
+		const zeroHintError = "429 quota exceeded. retry-after-ms=0";
+
+		const mock = createMockModel({
+			responses: [{ throw: zeroHintError }, { content: ["recovered after immediate retry"], stopReason: "stop" }],
+		});
+		const requestedModels: string[] = [];
+		const agent = new Agent({
+			getApiKey: requestedModel => `${requestedModel.provider}-test-key`,
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: (requestedModel, context, options) => {
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				return mock.stream(requestedModel, context, options);
+			},
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxDelayMs": 100,
+			"retry.modelFallback": false,
+			"retry.waitForUsageReset": true,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const retryStartEvents: AutoRetryStartEvent[] = [];
+		const retryEndEvents: AutoRetryEndEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") retryStartEvents.push(event);
+			if (event.type === "auto_retry_end") retryEndEvents.push(event);
+		});
+
+		await session.prompt("Trigger zero retry-after usage-limit with the opt-in set");
+		await session.waitForIdle();
+
+		// The retry ran within the cap instead of sleeping the heuristic or
+		// failing fast, and the second attempt recovered.
+		expect(requestedModels).toEqual([`${model.provider}/${model.id}`, `${model.provider}/${model.id}`]);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryStartEvents[0].delayMs).toBeGreaterThan(0);
+		expect(retryStartEvents[0].delayMs).toBeLessThanOrEqual(100);
+		for (const call of waitSpy.mock.calls) {
+			expect(call[0]).toBeLessThanOrEqual(100);
+		}
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({ success: true });
+		expect(lastAssistant(session).stopReason).toBe("stop");
+		expect(session.isRetrying).toBe(false);
+	});
+
 	it("honors the account reset over a shorter appended retry hint when retry.waitForUsageReset is set", async () => {
 		// Contract: a usage-limit message carrying both an account reset and
 		// a shorter appended `retry-after-ms` (header timing folded into the

@@ -200,4 +200,31 @@ describe("extractRetryHint", () => {
 		expect(hint).toBeGreaterThan(3_500_000);
 		expect(hint).toBeLessThanOrEqual(3_600_000);
 	});
+
+	// Zero-valued and elapsed signals are authoritative "retry now" replies:
+	// collapsing them into `undefined` lets callers substitute a heuristic
+	// wait (30-minute quota guess) for a provider that said retry immediately.
+	it("preserves an explicit zero retry-after-ms as retry-now", () => {
+		expect(extractRetryHint(undefined, "429 quota exceeded. retry-after-ms=0")).toBe(0);
+	});
+
+	it("preserves an explicit zero legacy retry-after as retry-now", () => {
+		expect(extractRetryHint(undefined, "rate limited; retry-after=0")).toBe(0);
+	});
+
+	it("treats elapsed x-ratelimit-reset epochs as retry-now", () => {
+		expect(extractRetryHint(undefined, `rate limited, x-ratelimit-reset-ms=${Date.now() - 60_000}`)).toBe(0);
+		expect(extractRetryHint(undefined, `rate limited, x-ratelimit-reset=${Math.floor(Date.now() / 1000) - 60}`)).toBe(
+			0,
+		);
+	});
+
+	it("lets a longer reset phrase win over a zero retry hint", () => {
+		expect(extractRetryHint(undefined, "429 quota exceeded. reset in 5 minutes. retry-after-ms=0")).toBe(5 * 60_000);
+	});
+
+	it("still returns undefined when only elapsed account resets are present", () => {
+		const past = new Date(Date.now() - 60_000).toISOString();
+		expect(extractRetryHint(undefined, `Your limit will reset at ${past}`)).toBeUndefined();
+	});
 });
