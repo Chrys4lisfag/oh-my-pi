@@ -761,6 +761,13 @@ export { isDefinitiveOAuthFailure } from "./error/auth-classify";
  * the usage report reveals. Callers that wait the account out (instead of
  * rotating) must sleep until this, not the error-text hint alone.
  *
+ * `priorBlockedUntilMs` (epoch ms) is the live block deadline the map already
+ * stored for this credential before this call. The merged `blockedUntilMs`
+ * masks a pre-existing block shorter than this call's own heuristic
+ * fallback (`Math.max` in the mark), so callers that replace that heuristic
+ * with an authoritative report window must consult the prior deadline to
+ * keep honoring the earlier response's provider-stated block.
+ *
  * `reportResetAtMs` (epoch ms) is present only when the usage report is a
  * complete authority for the wait: every exhausted window carries a future
  * reset, so sleeping until the latest one can actually clear the account. A
@@ -771,6 +778,7 @@ export interface UsageLimitMarkResult {
 	switched: boolean;
 	retryAtMs?: number;
 	blockedUntilMs?: number;
+	priorBlockedUntilMs?: number;
 	reportResetAtMs?: number;
 }
 
@@ -4614,6 +4622,15 @@ export class AuthStorage {
 		blockedUntil: number,
 		routing: CredentialBlockRouting,
 	): UsageLimitMarkResult {
+		// Snapshot the live block deadline BEFORE this call's mark: the merged
+		// value below masks a pre-existing block shorter than this call's own
+		// request (longest-wins), and recovery that replaces this call's
+		// heuristic fallback with an authoritative report window still needs
+		// the prior response's provider-stated deadline.
+		const priorBlockedUntilMs =
+			targetIndex >= 0
+				? this.#getCredentialBlockedUntil(provider, routing.providerKey, targetIndex, routing.blockScope)
+				: undefined;
 		if (targetIndex >= 0) {
 			this.#markCredentialBlocked(provider, routing.providerKey, targetIndex, blockedUntil, routing.blockScope);
 		}
@@ -4646,10 +4663,11 @@ export class AuthStorage {
 				candidate.index,
 				routing.siblingBlockScopes,
 			);
-			if (candidateBlockedUntil === undefined) return { switched: true, blockedUntilMs: mergedBlockedUntil };
+			if (candidateBlockedUntil === undefined)
+				return { switched: true, blockedUntilMs: mergedBlockedUntil, priorBlockedUntilMs };
 			if (retryAtMs === undefined || candidateBlockedUntil < retryAtMs) retryAtMs = candidateBlockedUntil;
 		}
-		return { switched: false, retryAtMs, blockedUntilMs: mergedBlockedUntil };
+		return { switched: false, retryAtMs, blockedUntilMs: mergedBlockedUntil, priorBlockedUntilMs };
 	}
 
 	/**

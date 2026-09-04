@@ -251,6 +251,7 @@ type UsageLimitOutcome = {
 	retryAfterMs: number;
 	retryAtMs: number | undefined;
 	blockedUntilMs: number | undefined;
+	priorBlockedUntilMs: number | undefined;
 	reportResetAtMs: number | undefined;
 };
 
@@ -614,6 +615,7 @@ export class TurnRecovery {
 					retryAfterMs,
 					retryAtMs: outcome.retryAtMs,
 					blockedUntilMs: outcome.blockedUntilMs,
+					priorBlockedUntilMs: outcome.priorBlockedUntilMs,
 					reportResetAtMs: outcome.reportResetAtMs,
 				};
 			})();
@@ -2196,6 +2198,16 @@ export class TurnRecovery {
 					// past a shorter reported reset overshoots, and vice
 					// versa.
 					usageLimitWaitMs = Math.max(0, recordedUsageLimitOutcome.reportResetAtMs - Date.now());
+				}
+				if (recordedUsageLimitOutcome.priorBlockedUntilMs !== undefined) {
+					// The merged deadline below masks a pre-existing block
+					// shorter than this call's heuristic fallback (longest-wins
+					// in the mark). The prior deadline is that block's own
+					// provenance — an earlier response's provider-stated
+					// window — and must survive this call's heuristic guess:
+					// waking before it retries a still-blocked credential.
+					const priorRemainingMs = Math.max(0, recordedUsageLimitOutcome.priorBlockedUntilMs - Date.now());
+					if (priorRemainingMs > usageLimitWaitMs) usageLimitWaitMs = priorRemainingMs;
 				}
 				if (recordedUsageLimitOutcome.blockedUntilMs !== undefined) {
 					// The stored deadline merges every mark call for this
