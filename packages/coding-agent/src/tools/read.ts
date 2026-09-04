@@ -254,12 +254,12 @@ interface ReadLineWindow {
 function omittedRequestedLine(
 	line: ReadLineWindow["byteLimitLine"],
 	requestedStart: number,
-	effectiveLimit: number,
 	rawSelector: boolean,
-	hasLeadingOutput: boolean,
+	leadingContext: number,
+	collectedLineCount: number,
 ): ReadLineWindow["byteLimitLine"] {
-	if (rawSelector || !hasLeadingOutput || !line) return undefined;
-	return line.index >= requestedStart && line.index < requestedStart + effectiveLimit ? line : undefined;
+	if (rawSelector || !line || leadingContext === 0) return undefined;
+	return line.index === requestedStart && collectedLineCount === leadingContext ? line : undefined;
 }
 
 function formatOmittedRequestedLineNotice(
@@ -1860,9 +1860,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					const omittedSelectedLine = omittedRequestedLine(
 						byteLimitLine,
 						requestedStart,
-						effectiveLimit,
 						rawSelector,
-						collectedLines.length > 0,
+						leadingContext,
+						collectedLines.length,
 					);
 					// A first line larger than the byte budget collects no complete
 					// line, yet the window still renders a byte-capped preview.
@@ -2297,9 +2297,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const omittedSelectedLine = omittedRequestedLine(
 			byteLimitLine,
 			requestedStart,
-			effectiveLimit,
 			rawSelector,
-			collectedLines.length > 0,
+			leadingContext,
+			collectedLines.length,
 		);
 		// Mirror the plain-file path: a preview-only oversized first line must
 		// count as one delivered partial line, not zero.

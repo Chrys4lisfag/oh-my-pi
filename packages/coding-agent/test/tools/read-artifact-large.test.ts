@@ -44,6 +44,10 @@ function oversizedSelectedLineArtifact(): string {
 	return ["leading-context", `oversized-${"x".repeat(70_000)}-end`, "trailing-one", "trailing-two"].join("\n");
 }
 
+function byteLimitedRangeArtifact(): string {
+	return Array.from({ length: 100 }, (_, index) => `line-${index + 1} ${"x".repeat(1_016)}`).join("\n");
+}
+
 describe("read tool large artifact handling", () => {
 	let testDir: string;
 	let artifactDir: string;
@@ -113,6 +117,24 @@ describe("read tool large artifact handling", () => {
 		const result = await tool.execute("call-raw-tail", { path: "artifact://0:raw:301-" });
 
 		expect(result.details?.totalLines).toBe(400);
+	});
+
+	it("keeps the continuation when the byte budget stops inside requested artifact content", async () => {
+		await Bun.write(path.join(artifactDir, "0.mcp.log"), byteLimitedRangeArtifact());
+
+		const result = await tool.execute("call-byte-limited-range", { path: "artifact://0:1-100" });
+		const output = getTextOutput(result);
+		const truncation = result.details?.meta?.truncation;
+
+		expect(output).not.toContain("could not fit after preceding context");
+		expect(output).not.toContain("to read that line without context");
+		expect(truncation).toBeDefined();
+		if (!truncation) throw new Error("expected truncation metadata");
+		const shownRange = truncation.shownRange;
+		expect(shownRange).toBeDefined();
+		if (!shownRange) throw new Error("expected shown range");
+		expect(truncation.nextOffset).toBe(shownRange.end + 1);
+		expect(formatTruncationMetaNotice(truncation)).toContain(`Use :${truncation.nextOffset} to continue`);
 	});
 
 	it("reports an oversized selected line instead of sending a looping continuation selector", async () => {
