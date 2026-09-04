@@ -5,6 +5,7 @@
 ### Fixed
 
 - Report oversized selected lines that cannot fit after read context, with a working raw recovery selector instead of a looping continuation hint ([#10775](https://github.com/can1357/oh-my-pi/issues/10775)).
+- Fixed WorkPool child sessions crashing during startup while constructing their incremental `yield` tool schema.
 
 ## [18.1.10] - 2026-09-04
 
@@ -39,8 +40,6 @@
 
 ### Fixed
 
-- Fixed two idle subagents exchanging a single IRC message ping-ponging forever: wake-turn relays are now tagged and never relayed back, so each automated relay is delivered exactly once instead of waking a reciprocal relay until manual cancellation.
-- Fixed WorkPool child sessions crashing during startup while constructing their incremental `yield` tool schema.
 - Fixed fallback authorization-code prompts remaining active after native OAuth callback completion.
 - Fixed reciprocal idle subagents repeatedly waking one another indefinitely.
 - Fixed `/wt` and `git worktree add` failing when the new worktree targeted the same commit as the clean source checkout.
