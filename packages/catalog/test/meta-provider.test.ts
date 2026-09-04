@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { CATALOG_PROVIDERS } from "@oh-my-pi/pi-catalog/provider-models/descriptors";
 import {
 	META_MUSE_STATIC_MODELS,
@@ -159,5 +160,17 @@ describe("Muse Code subscription provider", () => {
 			envVars: ["MODEL_API_KEY", "META_API_KEY"],
 			catalogDiscovery: { label: "Meta Model API" },
 		});
+	});
+
+	test("selects the compact edit prompt and freeform custom tools only for the subscription tier", () => {
+		const subscriber = buildModel(MUSE_CODE_STATIC_MODELS.find(model => model.id === "muse-spark-1.3-contributor")!);
+		expect(subscriber.editPromptVariant).toBe("compact");
+		expect(subscriber.applyPatchToolType).toBe("freeform");
+
+		// Same model ids on the direct Meta API key path keep the stock
+		// full-prompt JSON-function presentation.
+		const apiKey = buildModel(META_MUSE_STATIC_MODELS.find(model => model.id === "muse-spark-1.3-contributor")!);
+		expect(apiKey.editPromptVariant).toBeUndefined();
+		expect(apiKey.applyPatchToolType).toBeUndefined();
 	});
 });

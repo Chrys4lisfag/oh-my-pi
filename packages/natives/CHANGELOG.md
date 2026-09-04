@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the `editDescriptionCompact` binding exposing compact edit-tool prompt variants.
+
 ## [18.1.9] - 2026-09-04
 
 ### Added

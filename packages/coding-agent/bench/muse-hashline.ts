@@ -20,10 +20,11 @@ const SAMPLES = 41;
 const REQUEST_REPETITIONS = 100;
 const root = path.join(os.tmpdir(), "omp-bench-muse-hashline");
 const target = path.join(root, "fixture.ts");
-const fixture = Array.from(
-	{ length: 1_200 },
-	(_, index) => `export const value${index + 1} = ${index + 1}; // deterministic hashline benchmark payload`,
-).join("\n") + "\n";
+const fixture =
+	Array.from(
+		{ length: 1_200 },
+		(_, index) => `export const value${index + 1} = ${index + 1}; // deterministic hashline benchmark payload`,
+	).join("\n") + "\n";
 const replacement = "export const value600 = 600_000; // deterministic hashline benchmark payload";
 
 // Resolve the real bundled muse-code catalog row, then re-resolve it through
@@ -33,8 +34,10 @@ const bundled = getBundledModel("muse-code", "muse-spark-1.3-contributor");
 if (!bundled) throw new Error("muse-code/muse-spark-1.3-contributor missing from bundled catalog");
 const model = buildModel(bundled as unknown as ModelSpec<"openai-responses">) as Model<"openai-responses">;
 if (model.provider !== "muse-code") throw new Error(`unexpected provider: ${model.provider}`);
-if (model.editPromptVariant !== "compact") throw new Error("muse-code catalog policy did not resolve edit-prompt-variant compact");
-if (model.applyPatchToolType !== "freeform") throw new Error("muse-code catalog policy did not resolve freeform custom tools");
+if (model.editPromptVariant !== "compact")
+	throw new Error("muse-code catalog policy did not resolve edit-prompt-variant compact");
+if (model.applyPatchToolType !== "freeform")
+	throw new Error("muse-code catalog policy did not resolve freeform custom tools");
 
 const grammarDefinition = editGrammar("hashline");
 if (!grammarDefinition) throw new Error("hashline edit grammar is unavailable");
@@ -79,7 +82,11 @@ const context: Context = {
 		"You are a precise coding agent. Inspect before editing, use hashline anchors, preserve project conventions, and verify behavioral changes.",
 	],
 	messages: [
-		{ role: "user", content: "Change value600 to 600000 in fixture.ts and keep the comment unchanged.", timestamp: 0 },
+		{
+			role: "user",
+			content: "Change value600 to 600000 in fixture.ts and keep the comment unchanged.",
+			timestamp: 0,
+		},
 	],
 	tools,
 };
