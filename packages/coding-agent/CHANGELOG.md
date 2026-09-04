@@ -5,6 +5,7 @@
 ### Fixed
 
 - Fixed two idle subagents exchanging a single IRC message ping-ponging forever: wake-turn relays are now tagged and never relayed back, so each automated relay is delivered exactly once instead of waking a reciprocal relay until manual cancellation.
+- Fixed WorkPool child sessions crashing during startup while constructing their incremental `yield` tool schema.
 
 ## [18.1.8] - 2026-09-03
 

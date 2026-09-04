@@ -49,6 +49,17 @@ describe("SDK workpool yield schema", () => {
 			skipPythonPreflight: true,
 			requireYieldTool: true,
 			toolNames: ["yield"],
+			outputSchema: {
+				type: "object",
+				properties: { "pool#1": {} },
+				required: ["pool#1"],
+				additionalProperties: false,
+			},
+			parentTaskPrefix: "workpool-worker",
+			agentId: "workpool-worker",
+			agentName: "scout",
+			agentDisplayName: "scout",
+			taskDepth: 1,
 		});
 		sessions.push(session);
 		const tool = session.getToolByName("yield");
