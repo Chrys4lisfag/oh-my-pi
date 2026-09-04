@@ -13,6 +13,11 @@ import type { FetchImpl, ThinkingConfig } from "@oh-my-pi/pi-catalog/types";
 
 const MUSE_SPARK_THINKING: ThinkingConfig = {
 	mode: "effort",
+	efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
+};
+// Meta documents the `max` tier for Muse Spark 1.3 (standard) only.
+const MUSE_SPARK_MAX_THINKING: ThinkingConfig = {
+	mode: "effort",
 	efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max],
 };
 
@@ -41,7 +46,7 @@ describe("Meta Model API provider", () => {
 			cost: { input: 1.25, output: 4.25, cacheRead: 0.15, cacheWrite: 0 },
 			contextWindow: 1_048_576,
 			maxTokens: 131_072,
-			thinking: MUSE_SPARK_THINKING,
+			thinking: MUSE_SPARK_MAX_THINKING,
 			compat: { supportsReasoningEffort: true, includeEncryptedReasoning: true },
 		});
 		expect(byId.get("muse-spark-1.3-contributor")).toMatchObject({
@@ -71,7 +76,7 @@ describe("Meta Model API provider", () => {
 			input: ["text", "image"],
 			contextWindow: 1_048_576,
 			maxTokens: 131_072,
-			thinking: MUSE_SPARK_THINKING,
+			thinking: MUSE_SPARK_MAX_THINKING,
 		});
 		expect(byId.get("muse-spark-1.3-contributor")).toMatchObject({
 			name: "Muse Spark 1.3 (C)",
@@ -190,5 +195,32 @@ describe("Muse Code subscription provider", () => {
 		// Direct Meta API key rows carry neither field.
 		expect(getBundledModel("meta", "muse-spark-1.3-contributor")?.editPromptVariant).toBeUndefined();
 		expect(getBundledModel("meta", "muse-spark-1.3-contributor")?.applyPatchToolType).toBeUndefined();
+	});
+
+	test("exposes the max tier on bundled 1.3 standard rows only", () => {
+		for (const provider of ["muse-code", "meta"] as const) {
+			expect(getBundledModel(provider, "muse-spark-1.3")?.thinking?.efforts).toEqual([
+				Effort.Minimal,
+				Effort.Low,
+				Effort.Medium,
+				Effort.High,
+				Effort.XHigh,
+				Effort.Max,
+			]);
+			for (const id of [
+				"muse-spark-1.1",
+				"muse-spark-1.2",
+				"muse-spark-1.2-contributor",
+				"muse-spark-1.3-contributor",
+			]) {
+				expect(getBundledModel(provider, id)?.thinking?.efforts).toEqual([
+					Effort.Minimal,
+					Effort.Low,
+					Effort.Medium,
+					Effort.High,
+					Effort.XHigh,
+				]);
+			}
+		}
 	});
 });

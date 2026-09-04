@@ -4367,6 +4367,12 @@ const META_MUSE_SPARK_COST = { input: 1.25, output: 4.25, cacheRead: 0.15, cache
 const META_MUSE_SPARK_CONTRIBUTOR_COST = { input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 } as const;
 const META_MUSE_SPARK_THINKING: ThinkingConfig = {
 	mode: "effort",
+	efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
+};
+// Meta documents the `max` effort tier for Muse Spark 1.3 (standard) only;
+// contributor tiers and other revisions stay on the 5-tier ladder.
+const META_MUSE_SPARK_MAX_THINKING: ThinkingConfig = {
+	mode: "effort",
 	efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max],
 };
 
@@ -4383,7 +4389,7 @@ function museSparkSpec(revision: string, tier: "standard" | "contributor"): Mode
 		cost: contributor ? META_MUSE_SPARK_CONTRIBUTOR_COST : META_MUSE_SPARK_COST,
 		contextWindow: 1_048_576,
 		maxTokens: 131_072,
-		thinking: META_MUSE_SPARK_THINKING,
+		thinking: revision === "1.3" && tier === "standard" ? META_MUSE_SPARK_MAX_THINKING : META_MUSE_SPARK_THINKING,
 		compat: {
 			supportsReasoningEffort: true,
 			includeEncryptedReasoning: true,
