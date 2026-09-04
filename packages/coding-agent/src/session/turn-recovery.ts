@@ -2186,15 +2186,32 @@ export class TurnRecovery {
 				// longest-wins (mirroring extractRetryHint): the error-text hint
 				// (or heuristic fallback when hintless), the credential block
 				// the mark call persisted, and — when the usage report is a
-				// complete authority — its own reset, which additionally
-				// overrides the heuristic instead of sleeping a guess.
+				// complete authority — its own reset, which replaces the
+				// heuristic instead of sleeping a guess.
 				usageLimitWaitMs = recordedUsageLimitOutcome.retryAfterMs;
-				if (recordedUsageLimitOutcome.blockedUntilMs !== undefined) {
-					const blockedRemainingMs = Math.max(0, recordedUsageLimitOutcome.blockedUntilMs - Date.now());
-					if (blockedRemainingMs > usageLimitWaitMs) usageLimitWaitMs = blockedRemainingMs;
-				}
 				if (recordedUsageLimitOutcome.reportResetAtMs !== undefined && parsedRetryAfterMs === undefined) {
+					// A hintless error can still carry an authoritative
+					// usage-report window: it replaces THIS call's 30-minute
+					// heuristic guess in both directions — sleeping the guess
+					// past a shorter reported reset overshoots, and vice
+					// versa.
 					usageLimitWaitMs = Math.max(0, recordedUsageLimitOutcome.reportResetAtMs - Date.now());
+				}
+				if (recordedUsageLimitOutcome.blockedUntilMs !== undefined) {
+					// The stored deadline merges every mark call for this
+					// credential (longest-wins). Only a deadline past what
+					// THIS call requested — a longer report window, or a
+					// longer block an earlier sibling-session response stored
+					// for the shared credential — may override the wait:
+					// retrying before the credential's actual unblock time
+					// re-hits the cap, but this call's own heuristic
+					// contribution must not re-inflate over the authoritative
+					// report window above.
+					const requestedBlockedUntilMs = Date.now() + (recordedUsageLimitOutcome.retryAfterMs ?? 0);
+					if (recordedUsageLimitOutcome.blockedUntilMs > requestedBlockedUntilMs) {
+						const blockedRemainingMs = Math.max(0, recordedUsageLimitOutcome.blockedUntilMs - Date.now());
+						if (blockedRemainingMs > usageLimitWaitMs) usageLimitWaitMs = blockedRemainingMs;
+					}
 				}
 				if (siblingAvailabilityWaitMs !== undefined && siblingAvailabilityWaitMs < usageLimitWaitMs) {
 					usageLimitWaitMs = siblingAvailabilityWaitMs;
