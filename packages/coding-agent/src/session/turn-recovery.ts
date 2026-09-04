@@ -75,10 +75,6 @@ const EMPTY_STOP_MAX_RETRIES = 3;
 const MALFORMED_FUNCTION_CALL_MAX_RETRIES = 3;
 const SIBLING_UNBLOCK_BUFFER_MS = 1_000;
 const NON_WHITESPACE_RE = /\S/;
-// Largest delay a single timer accepts: larger values overflow the 32-bit
-// timeout (clamped to ~1ms, i.e. an instant retry that burns the budget),
-// so multi-week usage-reset waits sleep in chunks of at most this.
-const MAX_TIMER_WAIT_MS = 2_147_483_647;
 const USAGE_PREFLIGHT_BLOCKED_PREFIX = "Usage preflight blocked:";
 const STREAM_STALL_ERROR_RE = /stream stall/i;
 const HTTP2_STREAM_RESET_ERROR_RE =
@@ -2448,14 +2444,12 @@ export class TurnRecovery {
 		// pattern instead of re-sampling the same stalled reasoning.
 		this.#maybeInjectThinkingLoopRedirect(id);
 
-		// Wait with exponential backoff (abortable). Sleeps in timer-safe
-		// chunks: a single delay past the 32-bit timer max would overflow to
-		// an instant retry, so multi-week usage-reset waits loop instead.
+		// Wait with exponential backoff (abortable).
 		const retryAbortController = new AbortController();
 		this.#retryAbortController?.abort();
 		this.#retryAbortController = retryAbortController;
 		try {
-			await this.#abortableRetryWait(delayMs, retryAbortController.signal);
+			await scheduler.wait(delayMs, { signal: retryAbortController.signal });
 		} catch {
 			if (this.#retryAbortController !== retryAbortController) {
 				return false;
@@ -2504,20 +2498,6 @@ export class TurnRecovery {
 		});
 
 		return true;
-	}
-
-	/**
-	 * Sleep `delayMs` unless `signal` aborts, in timer-safe chunks. A single
-	 * timer past the 32-bit max overflows to an instant wake, so oversized
-	 * usage-reset waits loop; abort rejects out of whichever chunk is live.
-	 */
-	async #abortableRetryWait(delayMs: number, signal: AbortSignal): Promise<void> {
-		let remainingMs = Math.max(0, delayMs);
-		while (remainingMs > 0) {
-			const chunkMs = Math.min(remainingMs, MAX_TIMER_WAIT_MS);
-			await scheduler.wait(chunkMs, { signal });
-			remainingMs -= chunkMs;
-		}
 	}
 
 	/**
