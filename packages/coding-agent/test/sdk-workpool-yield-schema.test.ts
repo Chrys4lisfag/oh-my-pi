@@ -31,13 +31,13 @@ describe("SDK workpool yield schema", () => {
 		if (fs.existsSync(registryDir)) removeSyncWithRetries(registryDir);
 	});
 
-	it("switches the constructed yield tool before a pooled turn starts", async () => {
+	it("reads the dynamic yield schema during construction and switches it before a pooled turn", async () => {
 		const { session } = await createAgentSession({
 			cwd: registryDir,
 			agentDir: registryDir,
 			modelRegistry,
 			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated({}),
+			settings: Settings.isolated({ inlineToolDescriptors: "on" }),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			disableExtensionDiscovery: true,
 			skills: [],
