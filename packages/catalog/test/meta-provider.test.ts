@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { CATALOG_PROVIDERS } from "@oh-my-pi/pi-catalog/provider-models/descriptors";
 import {
 	META_MUSE_STATIC_MODELS,
@@ -172,5 +173,22 @@ describe("Muse Code subscription provider", () => {
 		const apiKey = buildModel(META_MUSE_STATIC_MODELS.find(model => model.id === "muse-spark-1.3-contributor")!);
 		expect(apiKey.editPromptVariant).toBeUndefined();
 		expect(apiKey.applyPatchToolType).toBeUndefined();
+	});
+
+	test("bundled startup rows materialize the subscription policy without re-resolution", () => {
+		// The registry serves committed rows verbatim on the cacheless,
+		// pre-discovery path (model-registry #loadBuiltInModels), so the
+		// policy must live in models.json itself — not only in live rules.
+		const bundled = getBundledModel("muse-code", "muse-spark-1.3-contributor");
+		expect(bundled?.editPromptVariant).toBe("compact");
+		expect(bundled?.applyPatchToolType).toBe("freeform");
+		for (const id of ["muse-spark-1.1", "muse-spark-1.2", "muse-spark-1.2-contributor", "muse-spark-1.3"]) {
+			const row = getBundledModel("muse-code", id);
+			expect(row?.editPromptVariant).toBe("compact");
+			expect(row?.applyPatchToolType).toBe("freeform");
+		}
+		// Direct Meta API key rows carry neither field.
+		expect(getBundledModel("meta", "muse-spark-1.3-contributor")?.editPromptVariant).toBeUndefined();
+		expect(getBundledModel("meta", "muse-spark-1.3-contributor")?.applyPatchToolType).toBeUndefined();
 	});
 });

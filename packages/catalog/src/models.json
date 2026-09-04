@@ -147206,7 +147206,9 @@
 			"compatConfig": {
 				"supportsReasoningEffort": true,
 				"includeEncryptedReasoning": true
-			}
+			},
+			"applyPatchToolType": "freeform",
+			"editPromptVariant": "compact"
 		},
 		"muse-spark-1.2": {
 			"id": "muse-spark-1.2",
@@ -147301,7 +147303,9 @@
 			"compatConfig": {
 				"supportsReasoningEffort": true,
 				"includeEncryptedReasoning": true
-			}
+			},
+			"applyPatchToolType": "freeform",
+			"editPromptVariant": "compact"
 		},
 		"muse-spark-1.2-contributor": {
 			"id": "muse-spark-1.2-contributor",
@@ -147396,7 +147400,9 @@
 			"compatConfig": {
 				"supportsReasoningEffort": true,
 				"includeEncryptedReasoning": true
-			}
+			},
+			"applyPatchToolType": "freeform",
+			"editPromptVariant": "compact"
 		},
 		"muse-spark-1.3": {
 			"id": "muse-spark-1.3",
@@ -147491,7 +147497,9 @@
 			"compatConfig": {
 				"supportsReasoningEffort": true,
 				"includeEncryptedReasoning": true
-			}
+			},
+			"applyPatchToolType": "freeform",
+			"editPromptVariant": "compact"
 		},
 		"muse-spark-1.3-contributor": {
 			"id": "muse-spark-1.3-contributor",
@@ -147586,7 +147594,9 @@
 			"compatConfig": {
 				"supportsReasoningEffort": true,
 				"includeEncryptedReasoning": true
-			}
+			},
+			"applyPatchToolType": "freeform",
+			"editPromptVariant": "compact"
 		}
 	},
 	"nanogpt": {
