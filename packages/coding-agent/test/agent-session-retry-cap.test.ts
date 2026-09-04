@@ -815,7 +815,11 @@ describe("AgentSession retry delay cap", () => {
 			await session.waitForIdle();
 
 			expect(retryStartEvents).toHaveLength(1);
-			expect(waitSpy.mock.calls.some(call => (call[0] as number) > 100)).toBe(true);
+			// The authoritative 5-minute report reset replaces the 30-minute
+			// heuristic — not just authorizes it.
+			expect(retryStartEvents[0].delayMs).toBeGreaterThan(290_000);
+			expect(retryStartEvents[0].delayMs).toBeLessThanOrEqual(300_000);
+			expect(waitSpy.mock.calls.some(call => (call[0] as number) > 290_000)).toBe(true);
 			expect(requestedModels).toEqual([
 				`${exhaustedModel.provider}/${exhaustedModel.id}`,
 				`${exhaustedModel.provider}/${exhaustedModel.id}`,

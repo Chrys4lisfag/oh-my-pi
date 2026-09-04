@@ -2231,15 +2231,19 @@ export class TurnRecovery {
 				// sibling minimum, one short-lived sibling block escalates a
 				// recoverable situation into the provider's multi-hour wait and
 				// trips the fail-fast cap below.
-				// The deadline is the later of the error-text hint and any
-				// exhausted window the usage report reveals (e.g. the response
-				// names the 5h reset while the weekly window is also spent):
-				// waking on the shorter hint alone would retry a still-blocked
-				// credential and burn the budget.
+				// The deadline merges every independent provider signal by
+				// longest-wins (mirroring extractRetryHint): the error-text hint
+				// (or heuristic fallback when hintless), the credential block
+				// the mark call persisted, and — when the usage report is a
+				// complete authority — its own reset, which additionally
+				// overrides the heuristic instead of sleeping a guess.
 				usageLimitWaitMs = recordedUsageLimitOutcome.retryAfterMs;
 				if (recordedUsageLimitOutcome.blockedUntilMs !== undefined) {
 					const blockedRemainingMs = Math.max(0, recordedUsageLimitOutcome.blockedUntilMs - Date.now());
 					if (blockedRemainingMs > usageLimitWaitMs) usageLimitWaitMs = blockedRemainingMs;
+				}
+				if (recordedUsageLimitOutcome.reportResetAtMs !== undefined && parsedRetryAfterMs === undefined) {
+					usageLimitWaitMs = Math.max(0, recordedUsageLimitOutcome.reportResetAtMs - Date.now());
 				}
 				if (siblingAvailabilityWaitMs !== undefined && siblingAvailabilityWaitMs < usageLimitWaitMs) {
 					usageLimitWaitMs = siblingAvailabilityWaitMs;
