@@ -391,6 +391,154 @@ describe("AgentSession retry delay cap", () => {
 		expect(session.isRetrying).toBe(false);
 	});
 
+	it("fails fast on a usage-limit error with no provider reset hint when retry.waitForUsageReset is set", async () => {
+		// Contract: the opt-in only honors *parsed provider* reset timing. A
+		// usage-limit error with no hint (e.g. 402 balance) falls back to the
+		// 30-minute QUOTA_EXHAUSTED heuristic, which must NOT bypass the cap —
+		// otherwise a permanent error holds the session through repeated
+		// heuristic sleeps instead of surfacing.
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) {
+			throw new Error("Expected bundled Anthropic test model to exist");
+		}
+
+		const balanceError = "402 Insufficient balance, please top up your account";
+
+		const mock = createMockModel({ handler: () => ({ throw: balanceError }) });
+		const requestedModels: string[] = [];
+		const agent = new Agent({
+			getApiKey: requestedModel => `${requestedModel.provider}-test-key`,
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: (requestedModel, context, options) => {
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				return mock.stream(requestedModel, context, options);
+			},
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxDelayMs": 100,
+			"retry.modelFallback": false,
+			"retry.waitForUsageReset": true,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const retryStartEvents: AutoRetryStartEvent[] = [];
+		const retryEndEvents: AutoRetryEndEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") retryStartEvents.push(event);
+			if (event.type === "auto_retry_end") retryEndEvents.push(event);
+		});
+
+		await session.prompt("Trigger hintless usage-limit error with the opt-in set");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([`${model.provider}/${model.id}`]);
+		expect(retryStartEvents).toHaveLength(0);
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({ success: false });
+		expect(retryEndEvents[0].finalError).toContain("exceeds retry.maxDelayMs");
+		expect(retryEndEvents[0].finalError).toContain("Provider requested 1800000ms wait");
+		for (const call of waitSpy.mock.calls) {
+			expect(call[0]).toBeLessThanOrEqual(100);
+		}
+		const last = lastAssistant(session);
+		expect(last.stopReason).toBe("error");
+		expect(last.errorMessage).toContain("Insufficient balance");
+		expect(session.isRetrying).toBe(false);
+	});
+
+	it("chunks a usage-limit reset past the 32-bit timer max when retry.waitForUsageReset is set", async () => {
+		// Contract: a provider-stated reset beyond one timer's range
+		// (2_147_483_647ms) must sleep in chunks, not overflow to an instant
+		// retry that burns the budget.
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) {
+			throw new Error("Expected bundled Anthropic test model to exist");
+		}
+
+		const monthlyLimitError = "429 Monthly quota exceeded, resets next cycle. retry-after-ms=3000000000";
+
+		const mock = createMockModel({
+			responses: [
+				{ throw: monthlyLimitError },
+				{ content: ["recovered after monthly reset"], stopReason: "stop" },
+			],
+		});
+		const requestedModels: string[] = [];
+		const agent = new Agent({
+			getApiKey: requestedModel => `${requestedModel.provider}-test-key`,
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: (requestedModel, context, options) => {
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				return mock.stream(requestedModel, context, options);
+			},
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxDelayMs": 100,
+			"retry.maxRetries": 2,
+			"retry.modelFallback": false,
+			"retry.waitForUsageReset": true,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const retryStartEvents: AutoRetryStartEvent[] = [];
+		const retryEndEvents: AutoRetryEndEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") retryStartEvents.push(event);
+			if (event.type === "auto_retry_end") retryEndEvents.push(event);
+		});
+
+		await session.prompt("Trigger oversized usage-limit reset with the opt-in set");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryStartEvents[0].delayMs).toBe(3_000_000_000);
+		const waits = waitSpy.mock.calls.map(call => call[0] as number);
+		// The oversized wait sleeps in timer-safe chunks; no single sleep may
+		// exceed the 32-bit timer max (which would overflow to an instant retry).
+		expect(waits).toContain(2_147_483_647);
+		expect(waits).toContain(3_000_000_000 - 2_147_483_647);
+		for (const wait of waits) {
+			expect(wait).toBeLessThanOrEqual(2_147_483_647);
+		}
+		expect(requestedModels).toEqual([`${model.provider}/${model.id}`, `${model.provider}/${model.id}`]);
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({ success: true });
+		expect(lastAssistant(session).stopReason).toBe("stop");
+		expect(session.isRetrying).toBe(false);
+	});
+
 	it("switches a long OpenCode Go usage limit to an earlier cross-provider fallback", async () => {
 		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const alternateOpenCodeModel = getBundledModel("opencode-go", "deepseek-v4-pro");

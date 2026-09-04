@@ -75,6 +75,10 @@ const EMPTY_STOP_MAX_RETRIES = 3;
 const MALFORMED_FUNCTION_CALL_MAX_RETRIES = 3;
 const SIBLING_UNBLOCK_BUFFER_MS = 1_000;
 const NON_WHITESPACE_RE = /\S/;
+// Largest delay a single timer accepts: larger values overflow the 32-bit
+// timeout (clamped to ~1ms, i.e. an instant retry that burns the budget),
+// so multi-week usage-reset waits sleep in chunks of at most this.
+const MAX_TIMER_WAIT_MS = 2_147_483_647;
 const USAGE_PREFLIGHT_BLOCKED_PREFIX = "Usage preflight blocked:";
 const STREAM_STALL_ERROR_RE = /stream stall/i;
 const HTTP2_STREAM_RESET_ERROR_RE =
@@ -2387,13 +2391,17 @@ export class TurnRecovery {
 		// can act on it.
 		// Opt-out: retry.waitForUsageReset lets a provider-stated usage-limit
 		// reset (Flag.UsageLimit — 5h/weekly quota windows, CN 使用上限, spend
-		// caps, … on any provider) sleep past the cap. Gated on the recorded
-		// outcome so transient retry-afters keep failing fast, and bounded by
+		// caps, … on any provider) sleep past the cap. Gated on a *parsed*
+		// provider reset hint: usage-limit errors without one fall back to the
+		// 30-minute QUOTA_EXHAUSTED heuristic, and sleeping on that for a
+		// permanent error (402 balance, dead spend cap) would hold the session
+		// through repeated heuristic sleeps instead of surfacing it. Bounded by
 		// the stated wait so an unrelated large backoff cannot sneak through.
 		const maxDelayMs = retrySettings.maxDelayMs;
 		const waitForUsageReset =
 			retrySettings.waitForUsageReset === true &&
 			recordedUsageLimitOutcome !== undefined &&
+			parsedRetryAfterMs !== undefined &&
 			effectiveUsageLimitWaitMs !== undefined &&
 			delayMs <= effectiveUsageLimitWaitMs;
 		if (maxDelayMs > 0 && delayMs > maxDelayMs && !switchedCredential && !switchedModel && !waitForUsageReset) {
@@ -2434,12 +2442,14 @@ export class TurnRecovery {
 		// pattern instead of re-sampling the same stalled reasoning.
 		this.#maybeInjectThinkingLoopRedirect(id);
 
-		// Wait with exponential backoff (abortable).
+		// Wait with exponential backoff (abortable). Sleeps in timer-safe
+		// chunks: a single delay past the 32-bit timer max would overflow to
+		// an instant retry, so multi-week usage-reset waits loop instead.
 		const retryAbortController = new AbortController();
 		this.#retryAbortController?.abort();
 		this.#retryAbortController = retryAbortController;
 		try {
-			await scheduler.wait(delayMs, { signal: retryAbortController.signal });
+			await this.#abortableRetryWait(delayMs, retryAbortController.signal);
 		} catch {
 			if (this.#retryAbortController !== retryAbortController) {
 				return false;
@@ -2488,6 +2498,20 @@ export class TurnRecovery {
 		});
 
 		return true;
+	}
+
+	/**
+	 * Sleep `delayMs` unless `signal` aborts, in timer-safe chunks. A single
+	 * timer past the 32-bit max overflows to an instant wake, so oversized
+	 * usage-reset waits loop; abort rejects out of whichever chunk is live.
+	 */
+	async #abortableRetryWait(delayMs: number, signal: AbortSignal): Promise<void> {
+		let remainingMs = Math.max(0, delayMs);
+		while (remainingMs > 0) {
+			const chunkMs = Math.min(remainingMs, MAX_TIMER_WAIT_MS);
+			await scheduler.wait(chunkMs, { signal });
+			remainingMs -= chunkMs;
+		}
 	}
 
 	/**
