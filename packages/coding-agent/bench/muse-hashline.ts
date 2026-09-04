@@ -5,15 +5,9 @@ import type { Context, Model, ModelSpec, Tool } from "@oh-my-pi/pi-ai";
 import { buildParams } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import {
-	EditSession,
-	EditStore,
-	editDescription,
-	editDescriptionCompact,
-	editGrammar,
-	type EditPolicy,
-} from "@oh-my-pi/pi-natives";
+import { EditSession, EditStore, editDescription, editGrammar, type EditPolicy } from "@oh-my-pi/pi-natives";
 import { type } from "@oh-my-pi/omptype";
+import { editDescriptionCompact } from "../src/edit/index";
 
 const WARMUP = 10;
 const SAMPLES = 41;

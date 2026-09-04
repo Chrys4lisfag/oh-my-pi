@@ -654,12 +654,6 @@ pub fn edit_description(mode: String) -> Result<String> {
 	Ok(pi_edit::description(parse_mode(&mode)?).to_owned())
 }
 
-/// Compact tool description markdown for `mode`, when one exists.
-#[napi]
-pub fn edit_description_compact(mode: String) -> Result<Option<String>> {
-	Ok(pi_edit::description_compact(parse_mode(&mode)?).map(str::to_owned))
-}
-
 /// Lark grammar for `mode`, when it has a custom wire format.
 #[napi]
 pub fn edit_grammar(mode: String) -> Result<Option<String>> {

@@ -13,7 +13,6 @@ import type { Model, ToolExample } from "@oh-my-pi/pi-ai";
 import {
 	EditSession,
 	editDescription,
-	editDescriptionCompact,
 	editGrammar,
 	editInspect,
 	type EditFileOutcome,
@@ -56,6 +55,7 @@ import { ToolError } from "../tools/tool-errors";
 import { type EditMode, normalizeEditMode, resolveEditMode } from "../utils/edit-mode";
 import { attemptEditAutoRepair, type EditAutoRepairOutcome } from "./auto-repair";
 import { type AppliedEditSnapshot, createEditBlackboxRecorder } from "./blackbox";
+import hashlineCompactPrompt from "./hashline-compact.md" with { type: "text" };
 import { type EditToolDetails, type EditToolPerFileResult, getLspBatchRequest, type Operation } from "./renderer";
 import {
 	type ApplyPatchParams,
@@ -129,6 +129,20 @@ function resolveConfiguredEditMode(rawEditMode: string): EditMode | undefined {
 	const editMode = normalizeEditMode(rawEditMode);
 	if (!editMode) throw new Error(`Invalid PI_EDIT_VARIANT: ${rawEditMode}`);
 	return editMode;
+}
+
+/**
+ * Compact tool description markdown for `mode`, when one exists. TS-side
+ * source (not the native addon) so PR CI — which tests against the latest
+ * *release* addons — exercises the same rendering production does.
+ */
+export function editDescriptionCompact(mode: EditMode): string | undefined {
+	switch (mode) {
+		case "hashline":
+			return hashlineCompactPrompt;
+		default:
+			return undefined;
+	}
 }
 
 /**
