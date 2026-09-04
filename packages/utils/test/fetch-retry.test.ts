@@ -173,7 +173,18 @@ describe("extractRetryHint", () => {
 				undefined,
 				'429 {"type":"error","error":{"type":"rate_limit_error","code":"1310"}} retry-after-ms=98497000',
 			),
-		).toBe(98497000);
+		).toBe(98_497_000);
+	});
+
+	it("parses colon-delimited and spaced retry-after-ms forms", () => {
+		expect(extractRetryHint(undefined, "429 quota exceeded. retry-after-ms: 7200000")).toBe(7_200_000);
+		expect(extractRetryHint(undefined, "429 quota exceeded. retry-after-ms = 7200000")).toBe(7_200_000);
+	});
+
+	it("keeps a longer colon-delimited retry-after-ms over a shorter reset phrase", () => {
+		expect(extractRetryHint(undefined, "429 quota exceeded. reset in 5 minutes. retry-after-ms: 3600000")).toBe(
+			3_600_000,
+		);
 	});
 
 	it.each([

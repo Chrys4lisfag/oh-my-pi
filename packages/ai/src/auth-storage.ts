@@ -768,6 +768,12 @@ export { isDefinitiveOAuthFailure } from "./error/auth-classify";
  * with an authoritative report window must consult the prior deadline to
  * keep honoring the earlier response's provider-stated block.
  *
+ * `priorBlockedUntilTimed` is `true` when that prior deadline came from
+ * provider-stated timing (a parsed hint or usage-report reset) rather than
+ * another session's heuristic guess — only timed priors may extend a wait
+ * past an authoritative report window. Persisted blocks carry no provenance
+ * and count as timed.
+ *
  * `reportResetAtMs` (epoch ms) is present only when the usage report is a
  * complete authority for the wait: every exhausted window carries a future
  * reset, so sleeping until the latest one can actually clear the account. A
@@ -779,6 +785,7 @@ export interface UsageLimitMarkResult {
 	retryAtMs?: number;
 	blockedUntilMs?: number;
 	priorBlockedUntilMs?: number;
+	priorBlockedUntilTimed?: boolean;
 	reportResetAtMs?: number;
 }
 
@@ -1346,6 +1353,14 @@ export class AuthStorage {
 	#oauthBearerFingerprints: Map<string, Map<number, string[]>> = new Map();
 	/** Maps provider:type -> credentialIndex -> blockedUntilMs for temporary backoff. */
 	#credentialBackoff: Map<string, Map<number, number>> = new Map();
+	/**
+	 * Provenance of each in-memory block: `true` when the deadline came from
+	 * provider-stated timing (a parsed retry hint or a usage-report reset),
+	 * `false` when it is a heuristic/default guess. Mirrors
+	 * {@link AuthStorage.#credentialBackoff} longest-wins semantics, tracking
+	 * the flag of whichever deadline currently wins.
+	 */
+	#credentialBackoffProviderTimed: Map<string, Map<number, boolean>> = new Map();
 	/** Earliest time a freshly-set in-memory block may be cleared by live usage reconciliation. */
 	#credentialBackoffProbeAfter: Map<string, Map<number, number>> = new Map();
 	/**
@@ -1821,6 +1836,10 @@ export class AuthStorage {
 			if (backoffMap.size === 0) {
 				this.#credentialBackoff.delete(backoffKey);
 			}
+			this.#credentialBackoffProviderTimed.get(backoffKey)?.delete(credentialIndex);
+			if (this.#credentialBackoffProviderTimed.get(backoffKey)?.size === 0) {
+				this.#credentialBackoffProviderTimed.delete(backoffKey);
+			}
 			const probeAfterMap = this.#credentialBackoffProbeAfter.get(backoffKey);
 			probeAfterMap?.delete(credentialIndex);
 			if (probeAfterMap?.size === 0) this.#credentialBackoffProbeAfter.delete(backoffKey);
@@ -1927,13 +1946,47 @@ export class AuthStorage {
 		return this.#getCredentialBlockedUntil(provider, providerKey, credentialIndex, blockScope) !== undefined;
 	}
 
-	/** Marks a credential as blocked until the specified time. */
+	/**
+	 * Whether the in-memory block currently sitting at exactly `deadline` for
+	 * this credential was written with provider-stated timing. Mirrors the
+	 * scope enumeration of {@link AuthStorage.#getCredentialBlockedUntil}; a
+	 * deadline with no equal in-memory entry came from the persisted store,
+	 * whose provenance is unknown — count it as provider-timed so a wait never
+	 * undercuts a block another process wrote.
+	 */
+	#isProviderTimedBlock(
+		providerKey: string,
+		blockScopeOrScopes: string | readonly string[] | undefined,
+		credentialIndex: number,
+		deadline: number,
+	): boolean {
+		const scopes = (
+			typeof blockScopeOrScopes === "string" ? [blockScopeOrScopes] : (blockScopeOrScopes ?? [])
+		).filter(scope => scope.length > 0);
+		let matchedInMemory = false;
+		for (const key of [providerKey, ...scopes.map(scope => this.#toScopedBackoffKey(providerKey, scope))]) {
+			const entry = this.#credentialBackoff.get(key)?.get(credentialIndex);
+			if (entry === undefined || entry !== deadline) continue;
+			matchedInMemory = true;
+			if (this.#credentialBackoffProviderTimed.get(key)?.get(credentialIndex) === true) return true;
+		}
+		return !matchedInMemory;
+	}
+
+	/**
+	 * Marks a credential as blocked until the specified time. `providerTimed`
+	 * records whether the requested deadline comes from provider-stated
+	 * timing (a parsed retry hint or a usage-report reset) rather than a
+	 * heuristic/default guess; the stored block keeps the provenance of
+	 * whichever deadline wins the longest-wins merge.
+	 */
 	#markCredentialBlocked(
 		provider: string,
 		providerKey: string,
 		credentialIndex: number,
 		blockedUntilMs: number,
 		blockScope: string | undefined = undefined,
+		providerTimed = false,
 	): void {
 		const backoffKey = this.#toScopedBackoffKey(providerKey, blockScope);
 		const backoffMap = this.#credentialBackoff.get(backoffKey) ?? new Map<number, number>();
@@ -1941,6 +1994,16 @@ export class AuthStorage {
 		const nextBlockedUntil = Math.max(existing, blockedUntilMs);
 		backoffMap.set(credentialIndex, nextBlockedUntil);
 		this.#credentialBackoff.set(backoffKey, backoffMap);
+		const timedMap = this.#credentialBackoffProviderTimed.get(backoffKey) ?? new Map<number, boolean>();
+		const existingTimed = timedMap.get(credentialIndex) ?? false;
+		const nextTimed =
+			blockedUntilMs > existing
+				? providerTimed
+				: blockedUntilMs === existing
+					? existingTimed || providerTimed
+					: existingTimed;
+		timedMap.set(credentialIndex, nextTimed);
+		this.#credentialBackoffProviderTimed.set(backoffKey, timedMap);
 		const probeAfterMap = this.#credentialBackoffProbeAfter.get(backoffKey) ?? new Map<number, number>();
 		probeAfterMap.set(credentialIndex, Math.min(nextBlockedUntil, Date.now() + USAGE_REPORT_TTL_MS));
 		this.#credentialBackoffProbeAfter.set(backoffKey, probeAfterMap);
@@ -2226,6 +2289,7 @@ export class AuthStorage {
 					selection.index,
 					blockedUntil,
 					args.blockScope,
+					resetAtMs !== undefined,
 				);
 				blocked = true;
 			}
@@ -2329,6 +2393,11 @@ export class AuthStorage {
 		for (const key of this.#credentialBackoff.keys()) {
 			if (key.startsWith(`${provider}:`)) {
 				this.#credentialBackoff.delete(key);
+			}
+		}
+		for (const key of this.#credentialBackoffProviderTimed.keys()) {
+			if (key.startsWith(`${provider}:`)) {
+				this.#credentialBackoffProviderTimed.delete(key);
 			}
 		}
 	}
@@ -4621,6 +4690,7 @@ export class AuthStorage {
 		targetIndex: number,
 		blockedUntil: number,
 		routing: CredentialBlockRouting,
+		providerTimed: boolean,
 	): UsageLimitMarkResult {
 		// Snapshot the live block deadline BEFORE this call's mark: the merged
 		// value below masks a pre-existing block shorter than this call's own
@@ -4631,8 +4701,19 @@ export class AuthStorage {
 			targetIndex >= 0
 				? this.#getCredentialBlockedUntil(provider, routing.providerKey, targetIndex, routing.blockScope)
 				: undefined;
+		const priorBlockedUntilTimed =
+			targetIndex >= 0 && priorBlockedUntilMs !== undefined
+				? this.#isProviderTimedBlock(routing.providerKey, routing.blockScope, targetIndex, priorBlockedUntilMs)
+				: false;
 		if (targetIndex >= 0) {
-			this.#markCredentialBlocked(provider, routing.providerKey, targetIndex, blockedUntil, routing.blockScope);
+			this.#markCredentialBlocked(
+				provider,
+				routing.providerKey,
+				targetIndex,
+				blockedUntil,
+				routing.blockScope,
+				providerTimed,
+			);
 		}
 
 		// Report the merged deadline the block map actually stores, not this
@@ -4664,10 +4745,21 @@ export class AuthStorage {
 				routing.siblingBlockScopes,
 			);
 			if (candidateBlockedUntil === undefined)
-				return { switched: true, blockedUntilMs: mergedBlockedUntil, priorBlockedUntilMs };
+				return {
+					switched: true,
+					blockedUntilMs: mergedBlockedUntil,
+					priorBlockedUntilMs,
+					priorBlockedUntilTimed,
+				};
 			if (retryAtMs === undefined || candidateBlockedUntil < retryAtMs) retryAtMs = candidateBlockedUntil;
 		}
-		return { switched: false, retryAtMs, blockedUntilMs: mergedBlockedUntil, priorBlockedUntilMs };
+		return {
+			switched: false,
+			retryAtMs,
+			blockedUntilMs: mergedBlockedUntil,
+			priorBlockedUntilMs,
+			priorBlockedUntilTimed,
+		};
 	}
 
 	/**
@@ -4682,6 +4774,12 @@ export class AuthStorage {
 		sessionId: string | undefined,
 		options?: {
 			retryAfterMs?: number;
+			/**
+			 * Whether `retryAfterMs` came from provider-stated timing (a parsed
+			 * retry hint) rather than a heuristic/default guess. A report reset
+			 * extending the block counts as provider timing regardless.
+			 */
+			providerTimed?: boolean;
 			baseUrl?: string;
 			modelId?: string;
 			apiKey?: string;
@@ -4715,6 +4813,9 @@ export class AuthStorage {
 		const routing = this.#credentialBlockRouting(provider, credentialType, options?.modelId);
 		const now = Date.now();
 		let blockedUntil = now + (options?.retryAfterMs ?? AuthStorage.#defaultBackoffMs);
+		// Heuristic/default fallbacks are guesses; provider-stated hints and
+		// report-derived extensions are timed.
+		let providerTimed = options?.providerTimed === true;
 
 		// Epoch ms of the usage-report-derived reset. Authoritative only when
 		// EVERY exhausted window carries a future reset: a permanent cap
@@ -4734,6 +4835,7 @@ export class AuthStorage {
 					const resetAtMs = this.#getUsageResetAtMs(scopedLimits, Date.now());
 					if (resetAtMs && resetAtMs > blockedUntil) {
 						blockedUntil = resetAtMs;
+						providerTimed = true;
 					}
 					const nowMs = Date.now();
 					const exhaustedLimits = scopedLimits.filter(limit => this.#isUsageLimitExhausted(limit));
@@ -4753,7 +4855,14 @@ export class AuthStorage {
 		const targetIndex = this.#getStoredCredentials(provider).findIndex(
 			entry => entry.id === targetCredentialId && entry.credential.type === credentialType,
 		);
-		const rotation = this.#blockCredentialForRotation(provider, credentialType, targetIndex, blockedUntil, routing);
+		const rotation = this.#blockCredentialForRotation(
+			provider,
+			credentialType,
+			targetIndex,
+			blockedUntil,
+			routing,
+			providerTimed,
+		);
 		return reportResetAtMs === undefined ? rotation : { ...rotation, reportResetAtMs };
 	}
 
@@ -4964,6 +5073,7 @@ export class AuthStorage {
 					selection.index,
 					blockedUntil,
 					args.blockScope,
+					resetAtMs !== undefined,
 				);
 				blocked = true;
 			}
@@ -5620,6 +5730,7 @@ export class AuthStorage {
 						selection.index,
 						resetAtMs ?? Date.now() + AuthStorage.#defaultBackoffMs,
 						blockScope,
+						resetAtMs !== undefined,
 					);
 					return undefined;
 				}
@@ -5700,6 +5811,7 @@ export class AuthStorage {
 							selection.index,
 							resetAtMs ?? Date.now() + AuthStorage.#defaultBackoffMs,
 							blockScope,
+							resetAtMs !== undefined,
 						);
 						return undefined;
 					}
@@ -6393,6 +6505,11 @@ export class AuthStorage {
 			backoffMap.delete(index);
 			if (backoffMap.size === 0) this.#credentialBackoff.delete(key);
 		}
+		for (const [key, timedMap] of this.#credentialBackoffProviderTimed) {
+			if (key !== providerKey && !key.startsWith(scopedPrefix)) continue;
+			timedMap.delete(index);
+			if (timedMap.size === 0) this.#credentialBackoffProviderTimed.delete(key);
+		}
 		for (const [key, probeAfterMap] of this.#credentialBackoffProbeAfter) {
 			if (key !== providerKey && !key.startsWith(scopedPrefix)) continue;
 			probeAfterMap.delete(index);
@@ -6454,6 +6571,9 @@ export class AuthStorage {
 		const backoffMap = this.#credentialBackoff.get(key);
 		backoffMap?.delete(credentialIndex);
 		if (backoffMap?.size === 0) this.#credentialBackoff.delete(key);
+		const timedMap = this.#credentialBackoffProviderTimed.get(key);
+		timedMap?.delete(credentialIndex);
+		if (timedMap?.size === 0) this.#credentialBackoffProviderTimed.delete(key);
 		const probeAfterMap = this.#credentialBackoffProbeAfter.get(key);
 		probeAfterMap?.delete(credentialIndex);
 		if (probeAfterMap?.size === 0) this.#credentialBackoffProbeAfter.delete(key);
@@ -6745,6 +6865,7 @@ export class AuthStorage {
 			return (
 				await this.markUsageLimitReached(provider, sessionId, {
 					retryAfterMs,
+					providerTimed: retryAfterMs !== undefined,
 					modelId: options?.modelId,
 					apiKey: options?.apiKey,
 					credentialId: options?.credentialId,
@@ -6784,6 +6905,7 @@ export class AuthStorage {
 				sessionCredential.index,
 				Date.now() + AuthStorage.#defaultBackoffMs,
 				routing,
+				false,
 			).switched;
 		}
 

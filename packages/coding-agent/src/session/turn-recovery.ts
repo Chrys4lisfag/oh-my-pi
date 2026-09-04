@@ -252,6 +252,7 @@ type UsageLimitOutcome = {
 	retryAtMs: number | undefined;
 	blockedUntilMs: number | undefined;
 	priorBlockedUntilMs: number | undefined;
+	priorBlockedUntilTimed: boolean | undefined;
 	reportResetAtMs: number | undefined;
 };
 
@@ -601,14 +602,20 @@ export class TurnRecovery {
 		let recorded = this.#usageLimitOutcomes.get(message);
 		if (!recorded) {
 			const errorMessage = message.errorMessage || "Unknown error";
-			const retryAfterMs =
-				this.#parseRetryAfterMsFromError(errorMessage) ??
-				calculateRateLimitBackoffMs(parseRateLimitReason(errorMessage));
+			const parsedRetryAfterMs = this.#parseRetryAfterMsFromError(errorMessage);
+			const retryAfterMs = parsedRetryAfterMs ?? calculateRateLimitBackoffMs(parseRateLimitReason(errorMessage));
 			recorded = (async (): Promise<UsageLimitOutcome> => {
 				const outcome = await this.#host.modelRegistry.authStorage.markUsageLimitReached(
 					activeModel.provider,
 					this.#host.sessionId(),
-					{ retryAfterMs, baseUrl: activeModel.baseUrl, modelId: activeModel.id },
+					{
+						retryAfterMs,
+						// Provider-stated timing only when the error text parsed;
+						// the 30-minute fallback is a guess.
+						providerTimed: parsedRetryAfterMs !== undefined,
+						baseUrl: activeModel.baseUrl,
+						modelId: activeModel.id,
+					},
 				);
 				return {
 					switchedCredential: outcome.switched,
@@ -616,6 +623,7 @@ export class TurnRecovery {
 					retryAtMs: outcome.retryAtMs,
 					blockedUntilMs: outcome.blockedUntilMs,
 					priorBlockedUntilMs: outcome.priorBlockedUntilMs,
+					priorBlockedUntilTimed: outcome.priorBlockedUntilTimed,
 					reportResetAtMs: outcome.reportResetAtMs,
 				};
 			})();
@@ -2199,13 +2207,19 @@ export class TurnRecovery {
 					// versa.
 					usageLimitWaitMs = Math.max(0, recordedUsageLimitOutcome.reportResetAtMs - Date.now());
 				}
-				if (recordedUsageLimitOutcome.priorBlockedUntilMs !== undefined) {
+				if (
+					recordedUsageLimitOutcome.priorBlockedUntilMs !== undefined &&
+					recordedUsageLimitOutcome.priorBlockedUntilTimed === true
+				) {
 					// The merged deadline below masks a pre-existing block
 					// shorter than this call's heuristic fallback (longest-wins
 					// in the mark). The prior deadline is that block's own
 					// provenance — an earlier response's provider-stated
 					// window — and must survive this call's heuristic guess:
-					// waking before it retries a still-blocked credential.
+					// waking before it retries a still-blocked credential. A
+					// prior deadline that was itself only a heuristic guess
+					// carries no such authority and must not extend the wait
+					// past an authoritative report window.
 					const priorRemainingMs = Math.max(0, recordedUsageLimitOutcome.priorBlockedUntilMs - Date.now());
 					if (priorRemainingMs > usageLimitWaitMs) usageLimitWaitMs = priorRemainingMs;
 				}
