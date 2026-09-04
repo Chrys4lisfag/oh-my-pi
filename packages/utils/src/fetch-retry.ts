@@ -83,6 +83,16 @@ export function extractRetryHint(source: Response | Headers | null | undefined, 
 
 	if (!body) return undefined;
 
+	// A body can carry several timing signals at once: the account-reset
+	// window plus header timing folded into the message text (already the
+	// max across response headers — see getRetryAfterMsFromHeaders in
+	// pi-ai). Honor the longest: retrying before either window clears
+	// re-hits a still-blocked credential and burns the retry budget.
+	let longestMs: number | undefined;
+	const consider = (ms: number | undefined): void => {
+		if (ms !== undefined && ms > 0 && (longestMs === undefined || ms > longestMs)) longestMs = ms;
+	};
+
 	const quotaMatch = QUOTA_RESET_PATTERN.exec(body);
 	if (quotaMatch) {
 		const hours = quotaMatch[1] ? Number.parseInt(quotaMatch[1], 10) : 0;
@@ -90,7 +100,7 @@ export function extractRetryHint(source: Response | Headers | null | undefined, 
 		const seconds = Number.parseFloat(quotaMatch[3]!);
 		if (!Number.isNaN(seconds)) {
 			const totalMs = ((hours * 60 + minutes) * 60 + seconds) * 1000;
-			if (totalMs > 0) return totalMs;
+			consider(totalMs > 0 ? totalMs : undefined);
 		}
 	}
 	for (const pattern of [WILL_RESET_AT_PATTERN, CN_RESET_AT_PATTERN]) {
@@ -101,27 +111,23 @@ export function extractRetryHint(source: Response | Headers | null | undefined, 
 			const hasOffset = /(?:Z|[+-][0-9]{2}:?[0-9]{2})$/i.test(normalized);
 			const parsed = Date.parse(hasOffset ? normalized : `${normalized}Z`);
 			if (!Number.isNaN(parsed) && parsed > Date.now()) {
-				return parsed - Date.now();
+				consider(parsed - Date.now());
 			}
 		}
 	}
-	// Account-reset hints ("will reset in …") take precedence over short
-	// retry hints ("please retry in 5s"): a body carrying both must honour the
-	// longer account window, not the shorter generic one. QUOTA_RESET_PATTERN
-	// ("reset after …") above already runs first and stays first.
 	const accountResetMatch = WILL_RESET_IN_PATTERN.exec(body);
 	if (accountResetMatch?.[1]) {
 		const value = Number.parseFloat(accountResetMatch[1]);
 		if (Number.isFinite(value) && value > 0) {
 			const unitMs = unitToMs(accountResetMatch[2]!);
-			if (unitMs !== undefined) return value * unitMs;
+			if (unitMs !== undefined) consider(value * unitMs);
 		}
 	}
 
 	const retryAfterMsMatch = RETRY_AFTER_MS_BODY_PATTERN.exec(body);
 	if (retryAfterMsMatch?.[1]) {
 		const ms = Number(retryAfterMsMatch[1]);
-		if (Number.isFinite(ms) && ms > 0) return ms;
+		if (Number.isFinite(ms)) consider(ms);
 	}
 
 	for (const pattern of [PLEASE_RETRY_PATTERN, RETRY_DELAY_FIELD_PATTERN, TRY_AGAIN_PATTERN]) {
@@ -130,11 +136,11 @@ export function extractRetryHint(source: Response | Headers | null | undefined, 
 			const value = Number.parseFloat(match[1]);
 			if (Number.isFinite(value) && value > 0) {
 				const unitMs = unitToMs(match[2]!);
-				if (unitMs !== undefined) return value * unitMs;
+				if (unitMs !== undefined) consider(value * unitMs);
 			}
 		}
 	}
-	return undefined;
+	return longestMs;
 }
 
 function unitToMs(unit: string): number | undefined {

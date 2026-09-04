@@ -147,6 +147,15 @@ describe("extractRetryHint", () => {
 	it("prefers the account reset window over a shorter retry hint", () => {
 		expect(extractRetryHint(undefined, "Please retry in 5s. Your limit will reset in 13 minutes")).toBe(13 * 60_000);
 	});
+	// The appended header hint is already the max across response headers
+	// (getRetryAfterMsFromHeaders in pi-ai). When it outlasts the textual
+	// account reset, it must win so the retry honors the provider's retry
+	// window instead of re-hitting a blocked credential.
+	it("prefers a longer appended retry hint over a shorter account reset", () => {
+		expect(
+			extractRetryHint(undefined, "429 quota exceeded. Your limit will reset in 5 minutes. retry-after-ms=3600000"),
+		).toBe(3600000);
+	});
 
 	it("parses retry-after-ms in error body", () => {
 		expect(
