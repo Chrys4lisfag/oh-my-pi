@@ -760,11 +760,17 @@ export { isDefinitiveOAuthFailure } from "./error/auth-classify";
  * deadline — the later of the caller's retry-after and any exhausted window
  * the usage report reveals. Callers that wait the account out (instead of
  * rotating) must sleep until this, not the error-text hint alone.
+ *
+ * `reportResetAtMs` (epoch ms) is present only when the usage report extended
+ * the block past the caller's hint. It lets callers distinguish an
+ * authoritative report window (safe to sleep on without an error-text hint)
+ * from the heuristic fallback (never safe to sleep on alone).
  */
 export interface UsageLimitMarkResult {
 	switched: boolean;
 	retryAtMs?: number;
 	blockedUntilMs?: number;
+	reportResetAtMs?: number;
 }
 
 export type ModelUsageHealthState = "healthy" | "reserve" | "depleted" | "unknown";
@@ -4680,6 +4686,11 @@ export class AuthStorage {
 		const now = Date.now();
 		let blockedUntil = now + (options?.retryAfterMs ?? AuthStorage.#defaultBackoffMs);
 
+		// Epoch ms of the usage-report-derived reset when the report extends
+		// the block past the caller's hint. Set only on extension so callers
+		// can tell an authoritative report window apart from the heuristic
+		// fallback they must not sleep on.
+		let reportResetAtMs: number | undefined;
 		if (target && routing.strategy) {
 			const report = await raceUsageWithSignal(
 				this.#getUsageReport(provider, target.credential, options),
@@ -4691,6 +4702,7 @@ export class AuthStorage {
 					const resetAtMs = this.#getUsageResetAtMs(scopedLimits, Date.now());
 					if (resetAtMs && resetAtMs > blockedUntil) {
 						blockedUntil = resetAtMs;
+						reportResetAtMs = resetAtMs;
 					}
 				}
 			}
@@ -4702,7 +4714,8 @@ export class AuthStorage {
 		const targetIndex = this.#getStoredCredentials(provider).findIndex(
 			entry => entry.id === targetCredentialId && entry.credential.type === credentialType,
 		);
-		return this.#blockCredentialForRotation(provider, credentialType, targetIndex, blockedUntil, routing);
+		const rotation = this.#blockCredentialForRotation(provider, credentialType, targetIndex, blockedUntil, routing);
+		return reportResetAtMs === undefined ? rotation : { ...rotation, reportResetAtMs };
 	}
 
 	#resolveWindowResetAt(window: UsageLimit["window"]): number | undefined {

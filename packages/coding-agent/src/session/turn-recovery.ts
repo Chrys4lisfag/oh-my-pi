@@ -251,6 +251,7 @@ type UsageLimitOutcome = {
 	retryAfterMs: number;
 	retryAtMs: number | undefined;
 	blockedUntilMs: number | undefined;
+	reportResetAtMs: number | undefined;
 };
 
 /** Owns terminal-stop recovery, automatic retries, and fallback routing. */
@@ -613,6 +614,7 @@ export class TurnRecovery {
 					retryAfterMs,
 					retryAtMs: outcome.retryAtMs,
 					blockedUntilMs: outcome.blockedUntilMs,
+					reportResetAtMs: outcome.reportResetAtMs,
 				};
 			})();
 			this.#usageLimitOutcomes.set(message, recorded);
@@ -2404,17 +2406,20 @@ export class TurnRecovery {
 		// can act on it.
 		// Opt-out: retry.waitForUsageReset lets a provider-stated usage-limit
 		// reset (Flag.UsageLimit — 5h/weekly quota windows, CN 使用上限, spend
-		// caps, … on any provider) sleep past the cap. Gated on a *parsed*
-		// provider reset hint: usage-limit errors without one fall back to the
-		// 30-minute QUOTA_EXHAUSTED heuristic, and sleeping on that for a
-		// permanent error (402 balance, dead spend cap) would hold the session
-		// through repeated heuristic sleeps instead of surfacing it. Bounded by
-		// the stated wait so an unrelated large backoff cannot sneak through.
+		// caps, … on any provider) sleep past the cap. Gated on authoritative
+		// provider timing: either a parsed reset hint from the error text, or
+		// a usage-report window that extends past the hint (or stands alone
+		// when the text carries none). Usage-limit errors with neither fall
+		// back to the 30-minute QUOTA_EXHAUSTED heuristic, and sleeping on
+		// that for a permanent error (402 balance, dead spend cap) would hold
+		// the session through repeated heuristic sleeps instead of surfacing
+		// it. Bounded by the stated wait so an unrelated large backoff cannot
+		// sneak through.
 		const maxDelayMs = retrySettings.maxDelayMs;
 		const waitForUsageReset =
 			retrySettings.waitForUsageReset === true &&
 			recordedUsageLimitOutcome !== undefined &&
-			parsedRetryAfterMs !== undefined &&
+			(parsedRetryAfterMs !== undefined || recordedUsageLimitOutcome.reportResetAtMs !== undefined) &&
 			effectiveUsageLimitWaitMs !== undefined &&
 			delayMs <= effectiveUsageLimitWaitMs;
 		if (maxDelayMs > 0 && delayMs > maxDelayMs && !switchedCredential && !switchedModel && !waitForUsageReset) {
