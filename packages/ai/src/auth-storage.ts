@@ -4618,6 +4618,17 @@ export class AuthStorage {
 			this.#markCredentialBlocked(provider, routing.providerKey, targetIndex, blockedUntil, routing.blockScope);
 		}
 
+		// Report the merged deadline the block map actually stores, not this
+		// call's input: a sibling session may have established a longer block
+		// for the same credential (out-of-order usage-limit responses), and
+		// #markCredentialBlocked keeps the longest. Waiting on the shorter
+		// value would retry before the credential is actually usable.
+		const mergedBlockedUntil =
+			targetIndex >= 0
+				? (this.#getCredentialBlockedUntil(provider, routing.providerKey, targetIndex, routing.blockScope) ??
+					blockedUntil)
+				: blockedUntil;
+
 		const remainingCredentials = this.#getCredentialsForProvider(provider)
 			.map((credential, index) => ({ credential, index }))
 			.filter(
@@ -4635,10 +4646,10 @@ export class AuthStorage {
 				candidate.index,
 				routing.siblingBlockScopes,
 			);
-			if (candidateBlockedUntil === undefined) return { switched: true, blockedUntilMs: blockedUntil };
+			if (candidateBlockedUntil === undefined) return { switched: true, blockedUntilMs: mergedBlockedUntil };
 			if (retryAtMs === undefined || candidateBlockedUntil < retryAtMs) retryAtMs = candidateBlockedUntil;
 		}
-		return { switched: false, retryAtMs, blockedUntilMs: blockedUntil };
+		return { switched: false, retryAtMs, blockedUntilMs: mergedBlockedUntil };
 	}
 
 	/**

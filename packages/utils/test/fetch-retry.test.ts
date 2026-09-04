@@ -157,6 +157,16 @@ describe("extractRetryHint", () => {
 		).toBe(3600000);
 	});
 
+	it("prefers a longer legacy retry-after over a shorter reset phrase", () => {
+		expect(extractRetryHint(undefined, "429 quota exceeded. reset in 5 minutes; retry-after=3600")).toBe(3_600_000);
+	});
+
+	it("parses x-ratelimit-reset epoch seconds in the body", () => {
+		const hint = extractRetryHint(undefined, "rate limited, x-ratelimit-reset=9999999999");
+		expect(hint).toBeDefined();
+		expect(hint!).toBeGreaterThan(8_000_000_000_000);
+	});
+
 	it("parses retry-after-ms in error body", () => {
 		expect(
 			extractRetryHint(

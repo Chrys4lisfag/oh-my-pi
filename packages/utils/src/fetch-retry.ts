@@ -140,6 +140,38 @@ export function extractRetryHint(source: Response | Headers | null | undefined, 
 			}
 		}
 	}
+
+	// Legacy text forms (also honored by older local parsers): a plain
+	// `retry-after` delta in seconds or as an HTTP date, and
+	// `x-ratelimit-reset[-ms]` counters. They compete in the same maximum —
+	// a longer legacy hint must not lose to a shorter reset phrase.
+	const retryAfterMatch = /retry-after\s*[:=]\s*([^\s,;]+)/i.exec(body);
+	if (retryAfterMatch) {
+		const value = retryAfterMatch[1]!;
+		const seconds = Number(value);
+		if (Number.isFinite(seconds)) {
+			consider(seconds * 1000);
+		} else {
+			const dateMs = Date.parse(value);
+			if (!Number.isNaN(dateMs)) consider(dateMs - Date.now());
+		}
+	}
+
+	const resetMsMatch = /x-ratelimit-reset-ms\s*[:=]\s*(\d+)/i.exec(body);
+	if (resetMsMatch) {
+		const resetMs = Number(resetMsMatch[1]);
+		if (!Number.isNaN(resetMs)) {
+			consider(resetMs > 1_000_000_000_000 ? resetMs - Date.now() : resetMs);
+		}
+	}
+
+	const resetMatch = /x-ratelimit-reset\s*[:=]\s*(\d+)/i.exec(body);
+	if (resetMatch) {
+		const resetSeconds = Number(resetMatch[1]);
+		if (!Number.isNaN(resetSeconds)) {
+			consider(resetSeconds > 1_000_000_000 ? resetSeconds * 1000 - Date.now() : resetSeconds * 1000);
+		}
+	}
 	return longestMs;
 }
 
