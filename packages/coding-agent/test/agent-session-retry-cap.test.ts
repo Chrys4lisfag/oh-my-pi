@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
@@ -16,6 +17,8 @@ import { createMockModel, type MockResponse, registerMockApi } from "@oh-my-pi/p
 import * as aiStream from "@oh-my-pi/pi-ai/stream";
 import { kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { SqliteAuthCredentialStore } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { opencodeGoUsageProvider } from "@oh-my-pi/pi-ai/usage/opencode-go";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { Model } from "@oh-my-pi/pi-catalog/types";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -531,6 +534,108 @@ describe("AgentSession retry delay cap", () => {
 		expect(retryEndEvents[0]).toMatchObject({ success: true });
 		expect(lastAssistant(session).stopReason).toBe("stop");
 		expect(session.isRetrying).toBe(false);
+	});
+
+	it("sleeps until the report-derived unblock deadline when it outlasts the error hint", async () => {
+		// Contract: when the usage report reveals a later exhausted window
+		// than the error text names (here a 60s hint while the weekly window
+		// is spent for ~2h), the wait honors the credential's actual unblock
+		// deadline — waking on the shorter hint would retry a still-blocked
+		// credential and burn the budget.
+		const exhaustedModel = getBundledModel("opencode-go", "deepseek-v4-flash");
+		if (!exhaustedModel) {
+			throw new Error("Expected bundled OpenCode Go test model to exist");
+		}
+
+		const weeklyResetIso = new Date(Date.now() + 7_200_000).toISOString();
+		const localStore = new SqliteAuthCredentialStore(new Database(":memory:"));
+		const localStorage = new AuthStorage(localStore, {
+			usageProviderResolver: provider => (provider === "opencode-go" ? opencodeGoUsageProvider : undefined),
+			usageFetch: (async () =>
+				new Response(
+					JSON.stringify({
+						usage: {
+							rolling: { status: "ok", percent: 12, resetsAt: new Date(Date.now() + 300_000).toISOString() },
+							weekly: { status: "rate-limited", percent: 100, resetsAt: weeklyResetIso },
+							monthly: {
+								status: "ok",
+								percent: 8,
+								resetsAt: new Date(Date.now() + 30 * 24 * 3_600_000).toISOString(),
+							},
+						},
+					}),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				)) as unknown as typeof fetch,
+		});
+		try {
+			await localStorage.reload();
+			await localStorage.set("opencode-go", { type: "api_key", key: "opencode-go-usage-key" });
+			const localRegistry = new ModelRegistry(localStorage, path.join(tempDir.path(), "models.yml"));
+
+			const mock = createMockModel({
+				responses: [
+					{ throw: "429 Weekly usage limit reached. type=GoUsageLimitError retry-after-ms=60000" },
+					{ content: ["recovered after weekly reset"], stopReason: "stop" },
+				],
+			});
+			const requestedModels: string[] = [];
+			const agent = new Agent({
+				getApiKey: model => localRegistry.resolver(model, agent.sessionId),
+				initialState: {
+					model: exhaustedModel,
+					systemPrompt: ["Test"],
+					tools: [],
+					messages: [],
+				},
+				streamFn: (requestedModel, context, options) => {
+					requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+					return mock.stream(requestedModel, context, options);
+				},
+			});
+
+			const settings = Settings.isolated({
+				"compaction.enabled": false,
+				"retry.baseDelayMs": 5,
+				"retry.maxDelayMs": 100,
+				"retry.maxRetries": 2,
+				"retry.modelFallback": false,
+				"retry.waitForUsageReset": true,
+			});
+			settings.setModelRole("default", `${exhaustedModel.provider}/${exhaustedModel.id}`);
+
+			session = new AgentSession({
+				agent,
+				sessionManager: SessionManager.inMemory(),
+				settings,
+				modelRegistry: localRegistry,
+			});
+
+			const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const retryStartEvents: AutoRetryStartEvent[] = [];
+			const retryEndEvents: AutoRetryEndEvent[] = [];
+			session.subscribe(event => {
+				if (event.type === "auto_retry_start") retryStartEvents.push(event);
+				if (event.type === "auto_retry_end") retryEndEvents.push(event);
+			});
+
+			await session.prompt("Trigger usage limit with a later report-derived reset");
+			await session.waitForIdle();
+
+			expect(retryStartEvents).toHaveLength(1);
+			expect(retryStartEvents[0].delayMs).toBeGreaterThan(7_100_000);
+			expect(retryStartEvents[0].delayMs).toBeLessThanOrEqual(7_200_000);
+			expect(waitSpy.mock.calls.some(call => (call[0] as number) > 7_100_000)).toBe(true);
+			expect(requestedModels).toEqual([
+				`${exhaustedModel.provider}/${exhaustedModel.id}`,
+				`${exhaustedModel.provider}/${exhaustedModel.id}`,
+			]);
+			expect(retryEndEvents).toHaveLength(1);
+			expect(retryEndEvents[0]).toMatchObject({ success: true });
+			expect(lastAssistant(session).stopReason).toBe("stop");
+			expect(session.isRetrying).toBe(false);
+		} finally {
+			localStorage.close();
+		}
 	});
 
 	it("switches a long OpenCode Go usage limit to an earlier cross-provider fallback", async () => {

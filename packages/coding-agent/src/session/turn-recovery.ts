@@ -250,6 +250,7 @@ type UsageLimitOutcome = {
 	switchedCredential: boolean;
 	retryAfterMs: number;
 	retryAtMs: number | undefined;
+	blockedUntilMs: number | undefined;
 };
 
 /** Owns terminal-stop recovery, automatic retries, and fallback routing. */
@@ -611,6 +612,7 @@ export class TurnRecovery {
 					switchedCredential: outcome.switched,
 					retryAfterMs,
 					retryAtMs: outcome.retryAtMs,
+					blockedUntilMs: outcome.blockedUntilMs,
 				};
 			})();
 			this.#usageLimitOutcomes.set(message, recorded);
@@ -2220,14 +2222,23 @@ export class TurnRecovery {
 				delayMs = 0;
 			} else {
 				// No sibling credential is usable right now. Wait for whichever
-				// comes first: the provider's retry-after window for the current
-				// account, or the earliest moment a temporarily blocked sibling
-				// frees up (e.g. a 60s post-401 block or a 5-min usage-probe
-				// block) — the next attempt's getApiKey re-ranks and picks it up.
-				// Without this, one short-lived sibling block escalates a
+				// comes first: the current account's actual unblock deadline, or
+				// the earliest moment a temporarily blocked sibling frees up
+				// (e.g. a 60s post-401 block or a 5-min usage-probe block) — the
+				// next attempt's getApiKey re-ranks and picks it up. Without the
+				// sibling minimum, one short-lived sibling block escalates a
 				// recoverable situation into the provider's multi-hour wait and
 				// trips the fail-fast cap below.
+				// The deadline is the later of the error-text hint and any
+				// exhausted window the usage report reveals (e.g. the response
+				// names the 5h reset while the weekly window is also spent):
+				// waking on the shorter hint alone would retry a still-blocked
+				// credential and burn the budget.
 				usageLimitWaitMs = recordedUsageLimitOutcome.retryAfterMs;
+				if (recordedUsageLimitOutcome.blockedUntilMs !== undefined) {
+					const blockedRemainingMs = Math.max(0, recordedUsageLimitOutcome.blockedUntilMs - Date.now());
+					if (blockedRemainingMs > usageLimitWaitMs) usageLimitWaitMs = blockedRemainingMs;
+				}
 				if (siblingAvailabilityWaitMs !== undefined && siblingAvailabilityWaitMs < usageLimitWaitMs) {
 					usageLimitWaitMs = siblingAvailabilityWaitMs;
 				}

@@ -755,10 +755,16 @@ export { isDefinitiveOAuthFailure } from "./error/auth-classify";
  * multi-hour) retry-after when it is sooner. `retryAtMs` is `undefined` when
  * no sibling credentials exist at all, or when the session has no tracked
  * credential to rotate away from.
+ *
+ * `blockedUntilMs` (epoch ms) is the just-blocked credential's own unblock
+ * deadline — the later of the caller's retry-after and any exhausted window
+ * the usage report reveals. Callers that wait the account out (instead of
+ * rotating) must sleep until this, not the error-text hint alone.
  */
 export interface UsageLimitMarkResult {
 	switched: boolean;
 	retryAtMs?: number;
+	blockedUntilMs?: number;
 }
 
 export type ModelUsageHealthState = "healthy" | "reserve" | "depleted" | "unknown";
@@ -4622,10 +4628,10 @@ export class AuthStorage {
 				candidate.index,
 				routing.siblingBlockScopes,
 			);
-			if (candidateBlockedUntil === undefined) return { switched: true };
+			if (candidateBlockedUntil === undefined) return { switched: true, blockedUntilMs: blockedUntil };
 			if (retryAtMs === undefined || candidateBlockedUntil < retryAtMs) retryAtMs = candidateBlockedUntil;
 		}
-		return { switched: false, retryAtMs };
+		return { switched: false, retryAtMs, blockedUntilMs: blockedUntil };
 	}
 
 	/**

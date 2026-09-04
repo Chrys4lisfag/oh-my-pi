@@ -861,7 +861,13 @@ describe("AuthStorage forceRefresh + rotateSessionCredential", () => {
 		]);
 
 		await authStorage.getApiKey(PROVIDER, "sess");
+		const blockedBefore = Date.now();
 		const outcome = await authStorage.markUsageLimitReached(PROVIDER, "sess", { retryAfterMs: 3_600_000 });
-		expect(outcome).toEqual({ switched: false, retryAtMs: undefined });
+		const blockedAfter = Date.now();
+		expect(outcome.switched).toBe(false);
+		expect(outcome.retryAtMs).toBeUndefined();
+		expect(outcome.blockedUntilMs).toBeDefined();
+		expect(outcome.blockedUntilMs!).toBeGreaterThanOrEqual(blockedBefore + 3_600_000);
+		expect(outcome.blockedUntilMs!).toBeLessThanOrEqual(blockedAfter + 3_600_000);
 	});
 });
