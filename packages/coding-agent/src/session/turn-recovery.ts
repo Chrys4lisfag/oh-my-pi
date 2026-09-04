@@ -2385,8 +2385,18 @@ export class TurnRecovery {
 		// subagent (or interactive session) silently hung. The original
 		// assistant error message is preserved in agent state so the caller
 		// can act on it.
+		// Opt-out: retry.waitForUsageReset lets a provider-stated usage-limit
+		// reset (Flag.UsageLimit — 5h/weekly quota windows, CN 使用上限, spend
+		// caps, … on any provider) sleep past the cap. Gated on the recorded
+		// outcome so transient retry-afters keep failing fast, and bounded by
+		// the stated wait so an unrelated large backoff cannot sneak through.
 		const maxDelayMs = retrySettings.maxDelayMs;
-		if (maxDelayMs > 0 && delayMs > maxDelayMs && !switchedCredential && !switchedModel) {
+		const waitForUsageReset =
+			retrySettings.waitForUsageReset === true &&
+			recordedUsageLimitOutcome !== undefined &&
+			effectiveUsageLimitWaitMs !== undefined &&
+			delayMs <= effectiveUsageLimitWaitMs;
+		if (maxDelayMs > 0 && delayMs > maxDelayMs && !switchedCredential && !switchedModel && !waitForUsageReset) {
 			await this.persistTerminalEmptyErrorTurn(message);
 			const attempt = this.#retryAttempt;
 			this.#retryAttempt = 0;

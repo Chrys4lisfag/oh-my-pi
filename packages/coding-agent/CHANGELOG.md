@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Surfaced skill source toggles (Codex/Claude/OMP/Agent user and project scopes), custom directories, and skill filters in the settings panel under Tasks → Commands & Skills.
+- Added the `retry.waitForUsageReset` setting: when a provider reports usage-limit exhaustion with a reset time (5-hour or weekly quota windows on any provider), the session sleeps until the reset instead of failing fast past `retry.maxDelayMs`.
+
 ### Fixed
 
 - Report oversized selected lines that cannot fit after read context, with a working raw recovery selector instead of a looping continuation hint ([#10775](https://github.com/can1357/oh-my-pi/issues/10775)).

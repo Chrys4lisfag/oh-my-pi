@@ -188,6 +188,209 @@ describe("AgentSession retry delay cap", () => {
 		expect(session.isRetrying).toBe(false);
 	});
 
+	it("waits past retry.maxDelayMs for a usage-limit reset when retry.waitForUsageReset is set", async () => {
+		// Contract: with the opt-in set, a provider-stated usage-limit reset
+		// sleeps until the reset instead of failing fast. Uses the reported
+		// ZAI shape (Zhipu 5h 使用上限, single credential so no rotation can
+		// save it); the bypass keys off Flag.UsageLimit, so every provider
+		// whose exhaustion classifies as a usage limit is covered.
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) {
+			throw new Error("Expected bundled Anthropic test model to exist");
+		}
+
+		const usageLimitError =
+			"429 已达到 5 小时的使用上限。您的限额将在 2030-01-01 00:00:00 重置。 retry-after-ms=7200000";
+
+		const mock = createMockModel({
+			responses: [{ throw: usageLimitError }, { content: ["recovered after usage reset"], stopReason: "stop" }],
+		});
+		const requestedModels: string[] = [];
+		const agent = new Agent({
+			getApiKey: requestedModel => `${requestedModel.provider}-test-key`,
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: (requestedModel, context, options) => {
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				return mock.stream(requestedModel, context, options);
+			},
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxDelayMs": 100,
+			"retry.maxRetries": 2,
+			"retry.modelFallback": false,
+			"retry.waitForUsageReset": true,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const retryStartEvents: AutoRetryStartEvent[] = [];
+		const retryEndEvents: AutoRetryEndEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") retryStartEvents.push(event);
+			if (event.type === "auto_retry_end") retryEndEvents.push(event);
+		});
+
+		await session.prompt("Trigger long usage-limit reset with waitForUsageReset");
+		await session.waitForIdle();
+
+		// The multi-hour provider-stated wait runs instead of failing fast,
+		// then the retry succeeds on the same credential.
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryStartEvents[0].delayMs).toBe(7_200_000);
+		expect(waitSpy.mock.calls.some(call => call[0] === 7_200_000)).toBe(true);
+		expect(requestedModels).toEqual([`${model.provider}/${model.id}`, `${model.provider}/${model.id}`]);
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({ success: true });
+		expect(lastAssistant(session).stopReason).toBe("stop");
+		expect(session.isRetrying).toBe(false);
+	});
+
+	it("still fails fast on a long usage-limit reset when retry.waitForUsageReset is off", async () => {
+		// Contract: the default is unchanged — a multi-hour usage-limit wait
+		// without the opt-in (or a sibling/fallback) MUST fail fast.
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) {
+			throw new Error("Expected bundled Anthropic test model to exist");
+		}
+
+		const usageLimitError =
+			"429 已达到 5 小时的使用上限。您的限额将在 2030-01-01 00:00:00 重置。 retry-after-ms=7200000";
+
+		const mock = createMockModel({ handler: () => ({ throw: usageLimitError }) });
+		const requestedModels: string[] = [];
+		const agent = new Agent({
+			getApiKey: requestedModel => `${requestedModel.provider}-test-key`,
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: (requestedModel, context, options) => {
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				return mock.stream(requestedModel, context, options);
+			},
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxDelayMs": 100,
+			"retry.modelFallback": false,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const retryStartEvents: AutoRetryStartEvent[] = [];
+		const retryEndEvents: AutoRetryEndEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") retryStartEvents.push(event);
+			if (event.type === "auto_retry_end") retryEndEvents.push(event);
+		});
+
+		await session.prompt("Trigger long usage-limit reset without the opt-in");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([`${model.provider}/${model.id}`]);
+		expect(retryStartEvents).toHaveLength(0);
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({ success: false });
+		expect(retryEndEvents[0].finalError).toContain("exceeds retry.maxDelayMs");
+		for (const call of waitSpy.mock.calls) {
+			expect(call[0]).toBeLessThanOrEqual(100);
+		}
+		const last = lastAssistant(session);
+		expect(last.stopReason).toBe("error");
+		expect(last.errorMessage).toContain("使用上限");
+		expect(session.isRetrying).toBe(false);
+	});
+
+	it("still fails fast on a long transient retry-after when retry.waitForUsageReset is set", async () => {
+		// Contract: the opt-in covers provider-stated *usage-limit* resets
+		// only — a long transient retry-after (server overload, no quota
+		// exhaustion) MUST still fail fast so the hung-subagent guard keeps
+		// working for non-quota errors.
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) {
+			throw new Error("Expected bundled Anthropic test model to exist");
+		}
+
+		const overloadedError = "503 service unavailable: overloaded_error retry-after-ms=3600000";
+
+		const mock = createMockModel({ handler: () => ({ throw: overloadedError }) });
+		const requestedModels: string[] = [];
+		const agent = new Agent({
+			getApiKey: requestedModel => `${requestedModel.provider}-test-key`,
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: (requestedModel, context, options) => {
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				return mock.stream(requestedModel, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxDelayMs": 100,
+			"retry.waitForUsageReset": true,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const retryStartEvents: AutoRetryStartEvent[] = [];
+		const retryEndEvents: AutoRetryEndEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") retryStartEvents.push(event);
+			if (event.type === "auto_retry_end") retryEndEvents.push(event);
+		});
+
+		await session.prompt("Trigger long transient retry-after with the opt-in set");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([`${model.provider}/${model.id}`]);
+		expect(retryStartEvents).toHaveLength(0);
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({ success: false });
+		expect(retryEndEvents[0].finalError).toContain("exceeds retry.maxDelayMs");
+		for (const call of waitSpy.mock.calls) {
+			expect(call[0]).toBeLessThanOrEqual(100);
+		}
+		expect(session.isRetrying).toBe(false);
+	});
+
 	it("switches a long OpenCode Go usage limit to an earlier cross-provider fallback", async () => {
 		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const alternateOpenCodeModel = getBundledModel("opencode-go", "deepseek-v4-pro");

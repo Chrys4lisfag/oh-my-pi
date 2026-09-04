@@ -1837,6 +1837,17 @@ export const SETTINGS_SCHEMA = {
 				"Maximum wait between retries, in ms. When the provider asks us to wait longer than this and no credential or model fallback succeeds, the request fails fast instead of sleeping (e.g. 3-hour Anthropic rate-limit windows). 0 disables the ceiling — to let the session auto-resume through provider-stated quota resets.",
 		},
 	},
+	"retry.waitForUsageReset": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Wait For Usage Reset",
+			description:
+				"When a provider reports usage-limit exhaustion with a reset time (5-hour or weekly quota windows on any provider), sleep until the reset instead of failing fast past retry.maxDelayMs. Waits are abortable (Esc) but also hold subagents, so leave off for unattended runs.",
+		},
+	},
 	"retry.modelFallback": {
 		type: "boolean",
 		default: true,
@@ -5184,7 +5195,16 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	// Skills
-	"skills.enabled": { type: "boolean", default: true },
+	"skills.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tasks",
+			group: "Commands & Skills",
+			label: "Enable Skills",
+			description: "Master switch for skill discovery; off disables all skills including managed auto-learn skills",
+		},
+	},
 
 	"skills.enableSkillCommands": {
 		type: "boolean",
@@ -5197,25 +5217,115 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-	"skills.enableCodexUser": { type: "boolean", default: false },
+	"skills.enableCodexUser": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tasks",
+			group: "Commands & Skills",
+			label: "Codex User Skills",
+			description: "Load skills from ~/.codex/skills/ (opt-in; for Codex migrants)",
+		},
+	},
 
-	"skills.enableClaudeUser": { type: "boolean", default: false },
+	"skills.enableClaudeUser": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tasks",
+			group: "Commands & Skills",
+			label: "Claude User Skills",
+			description: "Load skills from ~/.claude/skills/ (opt-in; for Claude Code migrants)",
+		},
+	},
 
-	"skills.enableClaudeProject": { type: "boolean", default: true },
+	"skills.enableClaudeProject": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tasks",
+			group: "Commands & Skills",
+			label: "Claude Project Skills",
+			description: "Load skills from .claude/skills/ walking up from cwd",
+		},
+	},
 
-	"skills.enablePiUser": { type: "boolean", default: true },
+	"skills.enablePiUser": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tasks",
+			group: "Commands & Skills",
+			label: "OMP User Skills",
+			description: "Load native OMP user skills from ~/.omp/",
+		},
+	},
 
-	"skills.enablePiProject": { type: "boolean", default: true },
+	"skills.enablePiProject": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tasks",
+			group: "Commands & Skills",
+			label: "OMP Project Skills",
+			description: "Load native OMP project skills from .omp/",
+		},
+	},
 
-	"skills.enableAgentsUser": { type: "boolean", default: true },
+	"skills.enableAgentsUser": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tasks",
+			group: "Commands & Skills",
+			label: "Agent User Skills",
+			description: "Load skills from ~/.agent/skills/ and ~/.agents/skills/",
+		},
+	},
 
-	"skills.enableAgentsProject": { type: "boolean", default: true },
+	"skills.enableAgentsProject": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tasks",
+			group: "Commands & Skills",
+			label: "Agent Project Skills",
+			description: "Load skills from .agent/skills/ and .agents/skills/ walking up from cwd",
+		},
+	},
 
-	"skills.customDirectories": { type: "array", default: [] as string[] },
+	"skills.customDirectories": {
+		type: "array",
+		default: [] as string[],
+		ui: {
+			tab: "tasks",
+			group: "Commands & Skills",
+			label: "Custom Skill Directories",
+			description: "Extra directories scanned for skills; a name collision here wins over default-path providers",
+		},
+	},
 
-	"skills.ignoredSkills": { type: "array", default: [] as string[] },
+	"skills.ignoredSkills": {
+		type: "array",
+		default: [] as string[],
+		ui: {
+			tab: "tasks",
+			group: "Commands & Skills",
+			label: "Ignored Skills",
+			description: "Glob patterns for skill names to skip (blocklist)",
+		},
+	},
 
-	"skills.includeSkills": { type: "array", default: [] as string[] },
+	"skills.includeSkills": {
+		type: "array",
+		default: [] as string[],
+		ui: {
+			tab: "tasks",
+			group: "Commands & Skills",
+			label: "Included Skills",
+			description: "Glob patterns limiting which skill names load; empty loads all (allowlist)",
+		},
+	},
 
 	// Commands
 	"commands.enableClaudeUser": {
@@ -6174,6 +6284,7 @@ export interface RetrySettings {
 	maxRetries: number;
 	baseDelayMs: number;
 	maxDelayMs: number;
+	waitForUsageReset: boolean;
 	modelFallback: boolean;
 	usageAwareFallback: boolean;
 	usageReservePct: number;
