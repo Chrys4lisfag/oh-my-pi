@@ -474,10 +474,7 @@ describe("AgentSession retry delay cap", () => {
 		const monthlyLimitError = "429 Monthly quota exceeded, resets next cycle. retry-after-ms=3000000000";
 
 		const mock = createMockModel({
-			responses: [
-				{ throw: monthlyLimitError },
-				{ content: ["recovered after monthly reset"], stopReason: "stop" },
-			],
+			responses: [{ throw: monthlyLimitError }, { content: ["recovered after monthly reset"], stopReason: "stop" }],
 		});
 		const requestedModels: string[] = [];
 		const agent = new Agent({

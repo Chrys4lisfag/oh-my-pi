@@ -5195,16 +5195,7 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	// Skills
-	"skills.enabled": {
-		type: "boolean",
-		default: true,
-		ui: {
-			tab: "tasks",
-			group: "Commands & Skills",
-			label: "Enable Skills",
-			description: "Master switch for skill discovery; off disables all skills including managed auto-learn skills",
-		},
-	},
+	"skills.enabled": { type: "boolean", default: true },
 
 	"skills.enableSkillCommands": {
 		type: "boolean",
@@ -5217,115 +5208,25 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-	"skills.enableCodexUser": {
-		type: "boolean",
-		default: false,
-		ui: {
-			tab: "tasks",
-			group: "Commands & Skills",
-			label: "Codex User Skills",
-			description: "Load skills from ~/.codex/skills/ (opt-in; for Codex migrants)",
-		},
-	},
+	"skills.enableCodexUser": { type: "boolean", default: false },
 
-	"skills.enableClaudeUser": {
-		type: "boolean",
-		default: false,
-		ui: {
-			tab: "tasks",
-			group: "Commands & Skills",
-			label: "Claude User Skills",
-			description: "Load skills from ~/.claude/skills/ (opt-in; for Claude Code migrants)",
-		},
-	},
+	"skills.enableClaudeUser": { type: "boolean", default: false },
 
-	"skills.enableClaudeProject": {
-		type: "boolean",
-		default: true,
-		ui: {
-			tab: "tasks",
-			group: "Commands & Skills",
-			label: "Claude Project Skills",
-			description: "Load skills from .claude/skills/ walking up from cwd",
-		},
-	},
+	"skills.enableClaudeProject": { type: "boolean", default: true },
 
-	"skills.enablePiUser": {
-		type: "boolean",
-		default: true,
-		ui: {
-			tab: "tasks",
-			group: "Commands & Skills",
-			label: "OMP User Skills",
-			description: "Load native OMP user skills from ~/.omp/",
-		},
-	},
+	"skills.enablePiUser": { type: "boolean", default: true },
 
-	"skills.enablePiProject": {
-		type: "boolean",
-		default: true,
-		ui: {
-			tab: "tasks",
-			group: "Commands & Skills",
-			label: "OMP Project Skills",
-			description: "Load native OMP project skills from .omp/",
-		},
-	},
+	"skills.enablePiProject": { type: "boolean", default: true },
 
-	"skills.enableAgentsUser": {
-		type: "boolean",
-		default: true,
-		ui: {
-			tab: "tasks",
-			group: "Commands & Skills",
-			label: "Agent User Skills",
-			description: "Load skills from ~/.agent/skills/ and ~/.agents/skills/",
-		},
-	},
+	"skills.enableAgentsUser": { type: "boolean", default: true },
 
-	"skills.enableAgentsProject": {
-		type: "boolean",
-		default: true,
-		ui: {
-			tab: "tasks",
-			group: "Commands & Skills",
-			label: "Agent Project Skills",
-			description: "Load skills from .agent/skills/ and .agents/skills/ walking up from cwd",
-		},
-	},
+	"skills.enableAgentsProject": { type: "boolean", default: true },
 
-	"skills.customDirectories": {
-		type: "array",
-		default: [] as string[],
-		ui: {
-			tab: "tasks",
-			group: "Commands & Skills",
-			label: "Custom Skill Directories",
-			description: "Extra directories scanned for skills; a name collision here wins over default-path providers",
-		},
-	},
+	"skills.customDirectories": { type: "array", default: [] as string[] },
 
-	"skills.ignoredSkills": {
-		type: "array",
-		default: [] as string[],
-		ui: {
-			tab: "tasks",
-			group: "Commands & Skills",
-			label: "Ignored Skills",
-			description: "Glob patterns for skill names to skip (blocklist)",
-		},
-	},
+	"skills.ignoredSkills": { type: "array", default: [] as string[] },
 
-	"skills.includeSkills": {
-		type: "array",
-		default: [] as string[],
-		ui: {
-			tab: "tasks",
-			group: "Commands & Skills",
-			label: "Included Skills",
-			description: "Glob patterns limiting which skill names load; empty loads all (allowlist)",
-		},
-	},
+	"skills.includeSkills": { type: "array", default: [] as string[] },
 
 	// Commands
 	"commands.enableClaudeUser": {
