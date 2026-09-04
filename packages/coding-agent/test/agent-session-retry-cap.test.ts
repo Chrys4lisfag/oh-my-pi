@@ -1191,6 +1191,127 @@ describe("AgentSession retry delay cap", () => {
 		}
 	});
 
+	it("ignores a persisted heuristic prior block after a restart", async () => {
+		// Contract: persisted credential blocks carry no provenance. A
+		// 30-minute heuristic guess persisted before a restart must not read
+		// as provider timing afterwards — a fresh complete ~5-minute report
+		// wins, instead of sleeping ~25 minutes past the known reset.
+		const exhaustedModel = getBundledModel("opencode-go", "deepseek-v4-flash");
+		if (!exhaustedModel) {
+			throw new Error("Expected bundled OpenCode Go test model to exist");
+		}
+
+		const windowPayload = (status: "ok" | "rate-limited", resetsAtIso: string): Record<string, unknown> => ({
+			status,
+			percent: 100,
+			resetsAt: resetsAtIso,
+		});
+		const usageOptions = {
+			usageProviderResolver: (provider: string) =>
+				provider === "opencode-go" ? opencodeGoUsageProvider : undefined,
+			usageFetch: (async () =>
+				new Response(
+					JSON.stringify({
+						usage: {
+							rolling: windowPayload("ok", new Date(Date.now() + 300_000).toISOString()),
+							weekly: windowPayload("rate-limited", new Date(Date.now() + 300_000).toISOString()),
+							monthly: {
+								status: "ok",
+								percent: 8,
+								resetsAt: new Date(Date.now() + 30 * 24 * 3_600_000).toISOString(),
+							},
+						},
+					}),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				)) as unknown as typeof fetch,
+		};
+
+		const store = new SqliteAuthCredentialStore(new Database(":memory:"));
+		const priorStorage = new AuthStorage(store, usageOptions);
+		const restartedStorage = new AuthStorage(store, usageOptions);
+		try {
+			await priorStorage.reload();
+			await restartedStorage.reload();
+			await priorStorage.set("opencode-go", { type: "api_key", key: "opencode-go-usage-key" });
+			await restartedStorage.reload();
+			// Pre-restart hintless sibling response with no report reset: the
+			// stored block is the 30-minute heuristic guess (no providerTimed).
+			await priorStorage.getApiKey("opencode-go", "sibling-session");
+			await priorStorage.markUsageLimitReached("opencode-go", "sibling-session", {
+				retryAfterMs: 1_800_000,
+			});
+
+			const localRegistry = new ModelRegistry(restartedStorage, path.join(tempDir.path(), "models.yml"));
+
+			const mock = createMockModel({
+				responses: [
+					{ throw: "429 quota exceeded for this account" },
+					{ content: ["recovered after short reported reset"], stopReason: "stop" },
+				],
+			});
+			const requestedModels: string[] = [];
+			const agent = new Agent({
+				getApiKey: model => localRegistry.resolver(model, agent.sessionId),
+				initialState: {
+					model: exhaustedModel,
+					systemPrompt: ["Test"],
+					tools: [],
+					messages: [],
+				},
+				streamFn: (requestedModel, context, options) => {
+					requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+					return mock.stream(requestedModel, context, options);
+				},
+			});
+
+			const settings = Settings.isolated({
+				"compaction.enabled": false,
+				"retry.baseDelayMs": 5,
+				"retry.maxDelayMs": 100,
+				"retry.maxRetries": 2,
+				"retry.modelFallback": false,
+				"retry.waitForUsageReset": true,
+			});
+			settings.setModelRole("default", `${exhaustedModel.provider}/${exhaustedModel.id}`);
+
+			session = new AgentSession({
+				agent,
+				sessionManager: SessionManager.inMemory(),
+				settings,
+				modelRegistry: localRegistry,
+			});
+
+			const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const retryStartEvents: AutoRetryStartEvent[] = [];
+			const retryEndEvents: AutoRetryEndEvent[] = [];
+			session.subscribe(event => {
+				if (event.type === "auto_retry_start") retryStartEvents.push(event);
+				if (event.type === "auto_retry_end") retryEndEvents.push(event);
+			});
+
+			await session.prompt("Trigger hintless usage limit after a restart over a heuristic block");
+			await session.waitForIdle();
+
+			// The fresh ~5-minute report wins over the stale persisted
+			// 30-minute heuristic guess.
+			expect(retryStartEvents).toHaveLength(1);
+			expect(retryStartEvents[0].delayMs).toBeGreaterThan(290_000);
+			expect(retryStartEvents[0].delayMs).toBeLessThanOrEqual(300_000);
+			expect(waitSpy.mock.calls.some(call => (call[0] as number) > 290_000)).toBe(true);
+			expect(requestedModels).toEqual([
+				`${exhaustedModel.provider}/${exhaustedModel.id}`,
+				`${exhaustedModel.provider}/${exhaustedModel.id}`,
+			]);
+			expect(retryEndEvents).toHaveLength(1);
+			expect(retryEndEvents[0]).toMatchObject({ success: true });
+			expect(lastAssistant(session).stopReason).toBe("stop");
+			expect(session.isRetrying).toBe(false);
+		} finally {
+			priorStorage.close();
+			restartedStorage.close();
+		}
+	});
+
 	it("fails fast when a co-exhausted window has no future reset despite a timed one", async () => {
 		// Contract: a report is authoritative only when EVERY exhausted
 		// window carries a future reset. Here the rolling window resets in

@@ -772,7 +772,9 @@ export { isDefinitiveOAuthFailure } from "./error/auth-classify";
  * provider-stated timing (a parsed hint or usage-report reset) rather than
  * another session's heuristic guess — only timed priors may extend a wait
  * past an authoritative report window. Persisted blocks carry no provenance
- * and count as timed.
+ * and count as untimed: a stale persisted heuristic must not outrank a
+ * fresh complete report (longer persisted deadlines still win through the
+ * merged `blockedUntilMs`).
  *
  * `reportResetAtMs` (epoch ms) is present only when the usage report is a
  * complete authority for the wait: every exhausted window carries a future
@@ -1949,10 +1951,13 @@ export class AuthStorage {
 	/**
 	 * Whether the in-memory block currently sitting at exactly `deadline` for
 	 * this credential was written with provider-stated timing. Mirrors the
-	 * scope enumeration of {@link AuthStorage.#getCredentialBlockedUntil}; a
-	 * deadline with no equal in-memory entry came from the persisted store,
-	 * whose provenance is unknown — count it as provider-timed so a wait never
-	 * undercuts a block another process wrote.
+	 * scope enumeration of {@link AuthStorage.#getCredentialBlockedUntil}.
+	 * A deadline with no matching in-memory entry came from the persisted
+	 * store, which carries no provenance — a stale persisted heuristic guess
+	 * (pre-restart hintless response) must not outrank a fresh complete usage
+	 * report, so persisted-only deadlines count as untimed. Persisted
+	 * deadlines longer than this call's own request still win through the
+	 * merged `blockedUntilMs` comparison, which needs no provenance.
 	 */
 	#isProviderTimedBlock(
 		providerKey: string,
@@ -1963,14 +1968,12 @@ export class AuthStorage {
 		const scopes = (
 			typeof blockScopeOrScopes === "string" ? [blockScopeOrScopes] : (blockScopeOrScopes ?? [])
 		).filter(scope => scope.length > 0);
-		let matchedInMemory = false;
 		for (const key of [providerKey, ...scopes.map(scope => this.#toScopedBackoffKey(providerKey, scope))]) {
 			const entry = this.#credentialBackoff.get(key)?.get(credentialIndex);
 			if (entry === undefined || entry !== deadline) continue;
-			matchedInMemory = true;
 			if (this.#credentialBackoffProviderTimed.get(key)?.get(credentialIndex) === true) return true;
 		}
-		return !matchedInMemory;
+		return false;
 	}
 
 	/**
