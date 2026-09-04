@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import { museCodeUsageProvider } from "@oh-my-pi/pi-ai/usage/muse-code";
@@ -10,6 +10,10 @@ const credential = {
 	expiresAt: Date.now() - 60_000,
 	email: "stored@example.com",
 };
+
+afterEach(() => {
+	vi.restoreAllMocks();
+});
 
 describe("Muse Code subscription usage", () => {
 	test("maps quota from a durable key even when legacy metadata marks the account token expired", async () => {
@@ -64,6 +68,51 @@ describe("Muse Code subscription usage", () => {
 				credential: { type: "api_key", apiKey: "LLM|payg-key" },
 			}),
 		).toBe(false);
+	});
+
+	test("backs off after Meta rate-limits a quota refresh", async () => {
+		const startedAt = 1_800_000_000_000;
+		let now = startedAt;
+		vi.spyOn(Date, "now").mockImplementation(() => now);
+		vi.spyOn(Math, "random").mockReturnValue(0.5);
+		let requests = 0;
+		const storage = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")), {
+			usageFetch: Object.assign(
+				() => {
+					requests += 1;
+					return Promise.resolve(
+						requests === 1
+							? Response.json({ status: 429 }, { status: 429 })
+							: Response.json({
+									is_subs_active: true,
+									subs_usage: {
+										window: { used_percent: 3, window_duration_mins: 300 },
+									},
+								}),
+					);
+				},
+				{ preconnect: fetch.preconnect },
+			),
+		});
+		try {
+			await storage.reload();
+			await storage.set("muse-code", {
+				type: "oauth",
+				access: credential.accessToken,
+				refresh: "meta-refresh",
+				expires: startedAt + 3_600_000,
+			});
+
+			expect(await storage.fetchUsageReports()).toEqual([]);
+			now += 30_000;
+			expect(await storage.fetchUsageReports()).toEqual([]);
+			expect(requests).toBe(1);
+			now += 5 * 60_000;
+			expect(await storage.fetchUsageReports()).toHaveLength(1);
+			expect(requests).toBe(2);
+		} finally {
+			storage.close();
+		}
 	});
 
 	test("reports inactive subscriptions through credential validation", async () => {

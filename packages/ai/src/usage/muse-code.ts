@@ -5,6 +5,7 @@ import { parseIsoTimestamp, parsePositiveTimestamp, usageStatus, WEEK_MS } from 
 
 const PROVIDER = "muse-code";
 const SOURCE = "api.meta.ai/muse-code/key";
+const FAILURE_BACKOFF_MS = 5 * 60_000;
 
 function parseResetTimestamp(value: string | number | undefined): number | undefined {
 	return typeof value === "string" ? parseIsoTimestamp(value) : parsePositiveTimestamp(value);
@@ -102,6 +103,7 @@ function buildLimits(payload: MuseCodeKeyResponse, accountId: string | undefined
 export const museCodeUsageProvider: UsageProvider = {
 	id: PROVIDER,
 	validatesCredentials: true,
+	failureBackoffMs: FAILURE_BACKOFF_MS,
 
 	supports(params: UsageFetchParams): boolean {
 		if (params.provider !== PROVIDER || params.credential.type !== "oauth" || !params.credential.accessToken) {
