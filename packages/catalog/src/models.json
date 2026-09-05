@@ -147209,7 +147209,6 @@
 				"supportsReasoningEffort": true,
 				"includeEncryptedReasoning": true
 			},
-			"applyPatchToolType": "freeform",
 			"editPromptVariant": "compact"
 		},
 		"muse-spark-1.2": {
@@ -147307,7 +147306,6 @@
 				"supportsReasoningEffort": true,
 				"includeEncryptedReasoning": true
 			},
-			"applyPatchToolType": "freeform",
 			"editPromptVariant": "compact"
 		},
 		"muse-spark-1.2-contributor": {
@@ -147405,7 +147403,6 @@
 				"supportsReasoningEffort": true,
 				"includeEncryptedReasoning": true
 			},
-			"applyPatchToolType": "freeform",
 			"editPromptVariant": "compact"
 		},
 		"muse-spark-1.3": {
@@ -147504,7 +147501,6 @@
 				"supportsReasoningEffort": true,
 				"includeEncryptedReasoning": true
 			},
-			"applyPatchToolType": "freeform",
 			"editPromptVariant": "compact"
 		},
 		"muse-spark-1.3-contributor": {
@@ -147602,7 +147598,6 @@
 				"supportsReasoningEffort": true,
 				"includeEncryptedReasoning": true
 			},
-			"applyPatchToolType": "freeform",
 			"editPromptVariant": "compact"
 		}
 	},

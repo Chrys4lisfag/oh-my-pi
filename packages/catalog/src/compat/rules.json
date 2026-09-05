@@ -9586,8 +9586,7 @@
 					"clampOutputToModelMax": true
 				},
 				"catalog": {
-					"editPromptVariant": "compact",
-					"applyPatchToolType": "freeform"
+					"editPromptVariant": "compact"
 				}
 			},
 			{

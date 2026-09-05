@@ -168,10 +168,13 @@ describe("Muse Code subscription provider", () => {
 		});
 	});
 
-	test("selects the compact edit prompt and freeform custom tools only for the subscription tier", () => {
+	test("selects the compact edit prompt only for the subscription tier", () => {
 		const subscriber = buildModel(MUSE_CODE_STATIC_MODELS.find(model => model.id === "muse-spark-1.3-contributor")!);
 		expect(subscriber.editPromptVariant).toBe("compact");
-		expect(subscriber.applyPatchToolType).toBe("freeform");
+		// Verified 2026-09-05: api.meta.ai/v1 400s `custom` tools
+		// ("`custom` tools are not supported on this endpoint"), so the
+		// subscription tier must keep apply-patch a function tool.
+		expect(subscriber.applyPatchToolType).toBeUndefined();
 
 		// Same model ids on the direct Meta API key path keep the stock
 		// full-prompt JSON-function presentation.
@@ -186,11 +189,11 @@ describe("Muse Code subscription provider", () => {
 		// policy must live in models.json itself — not only in live rules.
 		const bundled = getBundledModel("muse-code", "muse-spark-1.3-contributor");
 		expect(bundled?.editPromptVariant).toBe("compact");
-		expect(bundled?.applyPatchToolType).toBe("freeform");
+		expect(bundled?.applyPatchToolType).toBeUndefined();
 		for (const id of ["muse-spark-1.1", "muse-spark-1.2", "muse-spark-1.2-contributor", "muse-spark-1.3"]) {
 			const row = getBundledModel("muse-code", id);
 			expect(row?.editPromptVariant).toBe("compact");
-			expect(row?.applyPatchToolType).toBe("freeform");
+			expect(row?.applyPatchToolType).toBeUndefined();
 		}
 		// Direct Meta API key rows carry neither field.
 		expect(getBundledModel("meta", "muse-spark-1.3-contributor")?.editPromptVariant).toBeUndefined();

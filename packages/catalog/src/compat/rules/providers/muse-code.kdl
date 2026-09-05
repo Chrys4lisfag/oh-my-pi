@@ -4,11 +4,11 @@ provider "muse-code" {
 	include-encrypted-reasoning #true
 	supports-reasoning-effort #true
 	clamp-output-to-model-max #true
-	// Subscription tier bills per request; the compact edit prompt and raw
-	// grammar custom tools cut the recurring tool-schema bytes. Same wire
-	// contract as `meta`, so both directives stay opt-in here only.
+	// Subscription tier bills per request; the compact edit prompt cuts the
+	// recurring tool-schema bytes. Verified 2026-09-05 against api.meta.ai/v1:
+	// `custom` tools are rejected with 400 "`custom` tools are not supported
+	// on this endpoint", so apply-patch must stay a function tool here.
 	edit-prompt-variant "compact"
-	apply-patch-tool-type "freeform"
 	class "unknown" {
 		thinking-efforts "minimal" "low" "medium" "high" "xhigh"
 		thinking-mode "effort"
