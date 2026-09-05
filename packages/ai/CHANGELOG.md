@@ -20,7 +20,6 @@
 
 ### Fixed
 
-
 - Fixed Gemini tool continuations through custom Anthropic Messages proxies and OpenAI Responses relays, preserving tool-call and result associations across multi-turn requests.
 
 ## [18.1.8] - 2026-09-03

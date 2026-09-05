@@ -256,4 +256,60 @@ describe("Muse Code OAuth", () => {
 		expect(requests).toBe(0);
 		expect(result.access).toBe(minted);
 	});
+
+	test("surfaces upstream key exchange errors with status and excerpt on non-JSON failure", async () => {
+		await expect(
+			attachMuseCodeApiKey(
+				{ access: "meta-account-access", refresh: "meta-refresh", expires: Date.now() + 3_600_000 },
+				{
+					provider: "muse-code",
+					phase: "login",
+					raw: {},
+					fetch: Object.assign(
+						() =>
+							Promise.resolve(
+								new Response("<html><title>502 Bad Gateway</title><body>upstream outage</body></html>", {
+									status: 502,
+									headers: { "Content-Type": "text/html" },
+								}),
+							),
+						{ preconnect: fetch.preconnect },
+					),
+				},
+			),
+		).rejects.toMatchObject({
+			kind: "token-exchange",
+			provider: "muse-code",
+			status: 502,
+			message: expect.stringContaining("502 <html><title>502 Bad Gateway</title>"),
+		});
+	});
+
+	test("rejects key exchange returning invalid JSON on 200", async () => {
+		await expect(
+			attachMuseCodeApiKey(
+				{ access: "meta-account-access", refresh: "meta-refresh", expires: Date.now() + 3_600_000 },
+				{
+					provider: "muse-code",
+					phase: "login",
+					raw: {},
+					fetch: Object.assign(
+						() =>
+							Promise.resolve(
+								new Response("not-json", {
+									status: 200,
+									headers: { "Content-Type": "application/json" },
+								}),
+							),
+						{ preconnect: fetch.preconnect },
+					),
+				},
+			),
+		).rejects.toMatchObject({
+			kind: "validation",
+			provider: "muse-code",
+			status: 200,
+			message: expect.stringContaining("invalid JSON"),
+		});
+	});
 });

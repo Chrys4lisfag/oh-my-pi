@@ -69,19 +69,6 @@ function encodeMuseCodeCredential(oauthAccessToken: string, apiKey: string): str
 	return JSON.stringify({ oauthAccessToken, apiKey });
 }
 
-async function readJson(response: Response): Promise<unknown> {
-	try {
-		return await response.json();
-	} catch (cause) {
-		throw new AIError.OAuthError("Muse Code key exchange returned invalid JSON", {
-			kind: "validation",
-			provider: PROVIDER,
-			status: response.status,
-			cause,
-		});
-	}
-}
-
 export async function requestMuseCodeKey(
 	accessToken: string,
 	options: MuseCodeKeyRequestOptions = {},
@@ -98,12 +85,24 @@ export async function requestMuseCodeKey(
 		redirect: "error",
 		signal: requestSignal(options.signal),
 	});
-	const payload = await readJson(response);
+	const text = await response.text();
 	if (!response.ok) {
-		throw new AIError.OAuthError(`Muse Code key exchange failed: ${response.status}`, {
+		const excerpt = text.trim() ? ` ${text.slice(0, 500).trim()}` : "";
+		throw new AIError.OAuthError(`Muse Code key exchange failed: ${response.status}${excerpt}`, {
 			kind: "token-exchange",
 			provider: PROVIDER,
 			status: response.status,
+		});
+	}
+	let payload: unknown;
+	try {
+		payload = JSON.parse(text);
+	} catch (cause) {
+		throw new AIError.OAuthError("Muse Code key exchange returned invalid JSON", {
+			kind: "validation",
+			provider: PROVIDER,
+			status: response.status,
+			cause,
 		});
 	}
 	const parsed = museCodeKeyResponseSchema(payload);
