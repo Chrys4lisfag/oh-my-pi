@@ -81,6 +81,7 @@ const BASH_APPROVAL_SHELL_CONTROL_CHARS: Record<string, true> = {
 	")": true,
 };
 const BASH_APPROVAL_REINTERPRETED_ARGUMENT_RE = /(?:^|[ \t])(?:-[^-]*[ce]|--(?:command|eval))(?:[= \t]|$)/u;
+const CMD_EXE_SHELL_PATTERN = /(?:^|[\\/])cmd\.exe$/iu;
 
 function hasBashApprovalShellControl(command: string): boolean {
 	let quote: "'" | '"' | undefined;
@@ -596,20 +597,32 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		const rawCommand = (args as Partial<BashToolInput>).command;
 		const command = typeof rawCommand === "string" ? rawCommand : "";
 		const patternRules = getBashApprovalPatternRules(this.session.settings.get("bash.patterns"));
-		const compoundSegments = this.session.settings.get("bash.allowCompoundCommands")
-			? extractLiteralAndChainSegments(command)
-			: null;
-		// Segment rules keep their ordered first-match semantics. Only a restriction
-		// that matches the complete chain but no individual segment is a separate
-		// whole-chain veto (for example, `cmp * && rm *`).
-		const patternRule = compoundSegments
-			? patternRules.find(
-					rule =>
-						rule.approval !== "allow" &&
-						commandMatchesBashApprovalPattern(command, rule.match) &&
-						!compoundSegments.some(segment => commandSegmentMatchesBashApprovalPattern(segment.text, rule.match)),
-				)
-			: findBashApprovalPatternRule(command, patternRules);
+		const allowCompoundCommands = this.session.settings.get("bash.allowCompoundCommands");
+		const compoundSegments =
+			allowCompoundCommands && !CMD_EXE_SHELL_PATTERN.test(this.session.settings.getShellConfig().shell)
+				? extractLiteralAndChainSegments(command)
+				: null;
+		// Segment rules keep their ordered first-match semantics. Restrictions
+		// matching only the complete chain are aggregated separately: retain the
+		// first prompt, but keep scanning because any later deny takes precedence.
+		let patternRule: BashApprovalPatternRule | undefined;
+		if (compoundSegments) {
+			for (const rule of patternRules) {
+				if (
+					rule.approval !== "allow" &&
+					commandMatchesBashApprovalPattern(command, rule.match) &&
+					!compoundSegments.some(segment => commandSegmentMatchesBashApprovalPattern(segment.text, rule.match))
+				) {
+					if (rule.approval === "deny") {
+						patternRule = rule;
+						break;
+					}
+					patternRule ??= rule;
+				}
+			}
+		} else {
+			patternRule = findBashApprovalPatternRule(command, patternRules);
+		}
 		if (patternRule?.approval === "deny") {
 			return {
 				tier: "exec",

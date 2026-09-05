@@ -25,7 +25,7 @@ function tool(
 	return { name, approval, formatApprovalDetails };
 }
 
-function createBashTool(settingsOverrides: Record<string, unknown> = {}): BashTool {
+function createBashTool(settingsOverrides: Record<string, unknown> = {}, resolvedShell = "/bin/bash"): BashTool {
 	const settings = {
 		get(key: string): unknown {
 			if (Object.hasOwn(settingsOverrides, key)) return settingsOverrides[key];
@@ -43,12 +43,15 @@ function createBashTool(settingsOverrides: Record<string, unknown> = {}): BashTo
 					return undefined;
 			}
 		},
+		getShellConfig() {
+			return { shell: resolvedShell, args: ["-c"], env: {}, prefix: undefined };
+		},
 	};
 	return new BashTool({ settings } as unknown as ConstructorParameters<typeof BashTool>[0]);
 }
 
-function bashApproval(command: string, settingsOverrides: Record<string, unknown> = {}) {
-	const approval = createBashTool(settingsOverrides).approval;
+function bashApproval(command: string, settingsOverrides: Record<string, unknown> = {}, resolvedShell?: string) {
+	const approval = createBashTool(settingsOverrides, resolvedShell).approval;
 	if (typeof approval !== "function") throw new Error("Bash approval must be dynamic");
 	return approval({ command });
 }
@@ -530,6 +533,40 @@ describe("tool-owned dynamic approval declarations", () => {
 		).toEqual({ tier: "write", policy: "allow" });
 	});
 
+	it("uses legacy compound approval when the resolved shell is cmd.exe", () => {
+		const settingsOverrides = {
+			"bash.allowCompoundCommands": true,
+			"bash.patterns": [{ match: "echo *", approval: "allow" }],
+		};
+		const args = { command: "echo 'x && del victim && echo y' && echo done" };
+
+		for (const resolvedShell of ["cmd.exe", String.raw`C:\Windows\System32\CmD.ExE`]) {
+			const bash = createBashTool(settingsOverrides, resolvedShell);
+			expect(resolveApproval(bash, args, "write")).toMatchObject({
+				policy: "prompt",
+				source: "mode",
+			});
+			expect(requiresApproval(bash, args, "write").required).toBe(true);
+		}
+	});
+
+	it("retains compound opt-in for POSIX and Git Bash shells", () => {
+		const settingsOverrides = {
+			"bash.allowCompoundCommands": true,
+			"bash.patterns": [{ match: "echo *", approval: "allow" }],
+		};
+		const args = { command: "echo 'x && del victim && echo y' && echo done" };
+
+		for (const resolvedShell of ["/bin/bash", String.raw`C:\Program Files\Git\bin\bash.exe`]) {
+			const bash = createBashTool(settingsOverrides, resolvedShell);
+			expect(resolveApproval(bash, args, "always-ask")).toMatchObject({
+				policy: "allow",
+				source: "tool",
+			});
+			expect(requiresApproval(bash, args, "always-ask").required).toBe(false);
+		}
+	});
+
 	it("inherits standalone approval fallback when any literal && segment is unmatched", () => {
 		const bash = createBashTool({
 			"bash.allowCompoundCommands": true,
@@ -641,6 +678,25 @@ describe("tool-owned dynamic approval declarations", () => {
 				}),
 			).toMatchObject({ policy: approval });
 		}
+	});
+
+	it("applies deny precedence across all restrictions matching only the complete chain", () => {
+		const bash = createBashTool({
+			"bash.allowCompoundCommands": true,
+			"bash.patterns": [
+				{ match: "cmp *", approval: "allow" },
+				{ match: "rm *", approval: "allow" },
+				{ match: "cmp * && rm *", approval: "prompt" },
+				{ match: "cmp before after && rm -f protected", approval: "deny" },
+			],
+		});
+		const args = { command: "cmp before after && rm -f protected" };
+
+		expect(resolveApproval(bash, args, "yolo", { bash: "allow" })).toMatchObject({
+			policy: "deny",
+			source: "tool",
+		});
+		expect(() => requiresApproval(bash, args, "yolo", { bash: "allow" })).toThrow();
 	});
 
 	it("does not downgrade an explicit segment deny when another segment is unmatched", () => {
