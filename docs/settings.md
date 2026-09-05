@@ -175,7 +175,7 @@ Enabling this setting can therefore allow a compound command that the default po
 
 The opt-in accepts only a flat `&&` chain with literal arguments, including quoted literal arguments. It rejects expansions, variable assignments, other control flow, redirections, globbing, newlines, malformed syntax, and shell-state-changing commands such as `cd`, `source`, and `eval`. Rejected forms keep the legacy approval behavior; enabling the setting never broadens which non-chain commands an `allow` pattern can approve. Explicit chain and segment restrictions resolve before the existing raw and canonical critical-command checks, which still inspect the whole command and every segment so a broad allow cannot hide a critical later segment.
 
-When the resolved shell is `cmd.exe`, the opt-in is disabled and legacy approval behavior applies. This includes ACP terminal execution on Windows without Git Bash: `cmd.exe` does not interpret POSIX single quotes as protecting `&&`.
+When the resolved shell is cmd or PowerShell, the opt-in is disabled and legacy approval behavior applies. Approval uses the same shell classifiers as execution, including extensionless `cmd`, Windows PowerShell, and `pwsh`. Their quoting differs from POSIX shells: cmd does not treat single quotes as protecting `&&`, and PowerShell does not use backslashes to escape double quotes.
 
 Valid rule approvals are `allow`, `prompt`, and `deny`. Regardless of the opt-in, `deny` and `prompt` rules can match the whole command or a tokenized segment of other compound forms (split on `&&`, `||`, `;`, `|`, a single `&`, subshells, and newlines). This lets `match: "rm -rf *"` deny `cd /tmp && rm -rf build` and `sleep 1 & rm -rf build`.
 

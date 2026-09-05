@@ -540,7 +540,26 @@ describe("tool-owned dynamic approval declarations", () => {
 		};
 		const args = { command: "echo 'x && del victim && echo y' && echo done" };
 
-		for (const resolvedShell of ["cmd.exe", String.raw`C:\Windows\System32\CmD.ExE`]) {
+		for (const resolvedShell of ["cmd.exe", "cmd", String.raw`C:\Windows\System32\CmD.ExE`]) {
+			const bash = createBashTool(settingsOverrides, resolvedShell);
+			expect(resolveApproval(bash, args, "write")).toMatchObject({
+				policy: "prompt",
+				source: "mode",
+			});
+			expect(requiresApproval(bash, args, "write").required).toBe(true);
+		}
+	});
+
+	it("uses legacy compound approval for PowerShell quoting", () => {
+		const settingsOverrides = {
+			"bash.allowCompoundCommands": true,
+			"bash.patterns": [{ match: "Write-Output *", approval: "allow" }],
+		};
+		const args = {
+			command: String.raw`Write-Output "safe\" && Remove-Item victim && Write-Output \"done" && Write-Output final`,
+		};
+
+		for (const resolvedShell of ["pwsh", String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\PowerShell.EXE`]) {
 			const bash = createBashTool(settingsOverrides, resolvedShell);
 			expect(resolveApproval(bash, args, "write")).toMatchObject({
 				policy: "prompt",

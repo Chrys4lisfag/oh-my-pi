@@ -37,7 +37,7 @@ The bash tool has the `exec` approval tier. `bash.patterns` rules can explicitly
 
 Restrictions are combined conservatively across the chain: any explicit segment or whole-chain `deny` wins, otherwise any explicit `prompt` wins. A `deny` or `prompt` pattern matching the full chain but no individual segment remains a whole-chain restriction, while later broad restrictions do not override an earlier match for a segment. These restrictions resolve before the existing raw and canonical critical-command checks.
 
-Whole-chain restrictions are scanned with deny precedence, even when a matching prompt appears earlier. If the resolved shell is `cmd.exe` (including the Windows ACP fallback without Git Bash), the POSIX compound recognizer is not used and approval retains its legacy behavior.
+Whole-chain restrictions are scanned with deny precedence, even when a matching prompt appears earlier. If the shared shell classifiers identify the resolved shell as cmd or PowerShell (including `pwsh`), the POSIX compound recognizer is not used and approval retains its legacy behavior. The same classifiers select the non-POSIX `/c` and `-Command` execution paths.
 
 After those checks, the chain receives an explicit `write`-tier allow only when every segment explicitly resolves to `allow`. If any segment is unmatched, bash retains its standalone `exec` tier with no explicit policy, so the generic approval resolver applies `tools.approval.bash` and then the active mode. Unmatched segments therefore inherit existing policy rather than always prompting.
 

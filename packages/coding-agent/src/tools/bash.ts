@@ -11,6 +11,7 @@ import type { ImageContent } from "@oh-my-pi/pi-ai";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { ImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui";
 import { getProjectDir, isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
+import { isCmdShell, isPowerShell } from "@oh-my-pi/pi-utils/procmgr";
 import {
 	DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS,
 	formatBackgroundNotice,
@@ -81,7 +82,6 @@ const BASH_APPROVAL_SHELL_CONTROL_CHARS: Record<string, true> = {
 	")": true,
 };
 const BASH_APPROVAL_REINTERPRETED_ARGUMENT_RE = /(?:^|[ \t])(?:-[^-]*[ce]|--(?:command|eval))(?:[= \t]|$)/u;
-const CMD_EXE_SHELL_PATTERN = /(?:^|[\\/])cmd\.exe$/iu;
 
 function hasBashApprovalShellControl(command: string): boolean {
 	let quote: "'" | '"' | undefined;
@@ -597,11 +597,11 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		const rawCommand = (args as Partial<BashToolInput>).command;
 		const command = typeof rawCommand === "string" ? rawCommand : "";
 		const patternRules = getBashApprovalPatternRules(this.session.settings.get("bash.patterns"));
-		const allowCompoundCommands = this.session.settings.get("bash.allowCompoundCommands");
+		const shell = this.session.settings.get("bash.allowCompoundCommands")
+			? this.session.settings.getShellConfig().shell
+			: undefined;
 		const compoundSegments =
-			allowCompoundCommands && !CMD_EXE_SHELL_PATTERN.test(this.session.settings.getShellConfig().shell)
-				? extractLiteralAndChainSegments(command)
-				: null;
+			shell && !isCmdShell(shell) && !isPowerShell(shell) ? extractLiteralAndChainSegments(command) : null;
 		// Segment rules keep their ordered first-match semantics. Restrictions
 		// matching only the complete chain are aggregated separately: retain the
 		// first prompt, but keep scanning because any later deny takes precedence.
