@@ -44,6 +44,15 @@ const EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 /** Effort tiers accepted by taxonomy collapse/override vocabulary (`Effort` ∪ `"off"`). */
 export const EFFORT_TIERS: readonly string[] = [...EFFORTS, "off"];
+
+/**
+ * How hard agent prompts push subagent delegation for a model lineage
+ * (`delegation-bias` axis). `eager` is the unassigned default: the prompt
+ * actively pushes fan-out. `restrained` keeps fan-out for genuinely parallel
+ * slices but forbids reflexive scouts and single-agent babysitting. `gated`
+ * forbids subagents unless the user or a skill asks.
+ */
+export const DELEGATION_BIASES = ["eager", "restrained", "gated"] as const;
 const THINKING_MODES = [
 	"effort",
 	"budget",
@@ -81,7 +90,7 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"allows-synthetic-reasoning-content-for-tool-calls": wire("allowsSyntheticReasoningContentForToolCalls", OAI),
 	"always-send-max-tokens": wire("alwaysSendMaxTokens", OAI),
 	"cache-control-format": wire("cacheControlFormat", OAI, "scalar", ["anthropic"]),
-	"clamp-output-to-model-max": wire("clampOutputToModelMax", ["openai"]),
+	"clamp-output-to-model-max": wire("clampOutputToModelMax", OAI),
 	"disable-reasoning-on-forced-tool-choice": wire("disableReasoningOnForcedToolChoice", OAI),
 	"disable-reasoning-on-tool-choice": wire("disableReasoningOnToolChoice", OAI),
 	"drop-thinking-when-reasoning-effort": wire("dropThinkingWhenReasoningEffort", ["openai"]),
@@ -261,6 +270,8 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"context-promotion-target": { key: "contextPromotionTarget", set: "catalog", shape: "scalar" },
 	"context-window-floor": { key: "contextWindowFloor", set: "catalog", shape: "scalar" },
 	"cost-patch": { key: "costPatch", set: "catalog", shape: "object" },
+	"delegation-bias": { key: "delegationBias", set: "catalog", shape: "scalar", values: DELEGATION_BIASES },
+	"edit-prompt-variant": { key: "editPromptVariant", set: "catalog", shape: "scalar", values: ["full", "compact"] },
 	"edit-revision": { key: "editRevision", set: "catalog", shape: "scalar" },
 	"input-modalities": { key: "inputModalities", set: "catalog", shape: "array", values: ["text", "image"] },
 	"limits-patch": { key: "limitsPatch", set: "catalog", shape: "object" },

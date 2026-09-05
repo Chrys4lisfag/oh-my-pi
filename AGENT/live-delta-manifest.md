@@ -13,7 +13,7 @@ never assume commit count alone proves behavior survived.
 - Venice Qwen `enable_thinking` carve-out: `resolveModelPolicy` (compat/resolve)
   owns host-keyed thinking dialects; `buildOpenAICompat` no longer exists.
 
-### Merge-sensitive seams (v18.1.2)
+### Merge-sensitive seams (v18.1.11)
 
 - `Settings.#saveNow` gained upstream's generation-tracked mutation apply and a
   `shouldWrite` gate. Every fork profile mutation (item write/delete, live-field
@@ -47,6 +47,18 @@ never assume commit count alone proves behavior survived.
   `settings.get("retry.quotaCooldownMs")` into `calculateRateLimitBackoffMs`; the
   `CONCURRENT_LIMIT`/`RATE_LIMIT_EXCEEDED` call site deliberately does not.
   Upstream's signature is `(reason)` — the fork adds an optional second argument.
+- `packages/ai/src/utils/transport-fetch.ts` is upstream's single inference fetch
+  (v18.1.11 pulled UA/CA/proxy/request-debug out of the `stream.ts` entrypoints
+  into `transportFetch`, stamped idempotent). The fork's TLS opt-in lives INSIDE
+  that chain — `if (model.tls?.rejectUnauthorized === false) init =
+  withInsecureTlsInit(init)` after the CA bundle, before the proxy. Do not
+  restore a `withModelTls` wrapper at the entrypoints: `streamSimple` re-enters
+  `stream`, so a second wrapper layers per re-entry.
+- `#inspectImageModeOverride` and the `/vision` session override were deleted
+  upstream; the neighbouring fork field `#tryShakeEnabled` must survive that
+  same declaration block.
+- Compaction takes `remoteSystemPrompt?: string[]`, not the older joined
+  `remoteInstructions` string.
 
 ## Fork commit ledger
 
@@ -90,12 +102,16 @@ never assume commit count alone proves behavior survived.
   - excludes Google `resource_exhausted` from credential usage caps
   - `calculateRateLimitBackoffMs(reason, quotaCooldownMs?)` — the optional
     override drives the quota class and the conservative default arm only
-- `packages/ai/src/stream.ts`
-  - `withModelTls` applies `model.tls` at both stream entrypoints, covering every
-    provider transport in one place
+- `packages/ai/src/utils/transport-fetch.ts`
+  - `transportFetch` applies `model.tls` via `withInsecureTlsInit`, after the CA
+    bundle and before the proxy. This is the ONE inference fetch (v18.1.11
+    centralized UA/CA/proxy/request-debug here), so the fork no longer wraps at
+    the `stream.ts` entrypoints
 - `packages/utils/src/tls-fetch.ts`
-  - `wrapFetchForInsecureTls` beside the `NODE_EXTRA_CA_CERTS` shim; caller `tls`
-    fields win over the injected `rejectUnauthorized`
+  - `withInsecureTlsInit` (init form, used by `transportFetch`) and
+    `wrapFetchForInsecureTls` (fetch-wrapper form, used by registry discovery),
+    both beside the `NODE_EXTRA_CA_CERTS` shim; caller `tls` fields win over the
+    injected `rejectUnauthorized`
 - `packages/catalog/src/types.ts`
   - `Model.tls` opt-in
 - `packages/catalog/src/model-manager.ts`

@@ -60,6 +60,16 @@ export function wrapFetchForInsecureTls(baseFetch: FetchImpl): FetchImpl {
 	return wrapped;
 }
 
+/**
+ * Init-level form of {@link wrapFetchForInsecureTls}, for the single inference
+ * transport (`transportFetch`) that composes User-Agent, CA bundle and proxy
+ * mutations on one `RequestInit`. An explicit caller `tls` field still wins.
+ */
+export function withInsecureTlsInit(init: RequestInit | undefined): RequestInit {
+	const request = (init ?? {}) as BunTlsRequestInit;
+	return { ...request, tls: { rejectUnauthorized: false, ...request.tls } } as RequestInit;
+}
+
 /** Bun extension to `RequestInit` for the TLS options we touch. */
 type BunTlsOptions = {
 	ca?: string | string[];
@@ -96,7 +106,7 @@ let cacheValue: string | undefined;
  *   path, matching Node's "extensionless filename is still a path" contract.
  *   `ENOENT` becomes {@link ExtraCaError}; other I/O errors bubble.
  */
-function resolveExtraCa(): string | undefined {
+export function resolveExtraCa(): string | undefined {
 	const raw = $env.NODE_EXTRA_CA_CERTS?.trim();
 	if (!raw) return undefined;
 
@@ -142,7 +152,7 @@ export function __resetExtraCaCache(): void {
  * Anthropic Foundry's mTLS options, which already seed
  * `tls.rootCertificates`), only the extra CA is appended.
  */
-function withExtraCaInit(init: RequestInit | undefined, extraCa: string): RequestInit {
+export function withExtraCaInit(init: RequestInit | undefined, extraCa: string): RequestInit {
 	const existingTls = (init as BunTlsRequestInit | undefined)?.tls;
 	const existingCa = existingTls?.ca;
 	let mergedCa: string[];
@@ -181,18 +191,4 @@ export function wrapFetchForExtraCa(fetchImpl: FetchImpl): FetchImpl {
 		{ [EXTRA_CA_FETCH_MARKER]: true as const },
 	);
 	return wrapped;
-}
-
-/**
- * Convenience for options-bag composition (e.g. the stream-entry path in
- * `@oh-my-pi/pi-ai`'s `stream.ts`, which mirrors `withRequestDebugFetch` so
- * the proxy/debug/extra-CA wrappers compose uniformly). No-op when the env
- * var is unset.
- */
-export function withExtraCaFetch<T extends { fetch?: FetchImpl } | undefined>(options: T): T {
-	if (!$env.NODE_EXTRA_CA_CERTS?.trim()) return options;
-	const fetchImpl = options?.fetch ?? (globalThis.fetch as FetchImpl);
-	const wrapped = wrapFetchForExtraCa(fetchImpl);
-	if (wrapped === fetchImpl && options?.fetch !== undefined) return options;
-	return { ...options, fetch: wrapped } as T;
 }

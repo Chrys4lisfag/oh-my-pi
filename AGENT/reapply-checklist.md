@@ -332,8 +332,9 @@ git grep -n "retryFallbackChainModels" packages/coding-agent/src/session
 git grep -n "exhaustedFailure" packages/coding-agent/src/session/session-maintenance.ts
 git grep -n "exceededbudget" packages/ai/src/error/rate-limit.ts
 git grep -n "or \] reorder" packages/coding-agent/src/modes/components/model-hub.ts
-git grep -n "wrapFetchForInsecureTls" packages/utils/src/tls-fetch.ts packages/ai/src/stream.ts packages/coding-agent/src/config/model-registry.ts
-git grep -n "withModelTls" packages/ai/src/stream.ts
+git grep -n "withInsecureTlsInit" packages/utils/src/tls-fetch.ts packages/ai/src/utils/transport-fetch.ts
+git grep -n "wrapFetchForInsecureTls" packages/utils/src/tls-fetch.ts packages/coding-agent/src/config/model-registry.ts
+git grep -n "model.tls" packages/ai/src/utils/transport-fetch.ts
 git grep -n "tls" packages/catalog/src/types.ts packages/coding-agent/src/config/model-patch.ts
 git grep -n "providerDiscoveryContext" packages/coding-agent/src/config/model-registry.ts
 git grep -n "reloadConfigFromDisk" packages/coding-agent/src/config/model-registry.ts packages/coding-agent/src/modes/components/model-hub.ts
