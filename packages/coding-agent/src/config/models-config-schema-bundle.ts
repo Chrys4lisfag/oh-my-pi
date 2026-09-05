@@ -342,6 +342,15 @@ export const getModelsConfigSchemaBundle = once(() => {
 		 * and `apiKey` must carry the gateway bearer.
 		 */
 		"transport?": '"pi-native"',
+		/**
+		 * Per-provider TLS relaxation. `rejectUnauthorized: false` skips
+		 * certificate verification for this provider only — for a gateway whose
+		 * certificate is expired or self-signed. Prefer fixing the endpoint:
+		 * without verification, anyone on the path can read the API key and the
+		 * prompt content. Scoped so it cannot weaken first-party providers the
+		 * way `NODE_TLS_REJECT_UNAUTHORIZED=0` does.
+		 */
+		"tls?": { "rejectUnauthorized?": "boolean" },
 	}).narrow((value, ctx) => {
 		if (value.baseUrl !== undefined && typeof value.baseUrl === "string" && value.baseUrl.length === 0) {
 			return ctx.mustBe("baseUrl a non-empty string");

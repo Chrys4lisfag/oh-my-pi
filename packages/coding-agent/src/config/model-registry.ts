@@ -38,7 +38,13 @@ import {
 	resolveOllamaModelCacheProviderId,
 } from "@oh-my-pi/pi-catalog/provider-models";
 import { toModelSpec } from "@oh-my-pi/pi-catalog/provider-models/bundled-references";
-import { getAgentDir, isBunTestRuntime, logger, wrapFetchForExtraCa } from "@oh-my-pi/pi-utils";
+import {
+	getAgentDir,
+	isBunTestRuntime,
+	logger,
+	wrapFetchForExtraCa,
+	wrapFetchForInsecureTls,
+} from "@oh-my-pi/pi-utils";
 import { resolveProviderModelReference } from "../config/model-resolver";
 import { generateCodexAttestation } from "../live/attestation";
 import type { AuthStorage } from "../session/auth-storage";
@@ -241,6 +247,8 @@ export class ModelRegistry {
 	#lastStaticLoadMtime: number | null = null;
 	#registeredProviderSources: Set<string> = new Set();
 	#providerDiscoveryStates: Map<string, ProviderDiscoveryState> = new Map();
+	/** Providers already warned about disabled certificate verification. */
+	readonly #insecureTlsWarned = new Set<string>();
 	#providerLastDiscoveryAttemptAt = new Map<string, number>();
 	#cacheDbPath?: string;
 	#suppressedSelectors: Map<string, number> = new Map();
@@ -712,6 +720,26 @@ export class ModelRegistry {
 		this.#configError = undefined;
 		this.#providerDiscoveryStates.clear();
 		this.#loadModels();
+	}
+
+	/**
+	 * Re-read `models.yml` synchronously, without touching the network.
+	 *
+	 * `refresh()` does this too, but only as the prelude to full discovery —
+	 * which is async and can take seconds. A UI that opens and paints from the
+	 * current snapshot (the model hub) would otherwise show the config as it was
+	 * at startup, so a provider added while omp was running appeared only after
+	 * closing and reopening the menu. Cheap and idempotent: the mtime guard in
+	 * `#reloadStaticModels` makes an unchanged file a no-op.
+	 *
+	 * @returns true when the file had changed and the snapshot was rebuilt.
+	 */
+	reloadConfigFromDisk(): boolean {
+		const before = this.#lastStaticLoadMtime;
+		this.#reloadStaticModels();
+		const reloaded = this.#lastStaticLoadMtime !== before;
+		if (reloaded) this.#emitModelsUpdated();
+		return reloaded;
 	}
 
 	/**
@@ -1361,7 +1389,8 @@ export class ModelRegistry {
 				providerConfig.guardrailIdentifier ||
 				providerConfig.requestMetadata ||
 				providerConfig.remoteCompaction ||
-				providerConfig.transport
+				providerConfig.transport ||
+				providerConfig.tls
 			) {
 				const disableStrictCompat = providerConfig.disableStrictTools ? { disableStrictTools: true } : undefined;
 				overrides.set(providerName, {
@@ -1371,7 +1400,7 @@ export class ModelRegistry {
 							: providerConfig.discovery?.type === "litellm"
 								? normalizeLiteLLMDiscoveryBaseUrl(providerConfig.baseUrl ?? providerConfig.discovery.baseUrl)
 								: providerConfig.discovery?.type === "openai-models-list" &&
-										providerConfig.discovery.injectV1 === false
+									  providerConfig.discovery.injectV1 === false
 									? normalizeBareDiscoveryBaseUrl(providerConfig.baseUrl)
 									: providerConfig.baseUrl,
 					headers: resolvedProviderHeaders,
@@ -1379,6 +1408,7 @@ export class ModelRegistry {
 					authHeader: providerConfig.authHeader,
 					compat: mergeCompat(providerConfig.compat, disableStrictCompat),
 					remoteCompaction: providerConfig.remoteCompaction,
+					tls: providerConfig.tls,
 					transport: providerConfig.transport,
 					guardrailIdentifier: providerConfig.guardrailIdentifier,
 					guardrailVersion: providerConfig.guardrailVersion,
@@ -1404,6 +1434,7 @@ export class ModelRegistry {
 					headers: resolvedProviderHeaders,
 					compat: mergeCompat(providerConfig.compat, disableStrictCompat),
 					remoteCompaction: providerConfig.remoteCompaction,
+					tls: providerConfig.tls,
 					discovery: providerConfig.discovery,
 					optional: false,
 				});
@@ -1717,7 +1748,7 @@ export class ModelRegistry {
 			try {
 				const models = this.#applyProviderModelOverrides(
 					providerId,
-					await discoverModelsByProviderType(providerConfig, this.#discoveryContext()),
+					await discoverModelsByProviderType(providerConfig, this.#providerDiscoveryContext(providerConfig)),
 				);
 				this.#lastDiscoveryWarnings.delete(providerId);
 				return models.map(toModelSpec);
@@ -1743,7 +1774,11 @@ export class ModelRegistry {
 				? "cached"
 				: "unavailable"
 			: effectiveStrategy === "offline"
-				? cached
+				? // Stays `cached` even with zero models: a fetched-empty answer is
+					// cached knowledge and `attemptedAt` must survive the offline view
+					// (model-registry.test.ts pins this). The hub is responsible for not
+					// advertising an empty cached row as a usable model list.
+					cached
 					? "cached"
 					: "idle"
 				: result.models.length > 0
@@ -1772,6 +1807,28 @@ export class ModelRegistry {
 				providerConfig,
 				this.#applyProviderCompat(providerConfig.compat, result.models),
 			),
+		);
+	}
+
+	/**
+	 * Discovery context for one configured provider. `tls.rejectUnauthorized:
+	 * false` in `models.yml` has to apply to the `/models` probe too — that
+	 * probe is where an expired certificate first surfaces ("Discovery failed:
+	 * certificate has expired"), and the relaxation stays scoped to this
+	 * provider's fetch rather than the process-wide env var.
+	 */
+	#providerDiscoveryContext(providerConfig: DiscoveryProviderConfig): DiscoveryContext {
+		const context = this.#discoveryContext();
+		if (providerConfig.tls?.rejectUnauthorized !== false) return context;
+		this.#warnInsecureTlsOnce(providerConfig.provider);
+		return { ...context, fetch: wrapFetchForInsecureTls(context.fetch) };
+	}
+
+	#warnInsecureTlsOnce(providerId: string): void {
+		if (this.#insecureTlsWarned.has(providerId)) return;
+		this.#insecureTlsWarned.add(providerId);
+		logger.warn(
+			`provider ${providerId}: TLS certificate verification disabled by models.yml (tls.rejectUnauthorized: false)`,
 		);
 	}
 
@@ -2145,6 +2202,7 @@ export class ModelRegistry {
 			compat: override.compat ? mergeCompat(baseOverride?.compat, override.compat) : baseOverride?.compat,
 			remoteCompaction: mergeRemoteCompactionConfig(baseOverride?.remoteCompaction, override.remoteCompaction),
 			transport: override.transport ?? baseOverride?.transport,
+			tls: override.tls ?? baseOverride?.tls,
 		};
 	}
 	#applyProviderTransportOverride<
@@ -2153,7 +2211,7 @@ export class ModelRegistry {
 		entry: T,
 		override: Pick<
 			ProviderOverride,
-			"baseUrl" | "headers" | "authHeader" | "apiKey" | "remoteCompaction" | "transport"
+			"baseUrl" | "headers" | "authHeader" | "apiKey" | "remoteCompaction" | "transport" | "tls"
 		>,
 	): T {
 		const headers = mergeAuthHeaderSources(
@@ -2168,6 +2226,7 @@ export class ModelRegistry {
 			// Preserve the model's existing transport when the override omits one;
 			// providers without a `transport` field keep the default per-API dispatch.
 			...(override.transport !== undefined ? { transport: override.transport } : {}),
+			...(override.tls !== undefined ? { tls: override.tls } : {}),
 			remoteCompaction: mergeProviderRemoteCompactionConfig(entry.remoteCompaction, override.remoteCompaction),
 		};
 	}

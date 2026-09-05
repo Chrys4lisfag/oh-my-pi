@@ -153,6 +153,8 @@ export interface DiscoveryProviderConfig {
 	headers?: Record<string, string>;
 	compat?: ModelSpec<Api>["compat"];
 	remoteCompaction?: RemoteCompactionConfig<Api>;
+	/** Per-provider TLS relaxation; also applies to the `/models` probe. */
+	tls?: { rejectUnauthorized?: boolean };
 	discovery: ProviderDiscovery;
 	optional?: boolean;
 }

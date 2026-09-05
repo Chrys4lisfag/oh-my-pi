@@ -321,9 +321,15 @@ export class ModelHubComponent implements Component {
 			this.#tui.requestRender();
 		});
 
+		// Pick up `models.yml` edits made since startup BEFORE the first paint.
+		// Discovery below is async (and can take seconds), so without this a
+		// provider added while omp was running was missing from the menu until it
+		// was closed and reopened. Synchronous, network-free, and a no-op when
+		// the file has not changed.
+		this.#registry.reloadConfigFromDisk?.();
 		// Hydrate synchronously from the current registry snapshot so the first
 		// Enter after opening acts on cached models instead of being dropped
-		// while the offline refresh promise is still pending.
+		// while the refresh promise is still pending.
 		this.#syncFromRegistryState();
 
 		const initialProvider = options.initialProviderId;
@@ -333,13 +339,20 @@ export class ModelHubComponent implements Component {
 			this.#setActiveEntry("all");
 		}
 
-		// Reconcile with cached discovery state in the background. A --models
-		// scope is registry-independent, so the offline reload would only repeat
-		// the synchronous hydration above.
+		// Reconcile discovery in the background. A --models scope is
+		// registry-independent, so a reload would only repeat the synchronous
+		// hydration above.
+		//
+		// `online`, not `offline`: an offline hydration serves whatever the cache
+		// holds — including a zero-model row — so a provider that answered empty
+		// once showed `0 models` with "Using cached model list …" until the user
+		// pressed F5, and a local endpoint that came back up was never resurfaced
+		// (issue #2761). The fork's `awaitBackgroundRefresh` still runs first so a
+		// late dynamic catalog is not re-fetched twice.
 		if (this.#scopedModels.length === 0) {
 			this.#initialRegistrySync = (async () => {
 				await registry.awaitBackgroundRefresh?.();
-				await registry.refresh("offline");
+				await registry.refresh("online");
 				this.#syncFromRegistryState();
 			})()
 				.then(() => this.#reprobeHiddenOptionalProviders())
@@ -516,7 +529,12 @@ export class ModelHubComponent implements Component {
 				label: "Roles",
 				annotation: `${assignedCount}/${visibleRoles.length}`,
 			},
-			{ id: "all", kind: "all", label: "All models", annotation: String(availableModels.length) },
+			{
+				id: "all",
+				kind: "all",
+				label: "All models",
+				annotation: String(availableModels.length),
+			},
 		];
 
 		this.#fixedEntries = fixed;
@@ -565,7 +583,11 @@ export class ModelHubComponent implements Component {
 	/** Snapshot the focused entry and its row within the sidebar viewport. */
 	#captureSidebarAnchor(): SidebarAnchor {
 		const index = this.#entries.findIndex(entry => entry.id === this.#activeEntryId);
-		return { id: this.#activeEntryId, index, offset: index - this.#sidebarScroll };
+		return {
+			id: this.#activeEntryId,
+			index,
+			offset: index - this.#sidebarScroll,
+		};
 	}
 
 	/**
@@ -684,7 +706,12 @@ export class ModelHubComponent implements Component {
 			rows.push({ kind: "role", role });
 			const chain = chains[role] ?? [];
 			for (let i = 0; i < chain.length; i++) {
-				rows.push({ kind: "fallback", role, chainIndex: i, selector: chain[i] });
+				rows.push({
+					kind: "fallback",
+					role,
+					chainIndex: i,
+					selector: chain[i],
+				});
 			}
 		}
 		rows.push({ kind: "newRole" });
@@ -696,7 +723,12 @@ export class ModelHubComponent implements Component {
 			const chain = chains[key] ?? [];
 			rows.push({ kind: "chainKey", role: key });
 			for (let i = 0; i < chain.length; i++) {
-				rows.push({ kind: "fallback", role: key, chainIndex: i, selector: chain[i] });
+				rows.push({
+					kind: "fallback",
+					role: key,
+					chainIndex: i,
+					selector: chain[i],
+				});
 			}
 		}
 		rows.push({ kind: "newFallback" });
@@ -1049,6 +1081,15 @@ export class ModelHubComponent implements Component {
 					this.#refreshingProviders.has(providerId) ||
 					this.#scheduledProviderRefreshes.has(providerId) ||
 					this.#providerRefreshState.providerRefreshesInFlight.has(providerId);
+				// A cached row with no models cannot be served as a model list. Say
+				// what is actually true instead of "Using cached model list from
+				// <age>", which sent people hunting for a nonexistent list and left
+				// recovery to a manual F5.
+				if (state.models.length === 0) {
+					return pending
+						? "  No models cached for this provider. Live refresh is still pending."
+						: "  No models cached for this provider. Press F5 to refresh.";
+				}
 				if (pending) {
 					return age
 						? `  Using cached model list from ${age}. Live refresh is still pending.`
@@ -1108,7 +1149,10 @@ export class ModelHubComponent implements Component {
 					? (this.#settings.getProjectModelRole(scopedRole) ?? this.#settings.getGlobalModelRole(scopedRole))
 					: this.#settings.getGlobalModelRole(scopedRole),
 		};
-		return resolveModelRoleValue(roleValue, allModels, { settings: this.#settings, roleLookup });
+		return resolveModelRoleValue(roleValue, allModels, {
+			settings: this.#settings,
+			roleLookup,
+		});
 	}
 
 	#thinkingLevelForScope(role: string, scope: ModelRoleSelectionScope): ConfiguredThinkingLevel {
@@ -1195,14 +1239,28 @@ export class ModelHubComponent implements Component {
 			styled: theme.fg("muted", `fallbacks:${item.model.provider}/*`),
 			action: "fallbackProvider",
 		});
-		chips.push({ label: "fallback", styled: theme.fg("muted", "retry-fallback"), action: "fallback" });
+		chips.push({
+			label: "fallback",
+			styled: theme.fg("muted", "retry-fallback"),
+			action: "fallback",
+		});
 		this.#strip = { kind: "role", item, chips, index: 0, returnToRoles: false };
 	}
 
 	#openScopeStrip(item: ModelBrowserItem, role: string, returnToRoles: boolean): void {
 		const chips: StripChip[] = [
-			{ label: "project", styled: theme.fg("accent", "project"), action: "scope", scope: "project" },
-			{ label: "global", styled: theme.fg("muted", "global"), action: "scope", scope: "global" },
+			{
+				label: "project",
+				styled: theme.fg("accent", "project"),
+				action: "scope",
+				scope: "project",
+			},
+			{
+				label: "global",
+				styled: theme.fg("muted", "global"),
+				action: "scope",
+				scope: "global",
+			},
 		];
 		this.#strip = { kind: "scope", item, role, chips, index: 0, returnToRoles };
 	}

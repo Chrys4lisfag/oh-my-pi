@@ -15,6 +15,7 @@ export interface ProviderOverride {
 	compat?: ModelSpec<Api>["compat"];
 	remoteCompaction?: RemoteCompactionConfig<Api>;
 	transport?: Model<Api>["transport"];
+	tls?: Model<Api>["tls"];
 	guardrailIdentifier?: Model<Api>["guardrailIdentifier"];
 	guardrailVersion?: Model<Api>["guardrailVersion"];
 	guardrailTrace?: Model<Api>["guardrailTrace"];
@@ -62,7 +63,7 @@ export function mergeDiscoveredModel<TApi extends Api>(
 	existing: Model<Api> | undefined,
 	providerOverride?: Pick<
 		ProviderOverride,
-		"baseUrl" | "compat" | "headers" | "remoteCompaction" | "transport" | "authHeader" | "apiKey"
+		"baseUrl" | "compat" | "headers" | "remoteCompaction" | "transport" | "tls" | "authHeader" | "apiKey"
 	>,
 ): Model<TApi> {
 	if (existing) {
@@ -79,6 +80,7 @@ export function mergeDiscoveredModel<TApi extends Api>(
 				apiKeyConfig: providerOverride?.apiKey,
 			}),
 			transport: providerOverride?.transport ?? existing.transport ?? model.transport,
+			tls: providerOverride?.tls ?? existing.tls ?? model.tls,
 			remoteCompaction: mergeProviderRemoteCompactionConfig(
 				mergeRemoteCompactionConfig(existing.remoteCompaction, model.remoteCompaction),
 				providerOverride?.remoteCompaction,
@@ -96,6 +98,7 @@ export function mergeDiscoveredModel<TApi extends Api>(
 				apiKeyConfig: providerOverride.apiKey,
 			}),
 			...(providerOverride.transport !== undefined ? { transport: providerOverride.transport } : {}),
+			...(providerOverride.tls !== undefined ? { tls: providerOverride.tls } : {}),
 			remoteCompaction: mergeProviderRemoteCompactionConfig(
 				model.remoteCompaction,
 				providerOverride.remoteCompaction,

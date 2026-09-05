@@ -230,8 +230,15 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 		!cacheFingerprintMatches &&
 		cacheDropIds !== undefined &&
 		usableCachedModels.some(model => cacheDropIds.includes(model.id));
+	// A cache row that holds nothing can only "serve" a provider that has a
+	// static catalog to fall back on. For a configured provider (no bundled
+	// models) an empty row means zero selectable models, so treating it as a
+	// usable cache latches `0 models` for the whole TTL and the only way out is
+	// a manual F5. Keep such a row retryable instead.
+	const cacheCanServeModels = usableCachedModels.length > 0 || staticModels.length > 0;
 	const hasUsableFreshCache =
 		(cache?.fresh ?? false) &&
+		cacheCanServeModels &&
 		!cacheHasUnresolvedHeaders &&
 		!cacheNeedsModelMigration &&
 		(!dynamicModelsAuthoritative || cacheFingerprintMatches);

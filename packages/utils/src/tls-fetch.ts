@@ -40,6 +40,26 @@ export class ExtraCaError extends Error {
 	}
 }
 
+/**
+ * Wrap `fetch` so every request opts out of certificate verification.
+ *
+ * Scoped on purpose: callers pass a provider-specific fetch, so one gateway
+ * with an expired certificate cannot relax TLS for the rest of the process the
+ * way `NODE_TLS_REJECT_UNAUTHORIZED=0` does. An explicit `init.tls` from the
+ * caller still wins for the fields it sets.
+ */
+export function wrapFetchForInsecureTls(baseFetch: FetchImpl): FetchImpl {
+	const wrapped: FetchImpl = (input, init) => {
+		const request = (init ?? {}) as BunTlsRequestInit;
+		return baseFetch(input, {
+			...request,
+			tls: { rejectUnauthorized: false, ...request.tls },
+		} as RequestInit);
+	};
+	if (baseFetch.preconnect) wrapped.preconnect = baseFetch.preconnect.bind(baseFetch);
+	return wrapped;
+}
+
 /** Bun extension to `RequestInit` for the TLS options we touch. */
 type BunTlsOptions = {
 	ca?: string | string[];

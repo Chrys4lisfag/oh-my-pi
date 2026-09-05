@@ -1147,6 +1147,20 @@ export interface Model<TApi extends Api = Api> {
 	 * dispatch is redirected.
 	 */
 	transport?: "pi-native";
+	/**
+	 * Per-provider TLS relaxation, opt-in from `models.yml`.
+	 *
+	 * `rejectUnauthorized: false` skips certificate verification for THIS
+	 * provider's requests only — for a gateway serving an expired or
+	 * self-signed certificate. Everything else keeps full verification, unlike
+	 * `NODE_TLS_REJECT_UNAUTHORIZED=0`, which disables it process-wide (and
+	 * therefore for first-party providers and OAuth flows too).
+	 *
+	 * Certificate verification is what stops an attacker on the path from
+	 * reading the API key and prompt content, so this is a deliberate,
+	 * per-endpoint trade and the runtime warns when it is active.
+	 */
+	tls?: { rejectUnauthorized?: boolean };
 	/** Hint that websocket transport should be preferred when supported by the provider implementation. */
 	preferWebsockets?: boolean;
 	/** Codex Responses Lite transport: send the lite marker and carry instructions/tools as input items (mirrors codex-rs `use_responses_lite`). */

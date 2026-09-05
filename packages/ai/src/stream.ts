@@ -15,7 +15,15 @@ import {
 } from "@oh-my-pi/pi-catalog/model-thinking";
 import { CATALOG_PROVIDERS, type ProviderCatalogEntry } from "@oh-my-pi/pi-catalog/provider-models";
 import { CODEX_BASE_URL } from "@oh-my-pi/pi-catalog/wire/codex";
-import { $env, $pickenv, getProviderInFlightRoot, isEnoent, logger, withExtraCaFetch } from "@oh-my-pi/pi-utils";
+import {
+	$env,
+	$pickenv,
+	getProviderInFlightRoot,
+	isEnoent,
+	logger,
+	withExtraCaFetch,
+	wrapFetchForInsecureTls,
+} from "@oh-my-pi/pi-utils";
 import { getCustomApi } from "./api-registry";
 import { createAuthRetryKeyState, isApiKeyResolver, resolveNextAuthRetryKey } from "./auth-retry";
 import * as AIError from "./error";
@@ -88,6 +96,16 @@ import { withThinkingLoopGuard } from "./utils/thinking-loop";
 function defaultFetchForModel(model: Model<Api>): FetchImpl {
 	if (model.provider === "anthropic" && model.api === "anthropic-messages") return coworkFetch;
 	return globalThis.fetch;
+}
+
+/**
+ * Apply the model's opt-in TLS relaxation (`models.yml` → `tls`), scoped to
+ * this model's own requests. Wrapping here covers every provider transport in
+ * one place, the same way the proxy wrapper does.
+ */
+function withModelTls(fetchImpl: FetchImpl, model: Model<Api>): FetchImpl {
+	if (model.tls?.rejectUnauthorized !== false) return fetchImpl;
+	return wrapFetchForInsecureTls(fetchImpl);
 }
 
 function isGoogleVertexAuthenticatedModel(model: Model<Api>): boolean {
@@ -906,7 +924,10 @@ function streamDispatch<TApi extends Api>(
 	options?: OptionsForApi<TApi>,
 ): AssistantMessageEventStream {
 	const inputOptions = (options || {}) as StreamOptions;
-	const baseOptions = { ...inputOptions, fetch: inputOptions.fetch ?? defaultFetchForModel(model) };
+	const baseOptions = {
+		...inputOptions,
+		fetch: withModelTls(inputOptions.fetch ?? defaultFetchForModel(model), model),
+	};
 	const debugOptions = withExtraCaFetch(withRequestDebugFetch(baseOptions));
 	const requestOptions = {
 		...debugOptions,
@@ -1500,7 +1521,10 @@ function streamSimpleRequest<TApi extends Api>(
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
 	const inputOptions = (options || {}) as SimpleStreamOptions;
-	const baseOptions = { ...inputOptions, fetch: inputOptions.fetch ?? defaultFetchForModel(model) };
+	const baseOptions = {
+		...inputOptions,
+		fetch: withModelTls(inputOptions.fetch ?? defaultFetchForModel(model), model),
+	};
 	const debugOptions = withExtraCaFetch(withRequestDebugFetch(baseOptions));
 	const requestOptions = {
 		...debugOptions,

@@ -405,6 +405,39 @@ describe("ModelHub", () => {
 		});
 	});
 
+	describe("zero-model providers", () => {
+		test("a cached state with no models is not advertised as a cached list", () => {
+			// The bug: `clawn-vuln · 0 models` under "Using cached model list from
+			// less than a minute ago. Press F5 to refresh." — a list the provider
+			// cannot serve, with recovery left to a manual refresh.
+			const model = makeModel("populated", "m1");
+			const { hub } = createHub({
+				models: [model],
+				registry: {
+					getDiscoverableProviders: () => ["populated", "clawn-vuln"],
+					getProviderDiscoveryState: providerId =>
+						providerId === "clawn-vuln"
+							? {
+									provider: "clawn-vuln",
+									status: "cached",
+									optional: false,
+									stale: true,
+									fetchedAt: Date.now() - 30_000,
+									models: [],
+								}
+							: undefined,
+				},
+			});
+			installTestTheme();
+
+			const lines = hub
+				.render(220)
+				.map(line => stripVTControlCharacters(line))
+				.join("\n");
+			expect(lines).not.toContain("Using cached model list");
+		});
+	});
+
 	describe("fallback chain reordering", () => {
 		test("[ and ] move a fallback row within its chain, and the hint names those keys", () => {
 			// The footer used to read "[/] reorder", which people press as "/" —
@@ -1370,7 +1403,11 @@ describe("ModelHub", () => {
 			await waitForCondition(() => refreshProvider.mock.calls.length === providerIds.length);
 			expect(maxActive).toBe(4);
 		});
-		test("waits for startup background discovery before offline hydration and empty-provider fetch", async () => {
+		test("waits for startup background discovery before hydration and empty-provider fetch", async () => {
+			// The contract is the ORDER: startup discovery settles, then the hub
+			// hydrates, then empty providers are probed. The hydration strategy is
+			// `online` — an offline hydration would serve a zero-model cache row as
+			// if it were a model list and never resurface a revived local (#2761).
 			const models: Model[] = [];
 			const discovered = makeModel("prov-startup", "model-from-startup");
 			const background = Promise.withResolvers<void>();
@@ -1401,7 +1438,7 @@ describe("ModelHub", () => {
 			models.push(discovered);
 			background.resolve();
 			await Bun.sleep(10);
-			expect(order).toEqual(["background-wait", "background-done", "offline"]);
+			expect(order).toEqual(["background-wait", "background-done", "online"]);
 			expect(refreshProvider).not.toHaveBeenCalled();
 			expect(normalize(hub.render(220))).toContain("model-from-startup");
 		});
