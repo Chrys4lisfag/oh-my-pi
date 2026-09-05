@@ -11,7 +11,7 @@ import type { ImageContent } from "@oh-my-pi/pi-ai";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { ImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui";
 import { getProjectDir, isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
-import { isCmdShell, isPowerShell } from "@oh-my-pi/pi-utils/procmgr";
+import { isPosixShell } from "@oh-my-pi/pi-utils/procmgr";
 import {
 	DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS,
 	formatBackgroundNotice,
@@ -600,8 +600,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		const shell = this.session.settings.get("bash.allowCompoundCommands")
 			? this.session.settings.getShellConfig().shell
 			: undefined;
-		const compoundSegments =
-			shell && !isCmdShell(shell) && !isPowerShell(shell) ? extractLiteralAndChainSegments(command) : null;
+		const compoundSegments = shell && isPosixShell(shell) ? extractLiteralAndChainSegments(command) : null;
 		// Segment rules keep their ordered first-match semantics. Restrictions
 		// matching only the complete chain are aggregated separately: retain the
 		// first prompt, but keep scanning because any later deny takes precedence.

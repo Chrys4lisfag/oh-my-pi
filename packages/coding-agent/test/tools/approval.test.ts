@@ -569,6 +569,36 @@ describe("tool-owned dynamic approval declarations", () => {
 		}
 	});
 
+	it("does not apply POSIX compound approval to fish or unknown shells", () => {
+		const settingsOverrides = {
+			"bash.allowCompoundCommands": true,
+			"bash.patterns": [
+				{ match: "echo *", approval: "allow" },
+				{ match: "rm *", approval: "deny" },
+			],
+		};
+		const args = {
+			command: String.raw`echo 'safe\' filler' && rm -f victim && echo \' && echo final`,
+		};
+
+		for (const resolvedShell of ["/bin/BaSh", String.raw`C:\Program Files\Git\bin\ZSH.ExE`]) {
+			const bash = createBashTool(settingsOverrides, resolvedShell);
+			expect(resolveApproval(bash, args, "write")).toMatchObject({
+				policy: "allow",
+				source: "tool",
+			});
+			expect(requiresApproval(bash, args, "write").required).toBe(false);
+		}
+
+		for (const resolvedShell of ["/usr/bin/fish", "/usr/local/bin/custom-shell"]) {
+			const bash = createBashTool(settingsOverrides, resolvedShell);
+			expect(resolveApproval(bash, args, "write")).toMatchObject({
+				policy: "prompt",
+			});
+			expect(requiresApproval(bash, args, "write").required).toBe(true);
+		}
+	});
+
 	it("retains compound opt-in for POSIX and Git Bash shells", () => {
 		const settingsOverrides = {
 			"bash.allowCompoundCommands": true,
