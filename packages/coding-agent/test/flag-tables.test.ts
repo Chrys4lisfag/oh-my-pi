@@ -146,6 +146,21 @@ describe("parseArgs end-of-options (--)", () => {
 		expect(result.messages).toEqual(["@file.md", "--model", "opus"]);
 	});
 
+	it("parses --no-mcp as a boolean flag distinct from --no-tools", () => {
+		// `--no-tools` filters built-in tools only; MCP servers are custom tools
+		// and mount anyway, which is why headless batches need their own switch
+		// (each instance otherwise re-spawns the whole configured fleet).
+		const both = parseArgs(["--no-mcp", "--no-tools"]);
+		expect(both.noMcp).toBe(true);
+		expect(both.noTools).toBe(true);
+
+		const mcpOnly = parseArgs(["--no-mcp"]);
+		expect(mcpOnly.noMcp).toBe(true);
+		expect(mcpOnly.noTools).toBeUndefined();
+		// A boolean flag must not swallow the next argument as its value.
+		expect(parseArgs(["--no-mcp", "hello"]).messages).toEqual(["hello"]);
+	});
+
 	it("parses flags before -- and forwards the rest as text", () => {
 		const result = parseArgs(["--print", "hello", "--", "--no-tools"]);
 		expect(result.print).toBe(true);

@@ -41,9 +41,67 @@ for (const file of ["LICENSE", "THIRD-PARTY-NOTICES.txt"]) {
 	await Bun.write(path.join(distExtension, file), Bun.file(path.join(repoRoot, file)));
 }
 
-const zip = await $`zip -qr ../omp-browser-relay-extension.zip .`.cwd(distExtension).nothrow();
-if (zip.exitCode !== 0) {
-	console.error("zip failed:", zip.stderr.toString());
+const archivePath = path.join(dist, "omp-browser-relay-extension.zip");
+await fs.rm(archivePath, { force: true });
+
+/**
+ * Package `dist/extension/` with whatever archiver the host has.
+ *
+ * `zip` is not present on a stock Windows box (nor on many minimal Linux
+ * images), which failed the whole workspace build here rather than just this
+ * artifact. Tried in order: Info-ZIP, 7-Zip, then PowerShell's
+ * `Compress-Archive`. All three produce a flat zip rooted at the extension
+ * directory, which is what Chrome expects.
+ */
+async function packageExtension(): Promise<{ ok: true; via: string } | { ok: false; tried: string[] }> {
+	const attempts: Array<{ via: string; run: () => Promise<{ exitCode: number; stderr: string }> }> = [
+		{
+			via: "zip",
+			run: async () => {
+				const r = await $`zip -qr ${archivePath} .`.cwd(distExtension).nothrow().quiet();
+				return { exitCode: r.exitCode, stderr: r.stderr.toString() };
+			},
+		},
+		{
+			via: "7z",
+			run: async () => {
+				const r = await $`7z a -tzip -bso0 -bsp0 ${archivePath} .`.cwd(distExtension).nothrow().quiet();
+				return { exitCode: r.exitCode, stderr: r.stderr.toString() };
+			},
+		},
+		{
+			via: "Compress-Archive",
+			run: async () => {
+				const r =
+					await $`powershell -NoProfile -NonInteractive -Command ${`Compress-Archive -Path '${distExtension}\\*' -DestinationPath '${archivePath}' -Force`}`
+						.nothrow()
+						.quiet();
+				return { exitCode: r.exitCode, stderr: r.stderr.toString() };
+			},
+		},
+	];
+	const tried: string[] = [];
+	for (const attempt of attempts) {
+		let result: { exitCode: number; stderr: string };
+		try {
+			result = await attempt.run();
+		} catch (error) {
+			// A missing binary rejects instead of exiting non-zero.
+			tried.push(`${attempt.via}: ${error instanceof Error ? error.message : String(error)}`);
+			continue;
+		}
+		if (result.exitCode === 0 && (await Bun.file(archivePath).exists())) {
+			return { ok: true, via: attempt.via };
+		}
+		tried.push(`${attempt.via}: exit ${result.exitCode}${result.stderr ? ` ${result.stderr.trim()}` : ""}`);
+	}
+	return { ok: false, tried };
+}
+
+const packaged = await packageExtension();
+if (!packaged.ok) {
+	console.error("could not package the extension; tried:");
+	for (const line of packaged.tried) console.error(`  ${line}`);
 	process.exit(1);
 }
 
@@ -62,5 +120,5 @@ for (const [source, destination] of embeddedAssets) {
 
 console.log("built:");
 console.log(`  ${distExtension}`);
-console.log(`  ${path.join(dist, "omp-browser-relay-extension.zip")}`);
+console.log(`  ${archivePath} (via ${packaged.via})`);
 console.log(`  ${assetsDir} (embedded CLI assets — commit these)`);

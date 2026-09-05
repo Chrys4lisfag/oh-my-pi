@@ -66,6 +66,16 @@ export interface Args {
 	models?: string[];
 	tools?: string[];
 	noTools?: boolean;
+	/**
+	 * Skip MCP discovery and connection entirely.
+	 *
+	 * `--no-tools` only filters BUILT-IN tools: MCP servers mount as custom
+	 * tools and are force-included, so a batch of headless instances each spawn
+	 * the whole configured fleet (measured: ~11 server processes per instance,
+	 * +286 processes and ~20 GB for 30 instances, which starves interactive
+	 * sessions on the same machine).
+	 */
+	noMcp?: boolean;
 	noLsp?: boolean;
 	noPty?: boolean;
 	hooks?: string[];
@@ -248,6 +258,8 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			result.noSession = true;
 		} else if (arg === "--no-tools") {
 			result.noTools = true;
+		} else if (arg === "--no-mcp") {
+			result.noMcp = true;
 		} else if (arg === "--no-lsp") {
 			result.noLsp = true;
 		} else if (arg === "--no-pty") {

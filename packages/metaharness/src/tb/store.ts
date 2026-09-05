@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { getDbBusyTimeoutMs } from "@oh-my-pi/pi-utils";
 import type { TrialRow } from "./types";
 
 export interface TbSummaryRow {
@@ -68,6 +69,9 @@ export class TbStore {
 	constructor(dbPath: string) {
 		fs.mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true });
 		this.#db = new Database(dbPath);
+		// Busy handler before the WAL switch: WAL recovery takes an exclusive
+		// lock, and concurrent trials share this file (#2421).
+		this.#db.run(`PRAGMA busy_timeout = ${getDbBusyTimeoutMs()}`);
 		this.#db.run("PRAGMA journal_mode = WAL");
 		this.#db.run(SCHEMA);
 	}

@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { getDbBusyTimeoutMs } from "@oh-my-pi/pi-utils";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { Usage } from "@oh-my-pi/pi-ai";
@@ -47,6 +48,11 @@ export class CommitInferenceCache {
 		try {
 			await fs.mkdir(path.dirname(dbPath), { recursive: true });
 			const db = new Database(dbPath, { create: true });
+			// Install the busy handler BEFORE any lock-taking statement (incl.
+			// `PRAGMA journal_mode=WAL`, which takes an exclusive lock during WAL
+			// recovery — #2421). Without it a second omp opening this shared cache
+			// fails immediately with SQLITE_BUSY instead of waiting its turn.
+			db.run(`PRAGMA busy_timeout = ${getDbBusyTimeoutMs()}`);
 			db.run("PRAGMA journal_mode=WAL");
 			db.run("PRAGMA synchronous=NORMAL");
 			db.exec(`

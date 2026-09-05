@@ -60,6 +60,9 @@ export const launchHelp = {
 		"no-session": Flags.boolean({ description: "Don't save session (ephemeral)" }),
 		models: Flags.string({ description: "Comma-separated model patterns for Ctrl+P cycling" }),
 		"no-tools": Flags.boolean({ description: "Disable all built-in tools" }),
+		"no-mcp": Flags.boolean({
+			description: "Skip MCP discovery and servers (they mount despite --no-tools)",
+		}),
 		"no-lsp": Flags.boolean({ description: "Disable LSP tools, formatting, and diagnostics" }),
 		"no-pty": Flags.boolean({ description: "Disable PTY-based interactive bash execution" }),
 		tools: Flags.string({ description: "Comma-separated list of tools to enable (default: all)" }),

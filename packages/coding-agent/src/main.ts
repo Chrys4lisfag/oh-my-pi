@@ -1334,6 +1334,13 @@ export async function buildSessionOptions(
 		options.toolNames = parsed.tools;
 	}
 
+	if (parsed.noMcp) {
+		// MCP servers are custom tools and survive `--no-tools`, so batch/headless
+		// runs need their own switch to avoid re-spawning the whole fleet per
+		// process.
+		options.enableMCP = false;
+	}
+
 	if (parsed.noLsp) {
 		options.enableLsp = false;
 	}
