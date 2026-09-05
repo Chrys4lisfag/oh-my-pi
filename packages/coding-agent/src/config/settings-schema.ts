@@ -1855,6 +1855,17 @@ export const SETTINGS_SCHEMA = {
 				"Maximum wait between retries, in ms. When the provider asks us to wait longer than this and no credential or model fallback succeeds, the request fails fast instead of sleeping (e.g. 3-hour Anthropic rate-limit windows). 0 disables the ceiling — to let the session auto-resume through provider-stated quota resets.",
 		},
 	},
+	"retry.quotaCooldownMs": {
+		type: "number",
+		default: 30 * 60 * 1000,
+		ui: {
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Quota Cooldown",
+			description:
+				"How long a model is suppressed after account-local quota exhaustion (insufficient credits, spend cap, plan quota), in ms. Applies only when the provider states no reset window — a `retry-after` header always wins. Lower it to return to your primary model sooner; the swap back still happens on the next prompt after the cooldown expires, not on a timer. 0 restores the 30-minute default.",
+		},
+	},
 	"retry.modelFallback": {
 		type: "boolean",
 		default: true,

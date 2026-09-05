@@ -4441,6 +4441,120 @@ describe("advisor", () => {
 			expect(failures).toEqual([]);
 		});
 
+		it("hands a repeated tool-hallucination quarantine to the model fallback", async () => {
+			// Report: `Advisor "Memory Advisor" unavailable for
+			// maiarouter-ai-vuln/deepseek/deepseek-v4-flash: Advisor response
+			// quarantined: requested unavailable tool bash` — raised even though a
+			// fallback chain was configured. A model that keeps calling tools it was
+			// never granted is a capability problem like a refusal, so the chain must
+			// be tried before the advisor is declared unavailable.
+			//
+			// `session-advisors` throws the quarantine from its prompt wrapper (the
+			// turn is discarded before dispatch), so the fake agent does the same.
+			const failures: unknown[] = [];
+			let prompts = 0;
+			let fallbackCalls = 0;
+			let modelHallucinatesTools = true;
+			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
+			const agent: AdvisorAgent = {
+				prompt: async () => {
+					prompts++;
+					if (modelHallucinatesTools) {
+						throw new AdvisorOutputQuarantinedError(
+							"Advisor response quarantined: requested unavailable tool bash",
+						);
+					}
+					state.messages.push({
+						role: "assistant",
+						content: [{ type: "text", text: "no issue; continue" }],
+						timestamp: prompts + 1,
+					} as AgentMessage);
+				},
+				abort: () => {},
+				reset: () => {},
+				rollbackTo: count => {
+					state.messages.length = count;
+					state.error = undefined;
+				},
+				state,
+			};
+			const messages: AgentMessage[] = [
+				{ role: "assistant", content: [{ type: "text", text: "first" }], timestamp: 1 } as AgentMessage,
+			];
+			const runtime = new AdvisorRuntime(
+				agent,
+				{
+					snapshotMessages: () => messages,
+					enqueueAdvice: () => {},
+					notifyFailure: error => failures.push(error),
+					onTurnError: async () => {
+						fallbackCalls++;
+						modelHallucinatesTools = false;
+						return true;
+					},
+				},
+				0,
+			);
+
+			runtime.onTurnEnd(messages);
+			await settleUntil(() => runtime.backlog === 0);
+
+			// One quarantine is absorbed by a silent re-prime; the re-primed turn
+			// quarantines again, and THAT is handed to the chain (previously it went
+			// straight to "advisor unavailable").
+			expect(fallbackCalls).toBe(1);
+			expect(prompts).toBeGreaterThanOrEqual(1);
+			// The swap worked, so no notice reaches the user.
+			expect(failures).toEqual([]);
+		});
+
+		it("still surfaces the quarantine when no fallback model can be applied", async () => {
+			const failures: unknown[] = [];
+			let prompts = 0;
+			let fallbackCalls = 0;
+			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
+			const agent: AdvisorAgent = {
+				prompt: async () => {
+					prompts++;
+					throw new AdvisorOutputQuarantinedError("Advisor response quarantined: requested unavailable tool bash");
+				},
+				abort: () => {},
+				reset: () => {},
+				rollbackTo: count => {
+					state.messages.length = count;
+					state.error = undefined;
+				},
+				state,
+			};
+			const messages: AgentMessage[] = [
+				{ role: "assistant", content: [{ type: "text", text: "first" }], timestamp: 1 } as AgentMessage,
+			];
+			const runtime = new AdvisorRuntime(
+				agent,
+				{
+					snapshotMessages: () => messages,
+					enqueueAdvice: () => {},
+					notifyFailure: error => failures.push(error),
+					onTurnError: async () => {
+						fallbackCalls++;
+						return false;
+					},
+				},
+				0,
+			);
+
+			runtime.onTurnEnd(messages);
+			await settleUntil(() => runtime.backlog === 0);
+
+			// The chain is consulted even when it cannot help; the user-visible
+			// notice then follows the existing failure-notification policy.
+			expect(fallbackCalls).toBeGreaterThanOrEqual(1);
+			for (const failure of failures) {
+				expect(String(failure)).toContain("requested unavailable tool bash");
+			}
+			expect(prompts).toBeGreaterThanOrEqual(1);
+		});
+
 		it("starts a fresh fallback cascade after the host declines to switch models", async () => {
 			const promptInputs: Array<string | AgentMessage[]> = [];
 			const failures: unknown[] = [];

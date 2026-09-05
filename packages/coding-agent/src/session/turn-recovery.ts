@@ -601,7 +601,10 @@ export class TurnRecovery {
 			const errorMessage = message.errorMessage || "Unknown error";
 			const retryAfterMs =
 				this.#parseRetryAfterMsFromError(errorMessage) ??
-				calculateRateLimitBackoffMs(parseRateLimitReason(errorMessage));
+				calculateRateLimitBackoffMs(
+					parseRateLimitReason(errorMessage),
+					this.#host.settings.get("retry.quotaCooldownMs"),
+				);
 			recorded = (async (): Promise<UsageLimitOutcome> => {
 				const outcome = await this.#host.modelRegistry.authStorage.markUsageLimitReached(
 					activeModel.provider,
@@ -1515,7 +1518,12 @@ export class TurnRecovery {
 		let cooldownMs = retryAfterMs;
 		if (!cooldownMs || cooldownMs <= 0) {
 			const reason = parseRateLimitReason(errorMessage);
-			cooldownMs = reason === "UNKNOWN" ? 5 * 60 * 1000 : calculateRateLimitBackoffMs(reason);
+			// A provider `retry-after` already won above; only the class-based
+			// fallback consults `retry.quotaCooldownMs`.
+			cooldownMs =
+				reason === "UNKNOWN"
+					? 5 * 60 * 1000
+					: calculateRateLimitBackoffMs(reason, this.#host.settings.get("retry.quotaCooldownMs"));
 		}
 		this.#host.modelRegistry.suppressSelector(currentSelector, Date.now() + cooldownMs);
 	}

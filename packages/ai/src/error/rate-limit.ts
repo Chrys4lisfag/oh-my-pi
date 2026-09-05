@@ -274,11 +274,24 @@ export function parseRateLimitReason(errorMessage: string): RateLimitReason {
  * Calculate backoff delay in ms for a given rate limit reason.
  * MODEL_CAPACITY gets jitter to prevent thundering herd.
  */
-export function calculateRateLimitBackoffMs(reason: RateLimitReason): number {
+/** Default cooldown for account-local quota exhaustion (`retry.quotaCooldownMs` default). */
+export const DEFAULT_QUOTA_EXHAUSTED_BACKOFF_MS = QUOTA_EXHAUSTED_BACKOFF_MS;
+
+/**
+ * `quotaCooldownMs` overrides the quota-class cooldown only (`retry.quotaCooldownMs`).
+ * A provider-supplied `retry-after` still wins over any class-based value —
+ * the caller applies the hint before consulting this function — so this knob
+ * governs the case where the provider stated no reset window.
+ */
+export function calculateRateLimitBackoffMs(reason: RateLimitReason, quotaCooldownMs?: number): number {
+	const quotaBackoffMs =
+		quotaCooldownMs !== undefined && Number.isFinite(quotaCooldownMs) && quotaCooldownMs > 0
+			? quotaCooldownMs
+			: QUOTA_EXHAUSTED_BACKOFF_MS;
 	switch (reason) {
 		case "INSUFFICIENT_G1_CREDITS_BALANCE":
 		case "QUOTA_EXHAUSTED":
-			return QUOTA_EXHAUSTED_BACKOFF_MS;
+			return quotaBackoffMs;
 		case "RATE_LIMIT_EXCEEDED":
 			return RATE_LIMIT_EXCEEDED_BACKOFF_MS;
 		case "CONCURRENT_LIMIT":
@@ -288,7 +301,7 @@ export function calculateRateLimitBackoffMs(reason: RateLimitReason): number {
 		case "SERVER_ERROR":
 			return SERVER_ERROR_BACKOFF_MS;
 		default:
-			return QUOTA_EXHAUSTED_BACKOFF_MS; // conservative default
+			return quotaBackoffMs; // conservative default
 	}
 }
 

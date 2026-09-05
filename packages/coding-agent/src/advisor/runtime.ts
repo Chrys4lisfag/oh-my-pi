@@ -1347,6 +1347,56 @@ export class AdvisorRuntime {
 						// and drop the batch to break the loop (issue #6661).
 						this.#consecutiveQuarantines++;
 						if (this.#consecutiveQuarantines >= MAX_QUARANTINE_RETRIES) {
+							// A model that keeps asking for tools it was never granted is a
+							// model-capability problem, not a malformed request — the same
+							// class as a refusal, and the fallback chain exists for exactly
+							// this. Try it before declaring the advisor unavailable, using
+							// the shared tried-set so a cyclic chain cannot ping-pong.
+							const quarantineModel = this.host.getModelIdentity?.() ?? this.#modelIdentity ?? "";
+							let quarantineRecovered = false;
+							if (this.#refusalModelsTried.has(quarantineModel)) {
+								logger.debug("advisor quarantine chain exhausted", { model: quarantineModel });
+							} else {
+								this.#refusalModelsTried.add(quarantineModel);
+								try {
+									quarantineRecovered =
+										(await raceWithSignal(
+											Promise.resolve(this.host.onTurnError?.(err, failedMessages, iterationAbort.signal)),
+											iterationAbort.signal,
+										)) === true;
+								} catch (hookErr) {
+									logger.debug("advisor onTurnError hook failed after quarantine", {
+										err: String(hookErr),
+									});
+								}
+							}
+							if (this.#epoch !== epoch) continue;
+							if (this.#sessionTransitionPaused) {
+								this.#pending.unshift(...popped);
+								continue;
+							}
+							if (quarantineRecovered) {
+								this.#consecutiveQuarantines = 0;
+								this.#consecutiveFailures = 0;
+								this.#failureNotified = false;
+								// The swapped-in model renders tools differently, so start it
+								// on a clean advisor context; the batch is requeued so no
+								// primary turn is silently dropped by the swap.
+								this.#resetAdvisorContext(true, false, "quarantine-model-fallback");
+								this.#pending.unshift({
+									text: batch,
+									rawMessages,
+									renderRevision: this.#renderRevision,
+									turns: finalTurns,
+									wip,
+									overflowRecovery: recoveringOverflow || undefined,
+								});
+								logger.debug("advisor quarantine recovered by model fallback");
+								continue;
+							}
+							// Terminal for this cascade: let a later primary update retry the
+							// chain from the top.
+							this.#refusalModelsTried.clear();
 							this.#notifyFailureOnce(err);
 							this.#consecutiveQuarantines = 0;
 							this.#notifyTurnAbandoned();
