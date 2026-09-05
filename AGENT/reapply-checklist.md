@@ -123,6 +123,11 @@ Never edit generated catalog JSON for Venice.
 
 Take upstream's newest expanded usage-limit pattern, then remove
 `resource.?exhausted`. Keep the rationale adjacent to the pattern and decision tree.
+Also re-add the optional `quotaCooldownMs` parameter on
+`calculateRateLimitBackoffMs` (quota class + conservative default arm only) and the
+exported `DEFAULT_QUOTA_EXHAUSTED_BACKOFF_MS`; upstream's signature takes `reason`
+alone, so a merge that adopts the upstream function whole silently re-pins the
+cooldown at 30 minutes.
 
 ### `packages/ai/src/auth-storage.ts`
 
@@ -192,7 +197,9 @@ imported it to `resolveModelPolicy(spec).compat`.
 
 Union the result shape: fork `fetched` (remote attempt made this cycle) plus
 upstream `source`/`updatedAt`. Every return path must set all three; the cache
-fast path is `fetched: false`.
+fast path is `fetched: false`. Keep `cacheCanServeModels` in the
+`hasUsableFreshCache` gate — without it an empty discovery row is reported as a
+usable cache and the provider sits at `0 models` for the whole TTL.
 
 ### `packages/coding-agent/src/config/model-discovery.ts` and `model-provider-discovery.ts`
 
@@ -205,14 +212,36 @@ stays the provider's own. Discovery state keeps fork `attemptedAt` next to upstr
 
 Union the `discovery` schema keys (`baseUrl`, `auth`, `injectV1`) and keep every
 side's `narrow` validation branch; each key has its own type/scope error message.
+Also union the provider-level `tls` block (`rejectUnauthorized`). It is provider
+scope, not per model — `modelOverrides` cannot express it.
+
+### Per-provider `tls` propagation (`model-patch.ts`, `model-registry.ts`, `catalog/types.ts`)
+
+`tls` travels everywhere `transport` travels. On any conflict in these files,
+check all six seams: `Model.tls` in `catalog/types.ts`, `ProviderOverride.tls`,
+both `mergeDiscoveredModel` branches (`?? existing.tls ?? model.tls` and the
+`!== undefined` spread), `#applyProviderTransportOverride`, every
+`Pick<ProviderOverride, …>` union that lists `"transport"`, and the two
+registry records (`overrides.set(providerName, {…})` and
+`discoverableProviders.push({…})`) plus `DiscoveryProviderConfig`. Discovery uses
+`#providerDiscoveryContext(providerConfig)`, NOT the bare `#discoveryContext()` —
+the `/models` probe is where an untrusted certificate surfaces first.
 
 ### `packages/coding-agent/src/modes/components/model-hub.ts`
 
-Keep the fork's offline-first hydration (`awaitBackgroundRefresh` →
-`refresh("offline")` → sync → `#reprobeHiddenOptionalProviders`) over upstream's
-bare `refresh("online")`, plus the hidden/re-probed provider sets and
-`#initialRegistrySync`. Zero-model recovery depends on the re-probe running after
-hydration settles.
+Keep the fork's `awaitBackgroundRefresh` ordering, the hidden/re-probed
+provider sets and `#initialRegistrySync` — but hydrate with upstream's
+`refresh("online")`, NOT `refresh("offline")`. Offline hydration serves whatever
+the cache holds, so a provider that once answered with an empty catalog showed
+`0 models` under "Using cached model list …" until a manual F5, and a revived
+local endpoint was never resurfaced (upstream #2761). The contract the fork
+tests pin is the ORDER (startup discovery settles → hydrate → probe empties),
+not the strategy name.
+
+Also call `modelRegistry.reloadConfigFromDisk()` before the first
+`#syncFromRegistryState()`. The registry otherwise only re-reads `models.yml`
+inside async `refresh()`, so the synchronous first paint shows the startup config
+and a just-edited provider looks unsaved.
 
 ### `packages/coding-agent/src/modes/components/transcript-container.ts`
 
@@ -291,6 +320,8 @@ git grep -n "profileSnapshot\|loadedExistingSession" packages/coding-agent/src/s
 git grep -n "bindSessionToProfile\|captureTerminalProfileActivation" packages/coding-agent/src/config/settings.ts
 git grep -n "shouldWrite = true" packages/coding-agent/src/config/settings.ts
 git grep -n "reprobeHiddenOptionalProviders\|initialRegistrySync" packages/coding-agent/src/modes/components/model-hub.ts
+git grep -n "cacheCanServeModels" packages/catalog/src/model-manager.ts
+git grep -n "No models cached for this provider" packages/coding-agent/src/modes/components/model-hub.ts
 git grep -n "discovery.baseUrl\|injectV1" packages/coding-agent/src/config/model-discovery.ts packages/coding-agent/src/config/models-config-schema-bundle.ts
 git grep -n "attemptedAt" packages/coding-agent/src/config/model-provider-discovery.ts
 git grep -n "fetched" packages/catalog/src/model-manager.ts
@@ -301,6 +332,16 @@ git grep -n "retryFallbackChainModels" packages/coding-agent/src/session
 git grep -n "exhaustedFailure" packages/coding-agent/src/session/session-maintenance.ts
 git grep -n "exceededbudget" packages/ai/src/error/rate-limit.ts
 git grep -n "or \] reorder" packages/coding-agent/src/modes/components/model-hub.ts
+git grep -n "wrapFetchForInsecureTls" packages/utils/src/tls-fetch.ts packages/ai/src/stream.ts packages/coding-agent/src/config/model-registry.ts
+git grep -n "withModelTls" packages/ai/src/stream.ts
+git grep -n "tls" packages/catalog/src/types.ts packages/coding-agent/src/config/model-patch.ts
+git grep -n "providerDiscoveryContext" packages/coding-agent/src/config/model-registry.ts
+git grep -n "reloadConfigFromDisk" packages/coding-agent/src/config/model-registry.ts packages/coding-agent/src/modes/components/model-hub.ts
+git grep -n "retry.quotaCooldownMs" packages/coding-agent/src
+git grep -n "DEFAULT_QUOTA_EXHAUSTED_BACKOFF_MS" packages/ai/src/error/rate-limit.ts
+git grep -n "refusalModelsTried" packages/coding-agent/src/advisor/runtime.ts
+git grep -n "noMcp" packages/coding-agent/src/cli/args.ts packages/coding-agent/src/cli/flag-tables.ts
+git grep -n "getDbBusyTimeoutMs" packages/coding-agent/src/commit/conventional/cache.ts packages/metaharness/src/tb/store.ts
 ```
 
 Interpret the `resource.?exhausted` result carefully: the fork contract requires that
@@ -332,16 +373,24 @@ expand a file argument into a large test bucket.
   test/advisor-memory-reminder-integration.test.ts \
   test/advisor-toggle.test.ts \
   test/modes/controllers/advisor-status-command.test.ts \
-  test/modes/controllers/selector-controller-settings.test.ts)
+  test/modes/controllers/selector-controller-settings.test.ts \
+  test/provider-insecure-tls.test.ts \
+  test/models-yml-live-reload.test.ts \
+  test/zero-model-cache-recovery.test.ts \
+  test/quota-cooldown-setting.test.ts \
+  test/model-hub.test.ts \
+  test/flag-tables.test.ts)
 
 (cd packages/catalog && bun test \
   test/venice-qwen-thinking.test.ts \
-  test/venice-tool-support.test.ts)
+  test/venice-tool-support.test.ts \
+  test/zero-model-cache.test.ts)
 
 (cd packages/ai && bun test \
   src/providers/__tests__/openai-codex-error.test.ts \
   test/auth-storage-codex-selection.test.ts \
   test/rate-limit-utils.test.ts \
+  test/quota-cooldown-override.test.ts \
   test/anthropic-client.test.ts \
   test/anthropic-stream-timeout.test.ts)
 

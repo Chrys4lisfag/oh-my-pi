@@ -37,6 +37,16 @@ never assume commit count alone proves behavior survived.
   `#incompleteRecoveryAttempts` / `resetForNewPrompt` land next to the fork's
   try-shake checkpoint state and `#reanchorTryShakeCheckpoint`. A `@both`-style
   union must re-add the closing brace of whichever method the marker split.
+- `Model`/`ModelSpec` carry fork `tls?: { rejectUnauthorized?: boolean }` next to
+  upstream `transport`. Every seam that propagates `transport` (both
+  `mergeDiscoveredModel` branches, `#applyProviderTransportOverride`, the
+  `Pick<ProviderOverride, …>` unions, `DiscoveryProviderConfig`, the
+  `discoverableProviders.push({…})` record) must carry `tls` beside it — dropping
+  one silently reverts the provider to verified TLS after a catalog refresh.
+- `noteRetryFallbackCooldown` and the credential usage-limit path both pass
+  `settings.get("retry.quotaCooldownMs")` into `calculateRateLimitBackoffMs`; the
+  `CONCURRENT_LIMIT`/`RATE_LIMIT_EXCEEDED` call site deliberately does not.
+  Upstream's signature is `(reason)` — the fork adds an optional second argument.
 
 ## Fork commit ledger
 
@@ -62,6 +72,9 @@ never assume commit count alone proves behavior survived.
 | `c0d3a3b572` | active, runtime     | Model discovery/cache recovery, profile-bound sessions, advisor/status consistency, tokenizer fallback, try-shake/compact reminder |
 | `5546fc43d7` | active, runtime     | Compaction rotates models on spend caps/transients, `retry.fallbackChains` as compaction candidates, budget wording as usage limit, hub reorder-key hint |
 | `fd1710f3e4` | active, runtime     | Immutable terminal profile identity with session-header snapshots, single-apply profile switching, live-block status messages, reasoned fallback notices, re-anchored try-shake ladder |
+| `006b6c9b56` | active, runtime     | Per-provider `tls.rejectUnauthorized` opt-in, sync mtime-guarded `models.yml` reload, zero-model cache gate with `online` hub hydration, hub reorder-key hint text |
+| `ae16aa41fc` | active, runtime     | `retry.quotaCooldownMs` for selector and credential quota cooldowns, advisor quarantine consults the fallback chain |
+| `0fbdee8dd6` | active, runtime     | `--no-mcp` launch flag, `busy_timeout`-before-WAL repair in two SQLite stores, browser-relay archiver fallback chain |
 
 `PI_MCP_TIMING` is a live fork delta carried through merge commit history (reference
 `9a8062a7f`), so it does not appear in the non-merge ledger above.
@@ -75,6 +88,18 @@ never assume commit count alone proves behavior survived.
   - Codex paid-plan token `k12`
 - `packages/ai/src/error/rate-limit.ts`
   - excludes Google `resource_exhausted` from credential usage caps
+  - `calculateRateLimitBackoffMs(reason, quotaCooldownMs?)` — the optional
+    override drives the quota class and the conservative default arm only
+- `packages/ai/src/stream.ts`
+  - `withModelTls` applies `model.tls` at both stream entrypoints, covering every
+    provider transport in one place
+- `packages/utils/src/tls-fetch.ts`
+  - `wrapFetchForInsecureTls` beside the `NODE_EXTRA_CA_CERTS` shim; caller `tls`
+    fields win over the injected `rejectUnauthorized`
+- `packages/catalog/src/types.ts`
+  - `Model.tls` opt-in
+- `packages/catalog/src/model-manager.ts`
+  - `cacheCanServeModels` — an empty cache row serves nothing without a static catalog
 - `packages/ai/src/index.ts`
   - exports retry-after utilities
 - `packages/ai/src/providers/anthropic-client.ts`

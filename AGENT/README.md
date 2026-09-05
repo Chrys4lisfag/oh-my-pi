@@ -87,6 +87,27 @@ be adopted without silently losing fork features.
     provider failure instead of a credentials error. Spend-cap wording
     (`ExceededBudget`, `budget_exceeded`, `over budget`) classifies as a usage
     limit so it earns the quota cooldown.
+21. Provider TLS relaxation is per provider and opt-in: `providers.<id>.tls.rejectUnauthorized:
+    false` in `models.yml` relaxes certificate verification for that provider's
+    discovery probe AND its inference requests, never process-wide. An explicit
+    caller `tls` (the `NODE_EXTRA_CA_CERTS` bundle) still wins, the flag
+    propagates like `transport` so a catalog refresh cannot drop it, and the
+    registry warns once per provider while it is active.
+22. `models.yml` is re-read without a network round trip: `reloadConfigFromDisk()`
+    is sync and mtime-guarded, emits `onModelsUpdated` only on real change, and
+    runs before the model hub's first registry sync so an edited provider appears
+    on the first paint.
+23. An empty discovery cache row is not a usable cache when the provider has no
+    bundled catalog; providers WITH bundled models may legitimately cache
+    "discovery added nothing". The model hub hydrates `online`, and the contract
+    the fork tests pin is the ORDER (discovery settles → hydrate → probe empties),
+    not the strategy name.
+24. The quota cooldown is configurable via `retry.quotaCooldownMs` and governs both
+    the selector suppression and the credential usage-limit cooldown, so a model
+    and its credential return on the same clock. A provider `retry-after` stays
+    authoritative, and transient rate-limit/concurrency/server-error backoffs are
+    fixed. The advisor quarantine branch consults `retry.fallbackChains` before it
+    surfaces a notice.
 
 ## Important memory corrections
 
