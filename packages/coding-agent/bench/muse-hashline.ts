@@ -5,7 +5,7 @@ import type { Context, Model, ModelSpec, Tool } from "@oh-my-pi/pi-ai";
 import { buildParams } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { EditSession, EditStore, editDescription, editGrammar, type EditPolicy } from "@oh-my-pi/pi-natives";
+import { EditSession, EditStore, editDescription, type EditPolicy } from "@oh-my-pi/pi-natives";
 import { type } from "@oh-my-pi/omptype";
 import { editDescriptionCompact } from "../src/edit/index";
 
@@ -30,11 +30,11 @@ const model = buildModel(bundled as unknown as ModelSpec<"openai-responses">) as
 if (model.provider !== "muse-code") throw new Error(`unexpected provider: ${model.provider}`);
 if (model.editPromptVariant !== "compact")
 	throw new Error("muse-code catalog policy did not resolve edit-prompt-variant compact");
-if (model.applyPatchToolType !== "freeform")
-	throw new Error("muse-code catalog policy did not resolve freeform custom tools");
-
-const grammarDefinition = editGrammar("hashline");
-if (!grammarDefinition) throw new Error("hashline edit grammar is unavailable");
+// The edit tool ships as a JSON function tool: Meta rejects freeform custom
+// tools on this endpoint with 400, so apply-patch-tool-type is intentionally
+// unset for muse-code. Assert the shipped configuration, not the removed one.
+if (model.applyPatchToolType === "freeform")
+	throw new Error("muse-code must not resolve freeform custom tools (Meta 400s type:custom)");
 
 // Mirrors resolveEditToolDescription in src/edit/index.ts.
 const editPrompt =
@@ -67,7 +67,6 @@ const tools: Tool[] = [
 		name: "edit",
 		description: editPrompt,
 		parameters: type({ input: "string" }),
-		customFormat: { syntax: "lark", definition: grammarDefinition },
 	},
 ];
 
