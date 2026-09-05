@@ -118,12 +118,17 @@ Examples:
 ```ts
 approval: "read";
 
-approval: args => (LSP_READONLY_ACTIONS.has(args.action) ? "read" : "write");
+approval: (args) => (LSP_READONLY_ACTIONS.has(args.action) ? "read" : "write");
 
-approval: args =>
-	isCritical(args.command) ? { tier: "exec", override: true, reason: "Critical pattern detected" } : "exec";
+approval: (args) =>
+  isCritical(args.command)
+    ? { tier: "exec", override: true, reason: "Critical pattern detected" }
+    : "exec";
 
-approval: args => (isForbidden(args) ? { tier: "exec", policy: "deny", reason: "Blocked by tool policy" } : "write");
+approval: (args) =>
+  isForbidden(args)
+    ? { tier: "exec", policy: "deny", reason: "Blocked by tool policy" }
+    : "write";
 ```
 
 ## ACP sessions
