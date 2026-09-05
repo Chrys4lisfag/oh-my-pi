@@ -121,6 +121,17 @@ export const attachMuseCodeApiKey: AfterExchangeHook = async (
 	credentials: OAuthCredentials,
 	context: ExchangeContext,
 ): Promise<OAuthCredentials> => {
+	// Reuse an already-minted subscription key instead of re-minting on every
+	// token refresh. The key endpoint is aggressively rate-limited (429s), and
+	// Meta returns the same api_key for the account, so a refresh that already
+	// carries one must not burn another key call. Only a login/refresh without
+	// one (first login, or a previously failed mint) re-mints here.
+	try {
+		const existing = parseMuseCodeCredential(credentials.access);
+		if (existing.apiKey.trim()) return credentials;
+	} catch {
+		// No usable minted key yet — fall through to mint one.
+	}
 	const payload = await requestMuseCodeKey(credentials.access, {
 		fetch: context.fetch,
 		signal: context.signal,

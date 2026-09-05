@@ -233,4 +233,27 @@ describe("Muse Code OAuth", () => {
 			),
 		).rejects.toMatchObject({ provider: "muse-code", status: 403 });
 	});
+	test("reuses an already-minted subscription key on refresh without another key call", async () => {
+		// The key endpoint is rate-limited (429s); a refresh that already carries
+		// a minted api_key must not POST to it again.
+		const minted = JSON.stringify({ oauthAccessToken: "meta-account-access", apiKey: "LLM|subscription-key" });
+		let requests = 0;
+		const result = await attachMuseCodeApiKey(
+			{ access: minted, refresh: "meta-refresh", expires: Date.now() + 3_600_000 },
+			{
+				provider: "muse-code",
+				phase: "refresh",
+				raw: {},
+				fetch: Object.assign(
+					() => {
+						requests += 1;
+						return Promise.resolve(Response.json({ is_subs_active: true, api_key: "LLM|other" }));
+					},
+					{ preconnect: fetch.preconnect },
+				),
+			},
+		);
+		expect(requests).toBe(0);
+		expect(result.access).toBe(minted);
+	});
 });
