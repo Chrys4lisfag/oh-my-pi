@@ -380,6 +380,8 @@ export class TurnRecovery {
 		}
 		const value: ServingModel = {
 			selector: formatRetryFallbackSelector(model, level),
+			modelIdentity: formatModelStringWithRouting(model),
+			thinkingLevel: level,
 			isFallback: this.#fallbackRouted,
 		};
 		this.#bootstrapCache = { model, level, routed: this.#fallbackRouted, value };
@@ -433,9 +435,12 @@ export class TurnRecovery {
 		}
 		const model = this.#host.model();
 		if (model) {
+			const level = this.#host.thinkingLevel();
 			this.#lastServed = {
 				attribution: {
-					selector: formatRetryFallbackSelector(model, this.#host.thinkingLevel()),
+					selector: formatRetryFallbackSelector(model, level),
+					modelIdentity: formatModelStringWithRouting(model),
+					thinkingLevel: level,
 					isFallback: this.#fallbackRouted,
 				},
 				sessionId: this.#host.sessionManager.getSessionId(),

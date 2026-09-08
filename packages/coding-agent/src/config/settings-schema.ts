@@ -1,3 +1,4 @@
+import { ADVISOR_DEFAULT_BUDGET_PER_UPDATE } from "../advisor/emission-guard";
 import { THINKING_EFFORTS } from "@oh-my-pi/pi-ai";
 import { DEFAULT_SHARE_URL } from "@oh-my-pi/pi-wire";
 import { SHAPE_VARIANT_NAMES } from "@oh-my-pi/snapcompact";
@@ -600,6 +601,25 @@ export const SETTINGS_SCHEMA = {
 				{ value: "8", label: "8 reads", description: "Default." },
 				{ value: "12", label: "12 reads" },
 				{ value: "16", label: "16 reads" },
+			],
+			condition: "advisorEnabled",
+		},
+	},
+	"advisor.maxNotesPerUpdate": {
+		type: "number",
+		default: ADVISOR_DEFAULT_BUDGET_PER_UPDATE,
+		ui: {
+			tab: "model",
+			group: "Advisor",
+			label: "Advisor Max Notes Per Update",
+			description:
+				"Maximum non-blocker advice notes accepted per advisor prompt update (1–32; UI offers 1–5 quick picks). Blockers are exempt.",
+			options: [
+				{ value: "1", label: "1 note", description: "Anti-flood (strict)." },
+				{ value: "2", label: "2 notes" },
+				{ value: "3", label: "3 notes" },
+				{ value: "4", label: "4 notes", description: "Default." },
+				{ value: "5", label: "5 notes" },
 			],
 			condition: "advisorEnabled",
 		},
@@ -2542,9 +2562,9 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-	// Premium long-context tiers (OpenAI GPT-5.6 bills 2x input / 1.5x output
-	// above 272K input tokens). Off caps affected models at the threshold so
-	// compaction kicks in before any request crosses into premium billing.
+	// Opt in to advertised maximum context windows and premium long-context
+	// tiers. Off preserves default windows and caps premium models before
+	// requests cross into their higher pricing tier.
 	extendedContext: {
 		type: "boolean",
 		default: false,
@@ -2553,7 +2573,7 @@ export const SETTINGS_SCHEMA = {
 			group: "General",
 			label: "Extended Context",
 			description:
-				"Use premium long-context windows on models that bill extra past a threshold (e.g. GPT-5.6 1M charges 2x input above 272K); off caps them at the standard-pricing window",
+				"Use larger context windows where supported; may incur premium pricing. Off keeps default or standard-pricing windows",
 		},
 	},
 
@@ -4606,6 +4626,34 @@ export const SETTINGS_SCHEMA = {
 			label: "cmux Browser",
 			description:
 				"Use cmux WKWebView surfaces for browser automation when a cmux socket is available. Set PI_BROWSER_CMUX=0 or PI_BROWSER_CMUX=1 to override.",
+		},
+	},
+	"browser.freezeOnTurnEnd": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			group: "Grep & Browser",
+			label: "Freeze Browser Tabs On Turn End",
+			description:
+				"Freeze OMP-owned headless browser tabs when a turn settles so animated pages stop burning CPU/GPU while idle. Tabs unfreeze automatically on next use; pass persist:true on open to opt a tab out.",
+		},
+	},
+	"browser.idleCloseSec": {
+		type: "number",
+		default: 1800,
+		ui: {
+			tab: "tools",
+			group: "Grep & Browser",
+			label: "Browser Idle Close Timeout",
+			description:
+				"Close OMP-owned headless browser tabs idle longer than this many seconds (0 = never; session dispose still reaps). Applies only to OMP-launched headless tabs, never relay/CDP/spawned browsers or other sessions' tabs.",
+			options: [
+				{ value: "0", label: "Never" },
+				{ value: "900", label: "15 minutes" },
+				{ value: "1800", label: "30 minutes" },
+				{ value: "3600", label: "1 hour" },
+			],
 		},
 	},
 	"browser.screenshotDir": {
