@@ -290,6 +290,37 @@ describe("try-compact extension", () => {
 		expect(harness.entries.filter(entry => entry.customType === MID_REMINDER_STATE_ENTRY)).toHaveLength(1);
 	});
 
+	it("suppresses the duplicate when the paired events disagree on the session id", async () => {
+		// Observed in a real transcript: `auto_compaction_end` reminded, the
+		// compaction committed, a full turn ran, and `session_compact` reminded
+		// AGAIN 31s later — two reminders for one compaction. The pairing flag is
+		// keyed on the session id, so anything that changes it in between (a
+		// branch/switch around compaction) defeats it. Both events carry
+		// `firstKeptEntryId`/`tokensBefore`, which identifies the compaction
+		// itself regardless of the id it arrives under.
+		const harness = createHarness();
+		tempDirs.push(harness.sessionDir);
+		await harness.emit("session_start");
+		await harness.emit("auto_compaction_start", { action: "context-full", reason: "threshold" });
+		await harness.emit("auto_compaction_end", {
+			result: { summary: "done", firstKeptEntryId: "entry-42", tokensBefore: 812_345 },
+			aborted: false,
+		});
+		expect(harness.messages).toHaveLength(1);
+
+		harness.setSessionId("session-b");
+		await harness.emit("session_compact", {
+			compactionEntry: { type: "compaction", firstKeptEntryId: "entry-42", tokensBefore: 812_345 },
+		});
+		expect(harness.messages).toHaveLength(1);
+
+		// A genuinely different compaction still reminds.
+		await harness.emit("session_compact", {
+			compactionEntry: { type: "compaction", firstKeptEntryId: "entry-99", tokensBefore: 900_000 },
+		});
+		expect(harness.messages).toHaveLength(2);
+	});
+
 	it("idle auto-compaction suppresses only the reminder-generated turn", async () => {
 		const entries: TestEntry[] = [
 			{ type: "custom", customType: CONFIG_ENTRY, data: { ...DEFAULT_COMPACT_REMINDER_CONFIG, midRemind: true } },

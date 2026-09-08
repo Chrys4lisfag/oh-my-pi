@@ -366,10 +366,42 @@ export default function compactReminderExtension(pi: ExtensionAPI) {
 		persistMidReminderState(pi, reset);
 		midState = reset;
 	};
-	const handleCompaction = (sessionManager: ReadonlySessionManager, suppressOriginalAgentEnd: boolean) => {
+	/**
+	 * Identity of one compaction, shared by `auto_compaction_end` (via its
+	 * `CompactionResult`) and `session_compact` (via its committed
+	 * `CompactionEntry`). Both carry `firstKeptEntryId` and `tokensBefore`, so
+	 * the pair can be recognised even when they arrive a full turn apart or
+	 * disagree on the session id — the case that produced two visible reminders.
+	 */
+	const compactionIdentity = (
+		source: { firstKeptEntryId?: string; tokensBefore?: number } | undefined,
+	): string | undefined => {
+		// Both fields are required: a partial identity would collide across
+		// unrelated compactions and silently swallow a legitimate reminder.
+		if (!source || typeof source.firstKeptEntryId !== "string" || typeof source.tokensBefore !== "number") {
+			return undefined;
+		}
+		return `${source.firstKeptEntryId}:${source.tokensBefore}`;
+	};
+	const remindedCompactions = new Set<string>();
+	const handleCompaction = (
+		sessionManager: ReadonlySessionManager,
+		suppressOriginalAgentEnd: boolean,
+		options?: { identity?: string },
+	) => {
 		resetMidReminder(sessionManager);
 		if (suppressOriginalAgentEnd) {
 			suppressNextAgentEndAfterCompaction.add(sessionManager.getSessionId());
+		}
+		if (options?.identity !== undefined) {
+			if (remindedCompactions.has(options.identity)) return;
+			remindedCompactions.add(options.identity);
+			// Bound the set: only the most recent compactions can still be
+			// double-reported, and a session runs many over its lifetime.
+			if (remindedCompactions.size > 32) {
+				const oldest = remindedCompactions.values().next().value;
+				if (oldest !== undefined) remindedCompactions.delete(oldest);
+			}
 		}
 		sendReminder(sessionManager);
 	};
@@ -459,11 +491,26 @@ export default function compactReminderExtension(pi: ExtensionAPI) {
 		automaticCompactionInFlight.set(ctx.sessionManager.getSessionId(), event.reason);
 	});
 
-	pi.on("session_compact", async (_event, ctx) => {
+	pi.on("session_compact", async (event, ctx) => {
 		const sessionId = ctx.sessionManager.getSessionId();
+		// Same compaction already reminded at `auto_compaction_end`? The
+		// session-id flag alone is not enough: that event fires BEFORE the
+		// compaction entry commits, and a whole turn can run in between (observed
+		// 31s and four tool batches apart), after which the flag no longer
+		// matches. `firstKeptEntryId`/`tokensBefore` identify the compaction
+		// itself and are carried by both events.
+		const committedIdentity = compactionIdentity(event.compactionEntry);
+		if (committedIdentity !== undefined && remindedCompactions.has(committedIdentity)) {
+			// Consume the pending flag too: leaving it set would swallow the
+			// reminder for the NEXT compaction.
+			automaticEndHandledAwaitingCommit.delete(sessionId);
+			return;
+		}
 		if (automaticEndHandledAwaitingCommit.delete(sessionId)) return;
 		const automaticReason = automaticCompactionInFlight.get(sessionId);
-		handleCompaction(ctx.sessionManager, automaticReason !== undefined && automaticReason !== "idle");
+		handleCompaction(ctx.sessionManager, automaticReason !== undefined && automaticReason !== "idle", {
+			identity: committedIdentity,
+		});
 		if (automaticReason !== undefined) automaticCompactionHandledAtCommit.add(sessionId);
 	});
 
@@ -473,7 +520,9 @@ export default function compactReminderExtension(pi: ExtensionAPI) {
 		automaticCompactionInFlight.delete(sessionId);
 		if (automaticCompactionHandledAtCommit.delete(sessionId)) return;
 		if (!event.result || event.aborted) return;
-		handleCompaction(ctx.sessionManager, automaticReason !== undefined && automaticReason !== "idle");
+		handleCompaction(ctx.sessionManager, automaticReason !== undefined && automaticReason !== "idle", {
+			identity: compactionIdentity(event.result),
+		});
 		automaticEndHandledAwaitingCommit.add(sessionId);
 	});
 
