@@ -11,6 +11,7 @@
 
 ### Fixed
 
+- Fixed a model that failed after an earlier fallback still routing to the old chain's entries: a stale retry-fallback pin no longer outranks the failing model's own configured chain, so an exhausted chain stops instead of borrowing an unrelated one.
 - Fixed a provider that once answered with an empty model catalog staying at `0 models` for the whole cache TTL while `/models` claimed "Using cached model list from <age>. Press F5 to refresh." An empty cache row can serve nothing when the provider has no bundled catalog, so it is no longer treated as a usable cache; the hub hydrates with a live refresh (which also resurfaces a local endpoint that came back up), and a cached row with no models now says so instead of advertising a list it does not have.
 - Fixed compaction ending at the first exhausted provider instead of falling back. A summary rejected with a spend cap or rate limit (`429 ExceededBudget`, `budget_exceeded`) now advances to the next candidate; candidates include the models named by `retry.fallbackChains`, not just role assignments; and the final error reports the provider failure rather than a misleading credentials message. Spend-cap wording is also classified as a usage limit so it earns the quota cooldown instead of being retried against the same key.
 - Fixed the model hub's fallback/role footer advertising `[/] reorder`, which reads as the `/` key (bound to nothing there); the hint now names the `[` and `]` keys that actually move a row within its chain or cycle.

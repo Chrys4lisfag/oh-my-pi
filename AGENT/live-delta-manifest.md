@@ -47,6 +47,14 @@ never assume commit count alone proves behavior survived.
   `settings.get("retry.quotaCooldownMs")` into `calculateRateLimitBackoffMs`; the
   `CONCURRENT_LIMIT`/`RATE_LIMIT_EXCEEDED` call site deliberately does not.
   Upstream's signature is `(reason)` — the fork adds an optional second argument.
+- `retryFallbackChainKeys` filters a STALE pin: the pinned key is kept only when
+  `pinnedRole === current`, the failing model has no chain of its own, or
+  `retryFallbackChainContainsSelector(...)` reports membership. Upstream's shape
+  is the unconditional `[pinned, current]`, so a pick-a-side resolution restores
+  the defect where a leftover chain outranks the failing model's own mapping.
+  The membership helper must NOT be reimplemented over
+  `getRetryFallbackEffectiveChain`: a wildcard key synthesizes the active model
+  as its own primary, so every model would test as a member.
 - `packages/ai/src/utils/transport-fetch.ts` is upstream's single inference fetch
   (v18.1.11 pulled UA/CA/proxy/request-debug out of the `stream.ts` entrypoints
   into `transportFetch`, stamped idempotent). The fork's TLS opt-in lives INSIDE

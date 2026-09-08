@@ -243,6 +243,22 @@ Also call `modelRegistry.reloadConfigFromDisk()` before the first
 inside async `refresh()`, so the synchronous first paint shows the startup config
 and a just-edited provider looks unsaved.
 
+### `packages/coding-agent/src/session/retry-fallback-chains.ts` and `turn-recovery.ts` (chain walk)
+
+Adopt upstream's resolution ladder (exact model key → longest wildcard → hinted
+role → matching role with `default` preferred → `default`), then re-apply two
+fork deltas:
+
+1. `retryFallbackChainContainsSelector` — keep the exported helper, and keep it
+   independent of `getRetryFallbackEffectiveChain` (a wildcard key synthesizes
+   the active model as its own primary, so a chain-index test always matches).
+2. `retryFallbackChainKeys` must gate the pin on that helper. Upstream's body is
+   the unconditional `[pinned, current]`; restoring it re-breaks a configured
+   `model -> [fallback]` mapping whenever a stale pin from an earlier hop
+   survives a model change (`/advisor configure`, profile sync, context
+   promotion). The advisor path passes its own `pinnedRole` and relies on the
+   same gate.
+
 ### `packages/coding-agent/src/modes/components/transcript-container.ts`
 
 Union: upstream `resetStableEmission` and the fork's `isBlockLive`, with
@@ -327,6 +343,7 @@ git grep -n "attemptedAt" packages/coding-agent/src/config/model-provider-discov
 git grep -n "fetched" packages/catalog/src/model-manager.ts
 git grep -n "auth-none\|openai-models-list-bare-context" packages/coding-agent/src/config/model-registry.ts
 git grep -n "describeFallbackReason" packages/coding-agent/src/session/retry-fallback-chains.ts
+git grep -n "retryFallbackChainContainsSelector" packages/coding-agent/src/session/retry-fallback-chains.ts packages/coding-agent/src/session/turn-recovery.ts
 git grep -n "reanchorTryShakeCheckpoint" packages/coding-agent/src/session/session-maintenance.ts
 git grep -n "retryFallbackChainModels" packages/coding-agent/src/session
 git grep -n "exhaustedFailure" packages/coding-agent/src/session/session-maintenance.ts
@@ -379,6 +396,7 @@ expand a file argument into a large test bucket.
   test/models-yml-live-reload.test.ts \
   test/zero-model-cache-recovery.test.ts \
   test/quota-cooldown-setting.test.ts \
+  test/retry-fallback-stale-pin.test.ts \
   test/model-hub.test.ts \
   test/flag-tables.test.ts)
 

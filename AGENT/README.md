@@ -108,6 +108,15 @@ be adopted without silently losing fork features.
     authoritative, and transient rate-limit/concurrency/server-error backoffs are
     fixed. The advisor quarantine branch consults `retry.fallbackChains` before it
     surfaces a notice.
+25. A retry-fallback pin is honored only while the failing model still belongs to
+    the pinned chain — its primary, one of its configured entries, or a model its
+    wildcard covers (`retryFallbackChainContainsSelector` is the gate).
+    Otherwise the walk is the failing model's own chain alone, so an exhausted
+    chain stops instead of borrowing another one. Applies to the session pin and
+    the advisor-local pin alike: a pin is set at the first hop and never
+    re-resolved, so a model changed by `/advisor configure`, profile sync, or
+    context promotion must not let a leftover chain outrank the more specific
+    configured mapping.
 
 ## Important memory corrections
 
