@@ -610,6 +610,14 @@ export class AgentSession {
 	#planModeState: PlanModeState | undefined;
 	/** Whether automatic compaction should first attempt surgical shake cleanup in this logical session. */
 	#tryShakeEnabled = false;
+	/**
+	 * Memoized `getConfiguredDefaultModelState()` resolution, keyed by the
+	 * configured selector. Invalidated on catalog and role/settings changes.
+	 */
+	#configuredDefaultModelState?: {
+		configuredSelector: string | undefined;
+		state: { configuredSelector: string | undefined; resolvedModel: Model | undefined; unavailable: boolean };
+	};
 	#vibeModeState: VibeModeState | undefined;
 	#goalModeState: GoalModeState | undefined;
 	#goalRuntime: GoalRuntime;
@@ -1830,6 +1838,7 @@ export class AgentSession {
 		// ordinary late advisor build, retry any synchronized profile snapshot
 		// whose model was unavailable during its first apply.
 		this.#unsubscribeModelsUpdated = this.#modelRegistry.onModelsUpdated(() => {
+			this.#invalidateConfiguredDefaultModelState();
 			this.ensureAdvisorsBuilt();
 			if (this.#synchronizedProfileApplyPending && this.#agentKind === "main" && !this.#isDisposed) {
 				this.#queueSynchronizedProfileApply();
@@ -1843,8 +1852,12 @@ export class AgentSession {
 		this.#unsubscribeAgent = this.agent.subscribe(this.#handleAgentEvent);
 		// Re-evaluate append-only context mode when the setting changes at runtime.
 		this.#unsubscribeAppendOnly = onAppendOnlyModeChanged(_value => this.#syncAppendOnlyContext(this.model));
-		this.#unsubscribeModelRoles = onModelRolesChanged(() => this.#advisors.onModelRolesChanged());
+		this.#unsubscribeModelRoles = onModelRolesChanged(() => {
+			this.#invalidateConfiguredDefaultModelState();
+			this.#advisors.onModelRolesChanged();
+		});
 		this.#unsubscribeSettingsSynchronized = onSettingsSynchronized((source, changedPaths) => {
+			this.#invalidateConfiguredDefaultModelState();
 			if (
 				source !== this.settings ||
 				this.#agentKind !== "main" ||
@@ -10933,13 +10946,34 @@ export class AgentSession {
 		unavailable: boolean;
 	} {
 		const configuredSelector = this.settings.getModelRole("default");
+		const runtimeModel = this.model;
+		// The status line calls this on every repaint — i.e. once per keystroke —
+		// and `resolveRoleModel` walks `ModelRegistry.getAvailable()`, which
+		// recomposes and collapses the whole static catalog (measured 24-42ms at
+		// 15k models). Memoize the resolution: it depends only on the configured
+		// selector and the catalog, both of which announce their own changes
+		// (`onModelsUpdated`, `modelRoles`/settings hooks -> #invalidateConfiguredDefaultModelState).
+		const cached = this.#configuredDefaultModelState;
+		if (cached && cached.configuredSelector === configuredSelector) {
+			return { ...cached.state, runtimeModel, unavailable: cached.state.unavailable };
+		}
 		const resolvedModel = configuredSelector ? this.resolveRoleModel("default") : undefined;
-		return {
+		const state = {
 			configuredSelector,
 			resolvedModel,
-			runtimeModel: this.model,
 			unavailable: Boolean(configuredSelector && !resolvedModel),
 		};
+		this.#configuredDefaultModelState = { configuredSelector, state };
+		return { ...state, runtimeModel };
+	}
+
+	/**
+	 * Drop the memoized configured-default resolution. Called whenever the
+	 * catalog or the role configuration changes; a stale entry would keep
+	 * rendering `[unavailable]` after late discovery made the model resolvable.
+	 */
+	#invalidateConfiguredDefaultModelState(): void {
+		this.#configuredDefaultModelState = undefined;
 	}
 
 	/**
