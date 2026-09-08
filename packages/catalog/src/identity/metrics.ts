@@ -93,6 +93,8 @@ function metricCandidateKeys(modelId: string): string[] {
 export class CatalogMetricsIndex {
 	#exact = new Map<string, CatalogMetrics>();
 	#canonical = new Map<string, ScoredEntry>();
+	/** Metrics keyed `provider/id`: the only source allowed to supply `tps`. */
+	#byProvider = new Map<string, CatalogMetrics>();
 
 	constructor(models?: Iterable<Model<Api>>) {
 		if (models) this.add(models);
@@ -111,6 +113,10 @@ export class CatalogMetricsIndex {
 			const existing = this.#exact.get(exactKey);
 			this.#exact.set(exactKey, existing ? { ...metrics, ...existing } : metrics);
 
+			const providerKey = `${model.provider.toLowerCase()}/${exactKey}`;
+			const existingForProvider = this.#byProvider.get(providerKey);
+			this.#byProvider.set(providerKey, existingForProvider ? { ...metrics, ...existingForProvider } : metrics);
+
 			const canonical = canonicalKey(model.id);
 			const scored = this.#canonical.get(canonical);
 			if (!scored) this.#canonical.set(canonical, { ...metrics, identity: model.identity });
@@ -120,8 +126,33 @@ export class CatalogMetricsIndex {
 		}
 	}
 
-	/** Metrics for `model` by exact id, else by dialect-normalized id when the classified identities agree. */
+	/**
+	 * Metrics for `model` by exact id, else by dialect-normalized id when the
+	 * classified identities agree.
+	 *
+	 * `int` is a property of the WEIGHTS, so it resolves across providers: the
+	 * same model scores the same wherever it is hosted. `tps` is a property of
+	 * the HOST and never crosses providers — a proxy, a quantized re-host and a
+	 * first-party endpoint do not decode at the same rate. Sharing it by bare id
+	 * made every newly configured gateway advertise some other host's speed
+	 * (`~38t/s` on all 30+ routes serving `kimi-k3`), which reads as a
+	 * measurement of that gateway. A provider's own catalog row still supplies
+	 * its `tps`, and measured samples (`model_perf`, keyed `provider/id`)
+	 * override the estimate entirely.
+	 */
 	resolve(model: Model<Api>): CatalogMetrics | undefined {
+		const ownTps = this.#byProvider.get(`${model.provider.toLowerCase()}/${model.id.toLowerCase()}`)?.tps;
+		const shared = this.#resolveShared(model);
+		if (!shared) return ownTps === undefined ? undefined : { tps: ownTps };
+		const int = shared.int;
+		// Drop a `tps` that came from another provider's row.
+		const tps = ownTps ?? undefined;
+		if (int === undefined && tps === undefined) return undefined;
+		return { ...(int !== undefined ? { int } : {}), ...(tps !== undefined ? { tps } : {}) };
+	}
+
+	/** Provider-agnostic lookup: exact id, then dialect-normalized candidates. */
+	#resolveShared(model: Model<Api>): CatalogMetrics | undefined {
 		const exact = this.#exact.get(model.id.toLowerCase());
 		if (exact) return exact;
 		const identity = model.identity;

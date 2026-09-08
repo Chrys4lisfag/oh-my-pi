@@ -5,10 +5,33 @@ import type { Api, FetchImpl, Model } from "../types";
 import { getProxyForProvider, withProxyInit } from "./proxy";
 import { createFetchRequestDebugSession, isRequestDebugEnabled } from "./request-debug";
 
-/** Stamped on a fetch already built by {@link transportFetch}. */
+/**
+ * Stamped on a fetch already built by {@link transportFetch}: the identity of
+ * the model it was built FOR, plus the base fetch it wraps so it can be rebuilt
+ * for a different model without double-layering.
+ */
 const TRANSPORT_FETCH = Symbol("omp.transportFetch");
+const TRANSPORT_FETCH_BASE = Symbol("omp.transportFetch.base");
 
-type TransportFetch = FetchImpl & { [TRANSPORT_FETCH]?: true };
+type TransportFetch = FetchImpl & {
+	[TRANSPORT_FETCH]?: string;
+	[TRANSPORT_FETCH_BASE]?: FetchImpl;
+};
+
+/**
+ * What makes a built transport reusable. Everything the closure captures must
+ * appear here: the provider (proxy lookup, cowork base fetch), the api (base
+ * fetch selection) and the model's TLS opt-in. A fetch built for one model is
+ * NOT valid for another — reusing it silently dropped the second model's
+ * `tls.rejectUnauthorized`, so a session that started on an ordinary model and
+ * switched (`set_model`, role cycling, retry fallback) to a bare-IP gateway
+ * kept failing `ERR_TLS_CERT_ALTNAME_INVALID` with the opt-in configured.
+ */
+function transportIdentity(model: Model<Api>): string {
+	return [model.provider, model.id, model.api, model.tls?.rejectUnauthorized === false ? "insecure-tls" : ""].join(
+		"\u0000",
+	);
+}
 
 /**
  * The one fetch every inference request goes through. Per call it applies, in
@@ -22,16 +45,30 @@ type TransportFetch = FetchImpl & { [TRANSPORT_FETCH]?: true };
  * lands beside `tls.ca` rather than replacing it: a private gateway can carry
  * a custom CA and still skip hostname/expiry verification.
  *
- * Idempotent: the built fetch is stamped and returned as-is on later passes.
- * `streamSimple` re-enters `stream`, and `streamSimpleRequest` re-enters itself
- * on auth retries, so without the stamp each entry point would add another
- * layer (three PI_REQ_DEBUG dumps for one request).
+ * Idempotent PER MODEL: the built fetch is stamped with its model identity and
+ * returned as-is when re-entered for the SAME model. `streamSimple` re-enters
+ * `stream`, and `streamSimpleRequest` re-enters itself on auth retries, so
+ * without that each entry point would add another layer (three PI_REQ_DEBUG
+ * dumps for one request).
+ *
+ * Handed a transport built for a DIFFERENT model, it rebuilds from the original
+ * base fetch rather than returning the stale one (which would apply the wrong
+ * model's TLS/proxy/User-Agent) or wrapping it again (which would double-layer
+ * those concerns).
  */
 export function transportFetch(model: Model<Api>, fetchImpl: FetchImpl | undefined): FetchImpl {
 	const given = fetchImpl as TransportFetch | undefined;
-	if (given?.[TRANSPORT_FETCH]) return given;
+	const identity = transportIdentity(model);
+	const givenIdentity = given?.[TRANSPORT_FETCH];
+	if (givenIdentity !== undefined) {
+		if (givenIdentity === identity) return given as FetchImpl;
+		// Built for another model: start again from what it wraps.
+		fetchImpl = given?.[TRANSPORT_FETCH_BASE];
+	}
+	const unwrapped = fetchImpl as TransportFetch | undefined;
 	const base =
-		given ?? (model.provider === "anthropic" && model.api === "anthropic-messages" ? coworkFetch : globalThis.fetch);
+		unwrapped ??
+		(model.provider === "anthropic" && model.api === "anthropic-messages" ? coworkFetch : globalThis.fetch);
 	const proxyUrl = getProxyForProvider(model.provider);
 
 	const fetch: TransportFetch = async (input, init) => {
@@ -45,7 +82,9 @@ export function transportFetch(model: Model<Api>, fetchImpl: FetchImpl | undefin
 		return session.wrapResponse(await base(input, init));
 	};
 	if (base.preconnect) fetch.preconnect = base.preconnect;
-	fetch[TRANSPORT_FETCH] = true;
+	fetch[TRANSPORT_FETCH] = identity;
+	// Keep the unwrapped base so a later model can rebuild without layering.
+	if (unwrapped !== undefined) fetch[TRANSPORT_FETCH_BASE] = unwrapped;
 	return fetch;
 }
 

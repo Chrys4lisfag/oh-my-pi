@@ -898,7 +898,34 @@ export class ModelRegistry {
 		const combined = this.#mergeCustomModels(withConfigModels, select(this.#runtimeModelOverlays));
 		const withModelOverrides = this.#applyModelOverrides(collapseBuiltVariants(combined), this.#modelOverrides);
 		const withProviderBedrock = this.#applyProviderBedrockOverrides(withModelOverrides);
-		return this.#applyLlamaCppModelFixups(this.#applyRuntimeProviderOverrides(withProviderBedrock));
+		const withProviderTls = this.#applyProviderTlsOverrides(withProviderBedrock);
+		return this.#applyLlamaCppModelFixups(this.#applyRuntimeProviderOverrides(withProviderTls));
+	}
+
+	/**
+	 * Stamp the configured provider-level `tls` onto every model of that
+	 * provider.
+	 *
+	 * `tls` is config, not catalog, so it must be re-applied to whatever the
+	 * projection assembled — built-in entries, cached discovery rows written
+	 * before the block existed, and runtime overlays alike. Without this,
+	 * `getAvailable()` (what the session and RPC `set_model` read) served models
+	 * with no opt-in while a direct `find()` had it, so a provider kept failing
+	 * `ERR_TLS_CERT_ALTNAME_INVALID` with `rejectUnauthorized: false` configured.
+	 */
+	#applyProviderTlsOverrides(models: Model<Api>[]): Model<Api>[] {
+		if (this.#providerOverrides.size === 0) return models;
+		let changed = false;
+		const projected = models.map(model => {
+			const tls = this.#providerOverrides.get(model.provider)?.tls;
+			if (tls === undefined || model.tls?.rejectUnauthorized === tls.rejectUnauthorized) return model;
+			changed = true;
+			// Shallow clone, NOT `buildModel`: a spec rebuild drops everything the
+			// projection already attached that is not part of `ModelSpec`
+			// (catalog metrics, discovery provenance). `tls` is plain data.
+			return { ...model, tls };
+		});
+		return changed ? projected : models;
 	}
 
 	#composeStaticModels(providerFilter?: ReadonlySet<string>): Model<Api>[] {
@@ -1245,8 +1272,20 @@ export class ModelRegistry {
 					)
 				: models;
 
-		const withRemoteCompaction = providerConfig.remoteCompaction
+		// Provider-level TLS is config, not catalog: a model restored from the
+		// discovery cache carries whatever its spec held when written, so a `tls`
+		// block added later (or a cache row predating the field) was lost — the
+		// provider then failed `ERR_TLS_CERT_ALTNAME_INVALID` despite
+		// `rejectUnauthorized: false` being configured. Re-apply it here, the one
+		// seam every discovery path (fresh, cached, cold-start) passes through.
+		const withProviderTls = providerConfig.tls
 			? withDecoderMetadata.map(model =>
+					buildModel({ ...model, tls: providerConfig.tls, compat: model.compatConfig } as ModelSpec<Api>),
+				)
+			: withDecoderMetadata;
+
+		const withRemoteCompaction = providerConfig.remoteCompaction
+			? withProviderTls.map(model =>
 					buildModel({
 						...model,
 						remoteCompaction: mergeProviderRemoteCompactionConfig(
@@ -1256,7 +1295,7 @@ export class ModelRegistry {
 						compat: model.compatConfig,
 					} as ModelSpec<Api>),
 				)
-			: withDecoderMetadata;
+			: withProviderTls;
 
 		if (providerConfig.provider !== "ollama" || providerConfig.api !== "openai-responses") {
 			return withRemoteCompaction;

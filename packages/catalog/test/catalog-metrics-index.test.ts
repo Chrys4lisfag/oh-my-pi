@@ -56,13 +56,33 @@ describe("CatalogMetricsIndex", () => {
 		expect(scored.resolve(model("anthropic", "claude-opus-4-1"))).toBeUndefined();
 	});
 
-	test("exact id wins over dialect matching and merges partial rows", () => {
+	test("exact id wins over dialect matching and merges partial int rows", () => {
 		const index = new CatalogMetricsIndex([
 			model("a", "gpt-5.5", { int: 10 }),
 			model("b", "gpt-5.5", { tps: 20 }),
 			model("c", "openai/gpt-5.5", { int: 99, tps: 99 }),
 		]);
-		expect(index.resolve(model("d", "GPT-5.5"))).toEqual({ int: 10, tps: 20 });
+		// `int` is a property of the weights, so it resolves across providers.
+		// `tps` is a property of the host: provider `d` must NOT inherit `b`'s
+		// speed. Sharing it by bare id made every gateway serving a model
+		// advertise some other host's number as if it were measured there.
+		expect(index.resolve(model("d", "GPT-5.5"))).toEqual({ int: 10 });
+	});
+
+	test("keeps tps for the provider whose own row carries it", () => {
+		const index = new CatalogMetricsIndex([
+			model("fireworks", "kimi-k3", { int: 59.7, tps: 38 }),
+			model("proxy", "kimi-k3"),
+		]);
+		expect(index.resolve(model("fireworks", "kimi-k3"))).toEqual({ int: 59.7, tps: 38 });
+		// Same id, different host: intelligence carries over, speed does not.
+		expect(index.resolve(model("proxy", "kimi-k3"))).toEqual({ int: 59.7 });
+	});
+
+	test("supplies tps from a provider's own row even without a shared int", () => {
+		const index = new CatalogMetricsIndex([model("solo", "local-model", { tps: 12 })]);
+		expect(index.resolve(model("solo", "local-model"))).toEqual({ tps: 12 });
+		expect(index.resolve(model("other", "local-model"))).toBeUndefined();
 	});
 });
 
@@ -76,6 +96,7 @@ describe("applyCatalogMetrics", () => {
 		const filled = applyCatalogMetrics([already, model("openai-codex", "gpt-5.6-terra")], scored);
 		expect(filled[0]).toBe(already);
 		expect(filled[1].int).toBe(56.6);
-		expect(filled[1].tps).toBe(97.7);
+		// A different provider's row cannot supply speed (see index tests).
+		expect(filled[1].tps).toBeUndefined();
 	});
 });

@@ -777,8 +777,12 @@ describe("ModelRegistry", () => {
 			await registry.refresh("online");
 
 			const model = registry.find("cliproxy", "gpt-5.7-sol");
+			// `int` describes the weights, so a proxy inherits it from the catalog.
 			expect(model?.int).toBe(60.9);
-			expect(model?.tps).toBe(70.4);
+			// `tps` describes the HOST. A proxy must not advertise the first-party
+			// endpoint's speed as if it were its own — that made every newly
+			// configured gateway show another host's number in `/models`.
+			expect(model?.tps).toBeUndefined();
 		});
 
 		test("custom Responses providers can disable original image detail", () => {
