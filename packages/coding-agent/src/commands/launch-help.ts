@@ -63,6 +63,9 @@ export const launchHelp = {
 		"no-mcp": Flags.boolean({
 			description: "Skip MCP discovery and servers (they mount despite --no-tools)",
 		}),
+		"no-fallback": Flags.boolean({
+			description: "Pin the run to one model: no role fallback, usage-aware switch, or chains",
+		}),
 		"no-lsp": Flags.boolean({ description: "Disable LSP tools, formatting, and diagnostics" }),
 		"no-pty": Flags.boolean({ description: "Disable PTY-based interactive bash execution" }),
 		tools: Flags.string({ description: "Comma-separated list of tools to enable (default: all)" }),

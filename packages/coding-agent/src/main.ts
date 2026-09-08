@@ -1583,6 +1583,16 @@ export async function runRootCommand(
 		if (parsedArgs.externalThinking) {
 			settingsInstance.override("externalThinking", true);
 		}
+		// Apply --no-fallback (ephemeral, not persisted): pin the run to one
+		// model. Every model-switching path is disabled — role fallback, the
+		// usage-aware switch, and all configured chains — so a measurement or a
+		// scripted run can never be answered by a model it did not ask for.
+		// Same-model retries are untouched.
+		if (parsedArgs.noFallback) {
+			settingsInstance.override("retry.modelFallback", false);
+			settingsInstance.override("retry.usageAwareFallback", false);
+			settingsInstance.override("retry.fallbackChains", {});
+		}
 
 		await logger.time(
 			"initTheme:final",

@@ -161,6 +161,19 @@ describe("parseArgs end-of-options (--)", () => {
 		expect(parseArgs(["--no-mcp", "hello"]).messages).toEqual(["hello"]);
 	});
 
+	it("parses --no-fallback (and the --no-fallbacks spelling) as a boolean flag", () => {
+		// Pins a run to one model so a measurement or scripted turn can never be
+		// answered by a model it did not ask for.
+		expect(parseArgs(["--no-fallback"]).noFallback).toBe(true);
+		expect(parseArgs(["--no-fallbacks"]).noFallback).toBe(true);
+		expect(parseArgs([]).noFallback).toBeUndefined();
+		// A boolean flag must not swallow the next argument as its value.
+		expect(parseArgs(["--no-fallback", "hello"]).messages).toEqual(["hello"]);
+		// Composes with the other isolation switches.
+		const all = parseArgs(["--no-fallback", "--no-mcp", "--no-tools"]);
+		expect([all.noFallback, all.noMcp, all.noTools]).toEqual([true, true, true]);
+	});
+
 	it("parses flags before -- and forwards the rest as text", () => {
 		const result = parseArgs(["--print", "hello", "--", "--no-tools"]);
 		expect(result.print).toBe(true);

@@ -76,6 +76,16 @@ export interface Args {
 	 * sessions on the same machine).
 	 */
 	noMcp?: boolean;
+	/**
+	 * Disable every model-switching recovery for this run: `retry.modelFallback`,
+	 * `retry.usageAwareFallback` and all `retry.fallbackChains`.
+	 *
+	 * A run that must be attributed to ONE model needs this. Benchmarks were the
+	 * motivating case: a dead provider's turn was answered by a fallback model
+	 * and its tokens/second were credited to the pinned model, so broken
+	 * gateways scored as healthy. Retries on the SAME model are unaffected.
+	 */
+	noFallback?: boolean;
 	noLsp?: boolean;
 	noPty?: boolean;
 	hooks?: string[];
@@ -260,6 +270,8 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			result.noTools = true;
 		} else if (arg === "--no-mcp") {
 			result.noMcp = true;
+		} else if (arg === "--no-fallback" || arg === "--no-fallbacks") {
+			result.noFallback = true;
 		} else if (arg === "--no-lsp") {
 			result.noLsp = true;
 		} else if (arg === "--no-pty") {
