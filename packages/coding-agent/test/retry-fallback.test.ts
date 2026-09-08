@@ -59,8 +59,17 @@ describe("retry fallback selector resolution", () => {
 		);
 		expect(resolveRetryFallbackChainKey(roleContext, selector, undefined, "task")).toBe("task");
 
+		// The `default` chain applies with no `default` role only when the failing
+		// model IS the session model — then the running model is effectively the
+		// default. An unrelated failing model (subagent/advisor/role-scoped call)
+		// must not borrow it.
 		const defaultContext = createContext({ default: ["openai/gpt-4o-mini"] });
-		expect(resolveRetryFallbackChainKey(defaultContext, selector)).toBe("default");
+		const sessionModel = getBundledModel("openrouter", "google/gemini-2.5-flash");
+		if (!sessionModel) throw new Error("expected bundled model");
+		expect(resolveRetryFallbackChainKey(defaultContext, selector, sessionModel)).toBe("default");
+		const unrelated = getBundledModel("openai", "gpt-4o-mini");
+		expect(resolveRetryFallbackChainKey(defaultContext, selector, unrelated)).toBeUndefined();
+		expect(resolveRetryFallbackChainKey(defaultContext, selector)).toBeUndefined();
 	});
 
 	it("does not let a later shared-assignment role steal the default chain", () => {
@@ -117,14 +126,20 @@ describe("retry fallback selector resolution", () => {
 		]);
 	});
 
-	it("inherits the default chain only for roles without an explicit chain", () => {
+	it("never inherits the default chain onto other roles", () => {
+		// Chains are strict: a role gets a chain only when configured by name.
+		// Inheritance meant any model that happened to be a role's primary
+		// silently gained the `default` chain's target — an unconfigured
+		// `antigravity-native/gemini-3.8-flash` was answered with the default
+		// chain's `azure1-bitfrost/openai/gpt-6-astra`.
 		const defaultChain = ["openai/gpt-4o-mini"];
 		const expanded = expandDefaultRetryFallbackChains({ default: defaultChain, slow: ["google/gemini-2.5-flash"] }, [
 			"default",
 			"task",
 			"slow",
 		]);
-		expect(expanded.task).toBe(defaultChain);
+		expect(expanded.task).toBeUndefined();
 		expect(expanded.slow).toEqual(["google/gemini-2.5-flash"]);
+		expect(expanded.default).toEqual(defaultChain);
 	});
 });

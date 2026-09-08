@@ -3193,6 +3193,69 @@ describe("AgentSession retry fallback", () => {
 		]);
 	});
 
+	it("retries in place instead of borrowing an unrelated chain for an unconfigured model", async () => {
+		// User-visible contract for strict chains: the running model has no chain
+		// of its own, a `default` chain exists but belongs to a DIFFERENT model
+		// (the configured `default` role), so the retryable failure must be
+		// retried on the same model rather than answered with the default
+		// chain's target. Previously this switched providers (an
+		// `antigravity-native/gemini-3.8-flash` timeout answered with
+		// `azure1-bitfrost/openai/gpt-6-astra`).
+		const unconfiguredModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const defaultRoleModel = getBundledModel("openai", "gpt-4o");
+		const chainTarget = getBundledModel("openai", "gpt-4o-mini");
+		if (!unconfiguredModel || !defaultRoleModel || !chainTarget) {
+			throw new Error("Expected bundled test models to exist");
+		}
+
+		const requestedModels: string[] = [];
+		const fallbackAppliedEvents: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
+		// The reported failure: a timeout, which is retryable — it must not be
+		// converted into a provider switch.
+		const agent = createFallbackAgent(unconfiguredModel, requestedModels, {
+			retryAfterMs: 5,
+			firstError: "The operation timed out.",
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 2,
+			"retry.fallbackChains": {
+				default: [`${chainTarget.provider}/${chainTarget.id}`],
+			},
+		});
+		// The `default` role names a different model, so the default chain is
+		// owned by that model — not by whatever happens to be running.
+		settings.setModelRole("default", `${defaultRoleModel.provider}/${defaultRoleModel.id}`);
+		// And the running model IS another role's primary, with no chain of its
+		// own. That role used to inherit the `default` chain
+		// (`expandDefaultRetryFallbackChains`), which is how an unconfigured
+		// model acquired an unrelated provider's target.
+		settings.setModelRole("vision", `${unconfiguredModel.provider}/${unconfiguredModel.id}`);
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		session.subscribe(event => {
+			if (event.type === "retry_fallback_applied") fallbackAppliedEvents.push(event);
+		});
+
+		await session.prompt("Unconfigured model must retry, not switch");
+		await session.waitForIdle();
+
+		// Same model twice: the failure, then the retry that succeeds.
+		expect(requestedModels).toEqual([
+			`${unconfiguredModel.provider}/${unconfiguredModel.id}`,
+			`${unconfiguredModel.provider}/${unconfiguredModel.id}`,
+		]);
+		expect(fallbackAppliedEvents).toEqual([]);
+		expect(session.model?.id).toBe(unconfiguredModel.id);
+	});
+
 	it("falls back on structured classifier refusals and pins the fallback", async () => {
 		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");

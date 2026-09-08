@@ -149,18 +149,25 @@ export function isKnownProvider(modelRegistry: ModelRegistry, provider: string):
 	return modelRegistry.hasProvider(provider);
 }
 
-/** Apply the configured default chain to roles without their own chain. */
+/**
+ * Resolve the configured chains for role lookup.
+ *
+ * Chains are STRICT: a role gets a chain only when one is configured for it by
+ * name, and the `default` chain belongs to the `default` role alone. The
+ * previous behaviour copied the `default` chain onto every role without its own
+ * key, so any model that merely happened to be some role's primary inherited
+ * it — an `antigravity-native/gemini-3.8-flash` timeout was answered with the
+ * `default` chain's `azure1-bitfrost/openai/gpt-6-astra`, a provider the user
+ * had configured no chain for. A model with no chain of its own must retry, not
+ * borrow someone else's target.
+ *
+ * Roles that genuinely want a shared chain can name it explicitly per role.
+ */
 export function expandDefaultRetryFallbackChains(
 	configuredChains: RetryFallbackChains,
-	roleNames: readonly string[],
+	_roleNames: readonly string[],
 ): RetryFallbackChains {
-	const chains: RetryFallbackChains = { ...configuredChains };
-	const defaultChain = chains.default;
-	if (!Array.isArray(defaultChain)) return chains;
-	for (const role of roleNames) {
-		if (role !== "default" && chains[role] === undefined) chains[role] = defaultChain;
-	}
-	return chains;
+	return { ...configuredChains };
 }
 
 /** Resolves configured fallback chains, applying the default chain to named roles. */
@@ -289,9 +296,30 @@ export function resolveRetryFallbackChainKey(
 	roleHint?: string,
 ): string | undefined {
 	const parsedConfigured = parseRetryFallbackSelector(currentSelector, context.modelLookup);
-	const currentPlainSelector = currentModel
-		? formatModelSelectorValue(formatModelString(currentModel), parsedConfigured?.thinkingLevel)
-		: undefined;
+	// `currentModel` exists only to NORMALIZE the failing selector (a raw or
+	// unparseable selector still has to find its own chain). It must never widen
+	// the match: the session model can differ from the model that actually
+	// failed — a subagent/advisor turn, a role-scoped call, a model switched
+	// after the request went out — and matching a chain key against it made an
+	// unrelated failing model inherit the session model's chain
+	// (`antigravity-native/gemini-3.8-flash` picking up the `default` chain's
+	// `azure1-bitfrost/openai/gpt-6-astra`). Chains are strict: per model or per
+	// provider, matched against the FAILING selector only.
+	// Routing-suffixed selectors (`openrouter/z-ai/glm-4.7@cerebras`) name the
+	// same model as the bare id the registry holds, so identity is compared
+	// with the `@route` suffix stripped from both sides.
+	const sameModelId = (a: string, b: string): boolean =>
+		a.toLowerCase().split("@")[0] === b.toLowerCase().split("@")[0];
+	const currentModelIsFailingModel =
+		currentModel !== undefined &&
+		currentModel !== null &&
+		(parsedConfigured === undefined ||
+			(sameModelId(parsedConfigured.provider, currentModel.provider) &&
+				sameModelId(parsedConfigured.id, currentModel.id)));
+	const currentPlainSelector =
+		currentModel && currentModelIsFailingModel
+			? formatModelSelectorValue(formatModelString(currentModel), parsedConfigured?.thinkingLevel)
+			: undefined;
 	const parsedCurrent =
 		parsedConfigured ??
 		(currentPlainSelector ? parseRetryFallbackSelector(currentPlainSelector, context.modelLookup) : undefined);
@@ -345,7 +373,25 @@ export function resolveRetryFallbackChainKey(
 	// A shared assignment (default and vision both the same model) must not
 	// let yaml insertion order steal the live role's chain. Prefer the hint,
 	// then `default` when it also matches.
-	if (roleHint && Array.isArray(context.chains[roleHint])) return roleHint;
+	//
+	// The hint only breaks TIES between roles that already match — it never
+	// grants a chain to a model the role does not point at. A hint is derived
+	// from the last model-change role, which can name a role whose assignment
+	// has since moved (or never matched the failing model at all); honoring it
+	// blindly routed an unrelated failing model into that role's chain.
+	if (
+		roleHint &&
+		Array.isArray(context.chains[roleHint]) &&
+		selectorMatchesCurrent(
+			getRetryFallbackPrimarySelector(context, roleHint),
+			currentSelector,
+			currentBaseSelector,
+			currentPlainSelector,
+			currentPlainBaseSelector,
+		)
+	) {
+		return roleHint;
+	}
 	let matchedRole: string | undefined;
 	for (const key in context.chains) {
 		if (isRetryFallbackModelKey(key)) continue;
@@ -364,11 +410,18 @@ export function resolveRetryFallbackChainKey(
 	}
 	if (matchedRole) return matchedRole;
 
-	// 4. The default chain, when default has no explicit role primary.
+	// 4. The `default` chain, when `default` has no explicit role primary — the
+	// running model is then effectively the default. Strictly gated to the
+	// SESSION model: without that, a `default` chain answered a failure on any
+	// unrelated model (a subagent/advisor/role-scoped call whose model differs
+	// from the session's) with the default chain's target, which is how a
+	// `antigravity-native/gemini-3.8-flash` timeout reached
+	// `azure1-bitfrost/openai/gpt-6-astra`.
 	const defaultChain = context.chains.default;
 	if (
 		Array.isArray(defaultChain) &&
 		defaultChain.length > 0 &&
+		currentModelIsFailingModel &&
 		getRetryFallbackPrimarySelector(context, "default") === undefined
 	) {
 		return "default";
@@ -457,6 +510,82 @@ function getRetryFallbackEffectiveChain(
 		chain.push(parsed);
 	}
 	return chain;
+}
+
+/**
+ * Whether `currentSelector` actually belongs to `chainKey` — its primary, one
+ * of its configured entries, or (for a wildcard key) a model the wildcard
+ * covers.
+ *
+ * Used to discard a STALE pin. `#activeRetryFallback.role` is pinned at the
+ * first hop and never re-resolved, so an advisor (or session) whose model later
+ * changes by another route — `/advisor configure`, profile sync, context
+ * promotion — keeps a pin for a chain it no longer sits in. The pinned chain is
+ * consulted BEFORE the failing model's own chain, so a stale pin silently
+ * overrode a configured `model -> [fallback]` mapping (the advisor's
+ * `maiarouter … -> entrim …` chain lost to a leftover `mammouth-vuln/*` pin and
+ * fell back to that chain's kimi models instead).
+ *
+ * Deliberately does NOT use {@link getRetryFallbackEffectiveChain}: a wildcard
+ * key synthesizes the active model as its own primary, so every model would
+ * look like a member.
+ */
+export function retryFallbackChainContainsSelector(
+	context: RetryFallbackResolutionContext,
+	chainKey: string,
+	currentSelector: string,
+	currentModel?: Model | null,
+): boolean {
+	const chain = context.chains[chainKey];
+	if (!Array.isArray(chain)) return false;
+	const parsedConfigured = parseRetryFallbackSelector(currentSelector, context.modelLookup);
+	const currentPlainSelector = currentModel
+		? formatModelSelectorValue(formatModelString(currentModel), parsedConfigured?.thinkingLevel)
+		: undefined;
+	const parsedCurrent =
+		parsedConfigured ??
+		(currentPlainSelector ? parseRetryFallbackSelector(currentPlainSelector, context.modelLookup) : undefined);
+	if (!parsedCurrent) return false;
+	const currentBaseSelector = formatRetryFallbackBaseSelector(parsedCurrent);
+	const currentPlainBaseSelector =
+		currentPlainSelector && currentPlainSelector !== currentSelector
+			? formatRetryFallbackBaseSelector(parseRetryFallbackSelector(currentPlainSelector) ?? parsedCurrent)
+			: undefined;
+
+	// A wildcard key owns every model of its provider (under its id prefix).
+	if (isRetryFallbackWildcardKey(chainKey)) {
+		const { provider, idPrefix } = parseRetryFallbackWildcard(chainKey, candidate =>
+			context.modelLookup.hasProvider(candidate),
+		);
+		if (
+			provider === parsedCurrent.provider &&
+			(idPrefix === undefined || parsedCurrent.id.startsWith(`${idPrefix}/`))
+		) {
+			return true;
+		}
+	} else if (
+		selectorMatchesCurrent(
+			getRetryFallbackPrimarySelector(context, chainKey),
+			currentSelector,
+			currentBaseSelector,
+			currentPlainSelector,
+			currentPlainBaseSelector,
+		)
+	) {
+		return true;
+	}
+
+	// Or the model landed on one of the configured entries — the mid-chain hop
+	// whose continuation the pin exists to serve.
+	for (const entry of chain) {
+		const parsed = parseRetryFallbackChainEntry(context, entry, parsedCurrent);
+		if (!parsed) continue;
+		if (parsed.raw === currentSelector || parsed.raw === currentPlainSelector) return true;
+		const base = formatRetryFallbackBaseSelector(parsed);
+		if (base === currentBaseSelector || (!!currentPlainBaseSelector && base === currentPlainBaseSelector))
+			return true;
+	}
+	return false;
 }
 
 /**

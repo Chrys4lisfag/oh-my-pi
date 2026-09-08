@@ -722,3 +722,35 @@ describe("is402BillingCapBody", () => {
 		expect(is402BillingCapBody("Rate limit exceeded, too many requests")).toBe(false);
 	});
 });
+
+describe("402 credit-cap bodies (OpenRouter prompt-size cap)", () => {
+	// OpenRouter expresses an exhausted balance as a PROMPT-SIZE cap. It used to
+	// classify as a bare 402 with no flags: no retry, no credential rotation, no
+	// fallback chain — the turn just died.
+	const OPENROUTER_CREDIT_CAP =
+		"402 Prompt tokens limit exceeded: 661500 > 498951. To increase, visit https://openrouter.ai/settings/credits and add more credits";
+
+	it("treats a credit-purchase pointer as an account billing cap", () => {
+		expect(is402BillingCapBody(OPENROUTER_CREDIT_CAP)).toBe(true);
+		expect(is402BillingCapBody("402 add more credits")).toBe(true);
+		expect(is402BillingCapBody("Visit https://example.com/settings/credits")).toBe(true);
+	});
+
+	it("flags the message as a usage limit so recovery can rotate or fall back", () => {
+		const id = classify(new ProviderHttpError(OPENROUTER_CREDIT_CAP, 402));
+		expect(is(id, Flag.UsageLimit)).toBe(true);
+	});
+
+	it("leaves an informative non-billing 402 alone", () => {
+		// A subscription-required 402 is not an exhausted balance: rotating or
+		// burning a sibling credential would not help.
+		expect(is402BillingCapBody("402 This endpoint requires a Pro subscription plan feature")).toBe(false);
+	});
+
+	it("does not capture a context overflow that carries no billing hint", () => {
+		// Real overflow is compaction's job, not a usage limit.
+		expect(
+			is402BillingCapBody("This model's maximum context length is 200000 tokens, however you requested 240000"),
+		).toBe(false);
+	});
+});

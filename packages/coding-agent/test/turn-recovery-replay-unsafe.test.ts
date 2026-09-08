@@ -264,13 +264,25 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 		expect(modelChanges).toEqual([`${fallback.provider}/${fallback.id}`]);
 	});
 
-	it("treats a failed turn with partial non-whitespace text as NOT retriable", () => {
+	it("treats a failed turn with partial text as recoverable by switching model", () => {
+		// CONTRACT CHANGE: committed TEXT no longer blocks recovery. Most turns
+		// emit something before a provider fails, so vetoing on text ended the
+		// work on a dead route with healthy fallback entries unused. Recovery for
+		// these is switch-only (no same-model replay), so the cost is a
+		// duplicated partial answer, never repeated work. Tool calls, images and
+		// server-tool blocks still veto — see the side-effect cases below.
 		const recovery = new TurnRecovery(createHost(model, modelRegistry));
 		const message = makeMessage([{ type: "text", text: "Here is the first part of my answer" }], model);
-		expect(recovery.isRetryableError(message)).toBe(false);
+		expect(recovery.isRetryableError(message)).toBe(true);
 	});
 
-	it("does not replay a long OpenCode Go usage limit after committed text", () => {
+	it("moves a long OpenCode Go usage limit to the chain after committed text", () => {
+		// CONTRACT CHANGE: committed TEXT no longer blocks recovery. Most turns
+		// emit something before a provider fails, so vetoing on text ended the
+		// work on a dead route with healthy fallback entries unused. Recovery for
+		// these is switch-only (no same-model replay), so the cost is a
+		// duplicated partial answer, never repeated work. Tool calls, images and
+		// server-tool blocks still veto — see the side-effect cases below.
 		const openCodeModel = getBundledModel("opencode-go", "deepseek-v4-flash");
 		if (!openCodeModel) throw new Error("Expected bundled OpenCode Go model");
 		const recovery = new TurnRecovery(
@@ -284,7 +296,7 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 			...makeMessage([{ type: "text", text: "Already shown to the user" }], openCodeModel),
 			errorMessage: "429 Weekly usage limit reached. type=GoUsageLimitError retry-after-ms=3242000",
 		} as AssistantMessage;
-		expect(recovery.isRetryableError(message)).toBe(false);
+		expect(recovery.isRetryableError(message)).toBe(true);
 	});
 
 	it("allows replay-safe hard fallback and excludes committed text with a configured chain", () => {
@@ -409,7 +421,13 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 		expect(recovery.isRetryableError(message)).toBe(true);
 	});
 
-	it("treats a mix of thinking and text as replay-unsafe (text wins)", () => {
+	it("allows a switch for a mix of thinking and text", () => {
+		// CONTRACT CHANGE: committed TEXT no longer blocks recovery. Most turns
+		// emit something before a provider fails, so vetoing on text ended the
+		// work on a dead route with healthy fallback entries unused. Recovery for
+		// these is switch-only (no same-model replay), so the cost is a
+		// duplicated partial answer, never repeated work. Tool calls, images and
+		// server-tool blocks still veto — see the side-effect cases below.
 		const recovery = new TurnRecovery(createHost(model, modelRegistry));
 		const message = makeMessage(
 			[
@@ -418,7 +436,7 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 			],
 			model,
 		);
-		expect(recovery.isRetryableError(message)).toBe(false);
+		expect(recovery.isRetryableError(message)).toBe(true);
 	});
 
 	it("treats thinking plus whitespace-only text as replay-safe", () => {
@@ -433,7 +451,16 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 		expect(recovery.isRetryableError(message)).toBe(true);
 	});
 
-	it("does not retry malformed calls after visible text", () => {
+	it("keeps malformed calls after visible text on the corrective same-model path", () => {
+		// A malformed function call owns `handleMalformedFunctionCallStop` (a
+		// corrective reminder on the SAME model), so it is deliberately NOT
+		// chain-eligible — switching provider would abandon that mechanism.
+		// Committed TEXT no longer blocks recovery in general. Most turns
+		// emit something before a provider fails, so vetoing on text ended the
+		// work on a dead route with healthy fallback entries unused. Recovery for
+		// these is switch-only (no same-model replay), so the cost is a
+		// duplicated partial answer, never repeated work. Tool calls, images and
+		// server-tool blocks still veto — see the side-effect cases below.
 		const recovery = new TurnRecovery(createHost(model, modelRegistry));
 		const message = makeMessage([{ type: "text", text: "Already shown" }], model);
 		message.errorId = AIError.create(AIError.Flag.MalformedFunctionCall);
@@ -482,11 +509,17 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 		expect(recovery.isRetryableError(empty)).toBe(true);
 	});
 
-	it("does not retry a classifier refusal after visible text", () => {
+	it("moves a classifier refusal after visible text to the chain", () => {
+		// CONTRACT CHANGE: committed TEXT no longer blocks recovery. Most turns
+		// emit something before a provider fails, so vetoing on text ended the
+		// work on a dead route with healthy fallback entries unused. Recovery for
+		// these is switch-only (no same-model replay), so the cost is a
+		// duplicated partial answer, never repeated work. Tool calls, images and
+		// server-tool blocks still veto — see the side-effect cases below.
 		const recovery = new TurnRecovery(createHost(model, modelRegistry));
 		const message = makeMessage([{ type: "text", text: "Visible refusal output" }], model);
 		message.stopDetails = { type: "refusal" };
-		expect(recovery.isRetryableError(message)).toBe(false);
+		expect(recovery.isRetryableError(message)).toBe(true);
 	});
 
 	it("keeps pre-stream provider diagnostics replay-safe", () => {
@@ -976,6 +1009,8 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 			const { host, messages, continues } = continuationHost(message);
 			const recovery = new TurnRecovery(host);
 
+			// Malformed calls stay off the fallback chain: the corrective
+			// developer message retries them on the same model instead.
 			expect(recovery.isRetryableError(message)).toBe(false);
 			expect(recovery.handleMalformedFunctionCallStop(message)).toBe(true);
 

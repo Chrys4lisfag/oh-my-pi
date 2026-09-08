@@ -70,6 +70,12 @@ import type { WorkspaceTree } from "../workspace-tree";
 import { attributeSubagentError } from "./error-attribution";
 import { generateTaskLabel } from "./label";
 import { resolveAgentPrewalkDefault } from "./prewalk";
+import {
+	findRetryFallbackCandidates,
+	getRetryFallbackChains,
+	isRetryFallbackModelKey,
+	resolveRetryFallbackChainKey,
+} from "../session/retry-fallback-chains";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
@@ -213,15 +219,53 @@ function resolveSubagentRetryFallbackCandidates(
  * unexpanded alias through `modelOverride` or `agent.model`; retain that
  * existing path by deriving the role only when no preserved role was supplied.
  */
+/**
+ * The chain the subagent's own model owns, by the same specificity the session
+ * walk uses: exact model key, then the longest covering provider wildcard. Role
+ * keys are excluded here — the caller already tried the role by name, and a
+ * role whose assignment merely matches must not donate its chain.
+ */
+function resolveModelScopedSubagentChain(
+	settings: Settings,
+	modelRegistry: ModelRegistry,
+	modelSelector: string,
+): string[] | undefined {
+	const context = {
+		chains: getRetryFallbackChains(settings),
+		getModelRole: (role: string) => settings.getModelRole(role),
+		modelLookup: modelRegistry,
+	};
+	const key = resolveRetryFallbackChainKey(context, modelSelector);
+	if (key === undefined || !isRetryFallbackModelKey(key)) return undefined;
+	const candidates = findRetryFallbackCandidates(context, key, modelSelector);
+	return candidates.length > 0 ? candidates.map(candidate => candidate.raw) : undefined;
+}
+
 function resolveSubagentInheritedRetryFallbackChain(
 	settings: Settings,
 	modelRegistry: ModelRegistry,
 	role: string | undefined,
+	modelSelector?: string,
 ): string[] | undefined {
 	const configuredChains = settings.get("retry.fallbackChains");
-	// An explicitly emptied role chain means "no fallbacks", not "inherit
-	// default" — mirrors expandDefaultRetryFallbackChains.
-	const fallbackChain = (role !== undefined ? configuredChains?.[role] : undefined) ?? configuredChains?.default;
+	// Chains are strict: an agent role uses only the chain configured for that
+	// role by name. `default` applies to a role-less run, never as an inherited
+	// fallback for a named role — inheritance answered a failure on a model the
+	// user configured no chain for with the default chain's target. An
+	// explicitly emptied role chain still means "no fallbacks".
+	//
+	// A role without its own chain still gets the chain its MODEL owns: the
+	// exact `provider/id` key, else a covering `provider/*` wildcard. Roles are
+	// only one of the three key kinds, so looking up the role name alone left a
+	// subagent with no fallback even when its provider had a wildcard chain
+	// configured (`azure1-bitfrost/*`), which is how a `401 User not found.`
+	// killed a subagent turn instead of moving it to the next entry.
+	const roleChain = role !== undefined ? configuredChains?.[role] : configuredChains?.default;
+	const modelChain =
+		roleChain === undefined && modelSelector !== undefined
+			? resolveModelScopedSubagentChain(settings, modelRegistry, modelSelector)
+			: undefined;
+	const fallbackChain = roleChain ?? modelChain;
 	if (
 		!Array.isArray(fallbackChain) ||
 		fallbackChain.length === 0 ||
@@ -3159,6 +3203,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							subagentSettings,
 							modelRegistry,
 							modelRole ?? resolveExplicitModelRole(modelPatterns, subagentSettings),
+							configuredModelPatterns[0],
 						)
 					: undefined;
 			const {

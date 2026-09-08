@@ -50,6 +50,7 @@ import {
 	type ActiveRetryFallbackState,
 	calculateRetryBackoffDelayMs,
 	describeFallbackReason,
+	retryFallbackChainContainsSelector,
 	findRetryFallbackCandidates,
 	formatRetryFallbackSelector,
 	getRetryFallbackChains,
@@ -87,6 +88,17 @@ const HTTP2_STREAM_RESET_ERROR_RE =
 const PREMATURE_STREAM_CLOSE_ERROR_RE = /stream closed before a (?:finish_reason|terminal response event)/i;
 const IMMUTABLE_ANTHROPIC_THINKING_ERROR_PATTERN =
 	/messages\.\d+\.content\.\d+.*\b(?:thinking|redacted_thinking)\b.*\blatest assistant message cannot be modified\b/is;
+
+/**
+ * Transport failures that cut a stream mid-flight, leaving truncated text.
+ *
+ * Matched against the failed turn's error message to decide that its visible
+ * output is a FRAGMENT (safe to discard and replay) rather than a finished
+ * answer. Kept to unambiguous transport wording: an HTTP status, a provider
+ * refusal or a quota message must not qualify.
+ */
+const TRANSPORT_CLOSE_PATTERN =
+	/socket connection was closed|socket hang up|\bECONNRESET\b|\bEPIPE\b|premature close|connection closed|stream (?:was )?closed|terminated unexpectedly|closed unexpectedly/i;
 
 function hasNonWhitespace(value: string): boolean {
 	return NON_WHITESPACE_RE.test(value);
@@ -1260,9 +1272,88 @@ export class TurnRecovery {
 				AIError.is(id, AIError.Flag.MalformedFunctionCall) ||
 				AIError.retriable(id)) &&
 			this.#unexecutedToolCallsReplaySafe(message);
-		if (this.#hasReplayUnsafeOutput(message) && !replaySafeUnexecutedTools) return false;
+		if (
+			this.#hasReplayUnsafeOutput(message) &&
+			!replaySafeUnexecutedTools &&
+			!this.#isTruncatedTransportCloseReplaySafe(message, id) &&
+			// A provider failure still earns the fallback chain even when the turn
+			// already streamed output: most turns emit something before the
+			// provider dies, so vetoing here ended the work on a dead route.
+			// Recovery for these is switch-only, so nothing replays on the same
+			// model — the risk is a duplicated partial answer, not repeated work.
+			!this.#isFallbackOnlyFailure(message, id)
+		) {
+			return false;
+		}
+		// An auth failure is terminal for THIS credential, never for the turn: a
+		// sibling credential or the next chain entry can serve it. Reported as
+		// `401 User not found.` from a gateway whose key had been revoked — the
+		// turn died outright even though other providers were configured and
+		// healthy. Retryability here only opens the recovery path; the
+		// same-credential retry is suppressed below (a bad key does not heal), so
+		// this either rotates the credential, switches model, or closes the saga.
+		if (AIError.is(id, AIError.Flag.AuthFailed)) return true;
 		if (AIError.is(id, AIError.Flag.AccountPolicy) || this.isClassifierRefusal(message)) return true;
-		return AIError.retriable(id);
+		if (AIError.retriable(id)) return true;
+		// Anything else the PROVIDER refused still deserves the chain. A model
+		// the classifier cannot place (`400 no keys found that support model`,
+		// `404 model is only available through …`, `400 UnsupportedParamsError`)
+		// ended the turn after a single hop even with healthy entries left, so a
+		// chain walk stopped at the first misconfigured gateway. Eligibility here
+		// only opens the recovery path: `#isFallbackOnlyFailure` keeps these off
+		// the same-model retry, so the outcome is "switch model" or "close the
+		// saga", never a sleep-and-retry loop against a route that cannot work.
+		return this.#isFallbackOnlyFailure(message, id);
+	}
+
+	/**
+	 * A provider-side failure that only a DIFFERENT model can fix.
+	 *
+	 * These are errors the generic classifier declines to retry because
+	 * retrying the same route is pointless — a gateway that does not carry the
+	 * model, rejects the parameters, or answers 4xx for configuration reasons.
+	 * They are still worth the fallback chain: the next entry is a different
+	 * route entirely. Excluded are the cases where switching models is wrong or
+	 * harmful:
+	 *
+	 * - user aborts / interrupts: the operator stopped the turn
+	 * - context overflow: compaction owns it, and every model would refuse
+	 * - thinking loops: a same-model resample signal (issue #8760)
+	 * - replay-unsafe output: the turn already rendered or ran something, so it
+	 *   cannot be replayed elsewhere (the truncated-transport-close carve-out
+	 *   above is the one audited exception)
+	 */
+	#isFallbackOnlyFailure(message: AssistantMessage, id: number): boolean {
+		if (message.stopReason !== "error") return false;
+		// Only an operator abort is off limits: the user stopped the turn, so
+		// nothing should resume it elsewhere.
+		if (AIError.is(id, AIError.Flag.UserInterrupt) || AIError.is(id, AIError.Flag.Abort)) return false;
+		if (AIError.is(id, AIError.Flag.SilentAbort)) return false;
+		// A thinking loop wants a same-model resample, so it is not a *switch*
+		// signal — but it is still recoverable, and the loop guard owns it via
+		// the retriable path above.
+		if (AIError.is(id, AIError.Flag.ThinkingLoop)) return false;
+		// A malformed function call owns its own corrective-reminder retry on the
+		// SAME model (`handleMalformedFunctionCallStop`); switching provider for
+		// it would abandon that mechanism and spend a chain entry on a formatting
+		// mistake.
+		if (AIError.is(id, AIError.Flag.MalformedFunctionCall)) return false;
+		// Context overflow keeps going to compaction: it is rejected before this
+		// point in `isRetryableError`, and no chain entry would accept the same
+		// oversized request anyway.
+		//
+		// Committed TEXT no longer blocks a switch: most turns emit something
+		// before the provider fails, so vetoing on text ended the work on a dead
+		// route. Duplicating a partial answer is far cheaper than losing the turn.
+		//
+		// Side effects still block it. A tool call may already have run, and an
+		// image or server-tool block is a rendered artifact — replaying those
+		// elsewhere repeats WORK, not just words. `#unexecutedToolCallsReplaySafe`
+		// remains the only path that clears an emitted tool call, and it demands
+		// positive proof the call never executed.
+		return !message.content.some(
+			block => block.type === "toolCall" || block.type === "image" || block.type === "anthropicServerTool",
+		);
 	}
 
 	/**
@@ -1410,6 +1501,38 @@ export class TurnRecovery {
 				block.type === "anthropicServerTool" ||
 				(block.type === "text" && this.#host.textOutputCommitted() && block.text.trim().length > 0),
 		);
+	}
+
+	/**
+	 * True when the only replay-unsafe output is TRUNCATED text left behind by a
+	 * transport that died mid-stream — a fragment, not an answer.
+	 *
+	 * The committed-text veto exists so a replay cannot show the user the same
+	 * finished answer twice. That reasoning does not hold when the stream was
+	 * cut: the turn ended with `stopReason: "error"` on a transport-class
+	 * failure (`socket connection was closed unexpectedly`, `ECONNRESET`,
+	 * `stream closed`, `socket hang up`, `premature close`), so the visible text
+	 * stops mid-sentence and the turn produced no usable result. Refusing to
+	 * retry there costs the whole turn to avoid duplicating a partial paragraph,
+	 * and it silently bypasses a configured fallback chain: a provider that dies
+	 * after streaming a few hundred characters was never retried and never
+	 * handed to its chain.
+	 *
+	 * Deliberately narrow. Tool calls, images and server-tool blocks keep the
+	 * veto unconditionally (side effects may already have happened, and
+	 * `#unexecutedToolCallsReplaySafe` owns the one case where a call provably
+	 * did not run), and a turn that stopped for any non-error reason is a
+	 * complete answer that must never be replayed.
+	 */
+	#isTruncatedTransportCloseReplaySafe(message: AssistantMessage, id: number): boolean {
+		if (message.stopReason !== "error") return false;
+		if (!AIError.retriable(id)) return false;
+		// Only text (and thinking) may be present: any other block type carries
+		// side effects or rendered artifacts that a replay would duplicate.
+		if (message.content.some(block => block.type !== "text" && block.type !== "thinking")) {
+			return false;
+		}
+		return TRANSPORT_CLOSE_PATTERN.test(message.errorMessage ?? "");
 	}
 
 	/**
@@ -1580,14 +1703,34 @@ export class TurnRecovery {
 	 * Two keys is the whole walk per attempt. Chains that point at each other
 	 * alternate models instead of looping in place, and every hop still spends a
 	 * retry attempt, so the budget terminates either way.
+	 *
+	 * A pin is only honored while the failing model still BELONGS to the pinned
+	 * chain. A pin outlives the walk that created it (it is never re-resolved),
+	 * so a model changed by another route — `/advisor configure`, profile sync,
+	 * context promotion — would otherwise let a leftover chain outrank the
+	 * failing model's own configured fallbacks, which are strictly more
+	 * specific. When the failing model has no chain of its own, the pin is still
+	 * the only walk available and is kept.
 	 */
 	retryFallbackChainKeys(
 		currentSelector: string,
 		currentModel: Model | null | undefined = this.#host.model(),
 		options?: { pinnedRole?: string; roleHint?: string },
 	): string[] {
-		const pinned = options?.pinnedRole ?? this.#activeRetryFallback?.role;
+		const pinnedRole = options?.pinnedRole ?? this.#activeRetryFallback?.role;
 		const current = this.resolveRetryFallbackRole(currentSelector, currentModel, options?.roleHint);
+		const pinned =
+			pinnedRole === undefined ||
+			current === undefined ||
+			pinnedRole === current ||
+			retryFallbackChainContainsSelector(
+				this.#getRetryFallbackResolutionContext(),
+				pinnedRole,
+				currentSelector,
+				currentModel,
+			)
+				? pinnedRole
+				: undefined;
 		if (!pinned) return current ? [current] : [];
 		return current && current !== pinned ? [pinned, current] : [pinned];
 	}
@@ -1909,6 +2052,11 @@ export class TurnRecovery {
 			wrapAround?: boolean;
 		},
 	): Promise<boolean> {
+		// Why each candidate was passed over. A chain that dead-ends is otherwise
+		// silent: the operator sees the raw provider error and cannot tell whether
+		// the chain was empty, cooling down, keyless, or (the common one) filtered
+		// because the conversation no longer fits the remaining models' windows.
+		const skipped: string[] = [];
 		const ceiling = this.#host.thinkingLevelCeiling();
 		const latestAssistant = options?.preserveFailedTurn
 			? failedMessage
@@ -1917,11 +2065,20 @@ export class TurnRecovery {
 				);
 		for (const role of this.retryFallbackChainKeys(currentSelector)) {
 			for (const selector of this.findRetryFallbackCandidates(role, currentSelector, undefined, options)) {
-				if (this.isRetryFallbackSelectorSuppressed(selector)) continue;
+				if (this.isRetryFallbackSelectorSuppressed(selector)) {
+					skipped.push(`${selector.raw}: cooling down`);
+					continue;
+				}
 				const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
 				const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
-				if (!candidate) continue;
-				if (options?.excludeProvider === candidate.provider) continue;
+				if (!candidate) {
+					skipped.push(`${selector.raw}: not in the model catalog`);
+					continue;
+				}
+				if (options?.excludeProvider === candidate.provider) {
+					skipped.push(`${selector.raw}: same provider as the failure`);
+					continue;
+				}
 				// Anthropic signatures and redacted blocks are model-bound, while the
 				// latest assistant response must remain byte-identical. A same-provider
 				// model switch can satisfy neither constraint, so keep retrying the
@@ -1942,15 +2099,24 @@ export class TurnRecovery {
 				}
 				// A candidate whose effort floor exceeds the per-spawn ceiling would be
 				// clamped UP past the cap by its model floor — skip it entirely.
-				if (ceiling !== undefined && !modelSupportsEffortCeiling(candidate, ceiling)) continue;
+				if (ceiling !== undefined && !modelSupportsEffortCeiling(candidate, ceiling)) {
+					skipped.push(`${selector.raw}: effort floor above the per-spawn ceiling`);
+					continue;
+				}
 				// Skip a candidate whose window cannot hold the retry context. The
 				// failed assistant is excluded only when retry removes it; preserved
 				// unexecuted-tool turns remain part of the request (issue #8065).
 				if (!this.#host.contextFitsModel(candidate, options?.preserveFailedTurn ? undefined : failedMessage)) {
+					skipped.push(
+						`${selector.raw}: conversation does not fit its ${candidate.contextWindow ?? "unknown"}-token window`,
+					);
 					continue;
 				}
 				const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
-				if (!apiKey) continue;
+				if (!apiKey) {
+					skipped.push(`${selector.raw}: no usable credential`);
+					continue;
+				}
 				// Name why the switch happened: the failed turn's provider error is
 				// the only thing that explains a fallback to the operator.
 				return this.applyRetryFallbackCandidate(role, selector, currentSelector, {
@@ -1960,6 +2126,13 @@ export class TurnRecovery {
 			}
 		}
 
+		// Nothing switched. Name what was rejected and why: at a large context the
+		// usual cause is that every remaining entry has a smaller window, which no
+		// amount of retrying can fix (compaction or a bigger-window entry can).
+		logger.warn("retry fallback found no usable candidate", {
+			from: currentSelector,
+			skipped: skipped.length > 0 ? skipped : ["no chain candidates for this model"],
+		});
 		return false;
 	}
 
@@ -2192,6 +2365,10 @@ export class TurnRecovery {
 		const rateLimitReason = parseRateLimitReason(errorMessage);
 		const staleOpenAIResponsesReplayError = AIError.is(id, AIError.Flag.StaleResponsesItem);
 		const accountPolicyDenial = AIError.is(id, AIError.Flag.AccountPolicy);
+		// A revoked/unknown key (`401 User not found.`, 403) is dead for this
+		// credential only. Rotate to a sibling, else let the chain move the work
+		// to another provider; never sleep-and-retry the same key.
+		const authFailure = AIError.is(id, AIError.Flag.AuthFailed);
 		const recordedUsageLimitOutcome = await this.#usageLimitOutcomes.get(message);
 		const parsedRetryAfterMs = this.#parseRetryAfterMsFromError(errorMessage);
 		let delayMs = staleOpenAIResponsesReplayError
@@ -2307,7 +2484,7 @@ export class TurnRecovery {
 		const currentSelector = currentModel
 			? formatRetryFallbackSelector(currentModel, this.#host.thinkingLevel())
 			: undefined;
-		if (accountPolicyDenial && currentModel) {
+		if ((accountPolicyDenial || authFailure) && currentModel) {
 			switchedCredential = await this.#host.modelRegistry.authStorage.rotateSessionCredential(
 				currentModel.provider,
 				this.#host.sessionId(),
@@ -2344,6 +2521,10 @@ export class TurnRecovery {
 			/\bGoUsageLimitError\b/.test(errorMessage) &&
 			(!this.#hasReplayUnsafeOutput(message) || this.#unexecutedToolCallsReplaySafe(message));
 
+		// A failure only a different model can fix: it never consumed a same-model
+		// retry, so the budget-exhausted rewrite must not relabel it, and its walk
+		// may wrap around the chain.
+		const fallbackOnlyFailure = !AIError.retriable(id) && this.#isFallbackOnlyFailure(message, id);
 		if (!staleOpenAIResponsesReplayError && !switchedCredential && currentSelector) {
 			// A refusal chain stops at the retry budget: the exhausted-attempt
 			// last resort is for provider failures, not classifier decisions.
@@ -2361,7 +2542,14 @@ export class TurnRecovery {
 					excludeProvider: longUsageLimitFallback ? currentModel.provider : undefined,
 					pinFallback: classifierRefusal,
 					preserveFailedTurn,
-					wrapAround: longUsageLimitFallback,
+					// Wrap around for provider failures. `findRetryFallbackCandidates`
+					// returns only the entries AFTER the current one, so a walk that
+					// lands on the LAST entry (the earlier ones having been skipped for
+					// context fit, credentials or effort ceiling) has nowhere to go and
+					// the turn dies with entries it never tried. Wrapping revisits them;
+					// suppression, the retry budget and the same-model guard still bound
+					// the walk.
+					wrapAround: longUsageLimitFallback || fallbackOnlyFailure,
 				});
 			}
 			// Auto fallback from a Fireworks Fast variant to its base model. Independent
@@ -2378,7 +2566,12 @@ export class TurnRecovery {
 			}
 		}
 
-		if (retryBudgetExhausted) {
+		// Only the NEWLY eligible class skips the budget rewrite. Classifier
+		// refusals, account-policy denials and auth failures keep going through
+		// it: that branch aggregates the superseded attempts onto one terminal
+		// event, which the transcript renders as a single budget-labeled error.
+		const skipBudgetRewrite = fallbackOnlyFailure && !classifierRefusal && !accountPolicyDenial && !authFailure;
+		if (retryBudgetExhausted && !skipBudgetRewrite) {
 			if (!switchedModel && !switchedCredential) {
 				const attempt = this.#retryAttempt - 1;
 				message.errorMessage = `Retry budget exhausted after ${attempt} ${attempt === 1 ? "retry" : "retries"}: ${errorMessage}`;
@@ -2401,7 +2594,11 @@ export class TurnRecovery {
 			// same-route budget: every distinct account must be tried first.
 			if (switchedModel) this.#retryAttempt = 1;
 		}
-		if ((classifierRefusal || accountPolicyDenial) && !switchedCredential && !switchedModel) {
+		if (
+			(classifierRefusal || accountPolicyDenial || authFailure || fallbackOnlyFailure) &&
+			!switchedCredential &&
+			!switchedModel
+		) {
 			// A prior attempt in this saga already announced `auto_retry_start`
 			// (retryAttempt was incremented for each call to this method, so > 1
 			// means at least one earlier attempt started the loop) but this

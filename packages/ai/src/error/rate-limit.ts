@@ -339,8 +339,15 @@ const USAGE_LIMIT_PATTERN =
 export function isUsageLimitStatus(status: number | undefined): boolean {
 	return status === 429 || status === 402;
 }
+// A credit-purchase pointer is unambiguous account-billing wording. OpenRouter
+// expresses an exhausted balance as a PROMPT-SIZE cap ("402 Prompt tokens limit
+// exceeded: 661500 > 498951. To increase, visit …/settings/credits and add more
+// credits"), which classified as a bare 402 with no flags: no retry, no
+// credential rotation, no fallback chain — the turn just died. The credits
+// wording is what separates it from a real context overflow, which carries no
+// billing hint and stays compaction's job.
 const STATUS_402_QUOTA_PATTERN =
-	/\b(?:payment(?:\s+is)?[-_.\s]*required|deactivated_workspace|insufficient.?balance)\b/i;
+	/\b(?:payment(?:\s+is)?[-_.\s]*required|deactivated_workspace|insufficient.?balance)\b|\badd more credits\b|\/settings\/credits\b/i;
 
 export function is402BillingCapBody(message: string | undefined): boolean {
 	if (message === undefined || isOpaqueStatusBody(message)) return true;

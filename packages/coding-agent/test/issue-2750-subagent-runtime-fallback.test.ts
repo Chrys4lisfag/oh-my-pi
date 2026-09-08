@@ -326,7 +326,7 @@ describe("subagent runtime model resolution", () => {
 		expect(childFallbackChains?.["subagent:pre-expanded-role"]).toEqual(["task-provider/sonnet"]);
 	});
 
-	it("inherits the default chain for a role alias whose role configures no chain", async () => {
+	it("does not inherit the default chain for a role alias whose role configures no chain", async () => {
 		const fast = model("fast", "hy3");
 		const slow = model("slow", "opus");
 		let childFallbackChains: Record<string, string[]> | undefined;
@@ -361,7 +361,58 @@ describe("subagent runtime model resolution", () => {
 			enableLsp: false,
 		});
 
-		expect(childFallbackChains?.["subagent:role-alias-default-chain"]).toEqual(["slow/opus-backup"]);
+		// Chains are strict (see `retry-fallback-strict-scope.test.ts`): the
+		// `@smol` alias resolves to `fast/hy3`, for which no chain is configured,
+		// so the subagent gets no chain rather than the `default` chain's
+		// `slow/opus-backup` — a model the user configured no fallback for must
+		// retry in place instead of switching to an unrelated provider.
+		expect(childFallbackChains?.["subagent:role-alias-default-chain"]).toBeUndefined();
+	});
+
+	it("uses the chain the subagent's model owns when its role configures none", async () => {
+		// Reported: a subagent on `azure1-bitfrost/openai/gpt-6-astra` died on
+		// `401 User not found.` with no fallback, even though the provider had a
+		// wildcard chain. Roles are only one of three key kinds — looking up the
+		// role name alone missed the model's own exact/wildcard chain, which
+		// strictness does allow (it is scoped to that very model).
+		const primary = model("fast", "hy3");
+		const backup = model("slow", "opus");
+		let childFallbackChains: Record<string, string[]> | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			if (!options) throw new Error("Expected createAgentSession options");
+			childFallbackChains = options.settings?.get("retry.fallbackChains") as Record<string, string[]> | undefined;
+			return { session: createYieldingSession(), extensionsResult: {}, setToolUIContext: () => {} } as never;
+		});
+
+		const agent: AgentDefinition = {
+			name: "scout",
+			description: "test",
+			systemPrompt: "test",
+			source: "bundled",
+			model: ["fast/hy3"],
+		};
+		await runSubprocess({
+			cwd: "/tmp",
+			agent,
+			task: "work",
+			index: 0,
+			id: "model-wildcard-chain",
+			settings: Settings.isolated({
+				modelRoles: { default: "slow/opus" },
+				// No chain for any role — only for the model's PROVIDER.
+				"retry.fallbackChains": { "fast/*": ["slow/opus"] },
+			}),
+			modelRegistry: {
+				refresh: async () => {},
+				getAvailable: () => [primary, backup],
+				find: (provider: string, id: string) => [primary, backup].find(m => m.provider === provider && m.id === id),
+				hasProvider: (provider: string) => [primary, backup].some(m => m.provider === provider),
+				getApiKey: async () => "test-key",
+			} as never,
+			enableLsp: false,
+		});
+
+		expect(childFallbackChains?.["subagent:model-wildcard-chain"]).toEqual(["slow/opus"]);
 	});
 
 	it("does not inherit the default chain when multiple requested models collapse to one candidate", async () => {
