@@ -252,7 +252,7 @@ export class ModelRegistry {
 	#modelOverrides: Map<string, Map<string, ModelOverride>> = new Map();
 	#configError: ConfigError | undefined = undefined;
 	#modelsConfigFile: ConfigFile<ModelsConfig>;
-	#lastStaticLoadMtime: number | null = null;
+	#lastStaticLoadFingerprint: string | null | undefined;
 	#registeredProviderSources: Set<string> = new Set();
 	#providerDiscoveryStates: Map<string, ProviderDiscoveryState> = new Map();
 	/** Providers already warned about disabled certificate verification. */
@@ -458,7 +458,7 @@ export class ModelRegistry {
 
 	async #runPolicyReapply(): Promise<void> {
 		try {
-			this.#lastStaticLoadMtime = null;
+			this.#lastStaticLoadFingerprint = undefined;
 			await this.refresh("offline");
 		} finally {
 			this.#policyReapply = undefined;
@@ -704,11 +704,12 @@ export class ModelRegistry {
 		await this.#refreshRuntimeDiscoveries(strategy, new Set(this.#runtimeModelManagers.keys()));
 	}
 
-	#reloadStaticModels(): void {
-		const currentMtime = this.#modelsConfigFile.getMtimeMs();
-		if (currentMtime !== null && currentMtime === this.#lastStaticLoadMtime) {
-			// Models config unchanged since last load; reloading would be redundant.
-			return;
+	#reloadStaticModels(force = false): boolean {
+		const currentFingerprint = this.#modelsConfigFile.getContentFingerprint();
+		if (!force && currentFingerprint === this.#lastStaticLoadFingerprint) {
+			// Reading a small local config is cheap, and content identity avoids
+			// stale menus after same-mtime/atomic editor saves.
+			return false;
 		}
 		this.#modelsConfigFile.invalidate();
 		this.#customProviderApiKeys.clear();
@@ -728,24 +729,21 @@ export class ModelRegistry {
 		this.#configError = undefined;
 		this.#providerDiscoveryStates.clear();
 		this.#loadModels();
+		return true;
 	}
 
 	/**
 	 * Re-read `models.yml` synchronously, without touching the network.
 	 *
 	 * `refresh()` does this too, but only as the prelude to full discovery —
-	 * which is async and can take seconds. A UI that opens and paints from the
-	 * current snapshot (the model hub) would otherwise show the config as it was
-	 * at startup, so a provider added while omp was running appeared only after
-	 * closing and reopening the menu. Cheap and idempotent: the mtime guard in
-	 * `#reloadStaticModels` makes an unchanged file a no-op.
+	 * which is async and can take seconds. Content fingerprinting makes this
+	 * deterministic even when an editor preserves mtime, while unchanged menu
+	 * opens remain no-ops and do not emit model-update events.
 	 *
-	 * @returns true when the file had changed and the snapshot was rebuilt.
+	 * @returns true when the snapshot was rebuilt.
 	 */
-	reloadConfigFromDisk(): boolean {
-		const before = this.#lastStaticLoadMtime;
-		this.#reloadStaticModels();
-		const reloaded = this.#lastStaticLoadMtime !== before;
+	reloadConfigFromDisk(options?: { force?: boolean }): boolean {
+		const reloaded = this.#reloadStaticModels(options?.force === true);
 		if (reloaded) this.#emitModelsUpdated();
 		return reloaded;
 	}
@@ -787,7 +785,7 @@ export class ModelRegistry {
 		this.#cachedDiscoverableModels = logger.time("modelRegistry:loadDiscoverableModels", () =>
 			this.#applyHardcodedModelPolicies(this.#loadCachedDiscoverableModels()),
 		);
-		this.#lastStaticLoadMtime = this.#modelsConfigFile.getMtimeMs();
+		this.#lastStaticLoadFingerprint = this.#modelsConfigFile.getContentFingerprint();
 	}
 
 	#resetStaticComposition(): void {
@@ -2790,8 +2788,7 @@ export class ModelRegistry {
 			this.#runtimeProviderSourceByName.delete(providerName);
 			this.#clearRuntimeProviderState(providerName);
 		}
-		this.#lastStaticLoadMtime = null;
-		this.#reloadStaticModels();
+		this.#reloadStaticModels(true);
 	}
 
 	/**
@@ -2810,8 +2807,7 @@ export class ModelRegistry {
 		unregisterOAuthProvider(providerName);
 		this.#ensureFullSnapshot();
 		this.#clearRuntimeProviderState(providerName);
-		this.#lastStaticLoadMtime = null;
-		this.#reloadStaticModels();
+		this.#reloadStaticModels(true);
 	}
 
 	/**
@@ -2888,8 +2884,7 @@ export class ModelRegistry {
 			this.#runtimeProviderSourceByName.set(providerName, sourceId);
 		}
 		if (sourceHandoff) {
-			this.#lastStaticLoadMtime = null;
-			this.#reloadStaticModels();
+			this.#reloadStaticModels(true);
 		}
 
 		// Extension usage providers override built-ins/configured resolvers for the

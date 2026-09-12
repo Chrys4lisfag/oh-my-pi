@@ -16,6 +16,7 @@ import {
 	resetProviderAutoRefreshGuard,
 } from "@oh-my-pi/pi-coding-agent/modes/components/model-hub";
 import { getThemeByName, setThemeInstance, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import type { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AUTO_THINKING } from "@oh-my-pi/pi-coding-agent/thinking";
 import type { TUI } from "@oh-my-pi/pi-tui";
 
@@ -866,6 +867,36 @@ describe("ModelHub", () => {
 			const rendered = normalize(hub.render(220));
 			expect(rendered).toContain("↳ test/model-a");
 			expect(rendered).toContain("↳ test/model-b");
+		});
+
+		test("shows measured speed on role rows and their fallback entries", () => {
+			const a = makeModel("test", "model-a");
+			const b = makeModel("test", "model-b");
+			const storage = {
+				getModelUsageOrder: () => [],
+				getModelPerf: () =>
+					new Map([
+						["test/model-a", { samples: 8, tps: 118.4, ttftMs: 900 }],
+						["test/model-b", { samples: 4, tps: 42, ttftMs: null }],
+					]),
+			} as unknown as AgentStorage;
+			const settings = Settings.isolated(
+				{
+					modelRoles: { default: "test/model-b" },
+					"retry.fallbackChains": { default: ["test/model-a"], "test/model-b": ["test/model-a"] },
+				},
+				{ storage },
+			);
+			const { hub } = createHub({ models: [a, b], scoped: true, settings });
+
+			enterRolesView(hub);
+			const lines = hub.render(220).map(line => stripVTControlCharacters(line));
+			// The assigned role row carries its own model's speed…
+			expect(lines.find(line => line.includes("test/model-b") && !line.includes("↳"))).toContain("42t/s");
+			// …and every chain entry carries the fallback model's speed.
+			for (const line of lines.filter(line => line.includes("↳ test/model-a"))) {
+				expect(line).toContain("118t/s");
+			}
 		});
 
 		test("f on a role opens fallback assignment and Enter appends the picked model", () => {

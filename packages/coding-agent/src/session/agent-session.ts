@@ -1905,6 +1905,19 @@ export class AgentSession {
 		this.#unsubscribeModelsUpdated = this.#modelRegistry.onModelsUpdated(() => {
 			this.#invalidateConfiguredDefaultModelState();
 			this.ensureAdvisorsBuilt();
+			// A models.yml reload rebuilds registry objects, but the active Agent
+			// otherwise keeps its old transport/compat snapshot until explicitly
+			// reselected. Rebind only when same-key metadata actually changed;
+			// same-model rebinding skips provider-session reset and model_changed.
+			const currentModel = this.model;
+			const updatedModel = currentModel
+				? this.#modelRegistry.find(currentModel.provider, currentModel.id)
+				: undefined;
+			if (currentModel && updatedModel && !Bun.deepEquals(currentModel, updatedModel)) {
+				void this.#setModelWithProviderSessionReset(updatedModel).catch(error => {
+					logger.warn("active model metadata rebind failed", { error: String(error) });
+				});
+			}
 			if (this.#synchronizedProfileApplyPending && this.#agentKind === "main" && !this.#isDisposed) {
 				this.#queueSynchronizedProfileApply();
 			}

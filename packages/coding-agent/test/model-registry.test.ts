@@ -4,6 +4,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Effort, type FetchImpl, type Model, type OpenAICompat, type ThinkingConfig } from "@oh-my-pi/pi-ai";
+import {
+	applyChatCompletionsReasoningParams,
+	type OpenAICompletionsParams,
+} from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { fingerprintStaticModels } from "@oh-my-pi/pi-catalog/model-manager";
@@ -1460,6 +1464,39 @@ describe("ModelRegistry", () => {
 			await registry.refreshProvider("openai", "online");
 
 			expect(registry.find("openai", "gpt-5.4")?.contextWindow).toBe(512000);
+		});
+
+		test("modelOverrides preserve reasoning disable encoding from config", () => {
+			writeRawModelsJson({
+				"apigator-ai-vuln": {
+					baseUrl: "https://api.apigator.example/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					models: [{ id: "openai/gpt-6-astra", reasoning: true }],
+					modelOverrides: {
+						"openai/gpt-6-astra": {
+							compat: {
+								supportsReasoningEffort: true,
+								reasoningDisableMode: "lowest-effort",
+								reasoningEffortMap: { minimal: "low", max: "xhigh" },
+								extraBody: { allowed_openai_params: ["reasoning_effort"] },
+							},
+						},
+					},
+				},
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const compat = getOpenAICompat(registry.find("apigator-ai-vuln", "openai/gpt-6-astra"));
+			expect(compat?.reasoningDisableMode).toBe("lowest-effort");
+			expect(compat?.reasoningEffortMap).toMatchObject({ minimal: "low", max: "xhigh" });
+			expect(compat?.extraBody).toEqual({ allowed_openai_params: ["reasoning_effort"] });
+
+			const model = registry.find("apigator-ai-vuln", "openai/gpt-6-astra");
+			if (!model || model.api !== "openai-completions") throw new Error("expected Chat Completions model");
+			const chatModel = model as Model<"openai-completions">;
+			const params: OpenAICompletionsParams = { model: model.id, messages: [], stream: true };
+			applyChatCompletionsReasoningParams(params, chatModel, chatModel.compat, { disableReasoning: true });
+			expect(params.reasoning_effort).toBe("low");
 		});
 
 		test("newly discovered ids inherit provider fields, not another model's custom fields", async () => {

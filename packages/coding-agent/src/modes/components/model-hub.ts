@@ -31,12 +31,14 @@ import type { ModelRegistry } from "../../config/model-registry";
 import { type ModelRoleLookup, type ResolvedModelRoleValue, resolveModelRoleValue } from "../../config/model-resolver";
 import { getKnownRoleIds, getRoleInfo } from "../../config/model-roles";
 import type { Settings } from "../../config/settings";
+import type { ModelPerfStats } from "../../session/agent-storage";
 import { AUTO_THINKING, type ConfiguredThinkingLevel, getConfiguredThinkingLevelMetadata } from "../../thinking";
 import { thinkingLevelGlyph } from "../../tools/render-utils";
 import { theme } from "../theme/theme";
 import { matchesSelectCancel, matchesSelectDown, matchesSelectUp } from "../utils/keybinding-matchers";
 import {
 	buildBrowserItems,
+	formatTps,
 	ModelBrowser,
 	type ModelBrowserItem,
 	type RoleAssignments,
@@ -248,6 +250,10 @@ export class ModelHubComponent implements Component {
 	#roleScrollStart = 0;
 	/** Roles rows actually drawn this frame; bounds mouse hit-testing to the visible window. */
 	#rolesVisibleCount = 0;
+	/** Measured TPS/TTFT keyed by `provider/id`; mirrors what the browser rows show. */
+	#perf: ReadonlyMap<string, ModelPerfStats> = new Map();
+	/** Catalog models keyed by `provider/id`, for the estimated speed of unmeasured rows. */
+	#itemBySelector: ReadonlyMap<string, ModelBrowserItem> = new Map();
 
 	#assigning: AssignTarget | null = null;
 	#strip: StripState | null = null;
@@ -322,10 +328,8 @@ export class ModelHubComponent implements Component {
 		});
 
 		// Pick up `models.yml` edits made since startup BEFORE the first paint.
-		// Discovery below is async (and can take seconds), so without this a
-		// provider added while omp was running was missing from the menu until it
-		// was closed and reopened. Synchronous, network-free, and a no-op when
-		// the file has not changed.
+		// Content fingerprinting makes same-mtime/atomic saves reliable while an
+		// unchanged file remains a synchronous, network-free no-op.
 		this.#registry.reloadConfigFromDisk?.();
 		// Hydrate synchronously from the current registry snapshot so the first
 		// Enter after opening acts on cached models instead of being dropped
@@ -433,9 +437,11 @@ export class ModelHubComponent implements Component {
 		sortModelItems(this.#availableItems, { roles: this.#roles, mruOrder });
 		this.#browser.setRoles(this.#roles);
 		this.#browser.setMruOrder(mruOrder);
-		this.#browser.setPerfStats(storage?.getModelPerf() ?? new Map());
+		this.#perf = storage?.getModelPerf() ?? new Map();
+		this.#browser.setPerfStats(this.#perf);
 
 		const bySelector = new Map(this.#availableItems.map(item => [item.selector, item]));
+		this.#itemBySelector = bySelector;
 		this.#recentItems = [];
 		for (const key of mruOrder) {
 			const item = bySelector.get(key);
@@ -2125,6 +2131,28 @@ export class ModelHubComponent implements Component {
 		return out;
 	}
 
+	/**
+	 * Right-aligned speed badge for a `provider/id` roles row: the measured average
+	 * when the model has samples, else the catalog's `~118t/s` estimate. Wildcard
+	 * chain keys (`provider/*`) cover many models, so they get none.
+	 */
+	#rolesTpsCell(selector: string | undefined): string {
+		if (!selector || selector.endsWith("/*")) return "";
+		const measured = this.#perf.get(selector);
+		if (measured) return theme.fg("dim", formatTps(measured.tps));
+		const catalog = this.#itemBySelector.get(selector)?.model.tps;
+		if (catalog == null || !Number.isFinite(catalog) || catalog <= 0) return "";
+		return theme.fg("dim", `~${formatTps(catalog)}`);
+	}
+
+	/** Push `right` against the row's right edge; dropped when the row is too narrow. */
+	#alignRolesRight(line: string, right: string, width: number): string {
+		const rightWidth = visibleWidth(right);
+		const lineWidth = visibleWidth(line);
+		if (rightWidth === 0 || lineWidth + rightWidth + 2 > width) return line;
+		return `${line}${" ".repeat(width - lineWidth - rightWidth - 1)}${right}`;
+	}
+
 	#renderRolesView(width: number, rows: number): string[] {
 		const lines: string[] = [];
 		lines.push("");
@@ -2178,6 +2206,7 @@ export class ModelHubComponent implements Component {
 				const tail = key.slice(slash + 1);
 				const keyStyled = theme.fg("dim", key.slice(0, slash + 1)) + (selected ? theme.fg("accent", tail) : tail);
 				let line = ` ${cursor} ${theme.fg("dim", theme.status.shadowed)} ${keyStyled}`;
+				line = this.#alignRolesRight(line, this.#rolesTpsCell(key), width);
 				line = this.#finishRolesRow(line, width, hovered);
 				lines.push(line);
 				continue;
@@ -2187,6 +2216,7 @@ export class ModelHubComponent implements Component {
 				const branch = theme.fg("dim", `${"".padEnd(tagWidth + 3)}↳`);
 				const selector = selected ? theme.fg("accent", rowDef.selector) : theme.fg("muted", rowDef.selector);
 				let line = ` ${cursor} ${branch} ${selector}`;
+				line = this.#alignRolesRight(line, this.#rolesTpsCell(rowDef.selector), width);
 				line = this.#finishRolesRow(line, width, hovered);
 				lines.push(line);
 				continue;
@@ -2224,13 +2254,10 @@ export class ModelHubComponent implements Component {
 			const cycleIndex = cycleOrder.indexOf(role);
 			const cycleStyled = cycleIndex >= 0 ? theme.fg("accent", `${theme.icon.loop} ${cycleIndex + 1}`) : "";
 
+			const tpsStyled = assignment ? this.#rolesTpsCell(`${assignment.model.provider}/${assignment.model.id}`) : "";
 			let line = ` ${cursor} ${dot} ${tagStyled}  ${value}`;
-			const right = [levelStyled, cycleStyled].filter(part => part.length > 0).join("  ");
-			const rightWidth = visibleWidth(right);
-			const lineWidth = visibleWidth(line);
-			if (rightWidth > 0 && lineWidth + rightWidth + 2 <= width) {
-				line = `${line}${" ".repeat(width - lineWidth - rightWidth - 1)}${right}`;
-			}
+			const right = [tpsStyled, levelStyled, cycleStyled].filter(part => part.length > 0).join("  ");
+			line = this.#alignRolesRight(line, right, width);
 			line = this.#finishRolesRow(line, width, hovered);
 			lines.push(line);
 		}

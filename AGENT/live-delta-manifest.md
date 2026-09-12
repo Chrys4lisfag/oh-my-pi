@@ -92,7 +92,7 @@ never assume commit count alone proves behavior survived.
 | `c0d3a3b572` | active, runtime     | Model discovery/cache recovery, profile-bound sessions, advisor/status consistency, tokenizer fallback, try-shake/compact reminder |
 | `5546fc43d7` | active, runtime     | Compaction rotates models on spend caps/transients, `retry.fallbackChains` as compaction candidates, budget wording as usage limit, hub reorder-key hint |
 | `fd1710f3e4` | active, runtime     | Immutable terminal profile identity with session-header snapshots, single-apply profile switching, live-block status messages, reasoned fallback notices, re-anchored try-shake ladder |
-| `006b6c9b56` | active, runtime     | Per-provider `tls.rejectUnauthorized` opt-in, sync mtime-guarded `models.yml` reload, zero-model cache gate with `online` hub hydration, hub reorder-key hint text |
+| `006b6c9b56` | active, runtime     | Per-provider `tls.rejectUnauthorized` opt-in, sync content-fingerprint-gated `models.yml` reload (same-mtime safe), zero-model cache gate with `online` hub hydration, hub reorder-key hint text |
 | `ae16aa41fc` | active, runtime     | `retry.quotaCooldownMs` for selector and credential quota cooldowns, advisor quarantine consults the fallback chain |
 | `0fbdee8dd6` | active, runtime     | `--no-mcp` launch flag, `busy_timeout`-before-WAL repair in two SQLite stores, browser-relay archiver fallback chain |
 
@@ -226,11 +226,11 @@ subagent inheritance. Preserve all domains when resolving its conflicts.
 - `packages/coding-agent/src/hindsight/config.ts`
 - `packages/coding-agent/src/mcp/manager.ts`
 - `packages/coding-agent/src/session/agent-session.ts`
-  - logical-session try-shake state and boundary reset
+  - settings-backed try-shake toggle; only checkpoint marks reset at a session boundary
 - `packages/coding-agent/src/session/session-maintenance.ts`
   - fork-only automatic action selection plus one-shot try-shake preflight; upstream owns remote transport and lifecycle
 - `packages/coding-agent/src/slash-commands/builtin-lifecycle.ts`
-  - session-scoped `/tryshake on|off|status|step <tokens>` command
+  - persisted `/tryshake on|off|status|step <tokens>` command
 - `packages/coding-agent/src/tools/memory-reflect.ts`
 - `packages/coding-agent/src/tools/xdev.ts`
 - `packages/coding-agent/src/utils/external-editor.ts`

@@ -318,6 +318,51 @@ describe("AgentSession advisor + profile model sync", () => {
 		});
 	});
 
+	describe("active model metadata reload", () => {
+		it("rebinds the active same-key model when registry metadata changes", async () => {
+			const { session, modelRegistry } = await createHarness({
+				settingsOverrides: { "advisor.enabled": false },
+				credentialedProviders: [PRIMARY_PROVIDER],
+			});
+			const current = session.model;
+			if (!current) throw new Error("Expected active model");
+			const currentContextWindow = current.contextWindow ?? 0;
+			const updated: Model = {
+				...current,
+				contextWindow: currentContextWindow + 1234,
+			};
+			const originalFind = modelRegistry.find.bind(modelRegistry);
+			const findSpy = vi
+				.spyOn(modelRegistry, "find")
+				.mockImplementation((provider, id) =>
+					provider === current.provider && id === current.id ? updated : originalFind(provider, id),
+				);
+
+			await modelRegistry.reapplyModelPolicies();
+
+			expect(findSpy).toHaveBeenCalledWith(current.provider, current.id);
+			expect(session.model).toBe(updated);
+			expect(session.model?.contextWindow).toBe(currentContextWindow + 1234);
+		});
+
+		it("does not rebind when a registry update leaves active metadata unchanged", async () => {
+			const { session, modelRegistry } = await createHarness({
+				settingsOverrides: { "advisor.enabled": false },
+				credentialedProviders: [PRIMARY_PROVIDER],
+			});
+			const current = session.model;
+			if (!current) throw new Error("Expected active model");
+			const findSpy = vi.spyOn(modelRegistry, "find").mockReturnValue(current);
+			const setModelSpy = vi.spyOn(session.agent, "setModel");
+
+			await modelRegistry.reapplyModelPolicies();
+
+			expect(findSpy).toHaveBeenCalledWith(current.provider, current.id);
+			expect(setModelSpy).not.toHaveBeenCalled();
+			expect(session.model).toBe(current);
+		});
+	});
+
 	// ═════════════════════════════════════════════════════════════════════
 	// Contract #5 — applyProfileToSession()
 	// ═════════════════════════════════════════════════════════════════════

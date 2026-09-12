@@ -27,6 +27,8 @@ export const getModelsConfigSchemaBundle = once(() => {
 		"supportsMultipleSystemMessages?": "boolean",
 		"supportsReasoningEffort?": "boolean",
 		"reasoningEffortMap?": ReasoningEffortMapSchema,
+		"reasoningDisableMode?":
+			'"omit" | "lowest-effort" | "none-effort" | "openrouter-enabled-false" | "cline-enabled-false" | "venice-disable-thinking" | "zai-thinking-disabled" | "qwen-enable-thinking-false" | "qwen-template-false" | "chat-template-thinking-false"',
 		"maxTokensField?": '"max_completion_tokens" | "max_tokens"',
 		"supportsUsageInStreaming?": "boolean",
 		"requiresToolResultName?": "boolean",

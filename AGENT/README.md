@@ -60,15 +60,18 @@ be adopted without silently losing fork features.
 14. Memory-related advisors receive a retrieval reminder after the configured number
     of advisor context reads without `recall`/`reflect`; `/advisor status` reports
     actual reminder injections per advisor and in aggregate.
-15. `/tryshake on` enables session-scoped surgical shake. Million-token models add
+15. `/tryshake on` enables surgical shake before automatic compaction. Million-token models add
     monotonic checks at 275k then a configurable step (`/tryshake step 150k` by
     default); the existing 4k savings gate decides eligibility. A settled shake
     re-anchors the ladder to post-shake occupancy (never upward, floored at
     `275k - step`), so the next check requires one step of new context instead of
     regrowth above the old high-water mark. Automatic compaction
     triggers still get one preflight, never a duplicate after a checkpoint attempt.
-    `/tryshake status` reports toggle, step, and next checkpoint. Logical-session
-    boundaries reset all try-shake state; settings files never store it.
+    `/tryshake status` reports toggle, step, and next checkpoint. The toggle and step
+    are persisted settings (`compaction.tryShake`, `compaction.tryShakeCheckpointStepTokens`),
+    so both survive `/new`, session switches and restarts; logical-session boundaries
+    reset only the consumed checkpoint marks. This supersedes the earlier session-scoped
+    contract, which the user rejected because the toggle silently reverted every restart.
 16. Custom provider discovery may use a separate URL and anonymous auth while
     inference retains its bearer key; endpoint/protocol/auth cache identities stay
     isolated, and unfetched empty caches never become authoritative.
@@ -94,9 +97,10 @@ be adopted without silently losing fork features.
     propagates like `transport` so a catalog refresh cannot drop it, and the
     registry warns once per provider while it is active.
 22. `models.yml` is re-read without a network round trip: `reloadConfigFromDisk()`
-    is sync and mtime-guarded, emits `onModelsUpdated` only on real change, and
-    runs before the model hub's first registry sync so an edited provider appears
-    on the first paint.
+    is synchronous and content-fingerprint-gated (mtime is not identity), emits
+    `onModelsUpdated` only on real content change, and runs before the model
+    hub's first registry sync so same-mtime/atomic editor saves appear on the
+    first `/model` paint.
 23. An empty discovery cache row is not a usable cache when the provider has no
     bundled catalog; providers WITH bundled models may legitimately cache
     "discovery added nothing". The model hub hydrates `online`, and the contract

@@ -8,6 +8,7 @@
  * at startup; by the second open the async refresh had landed.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
@@ -72,9 +73,8 @@ describe("models.yml edits without restarting omp", () => {
 		await addSecondProvider();
 		expect(registry.reloadConfigFromDisk()).toBe(true);
 		expect(registry.getDiscoverableProviders()).toContain("second-vuln");
-
-		// Idempotent: an unchanged file is a no-op, so opening the hub repeatedly
-		// does not re-parse and re-emit on every keystroke-driven rebuild.
+		// Idempotent: an unchanged fingerprint is a no-op, so opening the hub
+		// repeatedly does not re-parse or re-emit model updates.
 		expect(registry.reloadConfigFromDisk()).toBe(false);
 	});
 
@@ -91,6 +91,36 @@ describe("models.yml edits without restarting omp", () => {
 		try {
 			// First paint only — no awaiting the async discovery that used to be
 			// the only thing that re-read the file.
+			const rendered = hub
+				.render(220)
+				.map(line => stripVTControlCharacters(line))
+				.join("\n");
+			expect(rendered).toContain("second-vuln");
+		} finally {
+			hub.dispose();
+		}
+	});
+
+	it("forces the first hub paint to reload even when an edit preserves mtime", async () => {
+		// Establish an exactly representable timestamp and make it the registry's
+		// baseline; fs.utimes rounds sub-millisecond values on Windows.
+		const fixedSeconds = Math.floor(Date.now() / 1000) - 10;
+		fs.utimesSync(modelsYml, fixedSeconds, fixedSeconds);
+		expect(registry.reloadConfigFromDisk({ force: true })).toBe(true);
+		const before = fs.statSync(modelsYml);
+		await addSecondProvider();
+		// Reproduce atomic/editor save behavior that defeats an mtime-only gate.
+		fs.utimesSync(modelsYml, before.atime, before.mtime);
+		expect(fs.statSync(modelsYml).mtimeMs).toBe(before.mtimeMs);
+
+		const ui = { requestRender: vi.fn(), terminal: { rows: 40 } } as unknown as TUI;
+		const hub = new ModelHubComponent(ui, Settings.isolated({}), registry, [], {
+			onAssign: () => {},
+			onUnassign: () => {},
+			onLoginRequest: () => {},
+			onCancel: () => {},
+		});
+		try {
 			const rendered = hub
 				.render(220)
 				.map(line => stripVTControlCharacters(line))

@@ -210,6 +210,20 @@ export class ConfigFile<T> implements IConfigFile<T> {
 		}
 	}
 
+	/**
+	 * Content identity for reload gates. Unlike mtime, this survives coarse
+	 * filesystem timestamp resolution and editors that preserve timestamps.
+	 */
+	getContentFingerprint(): string | null {
+		try {
+			const content = fs.readFileSync(this.#resolveReadPath());
+			return new Bun.CryptoHasher("sha256").update(content).digest("hex");
+		} catch (err) {
+			if (isEnoent(err)) return null;
+			throw err;
+		}
+	}
+
 	async getMtimeMsAsync(): Promise<number | null> {
 		const file = Bun.file(this.path());
 		if (!(await file.exists())) return null;

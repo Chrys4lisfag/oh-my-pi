@@ -387,7 +387,7 @@ function formatContext(model: Model): string {
 }
 
 /** `118t/s` average output speed; one decimal below 10 t/s. */
-function formatTps(tps: number): string {
+export function formatTps(tps: number): string {
 	const value = tps >= 10 ? String(Math.round(tps)) : tps.toFixed(1);
 	return `${value}t/s`;
 }
