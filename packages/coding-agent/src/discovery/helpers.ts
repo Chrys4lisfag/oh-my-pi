@@ -898,6 +898,14 @@ export async function discoverExtensionModulePaths(_ctx: LoadContext, dir: strin
 }
 
 /**
+ * Directory names that describe layout, not identity. A package.json manifest
+ * may point at `./src/index.ts`, and naming that extension "src" both collides
+ * with every other manifest extension and makes `disabledExtensions` unusable
+ * (the id the user must write is unrelated to the plugin they see).
+ */
+const GENERIC_EXTENSION_DIR_NAMES = new Set(["src", "dist", "lib", "build", "out"]);
+
+/**
  * Derive a stable extension name from a path.
  */
 export function getExtensionNameFromPath(extensionPath: string): string {
@@ -906,6 +914,11 @@ export function getExtensionNameFromPath(extensionPath: string): string {
 	if (base === "index.ts" || base === "index.js") {
 		const parts = extensionPath.replace(/\\/g, "/").split("/");
 		const parent = parts[parts.length - 2];
+		if (parent !== undefined && GENERIC_EXTENSION_DIR_NAMES.has(parent)) {
+			// `<plugin>/src/index.ts` is named for the plugin directory.
+			const grandparent = parts[parts.length - 3];
+			if (grandparent !== undefined && grandparent !== "extensions") return grandparent;
+		}
 		return parent ?? base;
 	}
 
