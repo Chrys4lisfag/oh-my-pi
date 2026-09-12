@@ -46,6 +46,19 @@ class "openai" {
 	models "gpt-6-astra" {
 		supports-configuration-update #true
 	}
+	// The 922K input ceiling is the model's own, not a Codex deployment trait:
+	// OpenAI documents 1.05M total with at most 922K input, and Azure-hosted
+	// resellers advertise exactly 922000. Resellers that report a stale 272K
+	// default therefore have a real ceiling extended context can reach, so the
+	// maximum lives here instead of only in providers/openai-codex.kdl.
+	// residue: reseller ids carry vendor prefixes (`Wukong/gpt-6-astra`,
+	// `azure/gpt-6-astra`, `openrouter/openai/gpt-6-astra`), which no taxonomy
+	// rank isolates; the trailing-anchored globs deliberately exclude
+	// narrower deployments such as `azure/gpt-6-astra-2026-09-03-private`
+	// (a real 128K window).
+	models "*gpt-6-astra" "*gpt-6-astra-wm" {
+		max-context-window 922000
+	}
 	// Codex SKUs: the advertised 400K figure includes the output budget; the
 	// true prompt window is 272K. Spark budgets are its own family's.
 	family "codex" {

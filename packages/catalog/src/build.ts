@@ -75,6 +75,10 @@ function applyCatalogAssignments<TApi extends Api>(model: Model<TApi>, catalog: 
  * `buildModel` to every upstream-sourced spec; user-authored overrides are
  * recomposed after building by the override applicators, so explicit user
  * limits and pricing still win.
+ *
+ * `reasoning-effort-capable` is applied before final policy resolution (see
+ * `applyCapabilityCorrections`) because thinking construction is capability
+ * gated; the remaining catalog corrections mutate the already-built model.
  */
 export function applyCatalogCorrections(
 	model: Pick<ModelSpec<Api>, "cost" | "contextWindow" | "maxTokens" | "input">,
@@ -144,6 +148,26 @@ export function applyCatalogCorrections(
 }
 
 /**
+ * Promote reviewed reasoning-effort lineages before final policy resolution.
+ * Thin OpenAI-compatible `/models` rows frequently publish stale false flags;
+ * user `modelOverrides` are recomposed after build and can still opt out.
+ */
+function applyCapabilityCorrections<TApi extends Api>(
+	spec: ModelSpec<TApi>,
+	catalog: Record<string, unknown>,
+): ModelSpec<TApi> {
+	if (catalog.reasoningEffortCapable !== true) return spec;
+	return {
+		...spec,
+		reasoning: true,
+		compat: {
+			...spec.compat,
+			supportsReasoningEffort: true,
+		} as ModelSpec<TApi>["compat"],
+	};
+}
+
+/**
  * Direct first-party OpenAI Responses endpoints (api.openai.com, Azure OpenAI
  * deployments). Gates GA computer-use detection; identity supplies the model
  * generation.
@@ -204,19 +228,21 @@ function supportsOpenAIGAComputerUse(
  * this only runs for discovered/custom/override specs.
  */
 export function buildModel<TApi extends Api>(spec: ModelSpec<TApi>): Model<TApi> {
-	const policy = resolveModelPolicy(spec);
-	const supportsComputerUseConfig = explicitComputerUseConfig(spec);
+	const initialPolicy = resolveModelPolicy(spec);
+	const correctedSpec = applyCapabilityCorrections(spec, initialPolicy.catalog);
+	const policy = correctedSpec === spec ? initialPolicy : resolveModelPolicy(correctedSpec);
+	const supportsComputerUseConfig = explicitComputerUseConfig(correctedSpec);
 	const model: Model<TApi> = {
-		...spec,
-		name: cleanModelName(spec.name),
+		...correctedSpec,
+		name: cleanModelName(correctedSpec.name),
 		identity: policy.identity,
 		requiresGlyphTokenization: policy.identity.class === "anthropic",
-		tokenizer: spec.tokenizer ?? resolveModelTokenizer(spec.requestModelId ?? spec.id),
+		tokenizer: correctedSpec.tokenizer ?? resolveModelTokenizer(correctedSpec.requestModelId ?? correctedSpec.id),
 		thinking: policy.thinking,
-		supportsComputerUse: supportsOpenAIGAComputerUse(spec, policy.identity, supportsComputerUseConfig),
+		supportsComputerUse: supportsOpenAIGAComputerUse(correctedSpec, policy.identity, supportsComputerUseConfig),
 		supportsComputerUseConfig,
 		compat: policy.compat,
-		compatConfig: spec.compat,
+		compatConfig: correctedSpec.compat,
 	};
 	applyCatalogAssignments(model, policy.catalog);
 	applyCatalogCorrections(model, policy.catalog);

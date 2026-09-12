@@ -4403,7 +4403,34 @@
 				}
 			},
 			{
-				"source": "classes/deepseek.kdl:30",
+				"source": "classes/deepseek.kdl:34",
+				"class": "deepseek",
+				"models": [
+					{
+						"kind": "glob",
+						"value": "*deepseek-v4.1-flash*"
+					},
+					{
+						"kind": "glob",
+						"value": "*deepseek-v4-1-flash*"
+					}
+				],
+				"thinking": {
+					"mode": "effort",
+					"defaultLevel": "high",
+					"efforts": [
+						"low",
+						"high",
+						"max"
+					]
+				},
+				"catalog": {
+					"contextWindowFloor": 1000000,
+					"reasoningEffortCapable": true
+				}
+			},
+			{
+				"source": "classes/deepseek.kdl:44",
 				"class": "deepseek",
 				"family": "r1",
 				"thinking": {
@@ -4414,7 +4441,7 @@
 				}
 			},
 			{
-				"source": "classes/deepseek.kdl:33",
+				"source": "classes/deepseek.kdl:47",
 				"class": "deepseek",
 				"family": "v3",
 				"thinking": {
@@ -4425,7 +4452,7 @@
 				}
 			},
 			{
-				"source": "classes/deepseek.kdl:36",
+				"source": "classes/deepseek.kdl:50",
 				"class": "deepseek",
 				"family": "reasoner",
 				"thinking": {
@@ -4436,7 +4463,7 @@
 				}
 			},
 			{
-				"source": "classes/deepseek.kdl:42",
+				"source": "classes/deepseek.kdl:56",
 				"class": "deepseek",
 				"providers": [
 					"openrouter"
@@ -4457,7 +4484,7 @@
 				}
 			},
 			{
-				"source": "classes/deepseek.kdl:40",
+				"source": "classes/deepseek.kdl:54",
 				"class": "deepseek",
 				"providers": [
 					"openrouter"
@@ -4470,7 +4497,7 @@
 				}
 			},
 			{
-				"source": "classes/deepseek.kdl:46",
+				"source": "classes/deepseek.kdl:60",
 				"class": "deepseek",
 				"providers": [
 					"openrouter"
@@ -4483,7 +4510,7 @@
 				}
 			},
 			{
-				"source": "classes/deepseek.kdl:49",
+				"source": "classes/deepseek.kdl:63",
 				"class": "deepseek",
 				"providers": [
 					"openrouter"
@@ -4496,7 +4523,7 @@
 				}
 			},
 			{
-				"source": "classes/deepseek.kdl:52",
+				"source": "classes/deepseek.kdl:66",
 				"class": "deepseek",
 				"providers": [
 					"openrouter"
@@ -4509,7 +4536,7 @@
 				}
 			},
 			{
-				"source": "classes/deepseek.kdl:55",
+				"source": "classes/deepseek.kdl:69",
 				"class": "deepseek",
 				"providers": [
 					"openrouter"
@@ -4522,7 +4549,7 @@
 				}
 			},
 			{
-				"source": "classes/deepseek.kdl:59",
+				"source": "classes/deepseek.kdl:73",
 				"class": "deepseek",
 				"providers": [
 					"alibaba-token-plan",
@@ -4533,7 +4560,7 @@
 				}
 			},
 			{
-				"source": "classes/deepseek.kdl:63",
+				"source": "classes/deepseek.kdl:77",
 				"class": "deepseek",
 				"providers": [
 					"deepseek",
@@ -4547,7 +4574,7 @@
 				}
 			},
 			{
-				"source": "classes/deepseek.kdl:70",
+				"source": "classes/deepseek.kdl:84",
 				"class": "deepseek",
 				"models": [
 					{
@@ -4560,7 +4587,7 @@
 				}
 			},
 			{
-				"source": "classes/deepseek.kdl:73",
+				"source": "classes/deepseek.kdl:87",
 				"class": "deepseek",
 				"models": [
 					{
@@ -4573,7 +4600,7 @@
 				}
 			},
 			{
-				"source": "classes/deepseek.kdl:76",
+				"source": "classes/deepseek.kdl:90",
 				"class": "deepseek",
 				"providers": [
 					"ollama-cloud",
@@ -6285,7 +6312,24 @@
 				}
 			},
 			{
-				"source": "classes/openai.kdl:52",
+				"source": "classes/openai.kdl:59",
+				"class": "openai",
+				"models": [
+					{
+						"kind": "glob",
+						"value": "*gpt-6-astra"
+					},
+					{
+						"kind": "glob",
+						"value": "*gpt-6-astra-wm"
+					}
+				],
+				"catalog": {
+					"maxContextWindow": 922000
+				}
+			},
+			{
+				"source": "classes/openai.kdl:65",
 				"class": "openai",
 				"family": "codex",
 				"revision": [

@@ -27,6 +27,20 @@ class "deepseek" {
 	family "v4" {
 		thinking-efforts "low" "high" "max"
 	}
+	// DeepSeek V4.1 Flash has a 1M prompt window across carriers. Many thin
+	// OpenAI-compatible resellers advertise the generic 128K discovery default,
+	// while OpenRouter and richer catalogs expose the real limit. Keep this
+	// lineage-owned and floor-only: larger live values (e.g. 1.3M) survive.
+	models "*deepseek-v4.1-flash*" "*deepseek-v4-1-flash*" {
+		context-window-floor 1000000
+		// Thin discovery rows often report reasoning=false and explicitly deny
+		// the effort capability. This reviewed catalog correction promotes both
+		// flags before policy is resolved, making the lineage ladder visible.
+		reasoning-effort-capable #true
+		thinking-mode "effort"
+		thinking-default-level "high"
+		thinking-efforts "low" "high" "max"
+	}
 	family "r1" {
 		thinking-efforts "high" "max"
 	}
