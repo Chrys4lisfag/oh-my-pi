@@ -336,7 +336,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		subcommands: [
 			{ name: "on", description: "Try shake before automatic compaction" },
 			{ name: "off", description: "Use the configured compaction strategy directly" },
-			{ name: "status", description: "Show current session try-shake status" },
+			{ name: "status", description: "Show current try-shake status" },
 			{ name: "step", description: "Set million-context checkpoint spacing (for example 150k)", usage: "<tokens>" },
 		],
 		acpInputHint: "[on|off|status|step <tokens>]",
@@ -348,7 +348,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				const step = runtime.session.getTryShakeCheckpointStepTokens();
 				const next = runtime.session.getNextTryShakeCheckpointTokens();
 				await runtime.output(
-					`Try-shake is ${enabled ? "enabled" : "disabled"} for this session. First: 275k; step: ${formatTryShakeTokens(step)}; next: ${formatTryShakeTokens(next)}.`,
+					`Try-shake is ${enabled ? "enabled" : "disabled"}. First: 275k; step: ${formatTryShakeTokens(step)}; next: ${formatTryShakeTokens(next)}.`,
 				);
 				return commandConsumed();
 			}
@@ -360,7 +360,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				} catch (error) {
 					return usage(error instanceof Error ? error.message : String(error), runtime);
 				}
-				await runtime.output(`Try-shake checkpoint step set to ${formatTryShakeTokens(tokens)} for this session.`);
+				await runtime.output(`Try-shake checkpoint step set to ${formatTryShakeTokens(tokens)}.`);
 				return commandConsumed();
 			}
 			if (arg !== "on" && arg !== "off") {
@@ -368,7 +368,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			}
 			const enabled = arg === "on";
 			runtime.session.setTryShakeEnabled(enabled);
-			await runtime.output(`Try-shake ${enabled ? "enabled" : "disabled"} for this session.`);
+			await runtime.output(`Try-shake ${enabled ? "enabled" : "disabled"}.`);
 			return commandConsumed();
 		},
 	},

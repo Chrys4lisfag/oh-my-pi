@@ -395,7 +395,6 @@ export class SessionMaintenance {
 	/** In-flight or armed background speculative compaction, if any. */
 	#speculation: SpeculationRun | undefined;
 	#skipPostTurnMaintenanceAssistantTimestamp: number | undefined;
-	#tryShakeCheckpointStepTokens = DEFAULT_TRY_SHAKE_CHECKPOINT_STEP_TOKENS;
 	readonly #lastMillionContextShakeCheckpointByModel = new Map<string, number>();
 	/**
 	 * Consecutive no-progress `response.incomplete` (length-stop) recoveries in
@@ -432,11 +431,21 @@ export class SessionMaintenance {
 				`Try-shake checkpoint step must be ${MIN_TRY_SHAKE_CHECKPOINT_STEP_TOKENS}-${MAX_TRY_SHAKE_CHECKPOINT_STEP_TOKENS} tokens`,
 			);
 		}
-		this.#tryShakeCheckpointStepTokens = tokens;
+		this.#host.settings.set("compaction.tryShakeCheckpointStepTokens", tokens);
 	}
 
 	get tryShakeCheckpointStepTokens(): number {
-		return this.#tryShakeCheckpointStepTokens;
+		// Persisted, so a hand-edited config can carry an out-of-range value; clamp
+		// rather than letting it poison checkpoint arithmetic.
+		const configured = this.#host.settings.get("compaction.tryShakeCheckpointStepTokens");
+		if (
+			!Number.isSafeInteger(configured) ||
+			configured < MIN_TRY_SHAKE_CHECKPOINT_STEP_TOKENS ||
+			configured > MAX_TRY_SHAKE_CHECKPOINT_STEP_TOKENS
+		) {
+			return DEFAULT_TRY_SHAKE_CHECKPOINT_STEP_TOKENS;
+		}
+		return configured;
 	}
 
 	get nextTryShakeCheckpointTokens(): number {
@@ -445,11 +454,12 @@ export class SessionMaintenance {
 			return TRY_SHAKE_FIRST_CHECKPOINT_TOKENS;
 		}
 		const last = this.#lastMillionContextShakeCheckpointByModel.get(`${model.provider}/${model.id}`);
-		return last === undefined ? TRY_SHAKE_FIRST_CHECKPOINT_TOKENS : last + this.#tryShakeCheckpointStepTokens;
+		return last === undefined ? TRY_SHAKE_FIRST_CHECKPOINT_TOKENS : last + this.tryShakeCheckpointStepTokens;
 	}
 
 	resetTryShakeCheckpoints(): void {
-		this.#tryShakeCheckpointStepTokens = DEFAULT_TRY_SHAKE_CHECKPOINT_STEP_TOKENS;
+		// Only the per-session checkpoint marks are session state. The configured
+		// spacing is a user setting and must survive `/new` and session switches.
 		this.#lastMillionContextShakeCheckpointByModel.clear();
 	}
 
@@ -493,7 +503,7 @@ export class SessionMaintenance {
 		const occupancy = Math.max(0, options.triggerContextTokens - options.tokensFreed);
 		const anchor = Math.max(
 			// Never schedule the next checkpoint below the first one.
-			TRY_SHAKE_FIRST_CHECKPOINT_TOKENS - this.#tryShakeCheckpointStepTokens,
+			TRY_SHAKE_FIRST_CHECKPOINT_TOKENS - this.tryShakeCheckpointStepTokens,
 			Math.min(options.crossedCheckpoint, occupancy),
 		);
 		if (anchor >= options.crossedCheckpoint) return;
@@ -502,7 +512,7 @@ export class SessionMaintenance {
 			model: modelKey,
 			postShakeTokens: occupancy,
 			previousCheckpointTokens: options.crossedCheckpoint,
-			nextCheckpointTokens: anchor + this.#tryShakeCheckpointStepTokens,
+			nextCheckpointTokens: anchor + this.tryShakeCheckpointStepTokens,
 		});
 	}
 
@@ -1977,7 +1987,7 @@ export class SessionMaintenance {
 		const nextCheckpoint =
 			lastCheckpoint === undefined
 				? TRY_SHAKE_FIRST_CHECKPOINT_TOKENS
-				: lastCheckpoint + this.#tryShakeCheckpointStepTokens;
+				: lastCheckpoint + this.tryShakeCheckpointStepTokens;
 		if (options.contextTokens < nextCheckpoint) return { attempted: false };
 		if (this.isCompacting || this.#host.isGeneratingHandoff()) return { attempted: false, busy: true };
 
@@ -1987,14 +1997,14 @@ export class SessionMaintenance {
 		const checkpointAnchor = lastCheckpoint ?? TRY_SHAKE_FIRST_CHECKPOINT_TOKENS;
 		const crossedCheckpoint =
 			checkpointAnchor +
-			Math.floor((options.contextTokens - checkpointAnchor) / this.#tryShakeCheckpointStepTokens) *
-				this.#tryShakeCheckpointStepTokens;
+			Math.floor((options.contextTokens - checkpointAnchor) / this.tryShakeCheckpointStepTokens) *
+				this.tryShakeCheckpointStepTokens;
 		this.#lastMillionContextShakeCheckpointByModel.set(modelKey, crossedCheckpoint);
 		logger.debug("Million-context try-shake checkpoint reached", {
 			model: modelKey,
 			contextTokens: options.contextTokens,
 			checkpointTokens: crossedCheckpoint,
-			nextCheckpointTokens: crossedCheckpoint + this.#tryShakeCheckpointStepTokens,
+			nextCheckpointTokens: crossedCheckpoint + this.tryShakeCheckpointStepTokens,
 		});
 		let tokensFreed = 0;
 		const outcome = await this.#runAutoShake(

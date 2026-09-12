@@ -616,7 +616,6 @@ export class AgentSession {
 	#queuedMessageDrainScheduled = false;
 	#planModeState: PlanModeState | undefined;
 	/** Whether automatic compaction should first attempt surgical shake cleanup in this logical session. */
-	#tryShakeEnabled = false;
 	/**
 	 * Memoized `getConfiguredDefaultModelState()` resolution, keyed by the
 	 * configured selector. Invalidated on catalog and role/settings changes.
@@ -1832,7 +1831,7 @@ export class AgentSession {
 			messages: () => this.messages,
 			baseSystemPrompt: () => this.#tools.baseSystemPrompt,
 			goalModeState: () => this.#goalModeState,
-			tryShakeEnabled: () => this.#tryShakeEnabled,
+			tryShakeEnabled: () => this.isTryShakeEnabled(),
 			planReferencePath: () => this.#planReferencePath,
 			nonMessageTokenSource: () => this,
 			memoryBackendSession: () => this,
@@ -5542,14 +5541,14 @@ export class AgentSession {
 		return this.#maintenance.autoCompactionEnabled;
 	}
 
-	/** Toggle shake-before-compaction for the current logical session. */
+	/** Toggle shake-before-compaction. Persisted, so it survives restarts. */
 	setTryShakeEnabled(enabled: boolean): void {
-		this.#tryShakeEnabled = enabled;
+		this.settings.set("compaction.tryShake", enabled);
 	}
 
-	/** Whether shake-before-compaction is enabled for the current logical session. */
+	/** Whether shake-before-compaction is enabled. */
 	isTryShakeEnabled(): boolean {
-		return this.#tryShakeEnabled;
+		return this.settings.get("compaction.tryShake");
 	}
 
 	setTryShakeCheckpointStepTokens(tokens: number): void {
@@ -5786,7 +5785,6 @@ export class AgentSession {
 
 	/** Drop mutable tool decisions and directives owned by the previous logical session. */
 	#clearSessionScopedToolState(): void {
-		this.#tryShakeEnabled = false;
 		this.#maintenance.resetTryShakeCheckpoints();
 		this.agent.clearDeferredToolDirectives();
 		this.#toolChoiceQueue.clear();

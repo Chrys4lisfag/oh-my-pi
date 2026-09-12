@@ -110,7 +110,7 @@ describe("AgentSession shake", () => {
 			.map(e => (e as { message: ToolResultMessage }).message);
 	}
 
-	it("resets try-shake at a logical session boundary", async () => {
+	it("keeps the try-shake preference across a logical session boundary", async () => {
 		session.setTryShakeEnabled(true);
 		session.setTryShakeCheckpointStepTokens(200_000);
 		expect(session.isTryShakeEnabled()).toBe(true);
@@ -118,9 +118,40 @@ describe("AgentSession shake", () => {
 
 		expect(await session.newSession()).toBe(true);
 
-		expect(session.isTryShakeEnabled()).toBe(false);
-		expect(session.getTryShakeCheckpointStepTokens()).toBe(150_000);
+		// The preference is a setting, not session state: `/new`, a session switch
+		// and a restart must all keep it. Only the checkpoint marks reset.
+		expect(session.isTryShakeEnabled()).toBe(true);
+		expect(session.getTryShakeCheckpointStepTokens()).toBe(200_000);
 		expect(session.getNextTryShakeCheckpointTokens()).toBe(275_000);
+	});
+
+	it("restores try-shake from settings in a freshly constructed session", async () => {
+		const settings = Settings.isolated({ "compaction.enabled": true, "compaction.autoContinue": false });
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected built-in anthropic model to exist");
+		const first = new AgentSession({
+			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager,
+			settings,
+			modelRegistry,
+		});
+		first.setTryShakeEnabled(true);
+		first.setTryShakeCheckpointStepTokens(250_000);
+		await first.dispose();
+
+		// Stands in for the next launch: same persisted settings, brand new session.
+		const restarted = new AgentSession({
+			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager,
+			settings,
+			modelRegistry,
+		});
+		try {
+			expect(restarted.isTryShakeEnabled()).toBe(true);
+			expect(restarted.getTryShakeCheckpointStepTokens()).toBe(250_000);
+		} finally {
+			await restarted.dispose();
+		}
 	});
 
 	it("validates try-shake checkpoint step boundaries on the real session API", () => {
@@ -747,7 +778,7 @@ describe("AgentSession shake", () => {
 			expect(session.getNextTryShakeCheckpointTokens()).toBe(275_000);
 		});
 
-		it("resets toggle, step, and consumed checkpoint when session context is cleared", async () => {
+		it("resets only the consumed checkpoint when session context is cleared", async () => {
 			useMillionContextModel();
 			session.setTryShakeCheckpointStepTokens(200_000);
 			vi.spyOn(session, "shake").mockResolvedValue({
@@ -762,8 +793,10 @@ describe("AgentSession shake", () => {
 			expect(await session.resetSessionContext()).toBeDefined();
 			const current = session.agent.state.model;
 			session.agent.setModel({ ...current, contextWindow: 1_000_000 });
-			expect(session.isTryShakeEnabled()).toBe(false);
-			expect(session.getTryShakeCheckpointStepTokens()).toBe(150_000);
+			// Clearing context discards the consumed checkpoint, but the toggle and
+			// spacing are persisted settings and outlive the session.
+			expect(session.isTryShakeEnabled()).toBe(true);
+			expect(session.getTryShakeCheckpointStepTokens()).toBe(200_000);
 			expect(session.getNextTryShakeCheckpointTokens()).toBe(275_000);
 		});
 

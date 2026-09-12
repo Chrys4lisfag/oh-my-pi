@@ -2708,6 +2708,20 @@ export const SETTINGS_SCHEMA = {
 
 	"compaction.v2RetainedMessageBudget": { type: "number", default: 64000 },
 
+	"compaction.tryShake": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "context",
+			group: "Compaction",
+			label: "Try Shake First",
+			description:
+				"Attempt a surgical shake before automatic compaction, falling back to the configured method order when it cannot recover enough context",
+		},
+	},
+
+	"compaction.tryShakeCheckpointStepTokens": { type: "number", default: 150000 },
+
 	// Idle compaction
 	"compaction.idleEnabled": {
 		type: "boolean",
@@ -6271,6 +6285,8 @@ export interface CompactionSettings {
 	idleTimeoutSeconds: number;
 	supersedeReads: boolean;
 	dropUseless: boolean;
+	tryShake: boolean;
+	tryShakeCheckpointStepTokens: number;
 }
 
 export interface RecapSettings {

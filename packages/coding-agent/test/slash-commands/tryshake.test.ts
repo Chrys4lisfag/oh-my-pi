@@ -45,41 +45,37 @@ function createRuntime() {
 }
 
 describe("/tryshake slash command", () => {
-	it("defaults to disabled for each session", () => {
+	it("defaults to disabled", () => {
 		expect(createRuntime().isEnabled()).toBe(false);
 		expect(createRuntime().isEnabled()).toBe(false);
 	});
 
-	it("toggles only current session state", async () => {
+	it("toggles the persisted preference", async () => {
 		const h = createRuntime();
 
 		expect(await executeAcpBuiltinSlashCommand("/tryshake on", h.runtime)).toEqual({ consumed: true });
 		expect(h.isEnabled()).toBe(true);
 		expect(h.setTryShakeEnabled).toHaveBeenLastCalledWith(true);
-		expect(h.output).toHaveBeenLastCalledWith("Try-shake enabled for this session.");
+		expect(h.output).toHaveBeenLastCalledWith("Try-shake enabled.");
 
 		await executeAcpBuiltinSlashCommand("/tryshake off", h.runtime);
 		expect(h.isEnabled()).toBe(false);
 		expect(h.setTryShakeEnabled).toHaveBeenLastCalledWith(false);
-		expect(h.output).toHaveBeenLastCalledWith("Try-shake disabled for this session.");
+		expect(h.output).toHaveBeenLastCalledWith("Try-shake disabled.");
 	});
 
 	it("reports current session status without changing it", async () => {
 		const h = createRuntime();
 
 		await executeAcpBuiltinSlashCommand("/tryshake status", h.runtime);
-		expect(h.output).toHaveBeenLastCalledWith(
-			"Try-shake is disabled for this session. First: 275k; step: 150k; next: 275k.",
-		);
+		expect(h.output).toHaveBeenLastCalledWith("Try-shake is disabled. First: 275k; step: 150k; next: 275k.");
 		expect(h.setTryShakeEnabled).not.toHaveBeenCalled();
 
 		await executeAcpBuiltinSlashCommand("/tryshake on", h.runtime);
 		await executeAcpBuiltinSlashCommand("/tryshake step 200k", h.runtime);
 		h.setNextTokens(425_000);
 		await executeAcpBuiltinSlashCommand("/tryshake status", h.runtime);
-		expect(h.output).toHaveBeenLastCalledWith(
-			"Try-shake is enabled for this session. First: 275k; step: 200k; next: 425k.",
-		);
+		expect(h.output).toHaveBeenLastCalledWith("Try-shake is enabled. First: 275k; step: 200k; next: 425k.");
 		expect(h.setTryShakeEnabled).toHaveBeenCalledTimes(1);
 	});
 
@@ -96,7 +92,7 @@ describe("/tryshake slash command", () => {
 			expect(h.stepTokens()).toBe(expected);
 			expect(h.setTryShakeCheckpointStepTokens).toHaveBeenLastCalledWith(expected);
 		}
-		expect(h.output).toHaveBeenLastCalledWith("Try-shake checkpoint step set to 1m for this session.");
+		expect(h.output).toHaveBeenLastCalledWith("Try-shake checkpoint step set to 1m.");
 	});
 
 	it("rejects malformed and out-of-range checkpoint steps", async () => {

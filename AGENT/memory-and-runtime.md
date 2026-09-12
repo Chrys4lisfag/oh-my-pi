@@ -360,11 +360,13 @@ status rendering. Do not conflate reminder injections with
 
 ## 11. Try-shake compaction preflight
 
-`/tryshake on` sets in-memory state on the current `AgentSession`. `/tryshake step
-150k` changes the session-scoped million-context checkpoint spacing (plain integers and
-`k`/`m` suffixes are accepted), while `/tryshake status` reports enabled state, first
-checkpoint, step, and next checkpoint. New, switched, and cleared logical sessions reset
-the toggle, step, and checkpoint map; no settings file stores them.
+`/tryshake on` writes the persisted `compaction.tryShake` setting. `/tryshake step
+150k` writes `compaction.tryShakeCheckpointStepTokens` (plain integers and `k`/`m`
+suffixes are accepted; out-of-range persisted values fall back to the 150k default),
+while `/tryshake status` reports enabled state, first checkpoint, step, and next
+checkpoint. New, switched, and cleared logical sessions reset only the checkpoint map —
+the toggle and step are user settings and survive restarts. (Before 2026-09-09 these
+were session-scoped in-memory fields that silently reverted on every restart.)
 
 For a selected model whose context window is at least 1,000,000 tokens, successful
 post-turn maintenance first checks at 275k used tokens, then at the configured step
