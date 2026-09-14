@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { type } from "@oh-my-pi/omptype";
+import { OmpErrors } from "@oh-my-pi/omptype";
+import { getModelsConfigSchema } from "@oh-my-pi/pi-coding-agent/config/models-config-schema-bundle";
 import { validateProviderConfiguration } from "@oh-my-pi/pi-coding-agent/config/models-config";
 import { ModelsConfigSchema } from "@oh-my-pi/pi-coding-agent/config/models-config-schema";
 
@@ -49,8 +50,8 @@ describe("models config discovery overrides", () => {
 			},
 		};
 		const parsed = ModelsConfigSchema(config);
-		expect(parsed instanceof type.errors).toBe(false);
-		if (!(parsed instanceof type.errors)) {
+		expect(parsed instanceof OmpErrors).toBe(false);
+		if (!(parsed instanceof OmpErrors)) {
 			expect(parsed.providers?.split?.discovery?.baseUrl).toBe("https://example.com/v1");
 			expect(parsed.providers?.split?.discovery?.auth).toBe("none");
 		}
@@ -71,7 +72,37 @@ describe("models config discovery overrides", () => {
 					},
 				},
 			});
-			expect(parsed instanceof type.errors).toBe(true);
+			expect(parsed instanceof OmpErrors).toBe(true);
+		}
+	});
+});
+
+describe("models.yml compat.stripImageInput (#11697)", () => {
+	const schema = getModelsConfigSchema();
+	const configWithModelCompat = (compat: unknown) => ({
+		providers: {
+			p: {
+				baseUrl: "http://x/v1",
+				apiKey: "K",
+				api: "openai-completions" as const,
+				models: [{ id: "m", input: ["text", "image"] as ("text" | "image")[], compat }],
+			},
+		},
+	});
+
+	test("accepts a boolean opt-out and preserves it", () => {
+		const parsed = schema(configWithModelCompat({ stripImageInput: false }));
+		expect(parsed instanceof OmpErrors).toBe(false);
+		if (!(parsed instanceof OmpErrors)) {
+			expect(parsed.providers?.p?.models?.[0]?.compat).toMatchObject({ stripImageInput: false });
+		}
+	});
+
+	test("rejects a wrong-typed opt-out instead of silently ignoring it", () => {
+		const parsed = schema(configWithModelCompat({ stripImageInput: "no" }));
+		expect(parsed instanceof OmpErrors).toBe(true);
+		if (parsed instanceof OmpErrors) {
+			expect(parsed.summary).toContain("stripImageInput");
 		}
 	});
 });

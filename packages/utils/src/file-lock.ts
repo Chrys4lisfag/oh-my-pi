@@ -16,13 +16,17 @@ export interface FileLockOptions {
 	retryDelayMs?: number;
 }
 
-interface FileLockHandle {
-	readonly acquired: boolean;
+/** An exclusive advisory lease. Releasing an already released handle is safe. */
+export interface FileLockHandle {
 	release(): void;
 }
 
+interface AcquiredFileLockHandle extends FileLockHandle {
+	readonly acquired: boolean;
+}
+
 interface FileLockConstructor {
-	tryAcquire(lockPath: string): FileLockHandle;
+	tryAcquire(lockPath: string): AcquiredFileLockHandle;
 }
 
 const DEFAULT_OPTIONS: Required<FileLockOptions> = {
@@ -49,7 +53,7 @@ function isSqliteBusy(error: unknown): boolean {
 	return error instanceof Error && /database (?:is )?locked|database is busy/i.test(error.message);
 }
 
-class SqliteFileLock implements FileLockHandle {
+class SqliteFileLock implements AcquiredFileLockHandle {
 	readonly #database: Database;
 	#acquired = true;
 
@@ -72,7 +76,7 @@ class SqliteFileLock implements FileLockHandle {
 	}
 }
 
-function tryAcquireCompatibilityLock(lockPath: string): FileLockHandle | null {
+function tryAcquireCompatibilityLock(lockPath: string): AcquiredFileLockHandle | null {
 	let database: Database | undefined;
 	try {
 		database = new Database(getCompatibilityDbPath(lockPath), { create: true });
@@ -86,12 +90,12 @@ function tryAcquireCompatibilityLock(lockPath: string): FileLockHandle | null {
 	}
 }
 
-class CompositeFileLock implements FileLockHandle {
-	readonly #compatibility: FileLockHandle;
-	readonly #native: FileLockHandle;
+class CompositeFileLock implements AcquiredFileLockHandle {
+	readonly #compatibility: AcquiredFileLockHandle;
+	readonly #native: AcquiredFileLockHandle;
 	#acquired = true;
 
-	constructor(compatibility: FileLockHandle, native: FileLockHandle) {
+	constructor(compatibility: AcquiredFileLockHandle, native: AcquiredFileLockHandle) {
 		this.#compatibility = compatibility;
 		this.#native = native;
 	}
@@ -113,7 +117,7 @@ class CompositeFileLock implements FileLockHandle {
 
 function createTryAcquire(
 	nativeConstructor: FileLockConstructor | undefined,
-): (lockPath: string) => FileLockHandle | null {
+): (lockPath: string) => AcquiredFileLockHandle | null {
 	if (!nativeConstructor || typeof nativeConstructor.tryAcquire !== "function") {
 		return tryAcquireCompatibilityLock;
 	}
@@ -136,7 +140,8 @@ function createTryAcquire(
 // an already-loaded .node file after a source merge. Capability-check the value.
 const tryAcquireLock = createTryAcquire(NativeFileLock as FileLockConstructor | undefined);
 
-async function acquireLock(filePath: string, options: FileLockOptions = {}): Promise<FileLockHandle> {
+/** Acquire an exclusive lease; callers must release it when their operation ends. */
+export async function acquireFileLock(filePath: string, options: FileLockOptions = {}): Promise<FileLockHandle> {
 	const opts = { ...DEFAULT_OPTIONS, ...options };
 	const lockPath = getLockPath(filePath);
 
@@ -155,7 +160,7 @@ export async function withFileLock<T>(
 	fn: () => Promise<T>,
 	options: FileLockOptions = {},
 ): Promise<T> {
-	const lock = await acquireLock(filePath, options);
+	const lock = await acquireFileLock(filePath, options);
 	try {
 		return await fn();
 	} finally {

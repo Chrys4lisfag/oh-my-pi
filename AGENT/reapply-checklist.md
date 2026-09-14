@@ -103,11 +103,14 @@ Never edit generated catalog JSON for Venice.
 11. Preserve the fork's remote-first automatic default only for unconfigured,
     provider-native-capable GPT/Codex candidates; upstream owns `/compact remote`,
     transport, fallback, and lifecycle semantics.
-12. Reapply session-scoped `/tryshake on|off|status|step <tokens>` state and boundary
-    reset: million-token models check at 275k then the configured step, the ladder
-    re-anchors to post-shake occupancy (`#reanchorTryShakeCheckpoint`, downward-only,
-    floored at `275k - step`), and automatic compaction keeps its one-attempt
-    preflight/fallthrough across deferred recursion.
+12. Preserve globally persisted `/tryshake on|off|status|step <tokens>` settings;
+    session boundaries reset consumed checkpoint marks only. Million-token models
+    check at 275k then the configured step; retain post-shake re-anchoring and
+    automatic compaction's one-attempt preflight/fallthrough across recursion.
+13. Preserve configured `no-log:true` propagation in Chat, Responses, and Anthropic,
+    post-payload-hook assertions, and central serialized-fetch guard. Byte bodies
+    (including CCH UTF-8 views) must be verified without silently dropping demand.
+    Run `provider-no-log-contract.test.ts` after every transport merge.
 
 ### 6. Generated and optional files
 
