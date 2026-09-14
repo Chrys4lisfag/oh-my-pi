@@ -105,6 +105,7 @@ import {
 	shouldDropAutoToolChoiceForReasoning,
 	shouldRetryWithoutStrictTools,
 } from "./openai-shared";
+import { assertConfiguredNoLog } from "../utils/request-body-policy";
 
 // OpenAI Responses-specific options
 export interface OpenAIResponsesOptions extends StreamOptions {
@@ -529,6 +530,7 @@ const streamOpenAIResponsesOnce = (
 				const payload =
 					replacementPayload !== undefined ? (replacementPayload as OpenAIResponsesSamplingParams) : requestParams;
 				applyReasoningEffortFallbackForRequest(payload);
+				assertConfiguredNoLog(payload, model.compat.extraBody);
 				return payload;
 			};
 			chained = { ...chained, params: await applyPayloadReplacement(chained.params) };
@@ -1305,6 +1307,7 @@ export function buildParams(
 		applyOpenAIGatewayRouting(params, model.compat);
 	}
 
+	applyOpenAIExtraBody(params, model.compat.extraBody);
 	applyOpenAIExtraBody(params, options?.extraBody);
 	applyOpenAIResponsesPromptCachePolicy(params, model, options, statefulCacheBaseline);
 

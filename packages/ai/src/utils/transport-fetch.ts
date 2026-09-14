@@ -4,6 +4,7 @@ import { withInferenceUserAgent } from "../providers/inference-headers";
 import type { Api, FetchImpl, Model } from "../types";
 import { getProxyForProvider, withProxyInit } from "./proxy";
 import { createFetchRequestDebugSession, isRequestDebugEnabled } from "./request-debug";
+import { assertConfiguredNoLogRequest, getConfiguredExtraBody } from "./request-body-policy";
 
 /**
  * Stamped on a fetch already built by {@link transportFetch}: the identity of
@@ -28,9 +29,15 @@ type TransportFetch = FetchImpl & {
  * kept failing `ERR_TLS_CERT_ALTNAME_INVALID` with the opt-in configured.
  */
 function transportIdentity(model: Model<Api>): string {
-	return [model.provider, model.id, model.api, model.tls?.rejectUnauthorized === false ? "insecure-tls" : ""].join(
-		"\u0000",
-	);
+	const extraBody = getConfiguredExtraBody(model);
+	const noLogIdentity = Object.hasOwn(extraBody ?? {}, "no-log") ? String(extraBody?.["no-log"]) : "";
+	return [
+		model.provider,
+		model.id,
+		model.api,
+		model.tls?.rejectUnauthorized === false ? "insecure-tls" : "",
+		noLogIdentity,
+	].join("\u0000");
 }
 
 /**
@@ -70,8 +77,10 @@ export function transportFetch(model: Model<Api>, fetchImpl: FetchImpl | undefin
 		unwrapped ??
 		(model.provider === "anthropic" && model.api === "anthropic-messages" ? coworkFetch : globalThis.fetch);
 	const proxyUrl = getProxyForProvider(model.provider);
+	const configuredExtraBody = getConfiguredExtraBody(model);
 
 	const fetch: TransportFetch = async (input, init) => {
+		await assertConfiguredNoLogRequest(input, init, configuredExtraBody);
 		init = withInferenceUserAgent(input, init);
 		const extraCa = resolveExtraCa();
 		if (extraCa) init = withExtraCaInit(init, extraCa);

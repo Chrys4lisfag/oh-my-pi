@@ -459,6 +459,8 @@ export interface OpenAICompat {
 export interface AnthropicCompat {
 	/** Whether thinking requests may include `context_management` and its beta header. Default: true. */
 	supportsContextManagement?: boolean;
+	/** Extra top-level request-body fields for compatible gateways (e.g. LiteLLM `no-log`). */
+	extraBody?: Record<string, unknown>;
 	/**
 	 * Whether requests may carry `output_config.effort` (and its effort beta
 	 * header). Vertex AI rejects the field/header. Default: true.
@@ -839,6 +841,8 @@ export interface ResolvedOpenAIResponsesCompat extends ResolvedOpenAISharedCompa
 	 */
 	supportsReasoningSummary: boolean;
 	streamIdleTimeoutMs?: number;
+	/** Extra top-level request-body fields for compatible gateways (e.g. LiteLLM `no-log`). */
+	extraBody?: OpenAICompat["extraBody"];
 	vercelGatewayRouting?: OpenAICompat["vercelGatewayRouting"];
 	/** The model sits behind Vercel AI Gateway's Responses endpoint. */
 	isVercelGatewayHost: boolean;
@@ -863,7 +867,11 @@ export interface ResolvedOpenAIResponsesCompat extends ResolvedOpenAISharedCompa
 export type ResolvedOpenRouterCompat = ResolvedOpenAICompat & ResolvedOpenAIResponsesCompat;
 
 /** Fully-resolved anthropic-messages compat view (same contract as `ResolvedOpenAICompat`). */
-export type ResolvedAnthropicCompat = Required<Omit<AnthropicCompat, "streamIdleTimeoutMs" | "thinkingLoopGuard">> & {
+export type ResolvedAnthropicCompat = Required<
+	Omit<AnthropicCompat, "streamIdleTimeoutMs" | "thinkingLoopGuard" | "extraBody">
+> & {
+	/** Gateway-specific top-level request-body fields. */
+	extraBody?: AnthropicCompat["extraBody"];
 	/** Thinking-loop watchdog guard family applied to streamed reasoning. */
 	thinkingLoopGuard?: AnthropicCompat["thinkingLoopGuard"];
 	/**

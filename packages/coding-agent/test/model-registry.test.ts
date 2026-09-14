@@ -1499,6 +1499,42 @@ describe("ModelRegistry", () => {
 			expect(params.reasoning_effort).toBe("low");
 		});
 
+		test("provider no-log contract survives per-model API reroutes", () => {
+			writeRawModelsJson({
+				"agentsey-native": {
+					baseUrl: "https://api-infer.example/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					compat: { extraBody: { "no-log": true } },
+					models: [
+						{ id: "sol", api: "openai-responses" },
+						{ id: "fable", api: "anthropic-messages" },
+					],
+					modelOverrides: {
+						sol: {
+							compat: { extraBody: { allowed_openai_params: ["reasoning_effort"] } },
+						},
+					},
+				},
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			const sol = registry.find("agentsey-native", "sol");
+			const fable = registry.find("agentsey-native", "fable");
+			if (!sol || sol.api !== "openai-responses") throw new Error("expected Responses model");
+			if (!fable || fable.api !== "anthropic-messages") throw new Error("expected Anthropic model");
+			const solResponses = sol as Model<"openai-responses">;
+			expect(solResponses.compat.extraBody).toEqual({
+				"no-log": true,
+				allowed_openai_params: ["reasoning_effort"],
+			});
+			expect(solResponses.compatConfig?.extraBody).toEqual({
+				"no-log": true,
+				allowed_openai_params: ["reasoning_effort"],
+			});
+			expect((fable as Model<"anthropic-messages">).compat.extraBody).toEqual({ "no-log": true });
+		});
+
 		test("newly discovered ids inherit provider fields, not another model's custom fields", async () => {
 			writeRawModelsJson({
 				openai: {

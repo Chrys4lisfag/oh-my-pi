@@ -207,6 +207,46 @@ are specified in `memory-and-runtime.md`. Preserve their session-boundary reset,
 monotonic checkpoint consumption, visible follow-up prompt, and extension tests
 when merging session-maintenance changes.
 
+## 8. Fail-closed provider `no-log` contract
+
+Some LiteLLM gateways accept zero-log routing metadata only as a top-level JSON
+body field:
+
+```yaml
+compat:
+  extraBody:
+    no-log: true
+```
+
+Contracts:
+
+- Chat Completions, OpenAI Responses, and Anthropic Messages propagate
+  configured `extraBody` into the final request body.
+- `transportFetch` independently checks the serialized body for every current
+  and future API. A transport that does not propagate configured `no-log`
+  therefore aborts rather than silently sending an unprotected request.
+- The central guard reads authored `compatConfig` first, so it still protects an
+  API whose resolved compatibility record accidentally drops `extraBody`.
+- `no-log` is opt-in. Providers without that configured key are unchanged.
+- A configured `no-log` value must be literal boolean `true`.
+- Responses/Anthropic compatibility resolvers must seed `extraBody`, because
+  `applyCompatOverrides` copies only keys present in the resolved baseline.
+
+Primary implementation:
+
+- `packages/ai/src/utils/request-body-policy.ts`
+- `packages/ai/src/utils/transport-fetch.ts`
+- `packages/ai/src/providers/openai-completions.ts`
+- `packages/ai/src/providers/openai-responses.ts`
+- `packages/ai/src/providers/anthropic.ts`
+- `packages/catalog/src/compat/resolve.ts`
+- `packages/catalog/src/types.ts`
+
+Regression coverage:
+
+- `packages/ai/test/provider-no-log-contract.test.ts`
+- `packages/coding-agent/test/model-registry.test.ts`
+
 ## Merge survival checks
 
 Run at minimum:

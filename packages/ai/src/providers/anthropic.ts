@@ -109,6 +109,7 @@ import {
 	hasCopilotVisionInput,
 	resolveGitHubCopilotBaseUrl,
 } from "./github-copilot-headers";
+import { assertConfiguredNoLog } from "../utils/request-body-policy";
 import { getOpenAIPromptCacheKey } from "./openai-shared";
 import { applyInferenceHeaders } from "./inference-headers";
 import { transformMessages } from "./transform-messages";
@@ -2208,6 +2209,7 @@ const streamAnthropicOnce = (
 					nextParams = replacementPayload as typeof nextParams;
 				}
 				nextParams = toWellFormedDeep(nextParams) as typeof nextParams;
+				assertConfiguredNoLog(nextParams, model.compat.extraBody);
 				rawRequestDump = {
 					provider: model.provider,
 					api: output.api,
@@ -4136,6 +4138,9 @@ function buildParams(
 	disableThinkingIfToolChoiceForced(params, model);
 	ensureMaxTokensForThinking(params, maxOutputTokens);
 	applyPromptCaching(params, cacheControl);
+	// Generic LiteLLM proxy metadata (e.g. `no-log`) must survive every API
+	// dialect, not only OpenAI Chat Completions.
+	if (model.compat.extraBody) Object.assign(params, model.compat.extraBody);
 
 	return params;
 }

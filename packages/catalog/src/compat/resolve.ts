@@ -719,6 +719,7 @@ function resolveOpenAIResponsesPolicy(
 		stripImageInput: false,
 		thinkingLoopGuard: undefined,
 		reasoningEffortMap: {},
+		extraBody: undefined,
 		supportsReasoningParams: true,
 		supportsSamplingParams: !(facts.is("openai") && (facts.family("o-series") || facts.revGte("5"))),
 		supportsPenaltyAndStopParams: !isXaiHost,
@@ -864,6 +865,7 @@ function resolveAnthropicPolicy(
 		stripImageInput: false,
 		thinkingLoopGuard: undefined,
 		streamIdleTimeoutMs: spec.compat?.streamIdleTimeoutMs,
+		extraBody: undefined,
 	};
 	applyWireAxes(compat, axes.wire, "anthropic-messages");
 	applyCompatOverrides(compat, spec.compat);

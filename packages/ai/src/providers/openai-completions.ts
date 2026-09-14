@@ -108,6 +108,7 @@ import {
 	shouldDropAutoToolChoiceForReasoning,
 	shouldRetryWithoutStrictTools,
 } from "./openai-shared";
+import { assertConfiguredNoLog } from "../utils/request-body-policy";
 import { transformMessages } from "./transform-messages";
 import {
 	isOpenAICompletionsVisionSupported,
@@ -769,6 +770,7 @@ const streamOpenAICompletionsOnce = (
 				activeReasoningEffortFallbackKey = reasoningEffortFallbackKey;
 				const replacedParams = await options?.onPayload?.(params, model);
 				if (replacedParams !== undefined) params = replacedParams as typeof params;
+				assertConfiguredNoLog(params, model.compat.extraBody);
 				activeRequestParams = params;
 				rawRequestDump = {
 					provider: model.provider,

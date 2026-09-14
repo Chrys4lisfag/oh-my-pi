@@ -120,6 +120,14 @@ never assume commit count alone proves behavior survived.
     `wrapFetchForInsecureTls` (fetch-wrapper form, used by registry discovery),
     both beside the `NODE_EXTRA_CA_CERTS` shim; caller `tls` fields win over the
     injected `rejectUnauthorized`
+- `packages/ai/src/utils/request-body-policy.ts`
+  - fail-closed configured `no-log:true` assertion after payload interceptors
+    and again at central serialized-fetch boundary for every API
+- `packages/ai/src/providers/openai-completions.ts`
+- `packages/ai/src/providers/openai-responses.ts`
+- `packages/ai/src/providers/anthropic.ts`
+  - Chat, Responses, and Anthropic propagate configured `extraBody`; the
+    central transport guard blocks unsupported/future serializers that omit it
 - `packages/catalog/src/types.ts`
   - `Model.tls` opt-in
 - `packages/catalog/src/model-manager.ts`
