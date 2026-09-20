@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import type { AgentMessage, SyntheticToolResultDetails } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
@@ -127,6 +127,12 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 	afterAll(() => {
 		authStorage.close();
 		tempDir.removeSync();
+	});
+
+	afterEach(() => {
+		// Constructor/setup failures must not leak a mocked clock into siblings.
+		vi.restoreAllMocks();
+		modelRegistry.clearSuppressedSelectors();
 	});
 
 	it("requires twelve minutes and fallback success, preserving cooldown and never policy", async () => {

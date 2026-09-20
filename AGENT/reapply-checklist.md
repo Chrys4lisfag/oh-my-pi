@@ -253,7 +253,7 @@ and a just-edited provider looks unsaved.
 ### `packages/coding-agent/src/session/retry-fallback-chains.ts` and `turn-recovery.ts` (chain walk)
 
 Adopt upstream's resolution ladder (exact model key → longest wildcard → hinted
-role → matching role with `default` preferred → `default`), then re-apply two
+role → matching role with `default` preferred → `default`), then re-apply these
 fork deltas:
 
 1. `retryFallbackChainContainsSelector` — keep the exported helper, and keep it
@@ -265,8 +265,12 @@ fork deltas:
    survives a model change (`/advisor configure`, profile sync, context
    promotion). The advisor path passes its own `pinnedRole` and relies on the
    same gate.
+3. Primary restoration requires twelve minutes since first fallback activation
+   (`startedAt`) AND `succeeded || chainExhausted`. Cooldown, pin, and `never`
+   still gate it. Keep `#isRetryFallbackPrimary` exclusions so wrap-around cannot
+   bypass restoration; a failed slow request must dispatch the next fallback.
 
-### `packages/coding-agent/src/modes/components/transcript-container.ts`
+### `packages/tui/src/chrome/transcript-container.ts`
 
 Union: upstream `resetStableEmission` and the fork's `isBlockLive`, with
 `canRemoveBlock` delegating to `isBlockLive`. `showStatus` may only mutate a live
@@ -354,6 +358,7 @@ git grep -n "fetched" packages/catalog/src/model-manager.ts
 git grep -n "auth-none\|openai-models-list-bare-context" packages/coding-agent/src/config/model-registry.ts
 git grep -n "describeFallbackReason" packages/coding-agent/src/session/retry-fallback-chains.ts
 git grep -n "retryFallbackChainContainsSelector" packages/coding-agent/src/session/retry-fallback-chains.ts packages/coding-agent/src/session/turn-recovery.ts
+git grep -n 'chainExhausted\|startedAt\|isRetryFallbackPrimary' packages/coding-agent/src/session
 git grep -n "reanchorTryShakeCheckpoint" packages/coding-agent/src/session/session-maintenance.ts
 git grep -n "retryFallbackChainModels" packages/coding-agent/src/session
 git grep -n "exhaustedFailure" packages/coding-agent/src/session/session-maintenance.ts
@@ -424,6 +429,9 @@ expand a file argument into a large test bucket.
   test/anthropic-stream-timeout.test.ts)
 
 (cd packages/utils && bun test test/postmortem-epipe.test.ts)
+
+(cd packages/tui && bun test test/usage-dashboard.test.ts test/status-line-model.test.ts && bun run check:types)
+# Model-hub integration coverage remains in packages/coding-agent/test/model-hub.test.ts.
 ```
 
 Then run targeted lint/format/type checks for touched packages: `bunx oxlint <paths>`,

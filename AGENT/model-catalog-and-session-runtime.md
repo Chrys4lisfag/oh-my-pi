@@ -252,9 +252,10 @@ Regression coverage:
 Run at minimum:
 
 ```sh
-cd packages/agent && bun test test/tokenizer.test.ts && bun run check:types
-cd packages/catalog && bun test test/build.test.ts test/litellm-provider.test.ts && bun run check:types
-cd packages/coding-agent && bun test \
+(cd packages/agent && bun test test/tokenizer.test.ts && bun run check:types)
+(cd packages/catalog && bun test test/build.test.ts test/litellm-provider.test.ts && bun run check:types)
+(cd packages/tui && bun test test/usage-dashboard.test.ts test/status-line-model.test.ts && bun run check:types)
+(cd packages/coding-agent && bun test \
   test/config/models-config-validation.test.ts \
   test/model-discovery.test.ts \
   test/model-registry.test.ts \
@@ -263,12 +264,10 @@ cd packages/coding-agent && bun test \
   test/profile-live-sync.test.ts \
   test/profiles-multi-instance.test.ts \
   test/profiles-process-sync.test.ts \
-  test/status-line-model.test.ts \
   test/advisor-config-model-picker.test.ts \
   test/agent-session-advisor-model-sync.test.ts \
   test/shake.test.ts \
-  test/slash-commands/tryshake.test.ts
-cd packages/coding-agent && bun run check:types
+  test/slash-commands/tryshake.test.ts && bun run check:types)
 ```
 
 Also run the repo linter/formatter on changed files (`bunx oxlint <paths>` and
