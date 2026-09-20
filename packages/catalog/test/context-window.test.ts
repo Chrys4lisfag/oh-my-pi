@@ -165,3 +165,12 @@ test("DeepSeek V4.1 Flash floor preserves larger live windows and excludes nearb
 	expect(resellerDeepSeek("deepseek/deepseek-v4-flash-0731", "custom", 128_000).contextWindow).toBe(128_000);
 	expect(resellerDeepSeek("deepseek/deepseek-v4.1-pro", "custom", 128_000).contextWindow).toBe(128_000);
 });
+
+test("Vercel DeepSeek V4.1 Flash resolves provider efforts without a model-menu overlap", () => {
+	for (const id of ["deepseek/deepseek-v4.1-flash", "deepseek/deepseek-v4-1-flash"]) {
+		const model = resellerDeepSeek(id, "vercel-ai-gateway", 128_000);
+		expect(model.contextWindow).toBe(1_000_000);
+		expect(model.thinking?.efforts).toEqual([Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh]);
+		expect(() => resolveMaxContextWindow(model)).not.toThrow();
+	}
+});

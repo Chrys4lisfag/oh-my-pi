@@ -2021,7 +2021,8 @@ export const SETTINGS_SCHEMA = {
 				{
 					value: "cooldown-expiry",
 					label: "Cooldown expiry",
-					description: "Return to the primary model after its suppression window ends",
+					description:
+						"Return after 12 minutes and fallback success or chain exhaustion, once primary cooldown ends",
 				},
 				{ value: "never", label: "Never", description: "Stay on the fallback model until manually changed" },
 			],

@@ -121,6 +121,17 @@ be adopted without silently losing fork features.
     re-resolved, so a model changed by `/advisor configure`, profile sync, or
     context promotion must not let a leftover chain outrank the more specific
     configured mapping.
+26. `/usage` opens Accounts view when any provider has multiple reporting accounts.
+    Show each report's identity, plan when available, all quota windows, remaining
+    percentage, and reset countdown without averaging sibling accounts. `a` opens
+    Accounts, `o` restores the aggregate overview, and Enter opens classic details.
+    Reuse existing usage reports; changing views must not fetch provider data.
+27. Automatic primary restoration requires 12 minutes since first fallback
+    activation AND either a completed successful fallback response (including
+    tool calls) or an exhausted chain. Original cooldown, pinned fallbacks, and
+    `retry.fallbackRevertPolicy: never` still gate restoration. Failed/aborted
+    output and merely selecting the last candidate do not count. Later hops
+    retain the first-activation clock; wrapping cannot bypass the restore gate.
 
 ## Important memory corrections
 

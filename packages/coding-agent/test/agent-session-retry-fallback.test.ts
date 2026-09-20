@@ -263,6 +263,8 @@ describe("AgentSession retry fallback", () => {
 			throw new Error("Expected bundled test models to exist");
 		}
 
+		let now = Date.now();
+		vi.spyOn(Date, "now").mockImplementation(() => now);
 		const requestedModels: string[] = [];
 		const requestedContexts: string[] = [];
 		const retryStartEvents: Array<Extract<AgentSessionEvent, { type: "auto_retry_start" }>> = [];
@@ -285,6 +287,9 @@ describe("AgentSession retry fallback", () => {
 				if (model.provider === primaryModel.provider && model.id === primaryModel.id) {
 					mock.push({ throw: "overloaded_error: provider returned error 503" });
 				} else if (model.provider === firstFallback.provider && model.id === firstFallback.id) {
+					// A slow failed fallback must not restore a cooled primary before
+					// the selected second fallback gets its first request.
+					now += 13 * 60_000;
 					mock.push({ throw: "service unavailable: 503 overloaded" });
 				} else if (model.provider === secondFallback.provider && model.id === secondFallback.id) {
 					mock.push({ content: ["Recovered on second fallback"] });
@@ -4678,7 +4683,7 @@ describe("AgentSession retry fallback", () => {
 		expect(session.model?.provider).toBe(fallbackModel.provider);
 		expect(session.model?.id).toBe(fallbackModel.id);
 
-		now += 240;
+		now += 12 * 60_000;
 		await session.prompt("Third prompt should lazily revert to primary");
 		await session.waitForIdle();
 		expect(requestedModels).toEqual([
@@ -4760,7 +4765,7 @@ describe("AgentSession retry fallback", () => {
 			if (event.type === "model_changed") servingDuringSwaps.push(restoring.servingModel);
 		});
 
-		now += 240;
+		now += 12 * 60_000;
 		await session.prompt("Cooldown expired: revert to the primary and fail there");
 		await session.waitForIdle();
 
@@ -4932,7 +4937,7 @@ describe("AgentSession retry fallback", () => {
 		// the primary's 4000 window, so it promotes to the larger-window model
 		// instead of issuing the oversized request. Before the fix the session
 		// stayed on the reverted primary and received the over-window request.
-		now += 60_000;
+		now += 12 * 60_000;
 		await session.followUp("Please continue on the reverted primary");
 		await session.waitForIdle();
 
@@ -5279,7 +5284,7 @@ describe("AgentSession retry fallback", () => {
 			`${fallbackModel.provider}/${fallbackModel.id}`,
 		]);
 
-		now += 240;
+		now += 12 * 60_000;
 		await session.prompt("Second prompt should restore routed primary");
 		await session.waitForIdle();
 		expect(requestedModels).toEqual([
@@ -5334,7 +5339,7 @@ describe("AgentSession retry fallback", () => {
 		expect(session.thinkingLevel).toBeUndefined();
 
 		session.setThinkingLevel(Effort.Low);
-		now += 240;
+		now += 12 * 60_000;
 		await session.prompt("Second prompt should restore model but preserve user thinking change");
 		await session.waitForIdle();
 		expect(requestedModels).toEqual([

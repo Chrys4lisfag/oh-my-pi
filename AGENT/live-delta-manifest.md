@@ -95,11 +95,21 @@ never assume commit count alone proves behavior survived.
 | `006b6c9b56` | active, runtime     | Per-provider `tls.rejectUnauthorized` opt-in, sync content-fingerprint-gated `models.yml` reload (same-mtime safe), zero-model cache gate with `online` hub hydration, hub reorder-key hint text |
 | `ae16aa41fc` | active, runtime     | `retry.quotaCooldownMs` for selector and credential quota cooldowns, advisor quarantine consults the fallback chain |
 | `0fbdee8dd6` | active, runtime     | `--no-mcp` launch flag, `busy_timeout`-before-WAL repair in two SQLite stores, browser-relay archiver fallback chain |
+| Source checkpoint (2026-09-21) | active, UI/runtime | Per-account `/usage`, Vercel DeepSeek effort precedence, and primary restore gated by 12 minutes plus fallback success or chain exhaustion |
 
 `PI_MCP_TIMING` is a live fork delta carried through merge commit history (reference
 `9a8062a7f`), so it does not appear in the non-merge ledger above.
 
 ## Active source map
+
+### Primary fallback restoration
+
+- `packages/coding-agent/src/session/turn-recovery.ts`
+- `packages/coding-agent/src/session/retry-fallback-chains.ts`
+  - restore only after twelve minutes and fallback success or chain exhaustion;
+    still honor suppression/never/pinned, and prevent wrap-around bypass
+- `packages/coding-agent/test/turn-recovery-replay-unsafe.test.ts`
+- `packages/coding-agent/test/agent-session-retry-fallback.test.ts`
 
 ### Provider/authentication
 
@@ -198,6 +208,11 @@ status-line model segment share configured-default availability only for the blo
 - `packages/coding-agent/src/config/settings-schema.ts`
 - `packages/coding-agent/src/config/settings.ts`
 - `packages/coding-agent/src/modes/controllers/command-controller.ts`
+- `packages/coding-agent/src/modes/components/usage-dashboard.ts`
+  - multi-account providers open Accounts view; `a` accounts, `o` overview, Enter classic details
+  - per-report identity/plan, independent quota percentages and reset times; no additional provider requests
+- `packages/coding-agent/test/usage-dashboard.test.ts`
+  - distinct account limits remain visible instead of their average; view navigation stays available
 - `packages/coding-agent/src/modes/controllers/selector-controller.ts`
   - applies live Memory Advisor reminder-interval changes by rebuilding advisors
   - refreshes the model registry before opening `/advisor configure`

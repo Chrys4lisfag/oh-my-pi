@@ -166,6 +166,43 @@ describe("UsageDashboardComponent", () => {
 	beforeAll(async () => {
 		await initTheme(false);
 	});
+	it("opens separate account limits instead of averaging a multi-account provider", () => {
+		const now = Date.now();
+		const first = report("openai-codex", "first@example.com", [
+			limit("openai-codex", "one", "5h", "5 hours", 0.9, "warning", now + 3_600_000),
+		]);
+		first.metadata = { email: "first@example.com", planType: "plus" };
+		const second = report("openai-codex", "second@example.com", [
+			limit("openai-codex", "two", "5h", "5 hours", 0.2, "ok", now + 7_200_000),
+		]);
+		second.metadata = { email: "second@example.com", planType: "pro" };
+		const component = new UsageDashboardComponent({
+			reports: [first, second],
+			renderDetail: () => "classic details",
+			loadActivity: async () => {},
+			requestRender: () => {},
+			onClose: () => {},
+		});
+		try {
+			const text = component.render(120).join("\n");
+			expect(text).toContain("Usage · Accounts");
+			expect(text).toContain("first@example.com · plan: plus");
+			expect(text).toContain("second@example.com · plan: pro");
+			expect(text).toContain("10% remaining");
+			expect(text).toContain("80% remaining");
+			expect(text).toContain("resets in");
+			expect(text).not.toContain("45% remaining");
+			component.handleInput("o");
+			expect(component.render(120).join("\n")).toContain("2 accts");
+			component.handleInput("a");
+			expect(component.render(120).join("\n")).toContain("first@example.com");
+			component.handleInput("\r");
+			expect(component.render(120).join("\n")).toContain("classic details");
+		} finally {
+			component.dispose();
+		}
+	});
+
 	it("renders specific error reason when activity loading fails instead of generic DB read error", async () => {
 		const { promise: rendered, resolve: markRendered } = Promise.withResolvers<void>();
 		const component = new UsageDashboardComponent({

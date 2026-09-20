@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, vi } from "bun:test";
 import type { AgentMessage, SyntheticToolResultDetails } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
@@ -116,6 +116,107 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 	afterAll(() => {
 		authStorage.close();
 		tempDir.removeSync();
+	});
+
+	it("requires twelve minutes and fallback success, preserving cooldown and never policy", async () => {
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!fallback) throw new Error("Missing fallback");
+		let now = Date.now();
+		const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+		let active = fallback;
+		const host = createHost(model, modelRegistry);
+		host.model = () => active;
+		host.sessionManager = { getSessionId: () => "gate-test", appendModelChange: () => {} } as never;
+		host.setModelWithProviderSessionReset = async next => {
+			active = next;
+		};
+		const recovery = new TurnRecovery(host, {
+			initialRetryFallback: {
+				role: "default",
+				originalSelector: `${model.provider}/${model.id}`,
+				originalThinkingLevel: undefined,
+			},
+		});
+		try {
+			await recovery.onAssistantSettledSuccessfully({ ...makeMessage([], fallback), stopReason: "stop" });
+			now += 12 * 60_000 - 1;
+			expect(await recovery.maybeRestoreRetryFallbackPrimary()).toBe(false);
+			now += 1;
+			host.settings.set("retry.fallbackRevertPolicy", "never");
+			expect(await recovery.maybeRestoreRetryFallbackPrimary()).toBe(false);
+			host.settings.set("retry.fallbackRevertPolicy", "cooldown-expiry");
+			modelRegistry.suppressSelector(`${model.provider}/${model.id}`, now + 1000);
+			expect(await recovery.maybeRestoreRetryFallbackPrimary()).toBe(false);
+			now += 1001;
+			expect(await recovery.maybeRestoreRetryFallbackPrimary()).toBe(true);
+			expect(active).toBe(modelRegistry.find(model.provider, model.id)!);
+		} finally {
+			clock.mockRestore();
+			modelRegistry.clearSuppressedSelectors();
+		}
+	});
+
+	it("does not count failed or aborted output as fallback success", async () => {
+		const host = createHost(model, modelRegistry);
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		host.sessionManager = { getSessionId: () => "failed-output-test" } as never;
+		let now = Date.now();
+		const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+		const recovery = new TurnRecovery(host, {
+			initialRetryFallback: {
+				role: "default",
+				originalSelector: "openai/gpt-4o-mini",
+				originalThinkingLevel: undefined,
+			},
+		});
+		try {
+			now += 13 * 60_000;
+			for (const stopReason of ["error", "aborted"] as const) {
+				await recovery.onAssistantSettledSuccessfully({
+					...makeMessage([{ type: "text", text: "partial" }], model),
+					stopReason,
+				});
+				expect(await recovery.maybeRestoreRetryFallbackPrimary()).toBe(false);
+			}
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
+	it("allows restoration after exhaustion only once twelve minutes have elapsed", async () => {
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!fallback) throw new Error("Missing fallback");
+		let now = Date.now();
+		const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+		let active = fallback;
+		const host = createHost(fallback, modelRegistry, {
+			fallbackChains: {
+				[`${model.provider}/${model.id}`]: [`${fallback.provider}/${fallback.id}`],
+			},
+		});
+		host.settings.set("retry.maxRetries", 0);
+		host.model = () => active;
+		host.agent = { state: { messages: [] }, replaceMessages: () => {} } as never;
+		host.sessionManager = { getSessionId: () => "exhaustion-test", appendModelChange: () => {} } as never;
+		host.setModelWithProviderSessionReset = async next => {
+			active = next;
+		};
+		const recovery = new TurnRecovery(host, {
+			initialRetryFallback: {
+				role: `${model.provider}/${model.id}`,
+				originalSelector: `${model.provider}/${model.id}`,
+				originalThinkingLevel: undefined,
+			},
+		});
+		try {
+			await recovery.handleRetryableError(makeMessage([], fallback));
+			expect(await recovery.maybeRestoreRetryFallbackPrimary()).toBe(false);
+			now += 12 * 60_000;
+			expect(await recovery.maybeRestoreRetryFallbackPrimary()).toBe(true);
+		} finally {
+			clock.mockRestore();
+			modelRegistry.clearSuppressedSelectors();
+		}
 	});
 
 	it("rolls back a usage fallback cancelled during model reconciliation", async () => {

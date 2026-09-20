@@ -329,6 +329,7 @@ export class TurnRecovery {
 				...options.initialRetryFallback,
 				lastAppliedFallbackThinkingLevel: host.configuredThinkingLevel(),
 				pinned: options.initialRetryFallback.pinned ?? false,
+				startedAt: Date.now(),
 			};
 			this.#markFallbackRouted();
 		}
@@ -432,6 +433,8 @@ export class TurnRecovery {
 	 * persisted errors.
 	 */
 	async onAssistantSettledSuccessfully(message: AssistantMessage): Promise<void> {
+		if (message.stopReason === "error" || message.stopReason === "aborted") return;
+		if (this.#activeRetryFallback && this.#fallbackRouted) this.#activeRetryFallback.succeeded = true;
 		if (!assistantTurnProducedOutput(message)) {
 			return;
 		}
@@ -1954,6 +1957,9 @@ export class TurnRecovery {
 		if (!candidate) {
 			throw new Error(`Retry fallback model not found: ${selector.raw}`);
 		}
+		// Original-model restoration is owned by the boundary gate below, never
+		// by a wrapping chain walk. Otherwise wrapAround bypasses the timer.
+		if (this.#isRetryFallbackPrimary(candidate)) return false;
 		const apiKey =
 			options?.apiKey ??
 			(await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId(), { signal: options?.signal }));
@@ -2008,9 +2014,11 @@ export class TurnRecovery {
 				originalThinkingLevel: currentThinkingLevel,
 				lastAppliedFallbackThinkingLevel: nextThinkingLevel,
 				pinned: options?.pinFallback === true,
+				startedAt: Date.now(),
 			};
 		} else {
 			this.#activeRetryFallback.lastAppliedFallbackThinkingLevel = nextThinkingLevel;
+			this.#activeRetryFallback.chainExhausted = false;
 			this.#activeRetryFallback.pinned = this.#activeRetryFallback.pinned || options?.pinFallback === true;
 		}
 		await this.#host.emitSessionEvent({
@@ -2084,6 +2092,10 @@ export class TurnRecovery {
 					skipped.push(`${selector.raw}: not in the model catalog`);
 					continue;
 				}
+				if (this.#isRetryFallbackPrimary(candidate)) {
+					skipped.push(`${selector.raw}: primary restoration deferred to turn boundary`);
+					continue;
+				}
 				if (options?.excludeProvider === candidate.provider) {
 					skipped.push(`${selector.raw}: same provider as the failure`);
 					continue;
@@ -2135,6 +2147,7 @@ export class TurnRecovery {
 			}
 		}
 
+		if (this.#activeRetryFallback) this.#activeRetryFallback.chainExhausted = true;
 		// Nothing switched. Name what was rejected and why: at a large context the
 		// usual cause is that every remaining entry has a smaller window, which no
 		// amount of retrying can fix (compaction or a bigger-window entry can).
@@ -2252,10 +2265,21 @@ export class TurnRecovery {
 		return true;
 	}
 
+	#isRetryFallbackPrimary(model: Model): boolean {
+		const original = this.#activeRetryFallback?.originalSelector;
+		if (!original) return false;
+		const resolved = resolveModelOverride([original], this.#host.modelRegistry, this.#host.settings).model;
+		return resolved !== undefined && formatModelStringWithRouting(resolved) === formatModelStringWithRouting(model);
+	}
+
 	async #maybeRestoreRetryFallbackPrimary(): Promise<boolean> {
 		if (!this.#activeRetryFallback) return false;
 		if (this.#activeRetryFallback.pinned) return false;
 		if (this.#getRetryFallbackRevertPolicy() !== "cooldown-expiry") return false;
+		// A slow failed request must not let a cooled primary steal the next hop.
+		// No sleeps: restore only at an existing continuation/user-prompt boundary.
+		if (Date.now() - this.#activeRetryFallback.startedAt < 12 * 60_000) return false;
+		if (!this.#activeRetryFallback.succeeded && !this.#activeRetryFallback.chainExhausted) return false;
 
 		const {
 			originalSelector: originalSelectorRaw,

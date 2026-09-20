@@ -111,6 +111,10 @@ Never edit generated catalog JSON for Venice.
     post-payload-hook assertions, and central serialized-fetch guard. Byte bodies
     (including CCH UTF-8 views) must be verified without silently dropping demand.
     Run `provider-no-log-contract.test.ts` after every transport merge.
+14. Preserve `/usage` Accounts view and automatic multi-account default. Keep every
+    report's identity/plan/window values distinct, reuse fetched reports, and retain
+    `a` accounts, `o` overview, Enter classic details, and scrolling. Run
+    `usage-dashboard.test.ts` and `issue-6767-usage-command-streaming.test.ts`.
 
 ### 6. Generated and optional files
 
@@ -316,6 +320,9 @@ git grep -n "handleProfilesCommand"
 git grep -n "setProfileItem"
 git grep -n "applyProfileToSession"
 git grep -n "onModelsUpdated"
+git grep -n 'a accounts · o overview' packages/coding-agent/src/modes/components/usage-dashboard.ts
+git grep -n 'card.accounts > 1' packages/coding-agent/src/modes/components/usage-dashboard.ts
+git grep -n 'opens separate account limits' packages/coding-agent/test/usage-dashboard.test.ts
 git grep -n "app.profile.cycle"
 git grep -n "setRoutingEnabled"
 git grep -n "routingDisabled"

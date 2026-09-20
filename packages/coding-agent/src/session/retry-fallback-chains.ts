@@ -49,6 +49,12 @@ export interface ActiveRetryFallbackState {
 	originalThinkingLevel: ConfiguredThinkingLevel | undefined;
 	lastAppliedFallbackThinkingLevel: ConfiguredThinkingLevel | undefined;
 	pinned: boolean;
+	/** First fallback activation; later hops must not restart this clock. */
+	startedAt: number;
+	/** A successful fallback response has completed during this activation. */
+	succeeded?: boolean;
+	/** The most recent chain walk found no eligible remaining fallback. */
+	chainExhausted?: boolean;
 	/**
 	 * Set once a turn on the fallback target settles successfully. Until then the
 	 * switch is only a routing decision — nothing has been produced by the new

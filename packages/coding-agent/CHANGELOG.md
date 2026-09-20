@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added an Accounts view to `/usage`, opening by default for multi-account providers so individual account identities, plans, quota windows, remaining percentages, and reset timers are visible rather than only an aggregate. Press `a` for accounts, `o` for overview, or Enter for classic details.
 - Added `discovery.baseUrl` for custom OpenAI-compatible providers whose `/models` catalog and inference traffic use different upstream routes; discovered models retain the provider inference URL, discovery queries are preserved, and caches are isolated by effective discovery endpoint.
 - Added `discovery.auth: none` for providers whose model catalog is public or rejects inference bearer credentials; inference keeps using the provider `apiKey`, discovery omits `Authorization`, and authenticated/anonymous catalogs have isolated caches.
 - Added per-provider `tls.rejectUnauthorized: false` for gateways serving an expired or self-signed certificate, which previously failed every request (and the `/models` probe) with `certificate has expired` unless the process-wide `NODE_TLS_REJECT_UNAUTHORIZED=0` disabled verification for first-party providers and OAuth flows too. The opt-in is scoped to one provider's discovery probe and inference requests, leaves an explicit caller `tls` (including the `NODE_EXTRA_CA_CERTS` bundle) intact, and logs a warning while active.
@@ -11,6 +12,7 @@
 
 ### Fixed
 
+- Fixed slow failed fallback requests restoring a cooled primary before the next candidate could run. Automatic restoration now requires 12 minutes plus a successful fallback response or exhausted chain, while retaining cooldown and never-return restrictions.
 - Fixed a model that failed after an earlier fallback still routing to the old chain's entries: a stale retry-fallback pin no longer outranks the failing model's own configured chain, so an exhausted chain stops instead of borrowing an unrelated one.
 - Fixed a provider that once answered with an empty model catalog staying at `0 models` for the whole cache TTL while `/models` claimed "Using cached model list from <age>. Press F5 to refresh." An empty cache row can serve nothing when the provider has no bundled catalog, so it is no longer treated as a usable cache; the hub hydrates with a live refresh (which also resurfaces a local endpoint that came back up), and a cached row with no models now says so instead of advertising a list it does not have.
 - Fixed compaction ending at the first exhausted provider instead of falling back. A summary rejected with a spend cap or rate limit (`429 ExceededBudget`, `budget_exceeded`) now advances to the next candidate; candidates include the models named by `retry.fallbackChains`, not just role assignments; and the final error reports the provider failure rather than a misleading credentials message. Spend-cap wording is also classified as a usage limit so it earns the quota cooldown instead of being retried against the same key.

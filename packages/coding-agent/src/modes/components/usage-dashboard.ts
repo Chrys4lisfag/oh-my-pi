@@ -1,9 +1,9 @@
 /**
  * Fullscreen `/usage` dashboard (the /settings idiom): mounted as an overlay
- * on the alternate screen so it takes no transcript space. Shows a compact
- * subscriptions grid (one card per provider, worst window per quota bucket)
- * above a GitHub-style daily activity heatmap fed by the local stats DB.
- * Enter flips into the classic full per-account report, scrollable in place.
+ * on the alternate screen so it takes no transcript space. Multi-account
+ * providers open in an account-by-account quota view. `o` shows the compact
+ * provider grid and activity heatmap; `a` returns to accounts; Enter opens the
+ * classic full report, scrollable in place.
  */
 import * as os from "node:os";
 import { resolveUsedFraction, type UsageLimit, type UsageReport } from "@oh-my-pi/pi-ai";
@@ -315,7 +315,7 @@ export class UsageDashboardComponent implements Component {
 	#options: UsageDashboardOptions;
 	#cards: ProviderCard[];
 	#nowMs: number;
-	#view: "overview" | "detail" = "overview";
+	#view: "overview" | "accounts" | "detail" = "overview";
 	#scroll = 0;
 	#activity: DailyActivityPoint[] | null = null;
 	#activityError: string | null = null;
@@ -329,6 +329,7 @@ export class UsageDashboardComponent implements Component {
 		this.#options = options;
 		this.#nowMs = Date.now();
 		this.#cards = buildProviderCards(options.reports, this.#nowMs);
+		if (this.#cards.some(card => card.accounts > 1)) this.#view = "accounts";
 		void this.#loadActivity();
 	}
 
@@ -545,6 +546,37 @@ export class UsageDashboardComponent implements Component {
 		return lines;
 	}
 
+	#accountLines(innerWidth: number): string[] {
+		const lines: string[] = [];
+		const clean = (value: string) => replaceTabs(sanitizeText(value)).replace(/[\r\n]+/g, " ");
+		for (const [index, report] of this.#options.reports.entries()) {
+			const meta = report.metadata ?? {};
+			const identity = [meta.email, meta.accountId, ...report.limits.map(limit => limit.scope.accountId)].find(
+				value => typeof value === "string" && value.length > 0,
+			);
+			const plan = typeof meta.planType === "string" ? ` · plan: ${clean(meta.planType)}` : "";
+			lines.push(theme.bold(truncateToWidth(formatProviderName(report.provider), innerWidth)));
+			lines.push(truncateToWidth(`${clean(String(identity ?? `account ${index + 1}`))}${plan}`, innerWidth));
+			if (report.limits.length === 0) lines.push(theme.fg("dim", "  No quota windows reported"));
+			for (const limit of report.limits) {
+				const fraction = resolveUsedFraction(limit);
+				const amount =
+					fraction === undefined
+						? (formatAbsoluteOnlyAmount([limit]) ?? "not reported")
+						: `${Math.max(0, Math.round((1 - fraction) * 100))}% remaining`;
+				const resetsAt = limit.window?.resetsAt;
+				const reset =
+					resetsAt !== undefined && resetsAt > this.#nowMs
+						? ` · resets in ${formatDuration(resetsAt - this.#nowMs)}`
+						: "";
+				lines.push(truncateToWidth(`  ${clean(formatLimitTitle(limit))}`, innerWidth));
+				lines.push(truncateToWidth(`    ${amount}${reset}`, innerWidth));
+			}
+			lines.push("");
+		}
+		return lines.length ? lines : ["No account usage data available."];
+	}
+
 	#detailLines(innerWidth: number): string[] {
 		if (this.#detailCache?.width !== innerWidth) {
 			this.#detailCache = { width: innerWidth, lines: this.#options.renderDetail(innerWidth).split("\n") };
@@ -556,7 +588,12 @@ export class UsageDashboardComponent implements Component {
 		const height = Math.max(14, process.stdout.rows || 40);
 		const innerWidth = Math.max(20, width - 4);
 
-		const contentSource = this.#view === "detail" ? this.#detailLines(innerWidth) : this.#overviewLines(innerWidth);
+		const contentSource =
+			this.#view === "detail"
+				? this.#detailLines(innerWidth)
+				: this.#view === "accounts"
+					? this.#accountLines(innerWidth)
+					: this.#overviewLines(innerWidth);
 		// Fixed chrome: top border, blank, content…, divider, hint, bottom border.
 		const contentRows = Math.max(5, height - 5);
 		this.#lastViewportRows = contentRows;
@@ -565,7 +602,8 @@ export class UsageDashboardComponent implements Component {
 
 		const latestFetchedAt = Math.max(0, ...this.#options.reports.map(report => report.fetchedAt ?? 0));
 		const checkedText = latestFetchedAt ? `checked ${formatDuration(this.#nowMs - latestFetchedAt)} ago` : "";
-		const title = this.#view === "detail" ? "Usage · Details" : "Usage";
+		const title =
+			this.#view === "detail" ? "Usage · Details" : this.#view === "accounts" ? "Usage · Accounts" : "Usage";
 
 		const out: string[] = [];
 		out.push(topBorder(width, title));
@@ -575,7 +613,7 @@ export class UsageDashboardComponent implements Component {
 		}
 		out.push(divider(width));
 		const scrollHint = maxScroll > 0 ? "↑/↓ scroll · " : "";
-		const hint = this.#view === "detail" ? `${scrollHint}Esc back` : `${scrollHint}↵ details · Esc close`;
+		const hint = `${scrollHint}a accounts · o overview · ↵ details · Esc ${this.#view === "overview" ? "close" : "back"}`;
 		out.push(row(theme.fg("dim", hint), width));
 		out.push(bottomBorder(width));
 		return out;
@@ -586,7 +624,7 @@ export class UsageDashboardComponent implements Component {
 		this.#options.requestRender();
 	}
 
-	#setView(view: "overview" | "detail"): void {
+	#setView(view: "overview" | "accounts" | "detail"): void {
 		this.#view = view;
 		this.#scroll = 0;
 		this.#options.requestRender();
@@ -603,7 +641,7 @@ export class UsageDashboardComponent implements Component {
 			return;
 		}
 		if (matchesSelectCancel(data) || matchesKey(data, "q")) {
-			if (this.#view === "detail") {
+			if (this.#view !== "overview") {
 				this.#setView("overview");
 				return;
 			}
@@ -611,10 +649,11 @@ export class UsageDashboardComponent implements Component {
 			this.#options.onClose();
 			return;
 		}
-		if (
-			this.#view === "overview" &&
-			(matchesKey(data, "return") || matchesKey(data, "tab") || matchesKey(data, "d"))
-		) {
+		if (matchesKey(data, "a") || matchesKey(data, "o")) {
+			this.#setView(matchesKey(data, "a") ? "accounts" : "overview");
+			return;
+		}
+		if (this.#view !== "detail" && (matchesKey(data, "return") || matchesKey(data, "tab") || matchesKey(data, "d"))) {
 			this.#setView("detail");
 			return;
 		}

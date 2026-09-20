@@ -9,7 +9,8 @@ provider "vercel-ai-gateway" {
 
 	// residue: the bare `deepseek/*` namespace rides the Anthropic route, whose
 	// ladder is the generic five-tier scale.
-	models "deepseek/*" {
+	// Transport-specific ladder outranks overlapping class model globs.
+	models "deepseek/*" priority=1 {
 		thinking-efforts "minimal" "low" "medium" "high" "xhigh"
 	}
 	class "anthropic" {
