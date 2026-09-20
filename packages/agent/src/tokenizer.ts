@@ -278,6 +278,7 @@ export class Tokenizer {
 				}
 				break;
 			}
+			case "custom":
 			case "hookMessage":
 			case "toolResult": {
 				if (typeof message.content === "string") {

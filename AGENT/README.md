@@ -144,9 +144,9 @@ be adopted without silently losing fork features.
   with `[oauth <email|accountId|projectId>]` before refusal handling. If the desired
   product behavior changes to retaining those turns, change code and this handbook
   together; do not “fix” it during a merge based only on memory.
-- `getIncrementalBackoffMs()` and `INCREMENTAL_BACKOFF_MS` currently have no caller.
-  They are dormant compatibility utilities, not proof that a 5s/15s/50s retry
-  schedule is active.
+- Unused `getIncrementalBackoffMs()`/`INCREMENTAL_BACKOFF_MS` exports were removed
+  during the 18.2.6 merge. No caller used their 5s/15s/50s schedule; do not restore
+  them as an assumed live retry contract.
 
 ## Rules for future merges
 

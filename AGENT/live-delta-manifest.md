@@ -208,10 +208,10 @@ status-line model segment share configured-default availability only for the blo
 - `packages/coding-agent/src/config/settings-schema.ts`
 - `packages/coding-agent/src/config/settings.ts`
 - `packages/coding-agent/src/modes/controllers/command-controller.ts`
-- `packages/coding-agent/src/modes/components/usage-dashboard.ts`
+- `packages/tui/src/overlays/usage-dashboard.ts`
   - multi-account providers open Accounts view; `a` accounts, `o` overview, Enter classic details
   - per-report identity/plan, independent quota percentages and reset times; no additional provider requests
-- `packages/coding-agent/test/usage-dashboard.test.ts`
+- `packages/tui/test/usage-dashboard.test.ts`
   - distinct account limits remain visible instead of their average; view navigation stays available
 - `packages/coding-agent/src/modes/controllers/selector-controller.ts`
   - applies live Memory Advisor reminder-interval changes by rebuilding advisors

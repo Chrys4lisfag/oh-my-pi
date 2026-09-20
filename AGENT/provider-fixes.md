@@ -191,11 +191,11 @@ so visible streamed content is never duplicated.
 
 ### Dormant incremental schedule
 
-The fork exports `INCREMENTAL_BACKOFF_MS = [5000, 15000, 50000, 50000]` and
-`getIncrementalBackoffMs` from `packages/ai/src/utils/retry-after.ts` through
-`packages/ai/src/index.ts`. No current caller uses either symbol. Do not claim this
-schedule is active, and do not preserve it at the expense of upstream architecture.
-Either wire it with a contract test or remove it in a deliberate cleanup.
+The dormant `INCREMENTAL_BACKOFF_MS`/`getIncrementalBackoffMs` exports were removed
+in the 18.2.6 upstream merge after confirming no caller. Their old
+`[5000, 15000, 50000, 50000]` schedule was never an active runtime contract.
+Preserve upstream retry-hint parsing and the fork's configurable quota cooldown,
+not these unused helpers.
 
 ## Commit references
 

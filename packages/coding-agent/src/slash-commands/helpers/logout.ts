@@ -1,15 +1,5 @@
+import type { LogoutAccount } from "@oh-my-pi/pi-tui/overlays/logout-account-selector";
 import type { OAuthAccountIdentity, StoredAuthCredential } from "../../session/auth-storage";
-
-export interface LogoutAccount {
-	credentialId: number;
-	provider: string;
-	label: string;
-	detail: string;
-	type: "api_key" | "oauth";
-	active: boolean;
-	/** True when this credential is disabled for request routing (kept for refresh/usage). */
-	routingDisabled: boolean;
-}
 
 interface LogoutAccountOptions {
 	activeIdentity?: OAuthAccountIdentity;

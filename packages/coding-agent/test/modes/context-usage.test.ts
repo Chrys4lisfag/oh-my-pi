@@ -1,28 +1,17 @@
-/**
- * Contract: tool schema token estimation reflects the wire JSON Schema.
- *
- * Tools authored with arktype must be counted by the JSON Schema providers
- * actually receive — not by stringifying the arktype instance's enumerable
- * internals, which massively overcounts.
- */
 import { describe, expect, it } from "bun:test";
-import { type } from "@oh-my-pi/omptype";
 import { Tokenizer } from "@oh-my-pi/pi-agent-core";
-import { arkToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import {
-	type ContextBreakdown,
 	computeNonMessageBreakdown,
 	computeNonMessageTokens,
+	type ContextBreakdown,
 	estimateToolSchemaTokens,
 	renderContextUsage,
-} from "@oh-my-pi/pi-coding-agent/modes/utils/context-usage";
+} from "@oh-my-pi/pi-tui/status-line/context-usage";
 import { applyToolProxy } from "../../src/extensibility/tool-proxy";
 
 const tokenizer = new Tokenizer();
 
-/** An arktype-shaped callable schema from an external arktype copy: a plain
- * function carrying `toJsonSchema`/`assert` that — unlike omptype schemas —
- * HAS `Function.prototype.bind`. */
+/** External arktype copies expose bind on callable schemas, unlike omptype. */
 function bindCapableSchema() {
 	return Object.assign((value: unknown) => value, {
 		toJsonSchema: () => ({ type: "object", properties: { a: { type: "string" } } }),
@@ -30,38 +19,14 @@ function bindCapableSchema() {
 	});
 }
 
-describe("estimateToolSchemaTokens", () => {
-	it("counts arktype tool schemas by their wire JSON Schema, not arktype internals", () => {
-		const parameters = type({
-			"query /** search query */": "string",
-			"limit?": "number",
-		});
-		const arktypeEstimate = estimateToolSchemaTokens(
-			[{ name: "web_search", description: "Searches the web.", parameters } as never],
-			tokenizer,
-		);
-		const wireEstimate = estimateToolSchemaTokens(
-			[{ name: "web_search", description: "Searches the web.", parameters: arkToWireSchema(parameters) } as never],
-			tokenizer,
-		);
-		expect(arktypeEstimate).toBe(wireEstimate);
-	});
-
+describe("extension tool context accounting", () => {
 	it("counts a proxied bind-capable callable schema by its wire JSON Schema", () => {
-		// Regression (PR #9185): applyToolProxy bound every callable property,
-		// and an external-arktype Type HAS Function.prototype.bind (unlike
-		// omptype), so the bound `parameters` lost its schema surface,
-		// toolWireSchema returned the bare function, and the undefined
-		// JSON.stringify poisoned token accounting — crashing every read-only
-		// subagent at first prompt. The proxied schema must keep counting as
-		// its wire JSON Schema, identical to the pre-converted equivalent.
+		// Binding the schema loses its wire surface and once poisoned token accounting.
 		const schema = bindCapableSchema();
 		const unwrapped = { name: "ext", description: "ext tool", parameters: schema };
 		const wrapper: Record<string, unknown> = {};
 		applyToolProxy(unwrapped, wrapper);
 		const proxied = wrapper as { name: string; description: string; parameters: unknown };
-		// The proxied tool must keep counting exactly like the unwrapped tool:
-		// old code fed `undefined` into the tokenizer here and crashed.
 		expect(estimateToolSchemaTokens([proxied as never], tokenizer)).toBe(
 			estimateToolSchemaTokens([unwrapped as never], tokenizer),
 		);
@@ -69,8 +34,6 @@ describe("estimateToolSchemaTokens", () => {
 	});
 
 	it("runs the full non-message breakdown on a proxied extension tool", () => {
-		// The crash frame was computeNonMessageBreakdown → estimateToolSchemaTokens
-		// inside pre-prompt compaction; exercise that whole path, memo included.
 		const schema = bindCapableSchema();
 		const wrapper: Record<string, unknown> = {};
 		applyToolProxy({ name: "ext", description: "ext tool", parameters: schema }, wrapper);

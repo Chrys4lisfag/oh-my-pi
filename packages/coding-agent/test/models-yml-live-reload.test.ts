@@ -11,11 +11,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { stripVTControlCharacters } from "node:util";
-import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-tui/theme/theme";
 import type { TUI } from "@oh-my-pi/pi-tui";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { ModelHubComponent } from "@oh-my-pi/pi-coding-agent/modes/components/model-hub";
+import { ModelHubComponent } from "@oh-my-pi/pi-tui/overlays/model-hub";
+import { createModelBrowserSource } from "@oh-my-pi/pi-coding-agent/modes/model-browser-source";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -82,7 +83,7 @@ describe("models.yml edits without restarting omp", () => {
 		await addSecondProvider();
 
 		const ui = { requestRender: vi.fn(), terminal: { rows: 40 } } as unknown as TUI;
-		const hub = new ModelHubComponent(ui, Settings.isolated({}), registry, [], {
+		const hub = new ModelHubComponent(ui, createModelBrowserSource(Settings.isolated({})), registry, [], {
 			onAssign: () => {},
 			onUnassign: () => {},
 			onLoginRequest: () => {},
@@ -114,7 +115,7 @@ describe("models.yml edits without restarting omp", () => {
 		expect(fs.statSync(modelsYml).mtimeMs).toBe(before.mtimeMs);
 
 		const ui = { requestRender: vi.fn(), terminal: { rows: 40 } } as unknown as TUI;
-		const hub = new ModelHubComponent(ui, Settings.isolated({}), registry, [], {
+		const hub = new ModelHubComponent(ui, createModelBrowserSource(Settings.isolated({})), registry, [], {
 			onAssign: () => {},
 			onUnassign: () => {},
 			onLoginRequest: () => {},

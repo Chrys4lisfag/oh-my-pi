@@ -59,8 +59,14 @@ function createHost(
 			settings.setModelRole(role, selector);
 		}
 	}
+	const agentState = { messages: options.messages ?? [] };
 	return {
-		agent: { state: { messages: options.messages ?? [] } } as never,
+		agent: {
+			state: agentState,
+			replaceMessages(messages: AgentMessage[]) {
+				agentState.messages = messages;
+			},
+		} as never,
 		sessionManager: {
 			getLastModelChangeRole: () => options.lastModelChangeRole,
 		} as never,
@@ -81,6 +87,7 @@ function createHost(
 		abortInProgress: () => false,
 		streamingEditAbortTriggered: () => false,
 		promptGeneration: () => 0,
+		promptSequence: () => 0,
 		sessionId: () => "test-session",
 		emitSessionEvent: async () => {},
 		scheduleAgentContinue: () => {},
@@ -88,10 +95,13 @@ function createHost(
 		appendSessionMessage: () => {},
 		sessionMessageAlreadyPersisted: () => false,
 		setModelWithProviderSessionReset: async () => {},
+		resolveActiveEditMode: () => "hashline",
+		syncAfterModelChange: async () => {},
 		resetCurrentResponsesProviderSession: () => {},
 		maybeAutoRedeemCodexReset: async () => false,
 		runAutoCompaction: async () =>
 			({ deferredHandoff: false, continuationScheduled: false }) as RecoveryCompactionResult,
+		shakeForRequestBodyReadTimeout: async () => false,
 		withBashBranchTransition: <T>(operation: () => T): T => operation(),
 	};
 }
@@ -110,7 +120,8 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 		// Live-role resolution (#liveRetryRoleHint) filters by provider auth;
 		// pin a runtime key so the test does not depend on host env credentials.
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+		const modelRegistrySettings = Settings.isolated();
+		modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"), { settings: modelRegistrySettings });
 	});
 
 	afterAll(() => {
@@ -153,6 +164,99 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 		} finally {
 			clock.mockRestore();
 			modelRegistry.clearSuppressedSelectors();
+		}
+	});
+
+	it("keeps the first activation deadline and success across later fallback hops", async () => {
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		const nextFallback = getBundledModel("google", "gemini-2.5-flash");
+		if (!fallback || !nextFallback) throw new Error("Missing fallback models");
+		let now = Date.now();
+		const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+		let active = model;
+		const host = createHost(model, modelRegistry);
+		host.model = () => active;
+		host.sessionManager = { getSessionId: () => "first-activation-test", appendModelChange: () => {} } as never;
+		host.setModelWithProviderSessionReset = async next => {
+			active = next;
+		};
+		const recovery = new TurnRecovery(host);
+		try {
+			expect(
+				await recovery.applyRetryFallbackCandidate(
+					"default",
+					{
+						raw: `${fallback.provider}/${fallback.id}`,
+						provider: fallback.provider,
+						id: fallback.id,
+						thinkingLevel: undefined,
+					},
+					`${active.provider}/${active.id}`,
+					{ apiKey: "test-key" },
+				),
+			).toBe(true);
+			await recovery.onAssistantSettledSuccessfully({ ...makeMessage([], active), stopReason: "stop" });
+			now += 6 * 60_000;
+			expect(
+				await recovery.applyRetryFallbackCandidate(
+					"default",
+					{
+						raw: `${nextFallback.provider}/${nextFallback.id}`,
+						provider: nextFallback.provider,
+						id: nextFallback.id,
+						thinkingLevel: undefined,
+					},
+					`${active.provider}/${active.id}`,
+					{ apiKey: "test-key" },
+				),
+			).toBe(true);
+			now += 6 * 60_000 - 1;
+			expect(await recovery.maybeRestoreRetryFallbackPrimary()).toBe(false);
+			now += 1;
+			expect(await recovery.maybeRestoreRetryFallbackPrimary()).toBe(true);
+			expect(active.provider).toBe(model.provider);
+			expect(active.id).toBe(model.id);
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
+	it("does not let a wrapped candidate bypass primary restoration even without an available-model match", async () => {
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!fallback) throw new Error("Missing fallback");
+		const primarySelector = `${model.provider}/${model.id}`;
+		const fallbackSelector = `${fallback.provider}/${fallback.id}`;
+		const host = createHost(fallback, modelRegistry, {
+			fallbackChains: { [primarySelector]: [fallbackSelector] },
+		});
+		host.sessionManager = { getSessionId: () => "wrapped-primary-test", appendModelChange: () => {} } as never;
+		const setModel = vi.fn(async () => {});
+		host.setModelWithProviderSessionReset = setModel;
+		const recovery = new TurnRecovery(host, {
+			initialRetryFallback: {
+				role: primarySelector,
+				originalSelector: primarySelector,
+				originalThinkingLevel: undefined,
+			},
+		});
+		const candidates = recovery.findRetryFallbackCandidates(primarySelector, fallbackSelector, fallback, {
+			wrapAround: true,
+		});
+		const wrappedPrimary = candidates.find(candidate => candidate.raw === primarySelector);
+		if (!wrappedPrimary) throw new Error("Expected wrapped primary candidate");
+		const available = vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([model]);
+		try {
+			for (const models of [[model], []]) {
+				available.mockReturnValue(models);
+				expect(
+					await recovery.applyRetryFallbackCandidate(primarySelector, wrappedPrimary, fallbackSelector, {
+						apiKey: "test-key",
+					}),
+				).toBe(false);
+				expect(setModel).not.toHaveBeenCalled();
+			}
+		} finally {
+			available.mockRestore();
 		}
 	});
 
@@ -377,13 +481,48 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 		expect(recovery.isRetryableError(message)).toBe(true);
 	});
 
+	it("keeps visible partial output when the full-replay timeout recovery is vetoed", async () => {
+		const message = {
+			...makeMessage([{ type: "text", text: "Visible partial answer" }], model),
+			api: "openai-responses" as const,
+			errorStatus: 408,
+			errorMessage: "Timed out reading request body.",
+			requestBodyReadTimeoutFullReplay: true,
+		};
+		const host = createHost(model, modelRegistry, { messages: [message] });
+		const recovery = new TurnRecovery(host);
+		expect(await recovery.handleResponsesRequestBodyReadTimeout(message)).toBe("handled-terminal");
+		expect(host.agent.state.messages).toContain(message);
+	});
+
+	it("keeps tool-call output when the full-replay timeout recovery is vetoed", async () => {
+		const message = {
+			...makeMessage([{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "pwd" } }], model),
+			api: "openai-responses" as const,
+			errorStatus: 408,
+			errorMessage: "Timed out reading request body.",
+			requestBodyReadTimeoutFullReplay: true,
+		};
+		const host = createHost(model, modelRegistry, { messages: [message] });
+		const recovery = new TurnRecovery(host);
+		expect(await recovery.handleResponsesRequestBodyReadTimeout(message)).toBe("handled-terminal");
+		expect(host.agent.state.messages).toContain(message);
+	});
+
+	it("ignores a stale full-replay marker on an aborted turn", async () => {
+		const message = {
+			...makeMessage([], model),
+			api: "openai-responses" as const,
+			stopReason: "aborted" as const,
+			errorStatus: 408,
+			errorMessage: "Timed out reading request body.",
+			requestBodyReadTimeoutFullReplay: true,
+		};
+		const recovery = new TurnRecovery(createHost(model, modelRegistry, { messages: [message] }));
+		expect(await recovery.handleResponsesRequestBodyReadTimeout(message)).toBe("not-applicable");
+	});
+
 	it("moves a long OpenCode Go usage limit to the chain after committed text", () => {
-		// CONTRACT CHANGE: committed TEXT no longer blocks recovery. Most turns
-		// emit something before a provider fails, so vetoing on text ended the
-		// work on a dead route with healthy fallback entries unused. Recovery for
-		// these is switch-only (no same-model replay), so the cost is a
-		// duplicated partial answer, never repeated work. Tool calls, images and
-		// server-tool blocks still veto — see the side-effect cases below.
 		const openCodeModel = getBundledModel("opencode-go", "deepseek-v4-flash");
 		if (!openCodeModel) throw new Error("Expected bundled OpenCode Go model");
 		const recovery = new TurnRecovery(

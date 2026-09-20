@@ -74,7 +74,7 @@ Primary implementation:
 - `packages/catalog/src/model-manager.ts`
 - `packages/coding-agent/src/config/model-provider-discovery.ts`
 - `packages/coding-agent/src/config/model-registry.ts`
-- `packages/coding-agent/src/modes/components/model-hub.ts`
+- `packages/tui/src/overlays/model-hub.ts`
 
 Regression coverage:
 

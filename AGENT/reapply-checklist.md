@@ -234,7 +234,7 @@ registry records (`overrides.set(providerName, {…})` and
 `#providerDiscoveryContext(providerConfig)`, NOT the bare `#discoveryContext()` —
 the `/models` probe is where an untrusted certificate surfaces first.
 
-### `packages/coding-agent/src/modes/components/model-hub.ts`
+### `packages/tui/src/overlays/model-hub.ts`
 
 Keep the fork's `awaitBackgroundRefresh` ordering, the hidden/re-probed
 provider sets and `#initialRegistrySync` — but hydrate with upstream's
@@ -320,9 +320,9 @@ git grep -n "handleProfilesCommand"
 git grep -n "setProfileItem"
 git grep -n "applyProfileToSession"
 git grep -n "onModelsUpdated"
-git grep -n 'a accounts · o overview' packages/coding-agent/src/modes/components/usage-dashboard.ts
-git grep -n 'card.accounts > 1' packages/coding-agent/src/modes/components/usage-dashboard.ts
-git grep -n 'opens separate account limits' packages/coding-agent/test/usage-dashboard.test.ts
+git grep -n 'a accounts · o overview' packages/tui/src/overlays/usage-dashboard.ts
+git grep -n 'card.accounts > 1' packages/tui/src/overlays/usage-dashboard.ts
+git grep -n 'opens separate account limits' packages/tui/test/usage-dashboard.test.ts
 git grep -n "app.profile.cycle"
 git grep -n "setRoutingEnabled"
 git grep -n "routingDisabled"
@@ -345,9 +345,9 @@ git grep -n "sessionProfile" packages/coding-agent/src/sdk.ts packages/coding-ag
 git grep -n "profileSnapshot\|loadedExistingSession" packages/coding-agent/src/session/session-manager.ts
 git grep -n "bindSessionToProfile\|captureTerminalProfileActivation" packages/coding-agent/src/config/settings.ts
 git grep -n "shouldWrite = true" packages/coding-agent/src/config/settings.ts
-git grep -n "reprobeHiddenOptionalProviders\|initialRegistrySync" packages/coding-agent/src/modes/components/model-hub.ts
+git grep -n "reprobeHiddenOptionalProviders\|initialRegistrySync" packages/tui/src/overlays/model-hub.ts
 git grep -n "cacheCanServeModels" packages/catalog/src/model-manager.ts
-git grep -n "No models cached for this provider" packages/coding-agent/src/modes/components/model-hub.ts
+git grep -n "No models cached for this provider" packages/tui/src/overlays/model-hub.ts
 git grep -n "discovery.baseUrl\|injectV1" packages/coding-agent/src/config/model-discovery.ts packages/coding-agent/src/config/models-config-schema-bundle.ts
 git grep -n "attemptedAt" packages/coding-agent/src/config/model-provider-discovery.ts
 git grep -n "fetched" packages/catalog/src/model-manager.ts
@@ -358,13 +358,13 @@ git grep -n "reanchorTryShakeCheckpoint" packages/coding-agent/src/session/sessi
 git grep -n "retryFallbackChainModels" packages/coding-agent/src/session
 git grep -n "exhaustedFailure" packages/coding-agent/src/session/session-maintenance.ts
 git grep -n "exceededbudget" packages/ai/src/error/rate-limit.ts
-git grep -n "or \] reorder" packages/coding-agent/src/modes/components/model-hub.ts
+git grep -n "or \] reorder" packages/tui/src/overlays/model-hub.ts
 git grep -n "withInsecureTlsInit" packages/utils/src/tls-fetch.ts packages/ai/src/utils/transport-fetch.ts
 git grep -n "wrapFetchForInsecureTls" packages/utils/src/tls-fetch.ts packages/coding-agent/src/config/model-registry.ts
 git grep -n "model.tls" packages/ai/src/utils/transport-fetch.ts
 git grep -n "tls" packages/catalog/src/types.ts packages/coding-agent/src/config/model-patch.ts
 git grep -n "providerDiscoveryContext" packages/coding-agent/src/config/model-registry.ts
-git grep -n "reloadConfigFromDisk" packages/coding-agent/src/config/model-registry.ts packages/coding-agent/src/modes/components/model-hub.ts
+git grep -n "reloadConfigFromDisk" packages/coding-agent/src/config/model-registry.ts packages/tui/src/overlays/model-hub.ts
 git grep -n "retry.quotaCooldownMs" packages/coding-agent/src
 git grep -n "DEFAULT_QUOTA_EXHAUSTED_BACKOFF_MS" packages/ai/src/error/rate-limit.ts
 git grep -n "refusalModelsTried" packages/coding-agent/src/advisor/runtime.ts

@@ -3,8 +3,8 @@ import { type Api, Effort, type Model, type ModelSpec } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { resolveModelOverride } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { resolveAdvisorPickerModels } from "@oh-my-pi/pi-coding-agent/modes/components/advisor-config";
-import { buildBrowserItems } from "@oh-my-pi/pi-coding-agent/modes/components/model-browser";
+import { resolveAdvisorPickerModels } from "@oh-my-pi/pi-tui/overlays/advisor-config";
+import { buildBrowserItems } from "@oh-my-pi/pi-tui/overlays/model-browser";
 
 function model(provider: string, id: string, name = id): Model<Api> {
 	return buildModel({
