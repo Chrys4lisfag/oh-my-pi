@@ -82,6 +82,41 @@ describe("AgentSession.newSession boundary", () => {
 		}
 	});
 
+	it("rejects a persistence failure before resetting active agent messages", async () => {
+		const { agent, session, sessionManager } = await createHarness();
+		agent.replaceMessages([{ role: "user", content: "keep this conversation", timestamp: 1 }]);
+		const previousId = session.sessionId;
+		const reset = spyOn(agent, "reset");
+		const flush = spyOn(sessionManager, "flush").mockRejectedValue(new Error("Session file changed before rewrite"));
+		try {
+			await expect(session.newSession()).rejects.toThrow("Session file changed before rewrite");
+			expect(reset).not.toHaveBeenCalled();
+			expect(agent.state.messages).toHaveLength(1);
+			expect(session.sessionId).toBe(previousId);
+		} finally {
+			flush.mockRestore();
+			reset.mockRestore();
+		}
+	});
+	it("preserves messages if the final outgoing flush fails after preflight", async () => {
+		const { agent, session, sessionManager } = await createHarness();
+		agent.replaceMessages([{ role: "user", content: "keep late-conflict conversation", timestamp: 1 }]);
+		const previousId = session.sessionId;
+		const reset = spyOn(agent, "reset");
+		const flush = spyOn(sessionManager, "flush")
+			.mockResolvedValueOnce(undefined)
+			.mockRejectedValue(new Error("Session file changed before rewrite"));
+		try {
+			await expect(session.newSession()).rejects.toThrow("Session file changed before rewrite");
+			expect(reset).not.toHaveBeenCalled();
+			expect(agent.state.messages).toHaveLength(1);
+			expect(session.sessionId).toBe(previousId);
+		} finally {
+			flush.mockRestore();
+			reset.mockRestore();
+		}
+	});
+
 	it("invalidates a primed append-only context so pre-/new bytes never reach the next turn", async () => {
 		const { agent, session } = await createHarness();
 		const appendOnlyContext = new AppendOnlyContextManager();

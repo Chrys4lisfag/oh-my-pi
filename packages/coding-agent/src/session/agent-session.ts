@@ -8474,6 +8474,10 @@ export class AgentSession {
 			}
 		}
 
+		// Fail before disconnecting/resetting live state if outgoing persistence
+		// cannot be committed. In particular, never clear the visible transcript
+		// merely because a guarded rewrite conflicts with another writer.
+		if (!options?.drop) await this.sessionManager.flush();
 		this.#disconnectFromAgent();
 		let advisorRecordersDetached = false;
 		await this.abort();
@@ -8486,9 +8490,6 @@ export class AgentSession {
 			advisorRecordersDetached = true;
 			await this.#advisors.drainAndDetachRecorders();
 			try {
-				this.#releaseQueuedTtsrReservations();
-				this.agent.reset();
-				this.tokenRate.reset();
 				if (options?.drop && previousSessionFile) {
 					try {
 						await this.sessionManager.dropSession(previousSessionFile);
@@ -8502,6 +8503,9 @@ export class AgentSession {
 					...options,
 					additionalDirectories: this.settings.get("workspace.additionalDirectories"),
 				});
+				this.#releaseQueuedTtsrReservations();
+				this.agent.reset();
+				this.tokenRate.reset();
 				this.#bash.markSessionTransition(bashTransition);
 				// The new session owns the transcript from here, so the previous
 				// conversation's advisor spend is retired with it. Clearing at the commit
@@ -8568,6 +8572,7 @@ export class AgentSession {
 
 			return true;
 		} finally {
+			if (!sessionTransitioned) this.#reconnectToAgent();
 			if (advisorRecordersDetached) {
 				if (sessionTransitioned) this.#advisors.resetSessionState();
 				else this.#advisors.reattachRecorderFeeds();

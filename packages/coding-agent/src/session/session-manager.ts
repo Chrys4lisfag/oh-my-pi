@@ -98,6 +98,7 @@ import {
 	MemorySessionStorage,
 	type SessionStorage,
 	type SessionStorageWriter,
+	SessionWriteConflictError,
 } from "./session-storage";
 import { type SessionTitleUpdate, serializeTitleSlot } from "./session-title-slot";
 import {
@@ -3142,14 +3143,51 @@ export class SessionManager {
 		const nextSnapshot = name ? (snapshot ? structuredClone(snapshot) : this.#sessionProfileSnapshot) : undefined;
 		if (this.getSessionProfile() === name && Bun.deepEquals(this.#sessionProfileSnapshot, nextSnapshot)) return;
 
+		// A metadata-only update must not poison an otherwise appendable session
+		// when another terminal grew its transcript. Retain the byte-size CAS;
+		// never overwrite/rebase unseen turns merely to stamp profile identity.
+		const previousProfile = this.#sessionProfile;
+		const previousSnapshot = this.#sessionProfileSnapshot;
+		const previousHeader = { ...this.#header };
+		const previousCurrent = this.#fileIsCurrent;
+		const previousRewriteRequired = this.#rewriteRequired;
+		const previousDiskFailure = this.#diskFailure;
+		const epoch = this.#diskEpoch;
+		const entryCount = this.#entries.length;
+		const expectedSize = this.#expectedDiskSize;
 		this.#sessionProfile = name;
 		this.#sessionProfileSnapshot = nextSnapshot;
 		this.#header.profile = name;
 		this.#header.profileSnapshot = nextSnapshot ? structuredClone(nextSnapshot) : undefined;
-		if (this.#persist && this.#sessionFile && this.#shouldHaveSessionFile() && !this.#released) {
-			this.#fileIsCurrent = false;
-			this.#rewriteRequired = true;
-			await this.#rewriteAtomically();
+		try {
+			if (this.#persist && this.#sessionFile && this.#shouldHaveSessionFile() && !this.#released) {
+				this.#fileIsCurrent = false;
+				this.#rewriteRequired = true;
+				await this.#rewriteAtomically();
+			}
+		} catch (error) {
+			if (
+				error instanceof SessionWriteConflictError &&
+				!previousDiskFailure &&
+				previousCurrent &&
+				!previousRewriteRequired &&
+				this.#sessionProfile === name &&
+				this.#sessionProfileSnapshot === nextSnapshot &&
+				this.#diskFailure === error &&
+				this.#diskEpoch === epoch &&
+				this.#entries.length === entryCount &&
+				this.#expectedDiskSize === expectedSize
+			) {
+				// Publish was rejected before touching disk and no local transcript
+				// mutation raced us. Roll back only this failed metadata transaction.
+				this.#sessionProfile = previousProfile;
+				this.#sessionProfileSnapshot = previousSnapshot;
+				this.#header = previousHeader;
+				this.#fileIsCurrent = previousCurrent;
+				this.#rewriteRequired = previousRewriteRequired;
+				this.#clearDiskError();
+			}
+			throw error;
 		}
 	}
 

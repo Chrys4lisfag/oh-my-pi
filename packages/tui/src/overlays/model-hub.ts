@@ -108,7 +108,7 @@ export interface ModelHubRegistry extends ModelBrowserRegistry {
 	refreshProvider(
 		provider: string,
 		strategy: "online",
-		options?: { refreshCommandCredentials?: boolean },
+		options?: { refreshCommandCredentials?: boolean; catalogOnly?: boolean },
 	): Promise<void>;
 	/** Reload host-owned model config without network discovery. */
 	reloadConfigFromDisk?(): boolean;
@@ -306,6 +306,8 @@ export class ModelHubComponent implements Component {
 	#pendingCredentialRefreshProviders = new Set<string>();
 	#refreshSpinnerFrame = 0;
 	#refreshSpinnerInterval?: Timer;
+	#allProviderRefresh: { completed: number; total: number } | undefined;
+	#registrySyncTimer?: Timer;
 	#unsubscribeModelsUpdated?: () => void;
 	#initialRegistrySync: Promise<void> = Promise.resolve();
 	#emptyProviderRetryTimer?: Timer;
@@ -364,6 +366,10 @@ export class ModelHubComponent implements Component {
 		this.#browser.onQueryChange = query => this.#onQueryChanged(query);
 		this.#unsubscribeModelsUpdated = this.#registry.onModelsUpdated?.(() => {
 			if (this.#disposed) return;
+			if (this.#allProviderRefresh) {
+				this.#scheduleRegistrySync();
+				return;
+			}
 			const updatedProviders = new Set([...this.#refreshingProviders, ...this.#scheduledProviderRefreshes.keys()]);
 			for (const providerId of updatedProviders) {
 				const previousCount =
@@ -427,6 +433,8 @@ export class ModelHubComponent implements Component {
 	/** Cancel pending provider refresh timers and the spinner. Host calls this on overlay close. */
 	dispose(): void {
 		this.#disposed = true;
+		clearTimeout(this.#registrySyncTimer);
+		this.#registrySyncTimer = undefined;
 		this.#unsubscribeModelsUpdated?.();
 		this.#unsubscribeModelsUpdated = undefined;
 		for (const [, timer] of this.#scheduledProviderRefreshes) clearTimeout(timer);
@@ -459,6 +467,21 @@ export class ModelHubComponent implements Component {
 	#reloadRoles(autoCandidates: ReadonlyArray<Model>): void {
 		const allModels = this.#scopedModels.length > 0 ? autoCandidates : this.#registry.getAll("all");
 		this.#roles = resolveRoleAssignments(this.#settings, allModels, autoCandidates);
+	}
+
+	/** Coalesce bulk discovery notifications; never rebuild the full list inline. */
+	#scheduleRegistrySync(): void {
+		if (this.#disposed || this.#registrySyncTimer) return;
+		this.#registrySyncTimer = setTimeout(() => {
+			this.#registrySyncTimer = undefined;
+			if (this.#disposed) return;
+			try {
+				this.#syncFromRegistryState();
+			} catch (error) {
+				this.#configError = error instanceof Error ? error.message : String(error);
+			}
+			this.#tui.requestRender();
+		}, 250);
 	}
 
 	/** Rebuild items, roles, and the sidebar from the registry's in-memory state. */
@@ -899,7 +922,7 @@ export class ModelHubComponent implements Component {
 	}
 
 	#scheduleEmptyProviderRetry(): void {
-		if (this.#disposed || this.#emptyProviderRetryTimer) return;
+		if (this.#disposed || this.#emptyProviderRetryTimer || this.#allProviderRefresh) return;
 		const discoverable = new Set(this.#registry.getDiscoverableProviders());
 		const populated = new Set(this.#registry.getAll("all").map(model => model.provider));
 		const now = Date.now();
@@ -924,7 +947,7 @@ export class ModelHubComponent implements Component {
 	}
 
 	async #refreshEmptyProvidersInBackground(): Promise<void> {
-		if (this.#disposed || this.#scopedModels.length > 0) return;
+		if (this.#disposed || this.#scopedModels.length > 0 || this.#allProviderRefresh) return;
 		const discoverable = new Set(this.#registry.getDiscoverableProviders());
 		const populated = new Set(this.#registry.getAll("all").map(model => model.provider));
 		const now = Date.now();
@@ -988,7 +1011,8 @@ export class ModelHubComponent implements Component {
 					// Provider discovery state carries the actionable error when available.
 				} finally {
 					this.#finishProviderRefresh(providerId);
-					if (!this.#disposed) {
+					if (this.#allProviderRefresh) this.#scheduleRegistrySync();
+					else if (!this.#disposed) {
 						this.#syncFromRegistryState();
 						this.#tui.requestRender();
 					}
@@ -1004,6 +1028,57 @@ export class ModelHubComponent implements Component {
 	// ═══════════════════════════════════════════════════════════════════════
 	// Provider discovery refresh
 	// ═══════════════════════════════════════════════════════════════════════
+
+	async #refreshAllProvidersInBackground(): Promise<void> {
+		if (this.#disposed || this.#scopedModels.length > 0 || this.#allProviderRefresh) return;
+		const batch = { completed: 0, total: 0 };
+		this.#allProviderRefresh = batch;
+		try {
+			await this.#initialRegistrySync;
+			if (this.#disposed) return;
+			this.#registry.reloadConfigFromDisk?.();
+			this.#syncFromRegistryState();
+			const providers = [
+				...new Set(
+					this.#entries
+						.filter(entry => entry.kind === "provider" && !entry.locked && entry.providerId)
+						.map(entry => entry.providerId!),
+				),
+			];
+			batch.total = providers.length;
+			this.#cancelScheduledRefreshesExcept();
+			let cursor = 0;
+			const worker = async () => {
+				while (!this.#disposed) {
+					const providerId = providers[cursor++];
+					if (!providerId) return;
+					// Join an existing refresh; bulk refresh never remints credentials.
+					while (this.#refreshingProviders.has(providerId)) {
+						if (this.#disposed) return;
+						await Bun.sleep(10);
+					}
+					if (this.#disposed) return;
+					this.#setProviderRefreshing(providerId, true);
+					await this.#refreshProviderInBackground(providerId, true, false, true);
+					batch.completed++;
+					if (!this.#disposed) this.#tui.requestRender();
+					// Resolved promises/cache hits must not monopolize the microtask queue.
+					await Bun.sleep(0);
+				}
+			};
+			this.#tui.requestRender();
+			await Promise.all(
+				Array.from({ length: Math.min(EMPTY_PROVIDER_REFRESH_CONCURRENCY, providers.length) }, worker),
+			);
+		} catch (error) {
+			if (!this.#disposed) this.#configError = error instanceof Error ? error.message : String(error);
+		} finally {
+			this.#allProviderRefresh = undefined;
+			this.#scheduleRegistrySync();
+			this.#scheduleEmptyProviderRetry();
+			if (!this.#disposed) this.#tui.requestRender();
+		}
+	}
 
 	#startRefreshSpinner(): void {
 		if (this.#refreshSpinnerInterval) return;
@@ -1086,7 +1161,12 @@ export class ModelHubComponent implements Component {
 		this.#scheduledProviderRefreshes.set(providerId, timer);
 	}
 
-	async #refreshProviderInBackground(providerId: string, force: boolean, providerWasEmpty: boolean): Promise<void> {
+	async #refreshProviderInBackground(
+		providerId: string,
+		force: boolean,
+		providerWasEmpty: boolean,
+		catalogOnly = false,
+	): Promise<void> {
 		let acquired = false;
 		try {
 			await this.#initialRegistrySync;
@@ -1115,16 +1195,26 @@ export class ModelHubComponent implements Component {
 			this.#providerRefreshState.providerRefreshesInFlight.add(providerId);
 			activeProviderRefreshCount += 1;
 			acquired = true;
-			if (force) {
+			if (catalogOnly) {
+				await this.#registry.refreshProvider(providerId, "online", { catalogOnly: true });
+			} else if (force) {
 				await this.#registry.refreshProvider(providerId, "online", { refreshCommandCredentials: true });
 			} else {
 				await this.#registry.refreshProvider(providerId, "online");
 			}
-			if (!this.#disposed) this.#syncFromRegistryState();
+			if (catalogOnly || this.#allProviderRefresh) this.#scheduleRegistrySync();
+			else if (!this.#disposed) this.#syncFromRegistryState();
 		} catch (error) {
 			this.#configError = error instanceof Error ? error.message : String(error);
 		} finally {
-			if (acquired) this.#finishProviderRefresh(providerId);
+			if (acquired) {
+				if (catalogOnly) {
+					// Manual batch must not change the automatic empty-provider budget.
+					if (this.#providerRefreshState.providerRefreshesInFlight.delete(providerId)) {
+						activeProviderRefreshCount = Math.max(0, activeProviderRefreshCount - 1);
+					}
+				} else this.#finishProviderRefresh(providerId);
+			}
 			this.#setProviderRefreshing(providerId, false);
 			if (!this.#disposed && this.#pendingCredentialRefreshProviders.delete(providerId)) {
 				this.#setProviderRefreshing(providerId, true);
@@ -1859,7 +1949,9 @@ export class ModelHubComponent implements Component {
 			return;
 		}
 		if (matchesKey(data, "f5")) {
-			if (entry.kind === "provider" && !entry.locked) {
+			if (entry.kind === "all") {
+				void this.#refreshAllProvidersInBackground();
+			} else if (entry.kind === "provider" && !entry.locked) {
 				this.#scheduleProviderRefresh(entry.providerId ?? "", { force: true });
 			}
 			return;
@@ -2637,7 +2729,16 @@ export class ModelHubComponent implements Component {
 			return entry.oauth ? "Enter log in · ↑/↓ providers · Esc close" : "↑/↓ providers · Esc close";
 		}
 		const arrows = this.#focus === "scope" ? "↑/↓ providers · → models" : "↑/↓ models · ← providers";
-		const refresh = entry.kind === "provider" ? " · F5 refresh" : "";
+		const batch = this.#allProviderRefresh;
+		const refresh = batch
+			? ` · Refreshing providers ${batch.completed}/${batch.total}`
+			: this.#scopedModels.length > 0
+				? ""
+				: entry.kind === "all"
+					? " · F5 refresh all providers"
+					: entry.kind === "provider"
+						? " · F5 refresh"
+						: "";
 		return `Enter assign roles · ${arrows} · type to search · Alt+←/→ kind${refresh} · Esc close`;
 	}
 

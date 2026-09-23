@@ -96,6 +96,7 @@ never assume commit count alone proves behavior survived.
 | `ae16aa41fc` | active, runtime     | `retry.quotaCooldownMs` for selector and credential quota cooldowns, advisor quarantine consults the fallback chain |
 | `0fbdee8dd6` | active, runtime     | `--no-mcp` launch flag, `busy_timeout`-before-WAL repair in two SQLite stores, browser-relay archiver fallback chain |
 | Source checkpoint (2026-09-21) | active, UI/runtime | Per-account `/usage`, Vercel DeepSeek effort precedence, and primary restore gated by 12 minutes plus fallback success or chain exhaustion |
+| Uncommitted | active, UI | All-models F5 background provider refresh, four-worker bound, incremental counts, failure isolation and disposal safety |
 
 `PI_MCP_TIMING` is a live fork delta carried through merge commit history (reference
 `9a8062a7f`), so it does not appear in the non-merge ledger above.

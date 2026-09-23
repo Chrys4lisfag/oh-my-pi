@@ -328,6 +328,35 @@ describe("SessionManager atomic rewrite race", () => {
 	});
 });
 describe("SessionManager cross-process rewrite freshness", () => {
+	it("rolls back a rejected profile stamp and permits /new without erasing another writer", async () => {
+		const tempDir = TempDir.createSync("@omp-profile-conflict-");
+		try {
+			const first = SessionManager.create(tempDir.path(), tempDir.path(), new FileSessionStorage());
+			await first.setSessionProfile("original");
+			await first.ensureOnDisk();
+			const sessionFile = first.getSessionFile();
+			if (!sessionFile) throw new Error("Expected session file");
+			const second = await SessionManager.open(sessionFile, tempDir.path(), new FileSessionStorage(), {
+				suppressBreadcrumb: true,
+			});
+			second.appendMessage({ role: "user", content: "newer durable second-writer turn", timestamp: Date.now() });
+			await second.close();
+			const storage = new FileSessionStorage();
+			const before = await storage.readText(sessionFile);
+
+			await expect(first.setSessionProfile("changed")).rejects.toBeInstanceOf(SessionWriteConflictError);
+			expect(first.getSessionProfile()).toBe("original");
+			expect(await storage.readText(sessionFile)).toBe(before);
+			await first.flush();
+			await first.newSession();
+			expect(first.getSessionFile()).not.toBe(sessionFile);
+			expect(await storage.readText(sessionFile)).toBe(before);
+			await first.close();
+		} finally {
+			await tempDir.remove();
+		}
+	});
+
 	it("refuses to erase a durable turn appended by another manager", async () => {
 		const tempDir = TempDir.createSync("@omp-session-rewrite-conflict-");
 		try {

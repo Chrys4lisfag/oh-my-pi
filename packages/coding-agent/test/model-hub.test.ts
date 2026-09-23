@@ -553,6 +553,36 @@ describe("ModelHub", () => {
 				.join("\n");
 			expect(lines).not.toContain("Using cached model list");
 		});
+		test("bulk F5 re-arms an empty-provider retry whose timer expired during the batch", async () => {
+			const gate = Promise.withResolvers<void>();
+			const attemptedAt = Date.now() - 29_500;
+			const refreshProvider = vi.fn(
+				async (_provider: string, _strategy?: string, options?: { catalogOnly?: boolean }) => {
+					if (options?.catalogOnly) await gate.promise;
+				},
+			);
+			const { hub } = createHub({
+				models: [makeModel("populated", "m")],
+				registry: {
+					refreshProvider,
+					getDiscoverableProviders: () => ["empty"],
+					getProviderDiscoveryState: () => ({ status: "unavailable", optional: false, attemptedAt }),
+				},
+			});
+			try {
+				// Let initial hydration arm the retry before starting the manual batch.
+				await Bun.sleep(20);
+				hub.handleInput("\x1b[15~");
+				await waitForCondition(() => refreshProvider.mock.calls.length === 2);
+				await Bun.sleep(600);
+				expect(refreshProvider).toHaveBeenCalledTimes(2);
+				gate.resolve();
+				await waitForCondition(() => refreshProvider.mock.calls.some(call => call[0] === "empty" && !call[2]));
+			} finally {
+				gate.resolve();
+				hub.dispose();
+			}
+		});
 	});
 
 	describe("fallback chain reordering", () => {
@@ -1487,6 +1517,117 @@ describe("ModelHub", () => {
 			// ...and scrolling back up restores the original window exactly.
 			for (let i = 0; i < 500; i++) hub.handleInput(WHEEL_UP_BODY);
 			expect(normalize(hub.render(220))).toBe(before);
+		});
+
+		test("F5 on All models refreshes providers concurrently, survives failure, and ignores duplicate F5", async () => {
+			const models = Array.from({ length: 6 }, (_, index) => makeModel(`batch-${index}`, "old"));
+			const gates = new Map(models.map(model => [model.provider, Promise.withResolvers<void>()]));
+			let active = 0;
+			let peak = 0;
+			const refreshProvider = vi.fn(
+				async (
+					providerId: string,
+					_strategy?: string,
+					options?: { refreshCommandCredentials?: boolean; catalogOnly?: boolean },
+				) => {
+					expect(options).toEqual({ catalogOnly: true });
+					active++;
+					peak = Math.max(peak, active);
+					try {
+						await gates.get(providerId)!.promise;
+						if (providerId === "batch-0") throw new Error("mock discovery failed");
+						models.push(makeModel(providerId, "new"));
+					} finally {
+						active--;
+					}
+				},
+			);
+			const { hub } = createHub({ models: () => models, registry: { refreshProvider } });
+			try {
+				expect(normalize(hub.render(220))).toContain("F5 refresh all providers");
+				hub.handleInput("\x1b[15~");
+				await waitForCondition(() => refreshProvider.mock.calls.length === 4);
+				expect(active).toBe(4);
+				hub.handleInput("\x1b[15~");
+				gates.get("batch-0")!.resolve();
+				await waitForCondition(() => refreshProvider.mock.calls.length === 5);
+				gates.get("batch-1")!.resolve();
+				await waitForCondition(() => refreshProvider.mock.calls.length === 6);
+				await waitForCondition(() => normalize(hub.render(220)).includes("batch-1/new"));
+				for (const gate of gates.values()) gate.resolve();
+				await waitForCondition(() => !normalize(hub.render(220)).includes("Refreshing providers"));
+				expect(refreshProvider).toHaveBeenCalledTimes(6);
+				expect(peak).toBe(4);
+			} finally {
+				for (const gate of gates.values()) gate.resolve();
+				hub.dispose();
+			}
+		});
+
+		test("bulk refresh yields to input and coalesces registry update bursts", async () => {
+			const models = Array.from({ length: 40 }, (_, index) => makeModel(`burst-${index}`, "m"));
+			let notify: () => void = () => {};
+			const getAll = vi.fn(() => models);
+			const gate = Promise.withResolvers<void>();
+			const refreshProvider = vi.fn(async () => {
+				await gate.promise;
+				notify();
+			});
+			const { hub, onCancel } = createHub({
+				models,
+				registry: {
+					getAll,
+					refreshProvider,
+					onModelsUpdated: listener => {
+						notify = listener;
+						return () => {};
+					},
+				},
+			});
+			try {
+				hub.handleInput("\x1b[15~");
+				await waitForCondition(() => refreshProvider.mock.calls.length === 4);
+				getAll.mockClear();
+				for (let i = 0; i < 100; i++) notify();
+				// Event subscribers must not enumerate/rebuild the catalog inline.
+				expect(getAll).not.toHaveBeenCalled();
+				let serviced = false;
+				const input = setTimeout(() => {
+					serviced = true;
+					hub.handleInput(ESC);
+				}, 0);
+				gate.resolve();
+				await waitForCondition(() => refreshProvider.mock.calls.length === 40);
+				expect(serviced).toBe(true);
+				expect(onCancel).toHaveBeenCalledTimes(1);
+				await waitForCondition(() => getAll.mock.calls.length > 0);
+				expect(getAll.mock.calls.length).toBeLessThan(10);
+				clearTimeout(input);
+			} finally {
+				gate.resolve();
+				hub.dispose();
+			}
+		});
+
+		test("closing All models refresh stops queued providers and scoped lists do not refresh", async () => {
+			const gate = Promise.withResolvers<void>();
+			const models = Array.from({ length: 6 }, (_, index) => makeModel(`close-${index}`, "m"));
+			const refreshProvider = vi.fn(async () => {
+				await gate.promise;
+			});
+			const { hub } = createHub({ models, registry: { refreshProvider } });
+			hub.handleInput("\x1b[15~");
+			await waitForCondition(() => refreshProvider.mock.calls.length === 4);
+			hub.dispose();
+			gate.resolve();
+			// Drains the owned provider workers without using timer delays.
+			for (let i = 0; i < 20; i++) await Promise.resolve();
+			expect(refreshProvider).toHaveBeenCalledTimes(4);
+			const scopedRefresh = vi.fn(async () => {});
+			const scoped = createHub({ models, scoped: true, registry: { refreshProvider: scopedRefresh } }).hub;
+			scoped.handleInput("\x1b[15~");
+			await Promise.resolve();
+			expect(scopedRefresh).not.toHaveBeenCalled();
 		});
 
 		test("wheel over the sidebar never changes the active scope or schedules refreshes", () => {

@@ -10,6 +10,7 @@
 
 ### Added
 
+- F5 on All models now refreshes unlocked providers concurrently in the background, showing progress while keeping the menu responsive; failed providers do not stop the batch.
 - Added an Accounts view to `/usage`, opening by default for multi-account providers so individual account identities, plans, quota windows, remaining percentages, and reset timers are visible rather than only an aggregate. Press `a` for accounts, `o` for overview, or Enter for classic details.
 - Added `discovery.baseUrl` for custom OpenAI-compatible providers whose `/models` catalog and inference traffic use different upstream routes; discovered models retain the provider inference URL, discovery queries are preserved, and caches are isolated by effective discovery endpoint.
 - Added `discovery.auth: none` for providers whose model catalog is public or rejects inference bearer credentials; inference keeps using the provider `apiKey`, discovery omits `Authorization`, and authenticated/anonymous catalogs have isolated caches.
@@ -18,6 +19,8 @@
 
 ### Fixed
 
+- Fixed bulk F5 freezes caused by full registry reloads and repeated menu rebuilds per provider. Bulk jobs now reuse loaded config, refresh only the target catalog, coalesce UI updates, and yield between jobs; command credential remint remains single-provider F5 only.
+- Fixed rejected profile-header rewrites poisoning subsequent `/new` transitions. Metadata-only conflicts now roll back safely without overwriting another writer's transcript; failed new-session transitions preserve messages and report an error instead of crashing.
 - Fixed slow failed fallback requests restoring a cooled primary before the next candidate could run. Automatic restoration now requires 12 minutes plus a successful fallback response or exhausted chain, while retaining cooldown and never-return restrictions.
 - Fixed a model that failed after an earlier fallback still routing to the old chain's entries: a stale retry-fallback pin no longer outranks the failing model's own configured chain, so an exhausted chain stops instead of borrowing an unrelated one.
 - Fixed a provider that once answered with an empty model catalog staying at `0 models` for the whole cache TTL while `/models` claimed "Using cached model list from <age>. Press F5 to refresh." An empty cache row can serve nothing when the provider has no bundled catalog, so it is no longer treated as a usable cache; the hub hydrates with a live refresh (which also resurfaces a local endpoint that came back up), and a cached row with no models now says so instead of advertising a list it does not have.

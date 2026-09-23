@@ -1072,7 +1072,7 @@ export class CommandController {
 	}
 
 	async #runNewSessionFlow(options?: NewSessionOptions, label: string = "New session started"): Promise<void> {
-		this.ctx.clearTransientSessionUi();
+		// Keep the transcript/UI intact until the session transition succeeds.
 
 		if (this.ctx.session.isCompacting) {
 			this.ctx.session.abortCompaction();
@@ -1080,7 +1080,12 @@ export class CommandController {
 				await Bun.sleep(10);
 			}
 		}
-		if (!(await this.ctx.session.newSession(options))) return;
+		try {
+			if (!(await this.ctx.session.newSession(options))) return;
+		} catch (error) {
+			this.ctx.showError(`Could not start a new session: ${error instanceof Error ? error.message : String(error)}`);
+			return;
+		}
 		// A focused subagent view keeps its own history: return to the main session
 		// first so the transcript below cannot rebuild from the subagent's surviving
 		// conversation, then drop any turn-scoped anchors (coalescing timers,

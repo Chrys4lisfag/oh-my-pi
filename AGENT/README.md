@@ -132,6 +132,19 @@ be adopted without silently losing fork features.
     `retry.fallbackRevertPolicy: never` still gate restoration. Failed/aborted
     output and merely selecting the last candidate do not count. Later hops
     retain the first-activation clock; wrapping cannot bypass the restore gate.
+28. A rejected profile-header rewrite must preserve the session freshness CAS.
+    Roll back profile metadata and its failure latch only when the previously
+    current transcript had no concurrent local mutation. `/new` validates outgoing
+    persistence before resetting messages; a rejected transition retains the UI
+    and reports an error instead of escaping as an unhandled rejection.
+29. F5 on All models refreshes unlocked provider catalogs asynchronously with
+    four workers, incrementally updating counts and progress. Repeated F5 during
+    a batch coalesces; provider failures do not stop siblings; disposal stops
+    queued work. Scoped `--models` lists do not trigger discovery. Bulk refresh
+    loads config once and uses catalog-only scoped jobs: no command credential
+    remint or unrelated runtime-manager sweeps. Single-provider F5 still remints.
+    Coalesce registry notifications at 250ms and yield between completed jobs;
+    never synchronously rebuild the entire model list for every batch event.
 
 ## Important memory corrections
 

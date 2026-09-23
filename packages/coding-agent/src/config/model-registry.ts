@@ -228,6 +228,8 @@ function isExtendedContextEnabledFromSettings(settingsInstance?: Settings): bool
  */
 export interface ModelRegistryRefreshOptions {
 	refreshCommandCredentials?: boolean;
+	/** Caller already synchronized config; refresh only this provider's catalog. */
+	catalogOnly?: boolean;
 }
 
 /** Authentication material returned to legacy extensions for one model request. */
@@ -596,13 +598,14 @@ export class ModelRegistry {
 		// Hover / auto-refresh uses `"online"` for a live catalog. Only F5 (and
 		// other explicit callers) pass refreshCommandCredentials to re-mint
 		// `!command` keys and headers for this provider.
-		this.#reloadStaticModelsForRefresh(options, providerId);
+		if (!options?.catalogOnly) this.#reloadStaticModelsForRefresh(options, providerId);
 		for (const selector of this.#suppressedSelectors.keys()) {
 			if (selector.startsWith(`${providerId}/`)) {
 				this.#suppressedSelectors.delete(selector);
 			}
 		}
 		await this.#refreshRuntimeDiscoveries(strategy, new Set([providerId]));
+		if (options?.catalogOnly) return;
 		// #reloadStaticModels above may have rebuilt #models from static sources,
 		// dropping models previously discovered by OTHER runtime providers (their
 		// fetchDynamicModels results live only in #models + the SQLite cache, not

@@ -1823,6 +1823,44 @@ describe("ModelRegistry", () => {
 			expect(model?.baseUrl).toBe("http://127.0.0.1:8080/v1");
 		});
 
+		test("catalog-only refresh keeps concurrent provider results without rereading config", async () => {
+			writeRawModelsJson(
+				Object.fromEntries(
+					["bulk-a", "bulk-b"].map(provider => [
+						provider,
+						{
+							baseUrl: `https://${provider}.example/v1`,
+							auth: "none",
+							api: "openai-completions",
+							discovery: { type: "openai-models-list" },
+							models: [{ id: "before" }],
+						},
+					]),
+				),
+			);
+			const gates = new Map(["bulk-a", "bulk-b"].map(provider => [provider, Promise.withResolvers<void>()]));
+			const fetchMock: FetchImpl = async input => {
+				const provider = new URL(String(input)).hostname.split(".")[0];
+				const gate = gates.get(provider);
+				if (!gate) throw new Error("Unexpected mocked discovery URL");
+				await gate.promise;
+				return new Response(JSON.stringify({ data: [{ id: "discovered" }] }), { status: 200 });
+			};
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+			registry.getAll();
+			// Config changes during the batch wait for the next explicit reload;
+			// rebuilding per job would invalidate the sibling discovery identity.
+			writeRawModelsJson({});
+			const first = registry.refreshProvider("bulk-a", "online", { catalogOnly: true });
+			const second = registry.refreshProvider("bulk-b", "online", { catalogOnly: true });
+			gates.get("bulk-b")!.resolve();
+			await second;
+			gates.get("bulk-a")!.resolve();
+			await first;
+			expect(registry.find("bulk-a", "discovered")).toBeDefined();
+			expect(registry.find("bulk-b", "discovered")).toBeDefined();
+		});
+
 		test("discoverable custom compat survives refresh", async () => {
 			writeRawModelsJson({
 				openai: {

@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it } from "bun:test";
+import { beforeAll, describe, expect, it, vi } from "bun:test";
 import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
@@ -86,6 +86,21 @@ function makeHarness(): NewSessionHarness {
 }
 
 describe("CommandController new-session teardown", () => {
+	it("reports a persistence conflict without an unhandled rejection or clearing the transcript", async () => {
+		const harness = makeHarness();
+		const failure = new Error("Session file changed before rewrite");
+		harness.ctx.session.newSession = async () => {
+			throw failure;
+		};
+		harness.ctx.showError = vi.fn();
+		harness.ctx.clearTransientSessionUi = vi.fn();
+		await harness.controller.handleClearCommand();
+		expect(harness.ctx.showError).toHaveBeenCalledWith(`Could not start a new session: ${failure.message}`);
+		expect(harness.ctx.clearTransientSessionUi).not.toHaveBeenCalled();
+		expect(harness.counts.resetTranscript()).toBe(0);
+		expect(harness.counts.unfocusSession()).toBe(0);
+	});
+
 	it("returns a focused subagent view to main and purges transcript anchors on /new", async () => {
 		const harness = makeHarness();
 
