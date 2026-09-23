@@ -273,7 +273,7 @@ export interface RetryFallbackAppliedEvent {
 	from: string;
 	to: string;
 	role: string;
-	/** Provider error (or policy) that triggered the switch, when known. */
+	/** Decision-time cause, including whether the source request was skipped. */
 	reason?: string;
 }
 

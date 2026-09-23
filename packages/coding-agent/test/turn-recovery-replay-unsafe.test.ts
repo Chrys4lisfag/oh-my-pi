@@ -98,7 +98,7 @@ function createHost(
 		resolveActiveEditMode: () => "hashline",
 		syncAfterModelChange: async () => {},
 		resetCurrentResponsesProviderSession: () => {},
-		maybeAutoRedeemCodexReset: async () => false,
+		maybeAutoRedeemReset: async () => false,
 		runAutoCompaction: async () =>
 			({ deferredHandoff: false, continuationScheduled: false }) as RecoveryCompactionResult,
 		shakeForRequestBodyReadTimeout: async () => false,
@@ -119,7 +119,7 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 		authStorage = await AuthStorage.create(tempDir.join("testauth.db"));
 		// Live-role resolution (#liveRetryRoleHint) filters by provider auth;
 		// pin a runtime key so the test does not depend on host env credentials.
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		const modelRegistrySettings = Settings.isolated();
 		modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"), { settings: modelRegistrySettings });
 	});
@@ -268,7 +268,7 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 
 	it("does not count failed or aborted output as fallback success", async () => {
 		const host = createHost(model, modelRegistry);
-		authStorage.setRuntimeApiKey("openai", "test-key");
+		authStorage.keys.setRuntime("openai", "test-key");
 		host.sessionManager = { getSessionId: () => "failed-output-test" } as never;
 		let now = Date.now();
 		const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
@@ -1269,7 +1269,7 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 		expect(recovery.resolveRetryFallbackRole(selector, model)).toBe("default");
 	});
 
-	it("does not attach the default chain to a model that is not default's primary", () => {
+	it("attaches the default chain to an ephemeral-hopped model that is not default's primary (#12421)", () => {
 		const other = getBundledModel("openai", "gpt-4o-mini");
 		if (!other) throw new Error("Expected bundled model gpt-4o-mini");
 		const recovery = new TurnRecovery(
@@ -1283,7 +1283,12 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 				},
 			}),
 		);
-		expect(recovery.resolveRetryFallbackRole(`${other.provider}/${other.id}`, other)).toBeUndefined();
+		// Resolving no chain let a wait past retry.maxDelayMs fail-fast with no
+		// walk (#12421), for `/model`-chosen models and ephemeral hops alike. A
+		// walk that produced the hop stays reachable first through
+		// retryFallbackChainKeys' pinned `#activeRetryFallback.role`, so
+		// attaching `default` here cannot displace the owning chain.
+		expect(recovery.resolveRetryFallbackRole(`${other.provider}/${other.id}`, other)).toBe("default");
 	});
 
 	// Gemini reports MALFORMED_FUNCTION_CALL when the model transcribes the call

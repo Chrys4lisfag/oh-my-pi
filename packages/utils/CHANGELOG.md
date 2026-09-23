@@ -4,6 +4,12 @@
 
 ### Changed
 
+- Migrated internal cryptographic utilities to `Bun` performance-optimized hashers
+
+## [18.2.7] - 2026-09-21
+
+### Changed
+
 - Mermaid diagrams are now rendered with the native renderer, with output remaining unchanged.
 - PI_TIMING span lines now include their start offset to make unspanned gaps easier to identify.
 

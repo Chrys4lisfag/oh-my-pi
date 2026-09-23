@@ -11,7 +11,7 @@ import { parseModelString, splitUpstreamRouting, formatModelSelectorValue } from
  * in the compact alt+p picker ({@link ./model-picker}).
  */
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { Model } from "@oh-my-pi/pi-ai";
+import type { KeysApi, Model } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { providerEntry } from "@oh-my-pi/pi-catalog/compat/providers";
@@ -91,7 +91,7 @@ export interface ModelHubSource extends ModelBrowserSource {
 
 /** Catalog capabilities required by the model hub. */
 export interface ModelHubRegistry extends ModelBrowserRegistry {
-	readonly authStorage: { hasAuth(provider: string): boolean };
+	readonly authStorage: { readonly keys: Pick<KeysApi, "source"> };
 	getDiscoverableProviders(): string[];
 	getProviderDiscoveryState(provider: string):
 		| {
@@ -567,7 +567,8 @@ export class ModelHubComponent implements Component {
 				// Discoverable without stored auth: catalog-backed providers stay
 				// locked; keyless/custom endpoints (ollama, vllm, …) surface as
 				// selectable so discovery can populate them.
-				if (authStorage.hasAuth(provider) || !locked.has(provider)) {
+				const authenticated = authStorage.keys.source(provider) !== undefined;
+				if (authenticated || !locked.has(provider)) {
 					// #2761: implicit local endpoints (optional: true) stay hidden
 					// until discovery actually reaches a server. "idle" means never
 					// probed; "unavailable" means the endpoint is unreachable; both
@@ -575,7 +576,7 @@ export class ModelHubComponent implements Component {
 					// configured. models.yml discovery providers (optional: false)
 					// and providers with stored auth keep their entry so
 					// misconfigurations stay visible and diagnosable.
-					if (!authStorage.hasAuth(provider)) {
+					if (!authenticated) {
 						const discovery = this.#registry.getProviderDiscoveryState(provider);
 						if (discovery?.optional && (discovery.status === "idle" || discovery.status === "unavailable")) {
 							this.#hiddenOptionalProviders.add(provider);
@@ -1956,23 +1957,19 @@ export class ModelHubComponent implements Component {
 			}
 			return;
 		}
-		if (rolesView && matchesKey(data, "ctrl+left")) {
-			this.#moveRoleTab(-1);
-			return;
-		}
-		if (rolesView && matchesKey(data, "ctrl+right")) {
-			this.#moveRoleTab(1);
-			return;
-		}
-		// macOS terminals (ghostty, Terminal.app, iTerm) send ESC b / ESC f for
-		// Option+←/→, which parse as alt+b / alt+f — same aliases the editor's
-		// word-motion bindings accept.
+		// Alt+←/→ cycles whichever tab strip is on screen: role tabs in the
+		// Roles view, kind tabs in every browser view. Ctrl+←/→ is unusable on
+		// macOS (Spaces shortcut). macOS terminals (ghostty, Terminal.app,
+		// iTerm) send ESC b / ESC f for Option+←/→, which parse as alt+b /
+		// alt+f — the same aliases the editor's word-motion bindings accept.
 		if (matchesKey(data, "alt+left") || matchesKey(data, "alt+b")) {
-			this.#moveModelKind(-1);
+			if (rolesView) this.#moveRoleTab(-1);
+			else this.#moveModelKind(-1);
 			return;
 		}
 		if (matchesKey(data, "alt+right") || matchesKey(data, "alt+f")) {
-			this.#moveModelKind(1);
+			if (rolesView) this.#moveRoleTab(1);
+			else this.#moveModelKind(1);
 			return;
 		}
 
@@ -2412,7 +2409,7 @@ export class ModelHubComponent implements Component {
 			ROLE_TABS.map(tab => ({ label: tab === "kind" ? "kinds" : tab })),
 			Math.max(0, active),
 		);
-		return truncateToWidth(` ${theme.fg("dim", "Roles:")} ${track}  ${theme.fg("dim", "Ctrl+←/→")}`, width);
+		return truncateToWidth(` ${theme.fg("dim", "Roles:")} ${track}  ${theme.fg("dim", "Alt+←/→")}`, width);
 	}
 
 	#statusRow(width: number): string {
@@ -2706,7 +2703,7 @@ export class ModelHubComponent implements Component {
 		const entry = this.#activeEntry();
 		if (entry.kind === "roles") {
 			if (this.#focus !== "list") {
-				return "↑/↓ providers · → roles · Ctrl+←/→ tabs · Esc close";
+				return "↑/↓ providers · → roles · Alt+←/→ tabs · Esc close";
 			}
 			const row = this.#rolesRows[this.#roleIndex];
 			if (row?.kind === "fallback") {

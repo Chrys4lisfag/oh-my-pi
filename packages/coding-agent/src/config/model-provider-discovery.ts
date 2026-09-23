@@ -133,7 +133,7 @@ export function extractGoogleOAuthProjectId(value: string | undefined): string |
 }
 
 export function getOAuthCredentialsForProvider(authStorage: AuthStorage, provider: string): OAuthCredential[] {
-	const providerEntry = authStorage.getAll()[provider];
+	const providerEntry = authStorage.credentials.all()[provider];
 	if (!providerEntry) {
 		return [];
 	}
@@ -157,7 +157,7 @@ export async function resolveCodexDiscoveryAccounts(
 	authStorage: AuthStorage,
 	resolvedAccessToken: string,
 ): Promise<OpenAICodexAccount[] | null> {
-	const accesses = await authStorage.getOAuthAccesses("openai-codex");
+	const accesses = await authStorage.oauth.accessAll("openai-codex");
 	const accounts: OpenAICodexAccount[] = [];
 	for (const access of accesses) {
 		if (!access.ok) return null;

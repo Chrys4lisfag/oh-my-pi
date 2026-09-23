@@ -65,6 +65,7 @@ import {
 	type ServingModel,
 	validateRetryFallbackChains,
 } from "./retry-fallback-chains";
+import { describeUsageFallback } from "./retry-fallback-reason";
 import { getLatestCompactionEntry } from "./session-context";
 import { EPHEMERAL_MODEL_CHANGE_ROLE, type SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
@@ -233,12 +234,11 @@ export interface TurnRecoveryHost {
 	syncAfterModelChange(previousEditMode: EditMode): Promise<void>;
 	resetCurrentResponsesProviderSession(reason: string): void;
 	/**
-	 * Spend a saved Codex reset for the blocked pool, if eligible.
-	 * `activeBlockUnblockAtMs` is the absolute unblock time parsed from the
-	 * live usage-limit error — authoritative for the active account when the
-	 * usage report still shows a pre-block snapshot.
+	 * Spend an eligible saved reset for the blocked provider pool.
+	 * `activeBlockUnblockAtMs` is the absolute unblock time parsed from the live
+	 * usage-limit error and never substitutes for live grant eligibility.
 	 */
-	maybeAutoRedeemCodexReset(activeBlockUnblockAtMs?: number): Promise<boolean>;
+	maybeAutoRedeemReset(activeBlockUnblockAtMs?: number): Promise<boolean>;
 	runAutoCompaction(
 		reason: "overflow" | "threshold" | "idle" | "incomplete",
 		willRetry: boolean,
@@ -646,7 +646,7 @@ export class TurnRecovery {
 					this.#host.settings.get("retry.quotaCooldownMs"),
 				);
 			recorded = (async (): Promise<UsageLimitOutcome> => {
-				const outcome = await this.#host.modelRegistry.authStorage.markUsageLimitReached(
+				const outcome = await this.#host.modelRegistry.authStorage.limits.markReached(
 					activeModel.provider,
 					this.#host.sessionId(),
 					{
@@ -1234,7 +1234,7 @@ export class TurnRecovery {
 	 * abort — issue #5375). Only fires while the session is neither aborting nor
 	 * tearing down. A user/lifecycle abort (`#abortInProgress`), a dispose-driven
 	 * abort (`#isDisposed`), or a session-induced streaming-edit guard abort
-	 * (`StreamingEditGuard.abortTriggered` — auto-generated-file guard or failed-patch
+	 * (`StreamingEditGuard.abortTriggered` — failed-patch
 	 * preview) is deliberate and MUST settle the turn instead: routing it through
 	 * retry would orphan `#retryPromise` on a continuation the guard skips
 	 * (hanging the in-flight `prompt()`) or silently undo the guard's intended
@@ -1837,7 +1837,7 @@ export class TurnRecovery {
 		const currentSelector = formatRetryFallbackSelector(currentModel, this.#host.thinkingLevel());
 		let health: ModelUsageHealth;
 		try {
-			health = await this.#host.modelRegistry.authStorage.getModelUsageHealth(currentModel.provider, {
+			health = await this.#host.modelRegistry.authStorage.health.model(currentModel.provider, {
 				modelId: currentModel.id,
 				sessionId: this.#host.sessionId(),
 				baseUrl: currentModel.baseUrl,
@@ -1862,10 +1862,7 @@ export class TurnRecovery {
 				selectedAccount.state !== "healthy" &&
 				health.accounts.some(account => account.state === "healthy")
 			) {
-				this.#host.modelRegistry.authStorage.releaseSessionCredentialForReselection(
-					currentModel.provider,
-					this.#host.sessionId(),
-				);
+				this.#host.modelRegistry.authStorage.sessions.release(currentModel.provider, this.#host.sessionId());
 			}
 			return false;
 		}
@@ -1906,7 +1903,7 @@ export class TurnRecovery {
 				// (issue #8065).
 				if (!this.#host.contextFitsModel(candidateModel)) continue;
 				try {
-					const candidateHealth = await this.#host.modelRegistry.authStorage.getModelUsageHealth(
+					const candidateHealth = await this.#host.modelRegistry.authStorage.health.model(
 						candidateModel.provider,
 						{
 							modelId: candidateModel.id,
@@ -1925,7 +1922,7 @@ export class TurnRecovery {
 							selected.state !== "healthy" &&
 							candidateHealth.accounts.some(account => account.state === "healthy")
 						) {
-							this.#host.modelRegistry.authStorage.releaseSessionCredentialForReselection(
+							this.#host.modelRegistry.authStorage.sessions.release(
 								candidateModel.provider,
 								this.#host.sessionId(),
 							);
@@ -1980,10 +1977,7 @@ export class TurnRecovery {
 			pinFallback: true,
 			apiKey: fallback.apiKey,
 			signal,
-			reason:
-				health.state === "depleted"
-					? "usage quota depleted on the configured model"
-					: "usage reserve threshold reached on the configured model",
+			reason: describeUsageFallback(health, this.#host.settings.get("retry.usageReservePct")),
 		});
 	}
 
@@ -2325,7 +2319,7 @@ export class TurnRecovery {
 			from: currentSelector,
 			to: baseSelector,
 			role: "fireworks-fast",
-			reason: "Fireworks Fast variant degraded to Standard",
+			reason: "Request rejected by the Fast tier. Retrying on the Standard tier.",
 		});
 		return true;
 	}
@@ -2513,7 +2507,7 @@ export class TurnRecovery {
 				recordedUsageLimitOutcome.switchedCredential ||
 				// Convert the parsed hint to an absolute timestamp NOW, before the
 				// hook's usage IO — a duration re-anchored after slow fetches drifts.
-				(await this.#host.maybeAutoRedeemCodexReset(
+				(await this.#host.maybeAutoRedeemReset(
 					parsedRetryAfterMs === undefined ? undefined : Date.now() + parsedRetryAfterMs,
 				))
 			) {
@@ -2590,7 +2584,7 @@ export class TurnRecovery {
 			? formatRetryFallbackSelector(currentModel, this.#host.thinkingLevel())
 			: undefined;
 		if ((accountPolicyDenial || authFailure) && currentModel) {
-			switchedCredential = await this.#host.modelRegistry.authStorage.rotateSessionCredential(
+			switchedCredential = await this.#host.modelRegistry.authStorage.limits.rotate(
 				currentModel.provider,
 				this.#host.sessionId(),
 				{ error: errorMessage, modelId: currentModel.id },

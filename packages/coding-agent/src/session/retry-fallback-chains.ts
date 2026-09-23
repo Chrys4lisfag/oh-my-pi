@@ -507,20 +507,12 @@ export function resolveRetryFallbackChainKey(
 	}
 	if (matchedRole) return matchedRole;
 
-	// 4. The `default` chain, when `default` has no explicit role primary — the
-	// running model is then effectively the default. Strictly gated to the
-	// SESSION model: without that, a `default` chain answered a failure on any
-	// unrelated model (a subagent/advisor/role-scoped call whose model differs
-	// from the session's) with the default chain's target, which is how a
-	// `antigravity-native/gemini-3.8-flash` timeout reached
-	// `azure1-bitfrost/openai/gpt-6-astra`.
+	// 4. The default chain also owns an unmatched LIVE session model (for
+	// example, after `/model` or a mid-chain hop), even when `default` has an
+	// explicit primary. Strictly gate this to the session model: an advisor,
+	// subagent, or stale role-scoped failure must not inherit the default chain.
 	const defaultChain = context.chains.default;
-	if (
-		Array.isArray(defaultChain) &&
-		defaultChain.length > 0 &&
-		currentModelIsFailingModel &&
-		getRetryFallbackPrimarySelector(context, "default") === undefined
-	) {
+	if (Array.isArray(defaultChain) && defaultChain.length > 0 && currentModelIsFailingModel) {
 		return "default";
 	}
 	return undefined;
@@ -742,5 +734,5 @@ export function findRetryFallbackCandidates(
 		const candidatesAfter = chain.slice(baseIndex + 1);
 		return options?.wrapAround ? [...candidatesAfter, ...chain.slice(0, baseIndex)] : candidatesAfter;
 	}
-	return chain.slice(1);
+	return chain;
 }

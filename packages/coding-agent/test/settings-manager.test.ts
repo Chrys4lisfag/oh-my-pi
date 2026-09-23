@@ -921,9 +921,9 @@ describe("Settings", () => {
 			await writeSettings({ setupVersion: 1 });
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
 			const canonicalConfigPath = await fs.promises.realpath(getConfigPath());
-			const rename = fsp.rename.bind(fsp);
+			const rename = fs.promises.rename.bind(fs.promises);
 			let injected = false;
-			vi.spyOn(fsp, "rename").mockImplementation(async (source, target) => {
+			vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
 				if (!injected && String(source).endsWith(".tmp") && String(target) === canonicalConfigPath) {
 					injected = true;
 					throw new FsCodeError("EPERM", "injected Windows replacement failure");
@@ -2461,9 +2461,8 @@ describe("Settings", () => {
 			expect(fs.readFileSync(path.join(agentDir, "last-changelog-version"), "utf8")).toBe("0.41.0");
 		});
 
-		it("migrates legacy find and search settings to glob and grep", async () => {
+		it("migrates legacy search settings to grep", async () => {
 			await writeSettings({
-				find: { enabled: false },
 				search: {
 					enabled: false,
 					contextBefore: 2,
@@ -2473,15 +2472,13 @@ describe("Settings", () => {
 
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
 
-			expect(settings.get("glob.enabled")).toBe(false);
 			expect(settings.get("grep.enabled")).toBe(false);
 			expect(settings.get("grep.contextBefore")).toBe(2);
 			expect(settings.get("grep.contextAfter")).toBe(5);
 		});
 
-		it("migrates flat legacy find and search settings keys to nested glob and grep", async () => {
+		it("migrates flat legacy search settings keys to nested grep", async () => {
 			await writeSettings({
-				"find.enabled": false,
 				"search.enabled": false,
 				"search.contextBefore": 2,
 				"search.contextAfter": 5,
@@ -2489,28 +2486,31 @@ describe("Settings", () => {
 
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
 
-			expect(settings.get("glob.enabled")).toBe(false);
 			expect(settings.get("grep.enabled")).toBe(false);
 			expect(settings.get("grep.contextBefore")).toBe(2);
 			expect(settings.get("grep.contextAfter")).toBe(5);
 		});
 
-		it("does not clobber existing glob/grep settings when migrating legacy find/search ones", async () => {
+		it("does not clobber existing grep settings when migrating legacy search ones", async () => {
 			await writeSettings({
-				find: { enabled: false },
-				glob: { enabled: true },
 				search: { enabled: false },
 				grep: { enabled: true },
-				"find.enabled": false,
-				"glob.enabled": true,
 				"search.enabled": false,
 				"grep.enabled": true,
 			});
 
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
 
-			expect(settings.get("glob.enabled")).toBe(true);
 			expect(settings.get("grep.enabled")).toBe(true);
+		});
+
+		it("migrates a boolean find.enabled to its explicit on/off mode without touching glob", async () => {
+			await writeSettings({ find: { enabled: true }, glob: { enabled: false } });
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("find.enabled")).toBe("on");
+			expect(settings.get("glob.enabled")).toBe(false);
 		});
 
 		it("migrates nested dev.autoqa.consent and todo.reminders.max without configuring parents", async () => {

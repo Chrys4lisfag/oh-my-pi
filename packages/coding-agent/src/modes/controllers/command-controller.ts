@@ -74,13 +74,18 @@ import { replaceTabs, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-uti
 import {
 	getChangelogPath,
 	parseChangelog,
-	RECENT_CHANGELOG_ENTRY_LIMIT,
+	parseChangelogView,
 	renderChangelogEntries,
+	selectChangelogEntries,
 } from "../../utils/changelog";
 import { copyToClipboard } from "../../utils/clipboard";
 import { openPath } from "../../utils/open";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
-import { collapseSharedUsageReports, formatLimitTitle } from "@oh-my-pi/pi-tui/overlays/usage-display";
+import {
+	collapseSharedUsageReports,
+	formatLimitTitle,
+	summarizeUsageResetCredits,
+} from "@oh-my-pi/pi-tui/overlays/usage-display";
 import { formatRemainingOnlyTotal, isUsedOnlyAbsoluteAmount } from "@oh-my-pi/pi-tui/prompt/usage-amounts";
 
 function formatCreditValue(value: number): string {
@@ -162,7 +167,9 @@ export class CommandController {
 				return;
 			}
 
-			const filePath = await this.ctx.session.exportToHtml(outputPath, useUserThemes);
+			// The viewed session: the focused subagent's transcript (plus its own
+			// subagents) from a focused view, otherwise the main session.
+			const filePath = await this.ctx.viewSession.exportToHtml(outputPath, useUserThemes);
 			this.ctx.showStatus(`Session exported to: ${filePath}`);
 			this.openInBrowser(filePath);
 		} catch (error: unknown) {
@@ -360,7 +367,7 @@ export class CommandController {
 			const openaiWebsocketSetting = this.ctx.settings.get("providers.openaiWebsockets") ?? "auto";
 			const preferOpenAICodexWebsockets =
 				openaiWebsocketSetting === "on" ? true : openaiWebsocketSetting === "off" ? false : undefined;
-			const credentialSource = this.ctx.session.modelRegistry.authStorage.describeCredentialSource(
+			const credentialSource = this.ctx.session.modelRegistry.authStorage.keys.describe(
 				model.provider,
 				stats.sessionId,
 			);
@@ -507,10 +514,7 @@ export class CommandController {
 		// Resolve the active OAuth identity for each advisor's provider so quota
 		// filtering matches the credential actually in use (not sibling accounts).
 		const resolveActiveAdvisorAccount = (provider: string, sessionId?: string): OAuthAccountIdentity | undefined =>
-			this.ctx.session.modelRegistry.authStorage.getOAuthAccountIdentity(
-				provider,
-				sessionId ?? this.ctx.session.sessionId,
-			);
+			this.ctx.session.modelRegistry.authStorage.oauth.identity(provider, sessionId ?? this.ctx.session.sessionId);
 		const nowMs = Date.now();
 		// Roster view: show every configured advisor with its status, even when
 		// none are live (all paused/no-model). The old code returned a generic
@@ -684,16 +688,31 @@ export class CommandController {
 		this.ctx.showUsageDashboard(usageReports);
 	}
 
-	async handleChangelogCommand(showFull = false): Promise<void> {
+	async handleChangelogCommand(args = ""): Promise<void> {
+		const view = parseChangelogView(args);
+		if ("error" in view) {
+			this.ctx.showWarning(view.error);
+			return;
+		}
 		const changelogPath = getChangelogPath();
 		const allEntries = await parseChangelog(changelogPath);
-		const entriesToShow = showFull ? allEntries : allEntries.slice(0, RECENT_CHANGELOG_ENTRY_LIMIT);
+		const entriesToShow = selectChangelogEntries(allEntries, view);
 		const changelogMarkdown =
 			entriesToShow.length > 0 ? renderChangelogEntries(entriesToShow).markdown : "No changelog entries found.";
-		const title = showFull ? "Full Changelog" : "Recent Changes";
-		const hint = showFull
-			? ""
-			: `\n\n${theme.fg("dim", "Use")} ${theme.bold("/changelog full")} ${theme.fg("dim", "to view the complete changelog.")}`;
+		const shown = entriesToShow.length;
+		const titleCount = shown > 0 ? shown : view.kind === "last" ? view.count : shown;
+		const title =
+			view.kind === "full"
+				? "Full Changelog"
+				: view.kind === "last"
+					? titleCount === 1
+						? "Last Release"
+						: `Last ${titleCount} Releases`
+					: "Recent Changes";
+		const hint =
+			view.kind === "full"
+				? ""
+				: `\n\n${theme.fg("dim", "Use")} ${theme.bold("/changelog full")} ${theme.fg("dim", "to view the complete changelog.")}`;
 
 		const block = new TranscriptBlock();
 		block.addChild(new DynamicBorder());
@@ -1973,16 +1992,16 @@ function formatNumber(value: number, maxFractionDigits = 1): string {
 }
 
 function resolveProviderAuthMode(authStorage: AuthStorage, provider: string): string {
-	if (authStorage.hasOAuth(provider)) {
+	if (authStorage.credentials.hasOAuth(provider)) {
 		return "oauth";
 	}
-	if (authStorage.has(provider)) {
+	if (authStorage.credentials.has(provider)) {
 		return "api key";
 	}
 	if (getEnvApiKey(provider)) {
 		return "env api key";
 	}
-	if (authStorage.hasAuth(provider)) {
+	if (authStorage.keys.source(provider) !== undefined) {
 		return "runtime/fallback";
 	}
 	return "unknown";
@@ -2313,37 +2332,48 @@ export function renderUsageReports(
 
 		const resetAccountLines: string[] = [];
 		for (const report of providerReports) {
-			const count = report.resetCredits?.availableCount ?? 0;
-			if (count <= 0) continue;
-			const label =
+			const resets = summarizeUsageResetCredits(report.resetCredits, nowMs);
+			if (!resets || resets.bankedCount <= 0) continue;
+			const identityLabel =
 				typeof report.metadata?.email === "string" && report.metadata.email
 					? report.metadata.email
 					: typeof report.metadata?.accountId === "string" && report.metadata.accountId
 						? report.metadata.accountId
 						: "account";
+			const orgLabel =
+				typeof report.metadata?.orgName === "string" && report.metadata.orgName
+					? report.metadata.orgName
+					: typeof report.metadata?.orgId === "string"
+						? report.metadata.orgId
+						: undefined;
+			const rawLabel = orgLabel && orgLabel !== identityLabel ? `${identityLabel} (${orgLabel})` : identityLabel;
+			const label = sanitizeText(rawLabel.replace(/[\r\n\t]+/g, " "));
+			const activeOrg = activeAccount?.orgId;
+			const reportOrg = typeof report.metadata?.orgId === "string" ? report.metadata.orgId : undefined;
+			const orgMatches = !activeOrg && !reportOrg ? true : activeOrg === reportOrg;
 			const isActive =
+				orgMatches &&
 				!!activeAccount &&
 				((!!activeAccount.accountId && activeAccount.accountId === report.metadata?.accountId) ||
 					(!!activeAccount.email && activeAccount.email === report.metadata?.email));
+			const availability =
+				resets.redeemableCount === resets.bankedCount ? "" : ` · ${resets.redeemableCount} usable now`;
 			resetAccountLines.push(
-				`    • ${label}: ${count} saved reset${count === 1 ? "" : "s"}${isActive ? " (active)" : ""}`,
+				`    • ${label}: ${resets.bankedCount} saved reset${resets.bankedCount === 1 ? "" : "s"}${availability}${isActive ? " (active)" : ""}`,
 			);
-			const credits = report.resetCredits?.credits;
-			if (credits) {
-				for (const credit of credits) {
-					if (credit.expiresAt) {
-						const expiryMs = Date.parse(credit.expiresAt);
-						if (!Number.isNaN(expiryMs)) {
-							const remaining = expiryMs - nowMs;
-							const expiryDate = credit.expiresAt.slice(0, 10);
-							if (remaining > 0) {
-								resetAccountLines.push(`        expires in ${formatDuration(remaining)} (${expiryDate})`);
-							} else {
-								resetAccountLines.push(`        expired (${expiryDate})`);
-							}
-						}
-					}
+			if (resets.soonestExpiry) {
+				const expiryMs = Date.parse(resets.soonestExpiry);
+				const remaining = expiryMs - nowMs;
+				const expiryDate = resets.soonestExpiry.slice(0, 10);
+				if (remaining > 0) {
+					resetAccountLines.push(`        soonest expires in ${formatDuration(remaining)} (${expiryDate})`);
+				} else {
+					resetAccountLines.push(`        expired (${expiryDate})`);
 				}
+			}
+			if (resets.redeemableCount === 0 && resets.unavailableReason) {
+				const reason = sanitizeText(resets.unavailableReason.replace(/[\r\n\t]+/g, " "));
+				resetAccountLines.push(`        unavailable: ${reason}`);
 			}
 		}
 		if (resetAccountLines.length > 0) {

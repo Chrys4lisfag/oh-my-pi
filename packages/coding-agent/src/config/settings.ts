@@ -766,6 +766,11 @@ export class Settings {
 		return globalInstance;
 	}
 
+	/** Return the initialized or in-flight global settings without starting a writable load. */
+	static get current(): Promise<Settings> | null {
+		return globalInstancePromise;
+	}
+
 	// ─────────────────────────────────────────────────────────────────────────
 	// Core API
 	// ─────────────────────────────────────────────────────────────────────────
@@ -2985,6 +2990,17 @@ export class Settings {
 			raw.inlineToolDescriptors = raw.inlineToolDescriptors ? "on" : "off";
 		}
 
+		// find.enabled: boolean -> enum (auto | on | off). Preserve an explicit
+		// choice; unset installs get `auto`, which enables `find` only when the
+		// judge role resolves to a native System One model.
+		const findObj = isRecord(raw.find) ? raw.find : undefined;
+		if (findObj && typeof findObj.enabled === "boolean") {
+			findObj.enabled = findObj.enabled ? "on" : "off";
+		}
+		if (typeof raw["find.enabled"] === "boolean") {
+			raw["find.enabled"] = raw["find.enabled"] ? "on" : "off";
+		}
+
 		// statusLine: rename "plan_mode" segment to "mode"
 		const statusLineObj = raw.statusLine as Record<string, unknown> | undefined;
 		if (statusLineObj) {
@@ -3039,10 +3055,9 @@ export class Settings {
 			if (migrated !== undefined) providersObj.tinyModel = migrated;
 		}
 
-		// codexResets.autoRedeem: boolean -> tri-state enum.
-		// Existing explicit false keeps the old "do not run" behavior; missing
-		// config now falls through to the new "unset" default, which asks before
-		// the first eligible spend.
+		// Saved-reset autoRedeem booleans -> tri-state enums. Existing explicit
+		// false keeps "do not run"; missing config falls through to "unset",
+		// which asks before the first eligible provider-specific spend.
 		const codexResetsObj = raw.codexResets as Record<string, unknown> | undefined;
 		if (codexResetsObj && typeof codexResetsObj.autoRedeem === "boolean") {
 			codexResetsObj.autoRedeem = codexResetsObj.autoRedeem ? "yes" : "no";
@@ -3149,9 +3164,10 @@ export class Settings {
 			delete raw["power.preventDisplaySleep"];
 		}
 
-		// Migration for renamed settings grep.* and glob.* from search.* and find.*:
-		// 1. Nested settings: find -> glob, search -> grep (per-property merge to avoid clobbering)
-		const ensureRawObject = (key: "glob" | "grep"): Record<string, unknown> => {
+		// Migration for renamed settings grep.* from search.*. (`find.*` is no
+		// longer migrated to `glob.*`: `find` is the semantic search tool now.)
+		// 1. Nested settings: search -> grep (per-property merge to avoid clobbering)
+		const ensureRawObject = (key: "grep"): Record<string, unknown> => {
 			const current = raw[key];
 			if (isRecord(current)) {
 				return current;
@@ -3160,20 +3176,6 @@ export class Settings {
 			raw[key] = created;
 			return created;
 		};
-
-		if ("find" in raw) {
-			const findObj = raw.find;
-			if (isRecord(findObj)) {
-				const globObj = ensureRawObject("glob");
-				const findKeys: Array<"enabled"> = ["enabled"];
-				for (const key of findKeys) {
-					if (key in findObj && !(key in globObj)) {
-						globObj[key] = findObj[key];
-					}
-				}
-			}
-			delete raw.find;
-		}
 
 		if ("search" in raw) {
 			const searchObj = raw.search;
@@ -3194,13 +3196,6 @@ export class Settings {
 		}
 
 		// 2. Flat settings keys: map them to the proper nested target so get/set resolves them correctly
-		if ("find.enabled" in raw) {
-			const globObj = ensureRawObject("glob");
-			if (!("enabled" in globObj)) {
-				globObj.enabled = raw["find.enabled"];
-			}
-			delete raw["find.enabled"];
-		}
 		if ("search.enabled" in raw) {
 			const grepObj = ensureRawObject("grep");
 			if (!("enabled" in grepObj)) {

@@ -485,6 +485,8 @@ export interface ExecutorOptions {
 	modelOverride?: string | string[];
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
+	/** Extension routing note for the chosen model; surfaced as `resolvedModelRoute`. */
+	modelRoute?: string;
 	/**
 	 * Active model selector of the parent session, used as an auth-aware fallback
 	 * if the resolved subagent model has no working credentials. See #985.
@@ -1084,6 +1086,8 @@ interface RunMonitorArgs {
 	modelOverride?: string | string[];
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
+	/** Extension routing note for the chosen model. */
+	modelRoute?: string;
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
 	eventBus?: EventBus;
@@ -1215,6 +1219,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		durationMs: 0,
 		modelOverride: args.modelOverride,
 		modelRole: args.modelRole,
+		resolvedModelRoute: args.modelRoute,
 	};
 
 	const outputChunks: string[] = [];
@@ -2631,6 +2636,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		resolvedModelIdentity: progress.resolvedModelIdentity,
 		resolvedThinkingLevel: progress.resolvedThinkingLevel,
 		resolvedModelIsFallback: progress.resolvedModelIsFallback,
+		resolvedModelRoute: progress.resolvedModelRoute,
 		advisor: progress.advisor,
 		error: exitCode !== 0 && stderr ? stderr : undefined,
 		aborted: wasAborted,
@@ -3465,6 +3471,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		settings,
 		modelOverride,
 		modelRole,
+		modelRoute: options.modelRoute,
 		signal,
 		onProgress,
 		eventBus: options.eventBus,
@@ -3877,6 +3884,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				);
 			}
 
+			const hasExistingModelRole = sessionManager.getLastModelChangeRole() !== undefined;
 			const sessionPromise = createAgentSession(buildSubagentSessionOptions(sessionManager, null));
 			let session: AgentSession;
 			try {
@@ -3887,6 +3895,18 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				// a cancelled subagent cannot leak them.
 				void sessionPromise.then(created => created.session.dispose()).catch(() => {});
 				throw err;
+			}
+			// The SDK records a new session's initial model as the default role.
+			// Pin the child's own chain so a parent default sharing that model
+			// cannot steal its fallback routing. Resumed history keeps its role.
+			if (
+				!hasExistingModelRole &&
+				retryFallbackRole &&
+				model &&
+				session.model &&
+				formatModelStringWithRouting(session.model) === formatModelStringWithRouting(model)
+			) {
+				sessionManager.appendModelChange(formatModelStringWithRouting(model), retryFallbackRole);
 			}
 			sessionCreatedAt = performance.now();
 
