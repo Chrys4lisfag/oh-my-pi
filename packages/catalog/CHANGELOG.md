@@ -10,6 +10,7 @@
 - Fixed Venice models that don't support function calling (the `e2ee-*` end-to-end-encrypted variants, several `-uncensored` models, `hermes-3-llama-3.1-405b`, `grok-4-20-multi-agent`) failing every request with `400 tools is not supported by this model`. Venice reports per-model support under `model_spec.capabilities.supportsFunctionCalling`, but discovery ignored it and always sent a native `tools` array. Discovery now maps `supportsFunctionCalling: false` → `supportsTools: false`, so the agent routes those models through a prompted (in-band) tool dialect instead of the native tools API.
 ### Added
 
+- Added per-account discovery support for Codex cyber access entitlements
 - Added `org-scoped-identity` and `oauth-token-env` rule support for auth providers
 
 ## [18.2.11] - 2026-09-23
