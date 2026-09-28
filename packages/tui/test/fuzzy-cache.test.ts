@@ -1,7 +1,14 @@
 import { describe, expect, it } from "bun:test";
-import { fuzzyMatch, fuzzyRank, resetFuzzyIndexCache } from "@oh-my-pi/pi-tui/fuzzy";
+import { FuzzyText, fuzzyMatch, fuzzyRank, resetFuzzyIndexCache } from "@oh-my-pi/pi-tui/fuzzy";
 
 describe("fuzzy index cache", () => {
+	it("prepared batch matcher preserves punctuation, aliases and rejection scoring", () => {
+		const values = ["openai/gpt-4o", "provider/o4-mini", "nika/openai/gpt-6-astra", "unrelated model"];
+		for (const query of ["!!!", "4o", "nika/astra", "absent"]) {
+			const match = FuzzyText.matcher(query);
+			expect(values.map(text => match(new FuzzyText(text)))).toEqual(values.map(text => fuzzyMatch(query, text)));
+		}
+	});
 	it("produces identical ordering whether the cache is cold or warm", () => {
 		const items = [
 			"openai/gpt-4o",

@@ -307,11 +307,11 @@ function scoreTokenDirect(token: string, index: SearchIndex): FuzzyMatch {
 	return best ?? { matches: false, score: 0 };
 }
 
-function scoreToken(token: string, index: SearchIndex): FuzzyMatch {
+function scoreToken(token: string, variants: readonly string[], index: SearchIndex): FuzzyMatch {
 	let best = scoreTokenDirect(token, index);
 	if (best.matches) return best;
 
-	for (const variant of buildAlphanumericSwapQueries(token)) {
+	for (const variant of variants) {
 		const match = scoreTokenDirect(variant, index);
 		if (!match.matches) continue;
 		const score = match.score + ALPHANUMERIC_SWAP_PENALTY;
@@ -327,14 +327,18 @@ function scoreToken(token: string, index: SearchIndex): FuzzyMatch {
  * same query for every candidate in the list. */
 interface PreparedQuery {
 	normalized: string;
-	tokens: string[];
+	tokens: Array<{ token: string; variants: string[] }>;
 	compact: string;
 }
 
 function prepareQuery(query: string): PreparedQuery | null {
 	const normalized = normalizeForSearch(query);
 	if (normalized.length === 0) return null;
-	return { normalized, tokens: normalized.split(" "), compact: normalized.replaceAll(" ", "") };
+	return {
+		normalized,
+		tokens: normalized.split(" ").map(token => ({ token, variants: buildAlphanumericSwapQueries(token) })),
+		compact: normalized.replaceAll(" ", ""),
+	};
 }
 
 function fuzzyMatchCore(pq: PreparedQuery | null, index: SearchIndex): FuzzyMatch {
@@ -359,8 +363,8 @@ function fuzzyMatchCore(pq: PreparedQuery | null, index: SearchIndex): FuzzyMatc
 		totalScore += compactPhraseIndex * 0.01;
 	}
 
-	for (const token of pq.tokens) {
-		const match = scoreToken(token, index);
+	for (const { token, variants } of pq.tokens) {
+		const match = scoreToken(token, variants, index);
 		if (!match.matches) {
 			return { matches: false, score: 0 };
 		}
@@ -396,6 +400,12 @@ export class FuzzyText {
 	/** Match `query` (space-separated tokens; all must match) against the prepared text. */
 	match(query: string): FuzzyMatch {
 		return fuzzyMatchCore(prepareQuery(query), this.#index);
+	}
+
+	/** Prepare one query for a batch of already indexed candidates. */
+	static matcher(query: string): (text: FuzzyText) => FuzzyMatch {
+		const prepared = prepareQuery(query);
+		return text => fuzzyMatchCore(prepared, text.#index);
 	}
 }
 

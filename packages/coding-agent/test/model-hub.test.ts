@@ -105,7 +105,7 @@ interface HubHarness {
 	onUnassign: ReturnType<typeof vi.fn>;
 	onLoginRequest: ReturnType<typeof vi.fn>;
 	onCancel: ReturnType<typeof vi.fn>;
-	onFallbackChainChange: Mock<(role: string, chain: string[]) => void>;
+	onFallbackChainChange: Mock<(role: string, chain: string[], previousRole?: string) => void>;
 }
 
 const openHubs: ModelHubComponent[] = [];
@@ -130,8 +130,9 @@ function createHub(options: {
 	const onLoginRequest = vi.fn();
 	const onCancel = vi.fn();
 	// Mirror the controller: persist chain edits so the hub's re-read sees them.
-	const onFallbackChainChange = vi.fn((role: string, chain: string[]) => {
+	const onFallbackChainChange = vi.fn((role: string, chain: string[], previousRole?: string) => {
 		const chains = { ...settings.get("retry.fallbackChains") };
+		if (previousRole !== undefined && previousRole !== role) delete chains[previousRole];
 		if (chain.length === 0) {
 			delete chains[role];
 		} else {
@@ -453,6 +454,7 @@ describe("ModelHub", () => {
 				vi.advanceTimersByTime(200);
 				await Promise.resolve();
 				await Promise.resolve();
+				vi.advanceTimersByTime(250);
 
 				// delta-local is gone; focus must land on the neighbouring provider,
 				// not snap back to "All models" at the top.
@@ -744,6 +746,42 @@ describe("ModelHub", () => {
 			expect(thinking).toContain("xhigh");
 			expect(thinking).not.toContain("max");
 		});
+		test("role edits reuse the catalog and perf snapshot while reflecting new assignments", async () => {
+			const models = Array.from({ length: 8000 }, (_, i) => makeModel(`perf-${i % 20}`, `model-${i}`));
+			const settings = Settings.isolated({});
+			const getAll = vi.fn(() => models);
+			const getAvailable = vi.fn(() => models);
+			const getModelPerf = vi.fn(() => new Map());
+			vi.spyOn(settings, "getStorage").mockReturnValue({
+				getModelUsageOrder: () => [],
+				getModelPerf,
+			} as unknown as AgentStorage);
+			const onAssign = vi.fn((_model: Model, role: string, _level: unknown, selector: string) => {
+				settings.setModelRole(role, selector);
+			});
+			const { hub } = createHub({ models, settings, registry: { getAll, getAvailable }, callbacks: { onAssign } });
+			await Bun.sleep(0);
+			getAll.mockClear();
+			getAvailable.mockClear();
+			getModelPerf.mockClear();
+			hub.handleInput("\n");
+			hub.handleInput("\n");
+			expect(onAssign).toHaveBeenCalledTimes(1);
+			expect(footerLine(hub.render(220))).toContain("inherit");
+			expect(getAll).not.toHaveBeenCalled();
+			expect(getAvailable).not.toHaveBeenCalled();
+			expect(getModelPerf).not.toHaveBeenCalled();
+			hub.handleInput(ESC);
+			hub.handleInput(UP);
+			expect(normalize(hub.render(220))).toContain(settings.getModelRole("default")!);
+			hub.handleInput(ESC);
+			for (let index = 0; index < 20; index++) {
+				hub.handleInput(DOWN);
+				hub.render(220);
+			}
+			expect(getAll).not.toHaveBeenCalled();
+		});
+
 		test("awaits an async default assignment and does not recommit its preselected thinking", async () => {
 			const model = getBundledModel("openai", "gpt-5.5");
 			if (!model) throw new Error("Expected bundled model openai/gpt-5.5");
@@ -1325,6 +1363,34 @@ describe("ModelHub", () => {
 			expect(normalize(hub.render(220))).not.toContain("↳ test/model-a");
 		});
 
+		test("changing a chain root preserves entries and focuses the renamed chain", () => {
+			const models = ["old", "new", "taken"].map(id => makeModel("test", id));
+			const chain = ["test/fallback@edge:high", "other/*"];
+			const settings = Settings.isolated({
+				"retry.fallbackChains": { "test/old": chain, "test/taken": ["other/keep"] },
+			});
+			const { hub } = createHub({ models, scoped: true, settings });
+			enterRolesView(hub);
+			for (let i = 0; i < 6; i++) hub.handleInput(UP);
+			hub.handleInput("r");
+			for (const ch of "taken") hub.handleInput(ch);
+			hub.handleInput("\n");
+			expect(settings.get("retry.fallbackChains")).toEqual({
+				"test/old": chain,
+				"test/taken": ["other/keep"],
+			});
+			hub.handleInput(ESC);
+			hub.handleInput("r");
+			for (const ch of "new") hub.handleInput(ch);
+			hub.handleInput("\n");
+			expect(settings.get("retry.fallbackChains")).toEqual({
+				"test/new": chain,
+				"test/taken": ["other/keep"],
+			});
+			hub.handleInput("x");
+			expect(settings.get("retry.fallbackChains")).toEqual({ "test/taken": ["other/keep"] });
+		});
+
 		test("t on a fallback entry sets an explicit effort suffix", () => {
 			const model = getBundledModel("openai", "gpt-5.5");
 			if (!model) throw new Error("Expected bundled model openai/gpt-5.5");
@@ -1518,6 +1584,39 @@ describe("ModelHub", () => {
 			// ...and scrolling back up restores the original window exactly.
 			for (let i = 0; i < 500; i++) hub.handleInput(WHEEL_UP_BODY);
 			expect(normalize(hub.render(220))).toBe(before);
+		});
+
+		test("coalesces background discovery without re-resolving unchanged roles or clearing search", async () => {
+			const models = [makeModel("quiet", "search-target")];
+			let notify = () => {};
+			const settings = Settings.isolated({});
+			const getModelPerf = vi.fn(() => new Map());
+			vi.spyOn(settings, "getStorage").mockReturnValue({
+				getModelUsageOrder: () => [],
+				getModelPerf,
+			} as unknown as AgentStorage);
+			const { hub } = createHub({
+				models,
+				settings,
+				registry: {
+					onModelsUpdated: listener => {
+						notify = listener;
+						return () => {};
+					},
+				},
+			});
+			hub.handleInput("search");
+			getModelPerf.mockClear();
+			for (let i = 0; i < 100; i++) notify();
+			expect(getModelPerf).not.toHaveBeenCalled();
+			await Bun.sleep(300);
+			expect(getModelPerf).not.toHaveBeenCalled();
+			expect(normalize(hub.render(220))).toContain("search-target");
+			expect(normalize(hub.render(220))).toContain("🔍 > search");
+			models.push(makeModel("quiet", "search-arrival"));
+			notify();
+			await waitForCondition(() => normalize(hub.render(220)).includes("search-arrival"));
+			expect(getModelPerf).toHaveBeenCalledTimes(1);
 		});
 
 		test("F5 on All models refreshes providers concurrently, survives failure, and ignores duplicate F5", async () => {
@@ -1857,7 +1956,7 @@ describe("ModelHub", () => {
 				},
 			});
 
-			await waitForCondition(() => models.length === 3);
+			await waitForCondition(() => normalize(hub.render(220)).includes("All models 3"));
 			expect(refreshProvider.mock.calls.map(call => call[0]).sort()).toEqual(["prov-zero-a", "prov-zero-b"]);
 			const rendered = normalize(hub.render(220));
 			expect(rendered).toContain("All models 3");
@@ -1884,7 +1983,7 @@ describe("ModelHub", () => {
 			expect(normalize(hub.render(220))).not.toContain("needle-arrived");
 
 			gate.resolve();
-			await waitForCondition(() => models.length === 1);
+			await waitForCondition(() => normalize(hub.render(220)).includes("needle-arrived"));
 			const rendered = normalize(hub.render(220));
 			expect(rendered).toContain("needle-arrived");
 			expect(rendered).toContain("All models 1");
@@ -1967,7 +2066,7 @@ describe("ModelHub", () => {
 
 			models.push(discovered);
 			background.resolve();
-			await Bun.sleep(10);
+			await waitForCondition(() => normalize(hub.render(220)).includes("model-from-startup"));
 			expect(order).toEqual(["background-wait", "background-done", "online"]);
 			expect(refreshProvider).not.toHaveBeenCalled();
 			expect(normalize(hub.render(220))).toContain("model-from-startup");
@@ -2156,6 +2255,7 @@ describe("ModelHub", () => {
 			models.push(discovered);
 			state = { ...state, status: "ok", models: [discovered.id] };
 			notifyModelsUpdated?.();
+			await waitForCondition(() => normalize(hub.render(220)).includes("arrived-in-background"));
 
 			const rendered = normalize(hub.render(220));
 			expect(rendered).toContain("prov-background · 1 model");
@@ -2209,6 +2309,7 @@ describe("ModelHub", () => {
 			reopened.handleInput(DOWN);
 			await Bun.sleep(140);
 			expect(refreshProvider).toHaveBeenCalledTimes(2);
+			await waitForCondition(() => normalize(reopened.render(220)).includes("model-live"));
 			const rendered = normalize(reopened.render(220));
 			expect(rendered).toContain("model-live");
 			expect(rendered).not.toContain("Live refresh is still pending");
@@ -2247,7 +2348,7 @@ describe("ModelHub", () => {
 			expect(refreshProvider).toHaveBeenCalledTimes(1);
 
 			gate.resolve();
-			await Bun.sleep(0);
+			await waitForCondition(() => normalize(reopened.render(220)).includes("model-from-first-request"));
 			expect(normalize(reopened.render(220))).toContain("model-from-first-request");
 		});
 
@@ -2277,6 +2378,7 @@ describe("ModelHub", () => {
 			reopened.handleInput(DOWN);
 			await Bun.sleep(140);
 			expect(refreshProvider).toHaveBeenCalledTimes(2);
+			await waitForCondition(() => normalize(reopened.render(220)).includes("model-after-retry"));
 			expect(normalize(reopened.render(220))).toContain("model-after-retry");
 		});
 
@@ -2307,7 +2409,7 @@ describe("ModelHub", () => {
 			await Bun.sleep(140);
 			expect(normalize(hub.render(220))).toContain("Live refresh is still pending");
 			gate.resolve();
-			await Bun.sleep(0);
+			await waitForCondition(() => normalize(hub.render(220)).includes("model-after-refresh"));
 			const rendered = normalize(hub.render(220));
 			expect(rendered).toContain("model-after-refresh");
 			expect(rendered).not.toContain("Live refresh is still pending");

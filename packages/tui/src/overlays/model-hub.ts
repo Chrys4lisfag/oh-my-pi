@@ -18,7 +18,7 @@ import { providerEntry } from "@oh-my-pi/pi-catalog/compat/providers";
 import { MODEL_KINDS, modelKind, type ModelKind } from "@oh-my-pi/pi-catalog/types";
 import type { Component, TUI } from "../tui";
 import { extractPrintableText, matchesKey } from "../keys";
-import { fuzzyFilter } from "../fuzzy";
+import { FuzzyText } from "../fuzzy";
 import { getKeybindings } from "../keybindings";
 import { Input } from "../components/input";
 import { routeSgrMouseInput, type SgrMouseEvent } from "../mouse";
@@ -76,6 +76,7 @@ type RolesRow =
 type AssignTarget =
 	| { kind: "role"; role: string }
 	| { kind: "fallback"; role: string; index: number | null }
+	| { kind: "fallbackRoot"; role: string }
 	| { kind: "fallbackKey" };
 
 /** Live preferences and selector operations supplied by the host. */
@@ -138,7 +139,7 @@ export interface ModelHubCallbacks {
 	/** Clear a configured role back to auto-selection. */
 	onUnassign: (role: string, scope?: ModelRoleSelectionScope) => void;
 	/** Persist a `retry.fallbackChains` entry — keyed by a role, `provider/model-id`, or `provider/*`; an empty chain clears the key. */
-	onFallbackChainChange?: (role: string, chain: string[]) => void;
+	onFallbackChainChange?: (role: string, chain: string[], previousRole?: string) => void;
 	/** Locked provider activation: forward to the /login flow. */
 	onLoginRequest?: (providerId: string) => void;
 	/** Persist a new quick-switch cycle order (the ctrl+p role cycle). */
@@ -256,6 +257,12 @@ export class ModelHubComponent implements Component {
 	#availableItems: ModelBrowserItem[] = [];
 	#recentItems: ModelBrowserItem[] = [];
 	#candidateItems: ModelBrowserItem[] = [];
+	#allModels: Model[] = [];
+	#availableModels: ReadonlyArray<Model> = [];
+	#catalogReady = false;
+	#searchTexts: Array<{ item: ModelBrowserItem; text: FuzzyText }> | undefined;
+	#providerItems = new Map<string, ModelBrowserItem[]>();
+	#fallbackItems = new Map<string, ModelBrowserItem | undefined>();
 	#modelKindTab: "all" | ModelKind = "all";
 	#roleTab: RoleTab = "all";
 	#configError: string | undefined;
@@ -366,30 +373,7 @@ export class ModelHubComponent implements Component {
 		this.#browser.onQueryChange = query => this.#onQueryChanged(query);
 		this.#unsubscribeModelsUpdated = this.#registry.onModelsUpdated?.(() => {
 			if (this.#disposed) return;
-			if (this.#allProviderRefresh) {
-				this.#scheduleRegistrySync();
-				return;
-			}
-			const updatedProviders = new Set([...this.#refreshingProviders, ...this.#scheduledProviderRefreshes.keys()]);
-			for (const providerId of updatedProviders) {
-				const previousCount =
-					this.#entries.find(entry => entry.kind === "provider" && entry.providerId === providerId)
-						?.catalogCount ?? 0;
-				const currentCount = this.#registry.getAll("all").filter(model => model.provider === providerId).length;
-				// Only an actual zero -> populated transition settles another pending
-				// refresh. Unrelated model events must never cancel an explicit F5.
-				if (previousCount > 0 || currentCount === 0) continue;
-				this.#providerRefreshState.emptyProviderRetryAfter.delete(providerId);
-				this.#providerRefreshState.emptyProviderAutoAttempts.delete(providerId);
-				const timer = this.#scheduledProviderRefreshes.get(providerId);
-				if (timer) clearTimeout(timer);
-				this.#scheduledProviderRefreshes.delete(providerId);
-				if (!this.#providerRefreshState.providerRefreshesInFlight.has(providerId)) {
-					this.#setProviderRefreshing(providerId, false);
-				}
-			}
-			this.#syncFromRegistryState();
-			this.#tui.requestRender();
+			this.#scheduleRegistrySync();
 		});
 
 		// Pick up `models.yml` edits made since startup BEFORE the first paint.
@@ -416,8 +400,11 @@ export class ModelHubComponent implements Component {
 		if (this.#scopedModels.length === 0) {
 			this.#initialRegistrySync = (async () => {
 				await registry.awaitBackgroundRefresh?.();
+				// Let the overlay paint and queued input run before catalog work.
+				await Bun.sleep(0);
+				if (this.#disposed) return;
 				await registry.refresh("online");
-				this.#syncFromRegistryState();
+				this.#scheduleRegistrySync();
 			})()
 				.then(() => this.#reprobeHiddenOptionalProviders())
 				.catch(error => {
@@ -465,17 +452,38 @@ export class ModelHubComponent implements Component {
 
 	/** Resolve every known role: configured values first, auto-selection for the rest. */
 	#reloadRoles(autoCandidates: ReadonlyArray<Model>): void {
-		const allModels = this.#scopedModels.length > 0 ? autoCandidates : this.#registry.getAll("all");
+		const allModels = this.#scopedModels.length > 0 ? autoCandidates : this.#allModels;
 		this.#roles = resolveRoleAssignments(this.#settings, allModels, autoCandidates);
 	}
 
-	/** Coalesce bulk discovery notifications; never rebuild the full list inline. */
+	/** Coalesce all discovery notifications, including startup and empty-provider retries. */
 	#scheduleRegistrySync(): void {
 		if (this.#disposed || this.#registrySyncTimer) return;
 		this.#registrySyncTimer = setTimeout(() => {
 			this.#registrySyncTimer = undefined;
 			if (this.#disposed) return;
 			try {
+				const updatedProviders = new Set([
+					...this.#refreshingProviders,
+					...this.#scheduledProviderRefreshes.keys(),
+				]);
+				for (const providerId of updatedProviders) {
+					const previousCount =
+						this.#entries.find(entry => entry.kind === "provider" && entry.providerId === providerId)
+							?.catalogCount ?? 0;
+					const currentCount = this.#registry.getAll("all").filter(model => model.provider === providerId).length;
+					// Only an actual zero -> populated transition settles another pending
+					// refresh. Unrelated model events must never cancel an explicit F5.
+					if (previousCount > 0 || currentCount === 0) continue;
+					this.#providerRefreshState.emptyProviderRetryAfter.delete(providerId);
+					this.#providerRefreshState.emptyProviderAutoAttempts.delete(providerId);
+					const timer = this.#scheduledProviderRefreshes.get(providerId);
+					if (timer) clearTimeout(timer);
+					this.#scheduledProviderRefreshes.delete(providerId);
+					if (!this.#providerRefreshState.providerRefreshesInFlight.has(providerId)) {
+						this.#setProviderRefreshing(providerId, false);
+					}
+				}
 				this.#syncFromRegistryState();
 			} catch (error) {
 				this.#configError = error instanceof Error ? error.message : String(error);
@@ -507,6 +515,26 @@ export class ModelHubComponent implements Component {
 				availableModels = [];
 			}
 		}
+		const unchanged =
+			this.#catalogReady &&
+			allModels.length === this.#allModels.length &&
+			availableModels.length === this.#availableModels.length &&
+			allModels.every((model, index) => model === this.#allModels[index]) &&
+			availableModels.every((model, index) => model === this.#availableModels[index]);
+		if (unchanged) {
+			// Failed/empty discovery often changes only status. Do not re-resolve
+			// every role, read metrics, sort, or reset the browser for that event.
+			const activeBefore = this.#activeEntryId;
+			this.#buildSidebar(allModels, availableModels);
+			this.#restoreSidebarAnchor(anchor);
+			if (activeBefore !== this.#activeEntryId) this.#applyScope();
+			return;
+		}
+		this.#catalogReady = true;
+		this.#allModels = [...allModels];
+		this.#availableModels = [...availableModels];
+		this.#searchTexts = undefined;
+		this.#fallbackItems.clear();
 
 		this.#reloadRoles(availableModels);
 		this.#buildRolesRows();
@@ -514,6 +542,12 @@ export class ModelHubComponent implements Component {
 		const mruOrder = this.#settings.mruOrder;
 		this.#availableItems = buildBrowserItems(availableModels);
 		sortModelItems(this.#availableItems, { roles: this.#roles, mruOrder });
+		this.#providerItems.clear();
+		for (const item of this.#availableItems) {
+			const group = this.#providerItems.get(item.provider);
+			if (group) group.push(item);
+			else this.#providerItems.set(item.provider, [item]);
+		}
 		this.#browser.setRoles(this.#roles);
 		this.#browser.setMruOrder(mruOrder);
 		this.#perf = this.#settings.modelPerf;
@@ -745,7 +779,7 @@ export class ModelHubComponent implements Component {
 				}
 				const providerId = entry.providerId;
 				this.#browser.setShowProvider(false);
-				this.#setCandidateItems(this.#availableItems.filter(item => item.provider === providerId));
+				this.#setCandidateItems(this.#providerItems.get(providerId ?? "") ?? []);
 				break;
 			}
 			case "roles":
@@ -759,7 +793,12 @@ export class ModelHubComponent implements Component {
 	}
 
 	#setCandidateItems(items: ReadonlyArray<ModelBrowserItem>): void {
-		this.#candidateItems = [...items];
+		const target = this.#assigning;
+		const root = target?.kind === "fallbackRoot" ? target.role : undefined;
+		const chains = root !== undefined ? this.#fallbackChains() : undefined;
+		this.#candidateItems = chains
+			? items.filter(item => item.selector === root || !Object.hasOwn(chains, item.selector))
+			: [...items];
 		this.#applyModelKind();
 	}
 
@@ -843,7 +882,16 @@ export class ModelHubComponent implements Component {
 
 	/** Refresh roles + dependent state after a settings mutation (assign/unassign). */
 	#refreshAfterMutation(): void {
-		this.#syncFromRegistryState();
+		// Assignment/cycle edits do not change the catalog or provider inventory.
+		// Avoid getAll/getAvailable, model construction, and sidebar regeneration.
+		this.#reloadRoles(this.#availableModels);
+		this.#buildRolesRows();
+		this.#browser.setRoles(this.#roles);
+		this.#browser.setMruOrder(this.#settings.mruOrder);
+		const visibleRoles = this.#visibleRoleIds();
+		const count = visibleRoles.filter(role => this.#roles[role] && !this.#roles[role].autoSelected).length;
+		const rolesEntry = this.#fixedEntries.find(entry => entry.kind === "roles");
+		if (rolesEntry) rolesEntry.annotation = `${count}/${visibleRoles.length}`;
 		this.#tui.requestRender();
 	}
 
@@ -864,17 +912,18 @@ export class ModelHubComponent implements Component {
 			this.#composeEntries();
 			return;
 		}
-		const matches = fuzzyFilter(this.#availableItems, query, modelSearchText);
+		this.#searchTexts ??= this.#availableItems.map(item => ({ item, text: new FuzzyText(modelSearchText(item)) }));
 		const counts = new Map<string, number>();
-		for (const item of matches) {
-			counts.set(item.provider, (counts.get(item.provider) ?? 0) + 1);
-		}
 		const recentSelectors = new Set(this.#recentItems.map(item => item.selector));
-		this.#recentSearchCount = matches.reduce(
-			(total, item) => total + (recentSelectors.has(item.selector) ? 1 : 0),
-			0,
-		);
-		this.#searchTotal = matches.length;
+		this.#searchTotal = 0;
+		this.#recentSearchCount = 0;
+		const match = FuzzyText.matcher(query);
+		for (const { item, text } of this.#searchTexts) {
+			if (!match(text).matches) continue;
+			counts.set(item.provider, (counts.get(item.provider) ?? 0) + 1);
+			this.#searchTotal++;
+			if (recentSelectors.has(item.selector)) this.#recentSearchCount++;
+		}
 		this.#searchCounts = counts;
 		this.#composeEntries();
 		const entry = this.#activeEntry();
@@ -1012,12 +1061,9 @@ export class ModelHubComponent implements Component {
 					// Provider discovery state carries the actionable error when available.
 				} finally {
 					this.#finishProviderRefresh(providerId);
-					if (this.#allProviderRefresh) this.#scheduleRegistrySync();
-					else if (!this.#disposed) {
-						this.#syncFromRegistryState();
-						this.#tui.requestRender();
-					}
+					this.#scheduleRegistrySync();
 				}
+				await Bun.sleep(0);
 			}
 		};
 		await Promise.all(
@@ -1143,7 +1189,9 @@ export class ModelHubComponent implements Component {
 		) {
 			return;
 		}
-		const retryableEmpty = !this.#registry.getAll("all").some(model => model.provider === providerId);
+		const retryableEmpty = !this.#entries.some(
+			entry => entry.providerId === providerId && (entry.catalogCount ?? 0) > 0,
+		);
 		if (!force) {
 			if (this.#providerRefreshState.autoRefreshedProviders.has(providerId) && !retryableEmpty) return;
 			if (retryableEmpty && (this.#providerRefreshState.emptyProviderAutoAttempts.get(providerId) ?? 0) >= 2) return;
@@ -1203,8 +1251,7 @@ export class ModelHubComponent implements Component {
 			} else {
 				await this.#registry.refreshProvider(providerId, "online");
 			}
-			if (catalogOnly || this.#allProviderRefresh) this.#scheduleRegistrySync();
-			else if (!this.#disposed) this.#syncFromRegistryState();
+			this.#scheduleRegistrySync();
 		} catch (error) {
 			this.#configError = error instanceof Error ? error.message : String(error);
 		} finally {
@@ -1317,6 +1364,8 @@ export class ModelHubComponent implements Component {
 				this.#assignRole(item, target.role, true);
 			} else if (target.kind === "fallbackKey") {
 				this.#openFallbackKeyStrip(item);
+			} else if (target.kind === "fallbackRoot") {
+				this.#commitFallbackRoot(item, target.role);
 			} else {
 				this.#commitFallback(item, target);
 			}
@@ -1328,8 +1377,7 @@ export class ModelHubComponent implements Component {
 	#roleForScope(role: string, scope: ModelRoleSelectionScope): ResolvedModelRoleValue {
 		const roleValue =
 			scope === "project" ? this.#settings.getProjectModelRole(role) : this.#settings.getGlobalModelRole(role);
-		const allModels =
-			this.#scopedModels.length > 0 ? this.#scopedModels.map(scoped => scoped.model) : this.#registry.getAll("all");
+		const allModels = this.#allModels;
 		const roleLookup: ModelRoleLookup = {
 			getModelRole: scopedRole =>
 				scope === "project"
@@ -1522,9 +1570,16 @@ export class ModelHubComponent implements Component {
 	 * exists, so the strip changes no scope.
 	 */
 	#findFallbackModel(provider: string, id: string): ModelBrowserItem | undefined {
+		const key = `${provider}/${id}`;
+		const existing = this.#itemBySelector.get(key);
+		if (existing) return existing;
+		if (this.#fallbackItems.has(key)) return this.#fallbackItems.get(key);
 		const model = this.#registry.find(provider, id);
-		if (!model) return undefined;
-		return { provider: model.provider, id: model.id, model, selector: `${model.provider}/${model.id}` };
+		const item = model
+			? { provider: model.provider, id: model.id, model, selector: `${model.provider}/${model.id}` }
+			: undefined;
+		this.#fallbackItems.set(key, item);
+		return item;
 	}
 
 	/**
@@ -1722,9 +1777,8 @@ export class ModelHubComponent implements Component {
 		this.#assigning = { kind: "role", role };
 		this.#focus = "scope";
 		this.#browser.setShowProvider(true);
-		this.#setCandidateItems(
-			this.#availableItems.filter(item => this.#settings.getRoleInfo(role).accepts(item.model)),
-		);
+		const info = this.#settings.getRoleInfo(role);
+		this.#setCandidateItems(this.#availableItems.filter(item => info.accepts(item.model)));
 		this.#browser.setQuery("");
 		const current = this.#roles[role];
 		if (current) {
@@ -1757,6 +1811,26 @@ export class ModelHubComponent implements Component {
 		this.#browser.setShowProvider(true);
 		this.#setCandidateItems(this.#availableItems);
 		this.#browser.setQuery("");
+	}
+
+	#startAssignFallbackRoot(role: string): void {
+		this.#assigning = { kind: "fallbackRoot", role };
+		this.#focus = "scope";
+		this.#browser.setShowProvider(true);
+		this.#setCandidateItems(this.#availableItems);
+		this.#browser.setQuery("");
+		this.#browser.selectSelector(role);
+	}
+
+	#commitFallbackRoot(item: ModelBrowserItem, role: string): void {
+		const chains = this.#fallbackChains();
+		if (item.selector !== role && !Object.hasOwn(chains, item.selector) && chains[role]) {
+			this.#callbacks.onFallbackChainChange?.(item.selector, [...chains[role]], role);
+			this.#refreshAfterMutation();
+		}
+		this.#cancelAssign();
+		const rowIndex = this.#rolesRows.findIndex(row => row.kind === "chainKey" && row.role === item.selector);
+		if (rowIndex >= 0) this.#roleIndex = rowIndex;
 	}
 
 	/** Second step of "+ New fallback…": key the chain by the picked model or its whole provider. */
@@ -2181,6 +2255,10 @@ export class ModelHubComponent implements Component {
 			else if (row?.kind === "chainKey") this.#setFallbackChain(row.role, []);
 			return;
 		}
+		if (printable === "r" && row?.kind === "chainKey") {
+			this.#startAssignFallbackRoot(row.role);
+			return;
+		}
 		if (printable === "f") {
 			if (row?.kind === "newFallback") this.#startAssignFallbackKey();
 			else if (row && row.kind !== "newRole" && row.kind !== "separator") {
@@ -2420,6 +2498,12 @@ export class ModelHubComponent implements Component {
 			if (this.#assigning.kind === "fallbackKey") {
 				return truncateToWidth(
 					theme.fg("accent", " New fallback chain — Enter picks the model it protects, Esc cancels"),
+					width,
+				);
+			}
+			if (this.#assigning.kind === "fallbackRoot") {
+				return truncateToWidth(
+					theme.fg("accent", ` Change root of ${this.#assigning.role} — existing chains excluded · Esc cancels`),
 					width,
 				);
 			}
@@ -2669,7 +2753,7 @@ export class ModelHubComponent implements Component {
 		const catalogCount = entry.catalogCount ?? 0;
 		if (catalogCount > 0) {
 			lines.push(truncateToWidth(theme.fg("dim", `  ${catalogCount} models in catalog:`), width));
-			const preview = this.#scopedModels.length > 0 ? [] : this.#registry.getAll("all");
+			const preview = this.#scopedModels.length > 0 ? [] : this.#allModels;
 			for (const model of preview) {
 				if (model.provider !== entry.providerId) continue;
 				if (lines.length >= rows) break;
@@ -2695,6 +2779,7 @@ export class ModelHubComponent implements Component {
 				case "fallback":
 					return "Enter pick fallback · ↑/↓ providers · type to search · Alt+←/→ kind · Esc cancel";
 				case "fallbackKey":
+				case "fallbackRoot":
 					return "Enter pick the protected model · ↑/↓ providers · type to search · Alt+←/→ kind · Esc cancel";
 				default:
 					return "Enter assign · ↑/↓ providers · type to search · Alt+←/→ kind · Esc cancel";
@@ -2715,7 +2800,7 @@ export class ModelHubComponent implements Component {
 				return `↑/↓ rows · Enter replace · f add another · x remove${thinking} · [ or ] reorder · ← providers`;
 			}
 			if (row?.kind === "chainKey") {
-				return "↑/↓ rows · Enter/f add fallback · x clear chain · ← providers";
+				return "↑/↓ rows · Enter/f add fallback · r change root · x clear chain · ← providers";
 			}
 			if (row?.kind === "newFallback") {
 				return "↑/↓ rows · Enter new model/provider fallback chain · ← providers";

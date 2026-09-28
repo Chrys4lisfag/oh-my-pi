@@ -13,7 +13,7 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import type { ModelKind } from "@oh-my-pi/pi-catalog/types";
 import type { Component } from "../tui";
-import { fuzzyRank } from "../fuzzy";
+import { FuzzyText, fuzzyRank } from "../fuzzy";
 import { Input } from "../components/input";
 import { ScrollView } from "../components/scroll-view";
 import { matchesKey } from "../keys";
@@ -178,13 +178,26 @@ export function resolveRoleAssignments(
 	const roles: RoleAssignments = {};
 	const knownRoles = settings.knownRoleIds;
 	const configuredRoles = new Set<string>();
-	const catalog = [...allModels];
+	// Most roles share one acceptance predicate. Keep their array identity so
+	// host selector indexes are built once per kind, not once per role.
+	const pools = new Map<ReadonlyArray<Model>, Map<(model: Model) => boolean, Model[]>>();
+	const candidatesFor = (models: ReadonlyArray<Model>, role: string): Model[] => {
+		const accepts = settings.getRoleInfo(role).accepts;
+		let byPredicate = pools.get(models);
+		if (!byPredicate) pools.set(models, (byPredicate = new Map()));
+		let candidates = byPredicate.get(accepts);
+		if (!candidates) {
+			candidates = models.filter(accepts);
+			byPredicate.set(accepts, candidates);
+		}
+		return candidates;
+	};
 
 	for (const role of knownRoles) {
 		const roleValue = settings.getModelRole(role);
 		if (!roleValue) continue;
 		configuredRoles.add(role);
-		const resolved = settings.resolveRoleValue(roleValue, catalog.filter(settings.getRoleInfo(role).accepts));
+		const resolved = settings.resolveRoleValue(roleValue, candidatesFor(allModels, role));
 		if (resolved.model) {
 			roles[role] = {
 				model: resolved.model,
@@ -195,13 +208,9 @@ export function resolveRoleAssignments(
 	}
 
 	if (autoCandidates.length > 0) {
-		const candidates = [...autoCandidates];
 		for (const role of knownRoles) {
 			if (configuredRoles.has(role)) continue;
-			const resolved = settings.resolveRoleValue(
-				`pi/${role}`,
-				candidates.filter(settings.getRoleInfo(role).accepts),
-			);
+			const resolved = settings.resolveRoleValue(`pi/${role}`, candidatesFor(autoCandidates, role));
 			if (!resolved.model) continue;
 			roles[role] = {
 				model: resolved.model,
@@ -267,20 +276,18 @@ export interface SortModelItemsOptions {
  * Order models for display: role-assigned first, then most-recently-used,
  * then per provider by priority, version, and recency.
  */
-export function sortModelItems(items: ModelBrowserItem[], options: SortModelItemsOptions = {}): void {
+function modelItemComparator(items: readonly ModelBrowserItem[], options: SortModelItemsOptions) {
 	const { roles = {}, mruOrder = [], skipRoleRank = false } = options;
 	const mruIndex = new Map(mruOrder.map((key, i) => [key, i]));
+	const ranks = new Map(items.map(item => [item, skipRoleRank ? 0 : computeModelRank(item.model, roles)]));
+	const versions = new Map(items.map(item => [item, extractVersionNumber(item.id)]));
+	const recency = new Map(
+		items.map(item => [item, { latest: /-latest$/.test(item.id), date: item.id.match(/-(\d{8})$/)?.[1] ?? "" }]),
+	);
 
-	const dateRe = /-(\d{8})$/;
-	const latestRe = /-latest$/;
-
-	items.sort((a, b) => {
-		if (!skipRoleRank) {
-			const aRank = computeModelRank(a.model, roles);
-			const bRank = computeModelRank(b.model, roles);
-			if (aRank !== bRank) return aRank - bRank;
-		}
-
+	return (a: ModelBrowserItem, b: ModelBrowserItem): number => {
+		const rankCmp = ranks.get(a)! - ranks.get(b)!;
+		if (rankCmp !== 0) return rankCmp;
 		// Then MRU order (models in mruIndex come before those not in it)
 		const aMru = mruIndex.get(a.selector) ?? Number.MAX_SAFE_INTEGER;
 		const bMru = mruIndex.get(b.selector) ?? Number.MAX_SAFE_INTEGER;
@@ -296,14 +303,12 @@ export function sortModelItems(items: ModelBrowserItem[], options: SortModelItem
 		if (aPri !== bPri) return aPri - bPri;
 
 		// Version number descending (higher version = better model)
-		const aVer = extractVersionNumber(a.id);
-		const bVer = extractVersionNumber(b.id);
+		const aVer = versions.get(a)!;
+		const bVer = versions.get(b)!;
 		if (aVer !== bVer) return bVer - aVer;
 
-		const aIsLatest = latestRe.test(a.id);
-		const bIsLatest = latestRe.test(b.id);
-		const aDate = a.id.match(dateRe)?.[1] ?? "";
-		const bDate = b.id.match(dateRe)?.[1] ?? "";
+		const { latest: aIsLatest, date: aDate } = recency.get(a)!;
+		const { latest: bIsLatest, date: bDate } = recency.get(b)!;
 
 		// Models with recency info come before those without
 		const aHasRecency = aIsLatest || aDate !== "";
@@ -321,7 +326,11 @@ export function sortModelItems(items: ModelBrowserItem[], options: SortModelItem
 
 		// One has date, other is latest — latest first
 		return aIsLatest ? -1 : bIsLatest ? 1 : a.id.localeCompare(b.id);
-	});
+	};
+}
+
+export function sortModelItems(items: ModelBrowserItem[], options: SortModelItemsOptions = {}): void {
+	items.sort(modelItemComparator(items, options));
 }
 
 /** Picker candidates and ordering inputs shared with composer model mentions. */
@@ -447,14 +456,60 @@ function compactModelSearchText(value: string): string {
 	return value.toLowerCase().replace(/[^\p{Letter}\p{Mark}\p{Number}]+/gu, "");
 }
 
-/** Exact id/selector → contiguous literal → fuzzy-only. */
-function modelSearchTier(query: string, item: ModelBrowserItem): number {
-	if (!query) return 2;
-	const id = compactModelSearchText(item.id);
-	const selector = compactModelSearchText(item.selector);
-	if (query === id || query === selector) return 0;
-	if (id.includes(query) || selector.includes(query)) return 1;
-	return 2;
+interface ModelSearchEntry {
+	item: ModelBrowserItem;
+	text: FuzzyText;
+	id: string;
+	selector: string;
+}
+
+function prepareModelSearch(item: ModelBrowserItem): ModelSearchEntry {
+	return {
+		item,
+		text: new FuzzyText(modelSearchText(item)),
+		id: compactModelSearchText(item.id),
+		selector: compactModelSearchText(item.selector),
+	};
+}
+
+function rankModelMatches(
+	query: string,
+	matches: { item: ModelBrowserItem; score: number }[],
+	affinity: SearchAffinity,
+	compare: (a: ModelBrowserItem, b: ModelBrowserItem) => number,
+	prepared?: ReadonlyMap<ModelBrowserItem, ModelSearchEntry>,
+): ModelBrowserItem[] {
+	const queryKey = compactModelSearchText(query);
+	const ranked = matches.map(({ item, score }) => {
+		const entry = prepared?.get(item);
+		const id = entry?.id ?? compactModelSearchText(item.id);
+		const selector = entry?.selector ?? compactModelSearchText(item.selector);
+		const tier = !queryKey
+			? 2
+			: queryKey === id || queryKey === selector
+				? 0
+				: id.includes(queryKey) || selector.includes(queryKey)
+					? 1
+					: 2;
+		return {
+			item,
+			score,
+			tier,
+			bucket: Math.round(score / 10),
+			model: affinity.models.get(item.selector.toLowerCase()) ?? Number.MAX_SAFE_INTEGER,
+			provider: affinity.providers.get(item.provider.toLowerCase()) ?? Number.MAX_SAFE_INTEGER,
+		};
+	});
+	ranked.sort(
+		(a, b) =>
+			a.tier - b.tier ||
+			a.model - b.model ||
+			a.provider - b.provider ||
+			a.bucket - b.bucket ||
+			compare(a.item, b.item) ||
+			a.score - b.score,
+	);
+	return ranked.map(result => result.item);
 }
 
 /** Rank picker and mention candidates by text relevance, user affinity, and MRU/version order. */
@@ -464,41 +519,16 @@ export function rankModelItems(
 	options: { roles: RoleAssignments; mruOrder: ReadonlyArray<string>; affinity: SearchAffinity },
 ): ModelBrowserItem[] {
 	if (!query.trim()) return [...items];
-	const ranked = fuzzyRank(items, query, modelSearchText);
-	const matches = ranked.map(result => result.item);
-	// Exact and contiguous matches stay ahead of fuzzy-only candidates; affinity
-	// breaks ties before fuzzy quality and the normal MRU/version ordering.
-	sortModelItems(matches, { roles: options.roles, mruOrder: options.mruOrder, skipRoleRank: true });
-	const fallbackRanks = new Map(matches.map((item, index) => [item, index]));
-	const queryKey = compactModelSearchText(query);
-	const searchRanks = new Map<ModelBrowserItem, { tier: number; bucket: number }>();
-	for (const result of ranked) {
-		searchRanks.set(result.item, {
-			tier: modelSearchTier(queryKey, result.item),
-			bucket: Math.round(result.score / 10),
-		});
-	}
-	matches.sort((a, b) => {
-		const aSearch = searchRanks.get(a);
-		const bSearch = searchRanks.get(b);
-		const tierCmp = (aSearch?.tier ?? Number.MAX_SAFE_INTEGER) - (bSearch?.tier ?? Number.MAX_SAFE_INTEGER);
-		if (tierCmp !== 0) return tierCmp;
-
-		const modelCmp =
-			(options.affinity.models.get(a.selector.toLowerCase()) ?? Number.MAX_SAFE_INTEGER) -
-			(options.affinity.models.get(b.selector.toLowerCase()) ?? Number.MAX_SAFE_INTEGER);
-		if (modelCmp !== 0) return modelCmp;
-
-		const providerCmp =
-			(options.affinity.providers.get(a.provider.toLowerCase()) ?? Number.MAX_SAFE_INTEGER) -
-			(options.affinity.providers.get(b.provider.toLowerCase()) ?? Number.MAX_SAFE_INTEGER);
-		if (providerCmp !== 0) return providerCmp;
-
-		const bucketCmp = (aSearch?.bucket ?? Number.MAX_SAFE_INTEGER) - (bSearch?.bucket ?? Number.MAX_SAFE_INTEGER);
-		if (bucketCmp !== 0) return bucketCmp;
-		return (fallbackRanks.get(a) ?? Number.MAX_SAFE_INTEGER) - (fallbackRanks.get(b) ?? Number.MAX_SAFE_INTEGER);
-	});
-	return matches;
+	const matches = fuzzyRank(items, query, modelSearchText);
+	return rankModelMatches(
+		query,
+		matches,
+		options.affinity,
+		modelItemComparator(
+			matches.map(result => result.item),
+			{ mruOrder: options.mruOrder, skipRoleRank: true },
+		),
+	);
 }
 
 /**
@@ -638,11 +668,16 @@ export class ModelBrowser implements Component {
 		getKey: item => item.selector,
 		getSearchText: modelSearchText,
 		isDisabled: item => item.id === "separator",
-		filter: (items, query) => this.#filterItems(items, query),
+		filter: (_items, query) => this.#filterItems(query),
 	});
 	#roles: RoleAssignments = {};
 	#mruOrder: ReadonlyArray<string> = [];
 	#affinity: SearchAffinity = { models: new Map(), providers: new Map() };
+	#affinityDirty = true;
+	#searchEntries: Map<ModelBrowserItem, ModelSearchEntry> | undefined;
+	#searchComparator: ((a: ModelBrowserItem, b: ModelBrowserItem) => number) | undefined;
+	#baseItems: ModelBrowserItem[] = [];
+	#separatorDirty = false;
 	#perf: ReadonlyMap<string, ModelBrowserPerf> = new Map();
 	#hoveredIndex: number | null = null;
 	#maxVisible = 10;
@@ -674,7 +709,7 @@ export class ModelBrowser implements Component {
 		this.#currentContextTokens = Number.isFinite(tokens) && tokens > 0 ? Math.floor(tokens) : 0;
 		this.#markOverContext = options.markOverContext ?? false;
 		this.#emptyText = options.emptyText;
-		this.#syncAffinity();
+		this.#affinityDirty = true;
 	}
 
 	/** Mark `selector` as the session's active model (undefined clears the mark). */
@@ -685,7 +720,11 @@ export class ModelBrowser implements Component {
 	/** Replace the scope's base items; the live query re-applies and selection is pinned by selector. */
 	setItems(items: ModelBrowserItem[]): void {
 		const selectedKey = this.getSelected()?.selector;
-		this.#menu.setItems(this.#insertSeparator(items), selectedKey);
+		this.#baseItems = items.filter(item => !this.#isDisabled(item));
+		this.#searchEntries = undefined;
+		this.#searchComparator = undefined;
+		this.#separatorDirty = false;
+		this.#menu.setItems(this.#insertSeparator(this.#baseItems), selectedKey);
 		this.onSelectionChange?.(this.getSelected());
 		if (selectedKey) {
 			this.selectSelector(selectedKey);
@@ -694,16 +733,21 @@ export class ModelBrowser implements Component {
 
 	setRoles(roles: RoleAssignments): void {
 		this.#roles = roles;
-		this.#syncAffinity();
+		this.#affinityDirty = true;
+		this.#separatorDirty = true;
 	}
 
 	setMruOrder(order: ReadonlyArray<string>): void {
 		this.#mruOrder = order;
-		this.#syncAffinity();
+		this.#affinityDirty = true;
+		this.#separatorDirty = true;
+		this.#searchComparator = undefined;
 	}
 
 	#syncAffinity(): void {
+		if (!this.#affinityDirty) return;
 		this.#affinity = buildSearchAffinity(this.#settings.modelProviderOrder, this.#roles, this.#mruOrder);
+		this.#affinityDirty = false;
 	}
 
 	/** Measured TPS/TTFT averages keyed by `provider/id` selector (see AgentStorage.getModelPerf). */
@@ -772,17 +816,26 @@ export class ModelBrowser implements Component {
 	 * re-seats via {@link #applyQuery} because the menu passes items through
 	 * unfiltered when the query is blank.
 	 */
-	#filterItems(items: readonly ModelBrowserItem[], query: string): readonly ModelBrowserItem[] {
-		const base = items.filter(item => !this.#isDisabled(item));
-		const ranked = this.#preserveQueryOrder
-			? query.trim()
-				? fuzzyRank(base, query, modelSearchText).map(result => result.item)
-				: base
-			: rankModelItems(query, base, {
-					roles: this.#roles,
-					mruOrder: this.#mruOrder,
-					affinity: this.#affinity,
-				});
+	#filterItems(query: string): readonly ModelBrowserItem[] {
+		this.#syncAffinity();
+		this.#searchEntries ??= new Map(this.#baseItems.map(item => [item, prepareModelSearch(item)]));
+		const matches: { item: ModelBrowserItem; score: number }[] = [];
+		const matchText = FuzzyText.matcher(query);
+		for (const entry of this.#searchEntries.values()) {
+			const match = matchText(entry.text);
+			if (match.matches) matches.push({ item: entry.item, score: match.score });
+		}
+		let ranked: ModelBrowserItem[];
+		if (this.#preserveQueryOrder) {
+			matches.sort((a, b) => a.score - b.score);
+			ranked = matches.map(result => result.item);
+		} else {
+			this.#searchComparator ??= modelItemComparator(this.#baseItems, {
+				mruOrder: this.#mruOrder,
+				skipRoleRank: true,
+			});
+			ranked = rankModelMatches(query, matches, this.#affinity, this.#searchComparator, this.#searchEntries);
+		}
 		return this.#insertSeparator(ranked);
 	}
 
@@ -881,20 +934,11 @@ export class ModelBrowser implements Component {
 		const previousItems = this.#menu.visibleItems;
 		const previousSelectedIndex = this.#menu.selectedIndex;
 		const previousSelected = previousItems[previousSelectedIndex];
-		if (!query.trim()) {
-			// The menu passes items through unfiltered on a blank query, so
-			// re-seat the separator on the fresh base order here.
-			const base = this.#menu.items.filter(item => !this.#isDisabled(item));
-			this.#menu.setQuery("", false);
-			this.#menu.setItems(
-				this.#insertSeparator(base),
-				selection === "clamp" ? previousSelected?.selector : undefined,
-			);
-		} else if (selection === "reset-changed-prefix") {
-			this.#menu.setQuery(query, false);
-		} else {
-			this.#menu.setQuery(query, true);
+		if (this.#separatorDirty) {
+			this.#menu.setItems(this.#insertSeparator(this.#baseItems));
+			this.#separatorDirty = false;
 		}
+		this.#menu.setQuery(query, selection === "clamp");
 		if (
 			selection === "reset-changed-prefix" &&
 			previousSelected &&

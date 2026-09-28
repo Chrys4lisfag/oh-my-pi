@@ -6137,6 +6137,77 @@ describe("AgentSession retry fallback", () => {
 		expect(modelRegistry.isSelectorSuppressed("openai/gpt-4o")).toBe(false);
 	});
 
+	it("resumes an unexecuted tool on fallback without exposing transport errors as tool failures", async () => {
+		const primary = getBundledModel("openai", "gpt-4o");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!primary || !fallback) throw new Error("Missing fixture models");
+		const error = "503 upstream saturation PRIVATE_REQUEST_ID";
+		let executions = 0;
+		const schema = type({ value: "string" });
+		const tool: AgentTool<typeof schema, { value: string }> = {
+			name: "record",
+			label: "Record",
+			description: "Record value",
+			parameters: schema,
+			async execute(_id, args) {
+				executions++;
+				return { content: [{ type: "text", text: "recorded once" }], details: args };
+			},
+		};
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [{ type: "toolCall", id: "not-run", name: "record", arguments: { value: "first" } }],
+					stopReason: "error",
+					errorMessage: error,
+				},
+				{
+					content: [{ type: "toolCall", id: "retry-call", name: "record", arguments: { value: "retry" } }],
+					stopReason: "toolUse",
+				},
+				{ content: ["Task completed"] },
+			],
+		});
+		const captured: Message[][] = [];
+		const requested: string[] = [];
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			convertToLlm,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [tool], messages: [] },
+			streamFn: (model, context, options) => {
+				requested.push(model.id);
+				captured.push(structuredClone(context.messages));
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 1,
+			"retry.maxRetries": 0,
+			"retry.modelFallback": true,
+			"retry.fallbackChains": { [`${primary.provider}/${primary.id}`]: [`${fallback.provider}/${fallback.id}`] },
+		});
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		await session.prompt("Record a value and complete the task");
+		await session.waitForIdle();
+		expect(requested).toEqual([primary.id, fallback.id, fallback.id]);
+		expect(executions).toBe(1);
+		const projected = captured[1].find(message => message.role === "toolResult");
+		expect(projected).toMatchObject({ toolCallId: "not-run", isError: false });
+		expect(JSON.stringify(projected)).not.toContain(error);
+		expect(JSON.stringify(projected)).not.toContain("PRIVATE_REQUEST_ID");
+		const stored = agent.state.messages.find(
+			message => message.role === "toolResult" && message.toolCallId === "not-run",
+		);
+		expect(stored).toMatchObject({ details: { executed: false, upstreamError: error }, isError: true });
+		expect(
+			captured[2].find(message => message.role === "toolResult" && message.toolCallId === "retry-call"),
+		).toMatchObject({
+			content: [{ type: "text", text: "recorded once" }],
+			isError: false,
+		});
+	});
+
 	it("auto-retries Gemini MALFORMED_FUNCTION_CALL after an unexecuted tool call", async () => {
 		const model = getBundledModel("google", "gemini-1.5-flash");
 		if (!model) {

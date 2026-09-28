@@ -145,6 +145,24 @@ be adopted without silently losing fork features.
     remint or unrelated runtime-manager sweeps. Single-provider F5 still remints.
     Coalesce registry notifications at 250ms and yield between completed jobs;
     never synchronously rebuild the entire model list for every batch event.
+30. Model-menu role edits reuse loaded catalog/performance snapshots; successful
+    assignment has one UI owner, not a controller refresh plus hub refresh.
+    Provider navigation uses cached provider item groups, and fallback rows reuse
+    resolved items until catalog invalidation. Browser ranking precomputes sort
+    keys and search text, lazily invalidates affinity/MRU state, and retains
+    selection/search semantics after model refresh. Assignment persistence errors
+    must still be awaited and surfaced; never fake a committed thinking choice.
+    Coalesce startup/single-provider/empty-provider discovery updates too, not
+    only F5 batches. Status-only updates must not re-resolve roles/read metrics
+    or reset search. Sidebar counts use catalog-scoped FuzzyText indexes (the
+    shared fuzzy cache is bounded below production catalog size) and one prepared
+    query per scan; preserve query/selection while delayed catalogs arrive.
+31. Provider-error synthetic tool results with verified `executed:false` project
+    to a neutral not-executed continuation notice, never raw transport errors.
+    Keep original diagnostics in stored messages/UI details. Preserve tool IDs,
+    never auto-execute recorded partial arguments, and never rewrite real tool
+    results, user aborts, skipped calls, or output-limit guidance. Cover with
+    `unexecuted-tool-projection.test.ts` and mocked fallback execution regression.
 
 ## Important memory corrections
 

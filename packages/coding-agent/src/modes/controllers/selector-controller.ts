@@ -1097,6 +1097,7 @@ export class SelectorController {
 					const scopeLabel =
 						configuredStorage === "project" ? `${targetScope === "project" ? "Project" : "Global"} ` : "";
 					const defaultStatusLabel = configuredStorage === "project" ? `${scopeLabel}default` : "Default";
+					let assigned = false;
 					try {
 						if (role === "default") {
 							// `auto` on the default role configures the active session. Other roles
@@ -1166,13 +1167,15 @@ export class SelectorController {
 								`${scopeLabel}${roleInfo?.tag ?? roleInfo?.name ?? role} model: ${selector ?? model.id}`,
 							);
 						}
+						assigned = true;
 						return true;
 					} catch (error) {
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
 						return false;
 					} finally {
 						releaseDefaultMutation?.();
-						hub?.refreshAfterExternalMutation();
+						// Successful assignments are refreshed by the hub before opening the thinking strip.
+						if (!assigned && !closed) hub?.refreshAfterExternalMutation();
 					}
 				},
 				onUnassign: async (role, scope?: ModelRoleSelectionScope) => {
@@ -1251,12 +1254,13 @@ export class SelectorController {
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
 					} finally {
 						releaseDefaultMutation?.();
-						hub?.refreshAfterExternalMutation();
+						if (!closed) hub?.refreshAfterExternalMutation();
 					}
 				},
-				onFallbackChainChange: (role, chain) => {
+				onFallbackChainChange: (role, chain, previousRole) => {
 					try {
 						const chains = { ...this.ctx.settings.get("retry.fallbackChains") };
+						if (previousRole !== undefined && previousRole !== role) delete chains[previousRole];
 						if (chain.length === 0) {
 							delete chains[role];
 						} else {

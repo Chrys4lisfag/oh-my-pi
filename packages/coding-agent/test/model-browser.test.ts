@@ -113,6 +113,47 @@ describe("resolveRoleAssignments", () => {
 });
 
 describe("ModelBrowser search ranking", () => {
+	test("refreshing items invalidates cached cost searches and retains surviving selection", () => {
+		const paid = makeModel("fixture", "paid", { cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 } });
+		const free = makeModel("fixture", "gratis");
+		const browser = makeBrowser([paid, free], []);
+		const items = buildBrowserItems([paid, free]);
+		browser.setItems(items);
+		browser.setQuery("free");
+		expect(browser.getSelected()?.selector).toBe("fixture/gratis");
+		paid.cost.input = 0;
+		paid.cost.output = 0;
+		browser.setItems(items);
+		expect(browser.visibleCount).toBe(2);
+		expect(browser.getSelected()?.selector).toBe("fixture/gratis");
+		free.cost.input = 1;
+		browser.setItems(items);
+		expect(browser.visibleCount).toBe(1);
+		expect(browser.getSelected()?.selector).toBe("fixture/paid");
+	});
+
+	test("role and MRU changes refresh search affinity without replacing items", () => {
+		const a = makeModel("a", "example-2");
+		const b = makeModel("b", "example-2");
+		const browser = makeBrowser([a, b], []);
+		browser.setQuery("example");
+		expect(browser.getSelected()?.selector).toBe("a/example-2");
+		browser.setMruOrder(["b/example-2"]);
+		browser.setQuery("example-2");
+		expect(browser.getSelected()?.selector).toBe("b/example-2");
+		browser.setRoles({ default: { model: a, thinkingLevel: ThinkingLevel.Inherit, autoSelected: false } });
+		browser.setQuery("example");
+		expect(browser.getSelected()?.selector).toBe("a/example-2");
+		browser.setQuery("");
+		expect(browser.visibleCount).toBe(2);
+		browser.setRoles({});
+		browser.setMruOrder(["a/example-2"]);
+		browser.setQuery("");
+		expect(browser.visibleCount).toBe(3);
+		browser.moveSelection(1);
+		expect(browser.getSelected()?.selector).toBe("b/example-2");
+	});
+
 	test("headless candidates preserve picker relevance and affinity ordering", () => {
 		const models = [makeModel("a", "example-2"), makeModel("b", "example-2"), makeModel("a", "other")];
 		const roles: RoleAssignments = {};

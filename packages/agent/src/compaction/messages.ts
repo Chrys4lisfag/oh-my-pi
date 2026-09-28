@@ -6,11 +6,12 @@ import type {
 	TextContent,
 	ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
-import { prompt } from "@oh-my-pi/pi-utils";
+import { isRecord, prompt } from "@oh-my-pi/pi-utils";
 import type { AgentMessage } from "../types";
 import branchSummaryContextPrompt from "./prompts/branch-summary-context.md" with { type: "text" };
 import compactionSummaryContextPrompt from "./prompts/compaction-summary-context.md" with { type: "text" };
 import handoffSummaryContextPrompt from "./prompts/handoff-summary-context.md" with { type: "text" };
+import unexecutedToolContinuation from "./prompts/unexecuted-tool-continuation.md" with { type: "text" };
 
 const COMPACTION_SUMMARY_TEMPLATE = compactionSummaryContextPrompt;
 const HANDOFF_SUMMARY_TEMPLATE = handoffSummaryContextPrompt;
@@ -261,6 +262,24 @@ export function convertMessageToLlm(message: AgentMessage): Message | undefined 
 		case "assistant":
 			return message;
 		case "toolResult":
+			if (
+				isRecord(message.details) &&
+				message.details.__synthetic === true &&
+				message.details.source === "assistant_stop_error" &&
+				message.details.executed === false
+			) {
+				// Project only verified execution state. Keep full provider diagnostics
+				// in the persisted event, never masquerading as a local tool failure.
+				return {
+					role: "toolResult",
+					toolCallId: message.toolCallId,
+					toolName: message.toolName,
+					content: [{ type: "text", text: unexecutedToolContinuation.trim() }],
+					isError: false,
+					timestamp: message.timestamp,
+					attribution: message.attribution ?? "agent",
+				};
+			}
 			return {
 				...message,
 				content: getPrunedToolResultContent(message as ToolResultMessage),
