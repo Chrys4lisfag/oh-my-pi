@@ -6,6 +6,8 @@ const CHILD_SOURCE = `
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { cfgProfilesActive, cfgProfilesItems } from "@oh-my-pi/pi-coding-agent/config/profiles";
+import { cfgDefaultThinkingLevel } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -15,7 +17,7 @@ const agentDir = process.argv[1];
 const mode = process.argv[2];
 const settings = await Settings.loadIsolated({ agentDir });
 const authStorage = await AuthStorage.create(agentDir + "/auth-" + mode + ".db");
-authStorage.setRuntimeApiKey("anthropic", "test-key");
+authStorage.keys.setRuntime("anthropic", "test-key");
 const modelRegistry = new ModelRegistry(authStorage);
 const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 if (!model) throw new Error("Expected bundled profile process model");
@@ -29,9 +31,9 @@ const session = new AgentSession({
 console.log(JSON.stringify({
   event: "ready",
   pid: process.pid,
-  active: settings.get("profiles.active"),
-  level: settings.get("defaultThinkingLevel"),
-  item: settings.get("profiles.items")["gpt-edu"]?.defaultThinkingLevel,
+  active: cfgProfilesActive.get(settings),
+  level: cfgDefaultThinkingLevel.get(settings),
+  item: cfgProfilesItems.get(settings)["gpt-edu"]?.defaultThinkingLevel,
   sessionLevel: session.thinkingLevel ?? null,
 }));
 
@@ -41,21 +43,21 @@ if (mode === "writer") {
   console.log(JSON.stringify({
     event: "written",
     pid: process.pid,
-    level: settings.get("defaultThinkingLevel"),
-    item: settings.get("profiles.items")["gpt-edu"]?.defaultThinkingLevel,
+    level: cfgDefaultThinkingLevel.get(settings),
+    item: cfgProfilesItems.get(settings)["gpt-edu"]?.defaultThinkingLevel,
     sessionLevel: session.thinkingLevel,
   }));
 } else {
   const deadline = Date.now() + 5_000;
-  while (settings.get("defaultThinkingLevel") !== "medium" && Date.now() < deadline) {
+  while (cfgDefaultThinkingLevel.get(settings) !== "medium" && Date.now() < deadline) {
     await Bun.sleep(50);
   }
   await session.waitForIdle();
   console.log(JSON.stringify({
     event: "observed",
     pid: process.pid,
-    level: settings.get("defaultThinkingLevel"),
-    item: settings.get("profiles.items")["gpt-edu"]?.defaultThinkingLevel,
+    level: cfgDefaultThinkingLevel.get(settings),
+    item: cfgProfilesItems.get(settings)["gpt-edu"]?.defaultThinkingLevel,
     sessionLevel: session.thinkingLevel,
   }));
 }

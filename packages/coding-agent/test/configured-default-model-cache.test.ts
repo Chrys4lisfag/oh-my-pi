@@ -41,7 +41,7 @@ describe("configured default model state cache", () => {
 		tempDir = TempDir.createSync("@pi-default-model-cache-");
 		settings = await Settings.loadIsolated({ cwd: tempDir.path(), agentDir: tempDir.path() });
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
-		authStorage.setRuntimeApiKey(PROVIDER, "test-key");
+		authStorage.keys.setRuntime(PROVIDER, "test-key");
 		modelRegistry = new ModelRegistry(authStorage);
 		const model = getBundledModel(PROVIDER, MODEL_ID);
 		if (!model) throw new Error(`Expected bundled model ${PROVIDER}/${MODEL_ID}`);
@@ -110,7 +110,7 @@ describe("configured default model state cache", () => {
 		// Credential arrives and the catalog settles. The SELECTOR never changes,
 		// so only invalidation via `onModelsUpdated` can surface the new
 		// resolution — a selector-keyed memo alone would keep saying unavailable.
-		authStorage.setRuntimeApiKey("openai", "test-key");
+		authStorage.keys.setRuntime("openai", "test-key");
 		await modelRegistry.refresh("offline");
 
 		const after = session.getConfiguredDefaultModelState();

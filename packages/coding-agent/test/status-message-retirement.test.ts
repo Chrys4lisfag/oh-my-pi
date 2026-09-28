@@ -17,6 +17,7 @@ import { initTheme } from "@oh-my-pi/pi-tui/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
 import { type Component, Text } from "@oh-my-pi/pi-tui";
+import { cfgProfilesActive, cfgProfilesItems } from "../src/config/profile-settings";
 
 const WIDTH = 80;
 
@@ -147,11 +148,11 @@ describe("profile cycle status over a real transcript", () => {
 		try {
 			await Settings.init({ inMemory: true });
 			const settings = Settings.isolated();
-			settings.set("profiles.items", {
+			cfgProfilesItems.set(settings, {
 				edu: { modelRoles: { default: "provider/edu-model" }, defaultThinkingLevel: "low" },
 				cyber: { modelRoles: { default: "provider/cyber-model" }, defaultThinkingLevel: "high" },
 			});
-			settings.set("profiles.active", "edu");
+			cfgProfilesActive.set(settings, "edu");
 
 			const ctx = buildContext();
 			const helpers = new UiHelpers(ctx);

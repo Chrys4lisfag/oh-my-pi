@@ -1,5 +1,10 @@
 import { type Settings, settings } from "./settings";
-import type { SettingValue } from "./settings-schema";
+import { cfgDefaultThinkingLevel } from "../session/settings";
+import { cfgModelRoles } from "./model-settings";
+import { cfgProfilesActive, cfgProfilesItems } from "./profile-settings";
+import type { SettingValueOf } from "./registry";
+
+export { cfgProfilesActive, cfgProfilesItems } from "./profile-settings";
 
 export interface ProfileSnapshot {
 	modelRoles: Record<string, string>;
@@ -43,8 +48,8 @@ function asSnapshot(raw: unknown): ProfileSnapshot | undefined {
 
 /** Capture the current live config as a profile snapshot. */
 export function captureCurrentSnapshot(source: Settings = settings): ProfileSnapshot {
-	const modelRoles = source.get("modelRoles");
-	const defaultThinkingLevel = source.get("defaultThinkingLevel");
+	const modelRoles = cfgModelRoles.get(source);
+	const defaultThinkingLevel = cfgDefaultThinkingLevel.get(source);
 	return {
 		modelRoles: { ...modelRoles },
 		defaultThinkingLevel,
@@ -53,7 +58,7 @@ export function captureCurrentSnapshot(source: Settings = settings): ProfileSnap
 
 /** List all saved profiles with their active status and snapshot. */
 export function listProfiles(source: Settings = settings): ProfileInfo[] {
-	const items = source.get("profiles.items");
+	const items = cfgProfilesItems.get(source);
 	const active = getActiveProfileName(source);
 	const result: ProfileInfo[] = [];
 	for (const [name, raw] of Object.entries(items)) {
@@ -65,9 +70,9 @@ export function listProfiles(source: Settings = settings): ProfileInfo[] {
 	return result;
 }
 
-/** Get the valid active profile name, or undefined for an empty/stale/malformed marker. */
+/** Get this terminal's selected profile name, even when its saved definition disappeared. */
 export function getActiveProfileName(source: Settings = settings): string | undefined {
-	const active = source.get("profiles.active");
+	const active = cfgProfilesActive.get(source);
 	return active || undefined;
 }
 
@@ -87,7 +92,7 @@ export function restoreProfileActivation(state: ProfileActivationState, source: 
  * Throws if the name already exists.
  */
 export function addProfile(name: string, snapshot?: ProfileSnapshot, source: Settings = settings): void {
-	const items = source.get("profiles.items");
+	const items = cfgProfilesItems.get(source);
 
 	if (name in items) {
 		throw new Error(`Profile "${name}" already exists`);
@@ -108,7 +113,7 @@ export function addProfile(name: string, snapshot?: ProfileSnapshot, source: Set
  * Throws if profile not found.
  */
 export function switchProfile(name: string, source: Settings = settings): void {
-	const items = source.get("profiles.items");
+	const items = cfgProfilesItems.get(source);
 	const snapshot = asSnapshot(items[name]);
 	if (!snapshot) {
 		throw new Error(`Profile "${name}" not found`);
@@ -130,13 +135,9 @@ export function switchProfile(name: string, source: Settings = settings): void {
 	source.activateProfile(name, snapshot);
 }
 
-/**
- * Delete a profile. When deleting the selected profile, activates the first
- * remaining valid profile alphabetically and applies its live settings.
- * Clears selection when none remain. Throws if the named key does not exist.
- */
+/** Delete a saved definition without changing any running terminal's selected identity. */
 export function deleteProfile(name: string, source: Settings = settings): ProfileDeleteResult {
-	const items = source.get("profiles.items");
+	const items = cfgProfilesItems.get(source);
 	if (!(name in items)) {
 		throw new Error(`Profile "${name}" not found`);
 	}
@@ -147,7 +148,7 @@ export function deleteProfile(name: string, source: Settings = settings): Profil
 
 /** Rename a profile. Throws if old not found or new already exists. */
 export function renameProfile(oldName: string, newName: string, source: Settings = settings): void {
-	const items = source.get("profiles.items");
+	const items = cfgProfilesItems.get(source);
 	if (!(oldName in items)) {
 		throw new Error(`Profile "${oldName}" not found`);
 	}
@@ -155,7 +156,7 @@ export function renameProfile(oldName: string, newName: string, source: Settings
 		throw new Error(`Profile "${newName}" already exists`);
 	}
 
-	const wasActive = source.get("profiles.active") === oldName;
+	const wasActive = cfgProfilesActive.get(source) === oldName;
 	const snapshot = asSnapshot(items[oldName]);
 	if (!snapshot) {
 		throw new Error(`Profile "${oldName}" is malformed`);
@@ -163,7 +164,7 @@ export function renameProfile(oldName: string, newName: string, source: Settings
 	source.renameProfileItem(oldName, newName, snapshot, wasActive);
 }
 
-/** Re-capture the current live config into the active profile. No-op if no active profile. */
+/** Re-capture the current live config into the selected profile; throws when none is selected. */
 export function saveActiveProfile(source: Settings = settings): void {
 	const active = getActiveProfileName(source);
 	if (!active) {
@@ -171,8 +172,8 @@ export function saveActiveProfile(source: Settings = settings): void {
 	}
 
 	const snapshot = captureCurrentSnapshot(source);
-	source.set("modelRoles", snapshot.modelRoles);
-	source.set("defaultThinkingLevel", snapshot.defaultThinkingLevel as SettingValue<"defaultThinkingLevel">);
+	cfgModelRoles.set(source, snapshot.modelRoles);
+	cfgDefaultThinkingLevel.set(source, snapshot.defaultThinkingLevel as SettingValueOf<typeof cfgDefaultThinkingLevel>);
 }
 
 /**
@@ -192,7 +193,7 @@ export function cycleProfile(source: Settings = settings): ProfileCycleResult | 
 
 /** Auto-create a "default" profile from current config if no profiles exist. */
 export function ensureDefaultProfile(source: Settings = settings): void {
-	const items = source.get("profiles.items");
+	const items = cfgProfilesItems.get(source);
 	if (Object.keys(items).length === 0) {
 		addProfile("default", undefined, source);
 	}

@@ -28,7 +28,7 @@ describe("retry.quotaCooldownMs", () => {
 	beforeAll(async () => {
 		tempDir = TempDir.createSync("@pi-quota-cooldown-");
 		authStorage = await AuthStorage.create(tempDir.join("testauth.db"));
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!bundled) throw new Error("Expected bundled model claude-sonnet-4-5");
 		model = bundled;

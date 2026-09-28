@@ -12,6 +12,8 @@ import {
 import { resolveConfiguredModelPatterns, resolveModelRoleValue } from "../config/model-resolver";
 import { getRoleInfo, isKindRole } from "../config/model-roles";
 
+import { cfgRetryFallbackChains, cfgRetryFallbackRevertPolicy } from "./settings";
+
 /** Configured fallback chains keyed by role or model selector. */
 export type RetryFallbackChains = Record<string, string[]>;
 
@@ -75,6 +77,13 @@ export interface ServingModel {
 	thinkingLevel?: ThinkingLevel;
 	/** Whether fallback routing, rather than the configured primary, owns it. */
 	isFallback: boolean;
+	/**
+	 * Context window of the attributed model, carried verbatim from
+	 * {@link Model.contextWindow} (`null` when the model declares none), so
+	 * observers size context usage against the model that produced the turn
+	 * instead of the one the run started on.
+	 */
+	contextWindow?: number | null;
 }
 
 const RETRY_BACKOFF_MAX_DELAY_MS = 8_000;
@@ -193,7 +202,7 @@ export function expandDefaultRetryFallbackChains(
 
 /** Resolves configured fallback chains without inheriting the default chain. */
 export function getRetryFallbackChains(settings: Settings): RetryFallbackChains {
-	const configuredChains = settings.get("retry.fallbackChains");
+	const configuredChains = cfgRetryFallbackChains.get(settings);
 	if (!configuredChains || typeof configuredChains !== "object") return {};
 	return expandDefaultRetryFallbackChains(configuredChains, Object.keys(settings.getModelRoles()));
 }
@@ -233,7 +242,7 @@ export function validateRetryFallbackChains(
 	warn: (message: string) => void,
 	options: { isDiscoveryPending?: (provider: string) => boolean } = {},
 ): void {
-	const configuredChains = settings.get("retry.fallbackChains");
+	const configuredChains = cfgRetryFallbackChains.get(settings);
 	if (configuredChains === undefined) return;
 	const report = warn;
 	const isDiscoveryPending = options.isDiscoveryPending ?? (() => false);
@@ -324,7 +333,7 @@ export function validateRetryFallbackChains(
 
 /** Returns the configured fallback-primary restoration policy. */
 export function getRetryFallbackRevertPolicy(settings: Settings): RetryFallbackRevertPolicy {
-	return settings.get("retry.fallbackRevertPolicy") === "never" ? "never" : "cooldown-expiry";
+	return cfgRetryFallbackRevertPolicy.get(settings) === "never" ? "never" : "cooldown-expiry";
 }
 
 /** Resolves the primary selector represented by a fallback-chain key. */
@@ -507,12 +516,15 @@ export function resolveRetryFallbackChainKey(
 	}
 	if (matchedRole) return matchedRole;
 
-	// 4. The default chain also owns an unmatched LIVE session model (for
-	// example, after `/model` or a mid-chain hop), even when `default` has an
-	// explicit primary. Strictly gate this to the session model: an advisor,
-	// subagent, or stale role-scoped failure must not inherit the default chain.
+	// An unassigned default chain can cover a live model; an explicit primary
+	// owns its chain and must never lend it to an unrelated model.
 	const defaultChain = context.chains.default;
-	if (Array.isArray(defaultChain) && defaultChain.length > 0 && currentModelIsFailingModel) {
+	if (
+		Array.isArray(defaultChain) &&
+		defaultChain.length > 0 &&
+		currentModelIsFailingModel &&
+		!context.getModelRole("default")
+	) {
 		return "default";
 	}
 	return undefined;

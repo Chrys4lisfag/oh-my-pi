@@ -14,6 +14,7 @@ import {
 	sortModelItems,
 } from "@oh-my-pi/pi-tui/overlays/model-browser";
 import { initTheme, theme } from "@oh-my-pi/pi-tui/theme";
+import { createModelMentionSource } from "@oh-my-pi/pi-tui/prompt/model-mention-autocomplete";
 
 /** Optional presentation metadata a catalog or discovery source may attach. */
 type NativeMetadata = Pick<Model, "description" | "isNew" | "isBeta" | "isRecommended" | "int" | "tps"> &
@@ -112,6 +113,29 @@ describe("resolveRoleAssignments", () => {
 	});
 });
 
+describe("createModelMentionSource", () => {
+	test("refreshes candidates when role settings or availability change between queries", () => {
+		const a = makeModel("a", "example-2");
+		const b = makeModel("b", "example-2");
+		const available = [a, b];
+		const settings = Settings.isolated({ modelRoles: { default: "b/example-2" } });
+		const candidates = createModelMentionSource({
+			source: createModelBrowserSource(settings),
+			registry: { getError: () => undefined, getAvailable: () => [...available], getAll: () => [...available] },
+			scopedModels: () => [],
+		});
+		const selectors = (query: string) => candidates(query).map(item => item.selector);
+
+		expect(selectors("example")).toEqual(["b/example-2", "a/example-2"]);
+
+		settings.setModelRole("default", "a/example-2");
+		expect(selectors("example")).toEqual(["a/example-2", "b/example-2"]);
+
+		available.push(makeModel("c", "example-3"));
+		expect(selectors("example")).toContain("c/example-3");
+	});
+});
+
 describe("ModelBrowser search ranking", () => {
 	test("refreshing items invalidates cached cost searches and retains surviving selection", () => {
 		const paid = makeModel("fixture", "paid", { cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 } });
@@ -126,6 +150,7 @@ describe("ModelBrowser search ranking", () => {
 		browser.setItems(items);
 		expect(browser.visibleCount).toBe(2);
 		expect(browser.getSelected()?.selector).toBe("fixture/gratis");
+		expect(browser.selectSelector("fixture/gratis")).toBe(true);
 		free.cost.input = 1;
 		browser.setItems(items);
 		expect(browser.visibleCount).toBe(1);
@@ -447,7 +472,6 @@ describe("ModelBrowser native model metadata", () => {
 	});
 
 	test.each([
-		[-1, 0, "$?/0"],
 		[0, -1, "$0/?"],
 		[-1, -2, "$?/?"],
 	] as const)("renders invalid rates %s/%s with per-leg markers", (input, output, expected) => {

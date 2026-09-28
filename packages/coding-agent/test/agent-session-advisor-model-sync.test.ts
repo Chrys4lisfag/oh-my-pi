@@ -31,6 +31,9 @@ import { Agent } from "@oh-my-pi/pi-agent-core";
 import { Effort, type Model } from "@oh-my-pi/pi-ai";
 import { type GeneratedProvider, getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { cfgModelRoles } from "@oh-my-pi/pi-coding-agent/config/model-settings";
+import { cfgProfilesActive, cfgProfilesItems } from "@oh-my-pi/pi-coding-agent/config/profiles";
+import { cfgDefaultThinkingLevel } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { deleteProfile, getActiveProfileName, switchProfile } from "@oh-my-pi/pi-coding-agent/config/profiles";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -82,7 +85,7 @@ describe("AgentSession advisor + profile model sync", () => {
 		const tempDir = TempDir.createSync("@pi-advisor-model-sync-");
 		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
 		for (const provider of opts.credentialedProviders) {
-			authStorage.setRuntimeApiKey(provider, `${provider}-test-key`);
+			authStorage.keys.setRuntime(provider, `${provider}-test-key`);
 		}
 		const modelRegistry = new ModelRegistry(authStorage);
 		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
@@ -237,7 +240,7 @@ describe("AgentSession advisor + profile model sync", () => {
 			expect(session.getAdvisorAgent()).toBeUndefined();
 
 			// Install the missing credential; ensureAdvisorsBuilt() retries the build.
-			authStorage.setRuntimeApiKey(LATE_PROVIDER, `${LATE_PROVIDER}-test-key`);
+			authStorage.keys.setRuntime(LATE_PROVIDER, `${LATE_PROVIDER}-test-key`);
 			const built = session.ensureAdvisorsBuilt();
 			expect(built).toBe(true);
 			expect(session.isAdvisorActive()).toBe(true);
@@ -308,7 +311,7 @@ describe("AgentSession advisor + profile model sync", () => {
 			// Add the runtime key, then let refresh() fire onModelsUpdated. The
 			// session's constructor subscribes ensureAdvisorsBuilt() to that
 			// event — we intentionally DO NOT call ensureAdvisorsBuilt() here.
-			authStorage.setRuntimeApiKey(LATE_PROVIDER, `${LATE_PROVIDER}-test-key`);
+			authStorage.keys.setRuntime(LATE_PROVIDER, `${LATE_PROVIDER}-test-key`);
 			await modelRegistry.refresh();
 
 			expect(session.isAdvisorActive()).toBe(true);
@@ -388,7 +391,7 @@ describe("AgentSession advisor + profile model sync", () => {
 			// Simulate a `/profiles switch` writing the profile's snapshot into
 			// live settings, then dispatching applyProfileToSession().
 			session.settings.setModelRole("default", `${PRIMARY_PROVIDER}/${SWAP_MODEL_ID}`);
-			session.settings.set("defaultThinkingLevel", Effort.High);
+			cfgDefaultThinkingLevel.set(session.settings, Effort.High);
 			session.settings.setModelRole("advisor", `${LATE_PROVIDER}/${LATE_MODEL_ID}`);
 
 			await session.applyProfileToSession();
@@ -414,7 +417,7 @@ describe("AgentSession advisor + profile model sync", () => {
 			});
 
 			session.settings.setModelRole("default", "bogus-provider/nonexistent-model");
-			session.settings.set("defaultThinkingLevel", Effort.Low);
+			cfgDefaultThinkingLevel.set(session.settings, Effort.Low);
 			session.settings.setModelRole("advisor", `${PRIMARY_PROVIDER}/${SWAP_MODEL_ID}`);
 
 			await session.applyProfileToSession();
@@ -436,7 +439,7 @@ describe("AgentSession advisor + profile model sync", () => {
 				credentialedProviders: [PRIMARY_PROVIDER],
 			});
 			session.settings.setModelRole("default", `${PRIMARY_PROVIDER}/${SWAP_MODEL_ID}`);
-			session.settings.set("defaultThinkingLevel", Effort.High);
+			cfgDefaultThinkingLevel.set(session.settings, Effort.High);
 			session.settings.setModelRole("advisor", `${LATE_PROVIDER}/${LATE_MODEL_ID}`);
 
 			await session.applyProfileToSession();
@@ -482,7 +485,7 @@ describe("AgentSession advisor + profile model sync", () => {
 				throw new Error("injected advisor refresh failure");
 			});
 			session.settings.setModelRole("default", `${PRIMARY_PROVIDER}/${SWAP_MODEL_ID}`);
-			session.settings.set("defaultThinkingLevel", Effort.High);
+			cfgDefaultThinkingLevel.set(session.settings, Effort.High);
 
 			await expect(session.applyProfileToSession()).rejects.toThrow("injected advisor refresh failure");
 			expect(session.model?.id).toBe(PRIMARY_MODEL_ID);
@@ -497,7 +500,7 @@ describe("AgentSession advisor + profile model sync", () => {
 				resetSettingsForTest();
 				await Settings.init({ inMemory: true });
 				const settings = Settings.instance;
-				settings.set("profiles.items", {
+				cfgProfilesItems.set(settings, {
 					first: {
 						modelRoles: { default: `${PRIMARY_PROVIDER}/${PRIMARY_MODEL_ID}` },
 						defaultThinkingLevel: "medium",
@@ -507,8 +510,8 @@ describe("AgentSession advisor + profile model sync", () => {
 						defaultThinkingLevel: "high",
 					},
 				});
-				settings.set("profiles.active", "first");
-				settings.set("modelRoles", { default: `${PRIMARY_PROVIDER}/${PRIMARY_MODEL_ID}` });
+				cfgProfilesActive.set(settings, "first");
+				cfgModelRoles.set(settings, { default: `${PRIMARY_PROVIDER}/${PRIMARY_MODEL_ID}` });
 				const { session } = await createHarness({
 					settingsOverrides: {},
 					credentialedProviders: [PRIMARY_PROVIDER],
@@ -519,7 +522,7 @@ describe("AgentSession advisor + profile model sync", () => {
 				await session.applyProfileToSession();
 
 				expect(getActiveProfileName()).toBe("second");
-				expect(settings.get("modelRoles").default).toBe(`${PRIMARY_PROVIDER}/${SWAP_MODEL_ID}`);
+				expect(cfgModelRoles.get(settings).default).toBe(`${PRIMARY_PROVIDER}/${SWAP_MODEL_ID}`);
 				expect(session.model?.provider).toBe(PRIMARY_PROVIDER);
 				expect(session.model?.id).toBe(SWAP_MODEL_ID);
 				expect(session.thinkingLevel).toBe(Effort.High);
@@ -529,7 +532,7 @@ describe("AgentSession advisor + profile model sync", () => {
 				resetSettingsForTest();
 				await Settings.init({ inMemory: true });
 				const settings = Settings.instance;
-				settings.set("profiles.items", {
+				cfgProfilesItems.set(settings, {
 					selected: {
 						modelRoles: { default: `${PRIMARY_PROVIDER}/${PRIMARY_MODEL_ID}` },
 						defaultThinkingLevel: "medium",
@@ -539,9 +542,9 @@ describe("AgentSession advisor + profile model sync", () => {
 						defaultThinkingLevel: "high",
 					},
 				});
-				settings.set("profiles.active", "selected");
-				settings.set("modelRoles", { default: `${PRIMARY_PROVIDER}/${PRIMARY_MODEL_ID}` });
-				settings.set("defaultThinkingLevel", Effort.Medium);
+				cfgProfilesActive.set(settings, "selected");
+				cfgModelRoles.set(settings, { default: `${PRIMARY_PROVIDER}/${PRIMARY_MODEL_ID}` });
+				cfgDefaultThinkingLevel.set(settings, Effort.Medium);
 				const { session } = await createHarness({
 					settingsOverrides: {},
 					credentialedProviders: [PRIMARY_PROVIDER],

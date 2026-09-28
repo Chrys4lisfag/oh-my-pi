@@ -76,6 +76,7 @@ export const getModelsConfigSchemaBundle = once(() => {
 		"strictResponsesPairing?": "boolean",
 		"supportsImageDetailOriginal?": "boolean",
 		"supportsConfigurationUpdate?": "boolean",
+		"supportsSteering?": "boolean",
 		"stripImageInput?": "boolean",
 		// anthropic-messages compat flags (same `compat` slot, per-api interpretation)
 		"supportsContextManagement?": "boolean",
@@ -206,6 +207,10 @@ export const getModelsConfigSchemaBundle = once(() => {
 			cacheRead: "number",
 			cacheWrite: "number",
 		},
+		"promptCache?": {
+			"short?": "number",
+			"long?": "number",
+		},
 		"premiumMultiplier?": "number",
 		"contextWindow?": "number",
 		"maxContextWindow?": "number",
@@ -259,6 +264,10 @@ export const getModelsConfigSchemaBundle = once(() => {
 			"cacheRead?": "number",
 			"cacheWrite?": "number",
 		},
+		"promptCache?": {
+			"short?": "number",
+			"long?": "number",
+		},
 		"premiumMultiplier?": "number",
 		"contextWindow?": "number",
 		"maxContextWindow?": "number",
@@ -292,7 +301,7 @@ export const getModelsConfigSchemaBundle = once(() => {
 	});
 
 	const ProviderDiscoverySchema = type({
-		type: '"ollama" | "llama.cpp" | "lm-studio" | "openai-models-list" | "proxy" | "litellm"',
+		type: '"ollama" | "llama.cpp" | "lm-studio" | "openai-models-list" | "proxy" | "litellm" | "apple-foundation-models"',
 		"timeoutMs?": "number",
 		"baseUrl?": "string",
 		"auth?": '"provider" | "none"',

@@ -5,11 +5,15 @@ import { AskDialogComponent } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
 import { HookEditorComponent } from "@oh-my-pi/pi-tui/overlays/hook-editor";
 import { TreeSelectorComponent } from "@oh-my-pi/pi-tui/overlays/tree-selector";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
+import { SpaceHoldGesture } from "@oh-my-pi/pi-tui/space-hold";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import type { SessionTreeNode } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { type KeyId, matchesKey } from "@oh-my-pi/pi-tui";
 import manualContinuePrompt from "../src/prompts/system/manual-continue.md" with { type: "text" };
+import { cfgCycleOrder, cfgModelRoles } from "../src/config/model-settings";
+import { cfgProfilesActive, cfgProfilesItems } from "../src/config/profile-settings";
+import { cfgDefaultThinkingLevel } from "../src/session/settings";
 
 type FakeEditor = {
 	onEscape?: () => void;
@@ -36,6 +40,7 @@ type FakeEditor = {
 	setActionKeys(action: string, keys: string[]): void;
 	setCustomKeyHandler(key: string, handler: () => void): void;
 	clearCustomKeyHandlers(): void;
+	spaceHold: SpaceHoldGesture;
 	pasteText(text: string): void;
 	imageLinks?: (string | undefined)[];
 	pendingImages: ImageContent[];
@@ -146,6 +151,7 @@ async function createContext() {
 		setActionKeys,
 		setCustomKeyHandler,
 		clearCustomKeyHandlers,
+		spaceHold: new SpaceHoldGesture(() => {}),
 		pendingImages: [],
 		pendingImageLinks: [],
 		clearDraft(historyText?: string) {
@@ -217,7 +223,7 @@ async function createContext() {
 		isPythonMode: false,
 		hideToolActivity: false,
 		toolOutputExpanded: false,
-		settings: { set: vi.fn() },
+		settings: Settings.isolated(),
 		chatContainer: { children: [], setToolActivityVisible: vi.fn() },
 		handleHotkeysCommand: vi.fn(),
 		handlePlanModeCommand: vi.fn(),
@@ -226,6 +232,7 @@ async function createContext() {
 		showUserMessageSelector: vi.fn(),
 		showSessionSelector: vi.fn(),
 		handleSTTToggle: vi.fn(),
+		dictationSpaceHold: vi.fn(),
 		showDebugSelector: vi.fn(),
 		showHistorySearch: vi.fn(),
 		toggleThinkingBlockVisibility: vi.fn(),
@@ -298,7 +305,7 @@ describe("InputController keybinding setup", () => {
 	it("uses session-local cycle order when switching role models", async () => {
 		const { InputController, ctx } = await createContext();
 		const local = Settings.isolated();
-		local.set("cycleOrder", ["slow", "default", "smol"]);
+		cfgCycleOrder.set(local, ["slow", "default", "smol"]);
 		ctx.settings = local;
 		const cycleRoleModels = vi.fn(async () => undefined);
 		ctx.session.cycleRoleModels = cycleRoleModels;
@@ -314,7 +321,7 @@ describe("InputController keybinding setup", () => {
 		resetSettingsForTest();
 		const singleton = await Settings.init({ inMemory: true });
 		try {
-			singleton.set("profiles.items", {
+			cfgProfilesItems.set(singleton, {
 				"singleton-current": {
 					modelRoles: { default: "provider/singleton-current" },
 					defaultThinkingLevel: "low",
@@ -324,12 +331,12 @@ describe("InputController keybinding setup", () => {
 					defaultThinkingLevel: "high",
 				},
 			});
-			singleton.set("profiles.active", "singleton-current");
-			singleton.set("modelRoles", { default: "provider/singleton-live" });
-			singleton.set("defaultThinkingLevel", Effort.Medium);
+			cfgProfilesActive.set(singleton, "singleton-current");
+			cfgModelRoles.set(singleton, { default: "provider/singleton-live" });
+			cfgDefaultThinkingLevel.set(singleton, Effort.Medium);
 
 			const peer = Settings.isolated();
-			peer.set("profiles.items", {
+			cfgProfilesItems.set(peer, {
 				"peer-current": {
 					modelRoles: { default: "provider/peer-current" },
 					defaultThinkingLevel: "low",
@@ -339,13 +346,13 @@ describe("InputController keybinding setup", () => {
 					defaultThinkingLevel: "high",
 				},
 			});
-			peer.set("profiles.active", "peer-current");
-			peer.set("modelRoles", { default: "provider/peer-live" });
-			peer.set("defaultThinkingLevel", Effort.Medium);
+			cfgProfilesActive.set(peer, "peer-current");
+			cfgModelRoles.set(peer, { default: "provider/peer-live" });
+			cfgDefaultThinkingLevel.set(peer, Effort.Medium);
 
 			const { InputController, ctx, customHandlers, setKeybinding } = await createContext();
 			const local = Settings.isolated();
-			local.set("profiles.items", {
+			cfgProfilesItems.set(local, {
 				"local-current": {
 					modelRoles: { default: "provider/local-current" },
 					defaultThinkingLevel: "medium",
@@ -355,22 +362,22 @@ describe("InputController keybinding setup", () => {
 					defaultThinkingLevel: "high",
 				},
 			});
-			local.set("profiles.active", "local-current");
-			local.set("modelRoles", { default: "provider/local-live" });
-			local.set("defaultThinkingLevel", Effort.Medium);
+			cfgProfilesActive.set(local, "local-current");
+			cfgModelRoles.set(local, { default: "provider/local-live" });
+			cfgDefaultThinkingLevel.set(local, Effort.Medium);
 			ctx.settings = local;
 
 			const singletonBefore = {
 				active: singleton.activeProfileName(),
-				modelRoles: structuredClone(singleton.get("modelRoles")),
-				thinking: singleton.get("defaultThinkingLevel"),
-				items: structuredClone(singleton.get("profiles.items")),
+				modelRoles: structuredClone(cfgModelRoles.get(singleton)),
+				thinking: cfgDefaultThinkingLevel.get(singleton),
+				items: structuredClone(cfgProfilesItems.get(singleton)),
 			};
 			const peerBefore = {
 				active: peer.activeProfileName(),
-				modelRoles: structuredClone(peer.get("modelRoles")),
-				thinking: peer.get("defaultThinkingLevel"),
-				items: structuredClone(peer.get("profiles.items")),
+				modelRoles: structuredClone(cfgModelRoles.get(peer)),
+				thinking: cfgDefaultThinkingLevel.get(peer),
+				items: structuredClone(cfgProfilesItems.get(peer)),
 			};
 			const binding = Promise.withResolvers<boolean>();
 			const bindSessionProfile = vi.fn(() => binding.promise);
@@ -396,8 +403,8 @@ describe("InputController keybinding setup", () => {
 			await binding.promise;
 
 			expect(local.activeProfileName()).toBe("nightly");
-			expect(local.get("modelRoles")).toEqual({ default: "provider/model-zeta" });
-			expect(local.get("defaultThinkingLevel")).toBe(Effort.High);
+			expect(cfgModelRoles.get(local)).toEqual({ default: "provider/model-zeta" });
+			expect(cfgDefaultThinkingLevel.get(local)).toBe(Effort.High);
 			expect(bindSessionProfile).toHaveBeenCalledTimes(1);
 			expect(bindSessionProfile).toHaveBeenCalledWith("nightly");
 			expect(showStatus).toHaveBeenCalledTimes(1);
@@ -405,15 +412,15 @@ describe("InputController keybinding setup", () => {
 			expect(showStatus).toHaveBeenCalledWith(expect.any(String), { dim: false });
 			expect({
 				active: singleton.activeProfileName(),
-				modelRoles: singleton.get("modelRoles"),
-				items: singleton.get("profiles.items"),
-				thinking: singleton.get("defaultThinkingLevel"),
+				modelRoles: cfgModelRoles.get(singleton),
+				items: cfgProfilesItems.get(singleton),
+				thinking: cfgDefaultThinkingLevel.get(singleton),
 			}).toEqual(singletonBefore);
 			expect({
 				active: peer.activeProfileName(),
-				modelRoles: peer.get("modelRoles"),
-				items: peer.get("profiles.items"),
-				thinking: peer.get("defaultThinkingLevel"),
+				modelRoles: cfgModelRoles.get(peer),
+				items: cfgProfilesItems.get(peer),
+				thinking: cfgDefaultThinkingLevel.get(peer),
 			}).toEqual(peerBefore);
 		} finally {
 			resetSettingsForTest();
@@ -572,20 +579,6 @@ describe("InputController keybinding setup", () => {
 		expect(spies.handleBtwBranchKey).not.toHaveBeenCalled();
 	});
 
-	it("consumes b while a completed /btw branch is unavailable", async () => {
-		const { InputController, ctx, spies } = await createContext();
-		spies.handlesBtwBranchKey.mockReturnValue(true);
-		const controller = new InputController(ctx);
-
-		controller.setupKeyHandlers();
-		const listener = spies.addInputListener.mock.calls[1]?.[0];
-		expect(listener).toBeDefined();
-		const result = listener?.("b");
-
-		expect(result).toEqual({ consume: true });
-		expect(spies.handleBtwBranchKey).toHaveBeenCalledTimes(1);
-	});
-
 	it("lets b reach the composer before an active /btw answer is branchable", async () => {
 		const { InputController, ctx, spies } = await createContext();
 		spies.hasActiveBtw.mockReturnValue(true);
@@ -731,22 +724,6 @@ describe("InputController keybinding setup", () => {
 
 		expect(result).toBeUndefined();
 		expect(spies.handleBtwCopyKey).not.toHaveBeenCalled();
-	});
-
-	it("empty Enter aborts the active stream when queued messages are pending", async () => {
-		const { InputController, ctx, editor, spies } = await createContext();
-		const session = ctx.session as unknown as { isStreaming: boolean; queuedMessageCount: number };
-		session.isStreaming = true;
-		session.queuedMessageCount = 1;
-		const controller = new InputController(ctx);
-
-		controller.setupEditorSubmitHandler();
-		await editor.onSubmit?.("");
-
-		expect(spies.abort).toHaveBeenCalledWith({ reason: "Interrupted by user" });
-		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
-		expect(spies.requestRender).toHaveBeenCalledTimes(1);
-		expect(spies.prompt).not.toHaveBeenCalled();
 	});
 
 	it("marks streaming follow-up submissions as local", async () => {

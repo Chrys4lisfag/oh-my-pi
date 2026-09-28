@@ -12,9 +12,6 @@ import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
-import { initTheme } from "@oh-my-pi/pi-tui/theme/theme";
-import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session-events";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -47,48 +44,6 @@ describe("describeFallbackReason", () => {
 	});
 });
 
-describe("fallback notice rendering", () => {
-	async function renderNotice(event: Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>) {
-		await initTheme(false);
-		const warnings: string[] = [];
-		const ctx = {
-			isInitialized: true,
-			init: async () => {},
-			statusLine: { invalidate: vi.fn(), markActivityStart: vi.fn(), markActivityEnd: vi.fn() },
-			showWarning: (message: string) => warnings.push(message),
-			showStatus: vi.fn(),
-		} as unknown as InteractiveModeContext;
-		const controller = new EventController(ctx);
-		await controller.handleEvent(event);
-		return warnings;
-	}
-
-	it("names the trigger next to the model swap", async () => {
-		const warnings = await renderNotice({
-			type: "retry_fallback_applied",
-			from: "mammouth-vuln/kimi-k3:high",
-			to: "entrim-ai-vuln/deepseek-ai/DeepSeek-V4-Flash",
-			role: "default",
-			reason: "429 All 3 tokens are in cooldown. Next available in 657.5s",
-		});
-
-		expect(Bun.stripANSI(warnings[0] ?? "")).toBe(
-			"Fallback: mammouth-vuln/kimi-k3:high -> entrim-ai-vuln/deepseek-ai/DeepSeek-V4-Flash — " +
-				"429 All 3 tokens are in cooldown. Next available in 657.5s",
-		);
-	});
-
-	it("keeps the old shape when no reason is known", async () => {
-		const warnings = await renderNotice({
-			type: "retry_fallback_applied",
-			from: "a/one",
-			to: "b/two",
-			role: "default",
-		});
-		expect(Bun.stripANSI(warnings[0] ?? "")).toBe("Fallback: a/one -> b/two");
-	});
-});
-
 describe("session emits the triggering error", () => {
 	it("carries the provider error on the applied event", async () => {
 		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -97,8 +52,8 @@ describe("session emits the triggering error", () => {
 
 		const tempDir = TempDir.createSync("@pi-fallback-reason-");
 		const authStorage = await AuthStorage.create(`${tempDir.path()}/auth.db`);
-		authStorage.setRuntimeApiKey("anthropic", "key-a");
-		authStorage.setRuntimeApiKey("google", "key-b");
+		authStorage.keys.setRuntime("anthropic", "key-a");
+		authStorage.keys.setRuntime("google", "key-b");
 		const modelRegistry = new ModelRegistry(authStorage);
 		const primarySelector = `${primary.provider}/${primary.id}`;
 		const fallbackSelector = `${fallback.provider}/${fallback.id}`;

@@ -25,6 +25,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { cfgRetryFallbackChains } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { assistantMsg, userMsg } from "./utilities";
 
@@ -59,7 +60,7 @@ describe("compaction fallback on provider budget exhaustion", () => {
 		});
 		if (options?.via === "chain") {
 			// No role points anywhere useful; only the fallback chain names the spare.
-			settings.set("retry.fallbackChains", {
+			cfgRetryFallbackChains.set(settings, {
 				[`${exhausted.provider}/${exhausted.id}`]: [`${spare.provider}/${spare.id}`],
 			});
 		} else if (options?.via === "role") {
@@ -70,8 +71,8 @@ describe("compaction fallback on provider budget exhaustion", () => {
 			initialState: { model: exhausted, systemPrompt: ["Test"], tools: [], messages: [] },
 		});
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		authStorage.setRuntimeApiKey(exhausted.provider, "openai-token");
-		authStorage.setRuntimeApiKey(spare.provider, "anthropic-token");
+		authStorage.keys.setRuntime(exhausted.provider, "openai-token");
+		authStorage.keys.setRuntime(spare.provider, "anthropic-token");
 		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([exhausted, spare]);
 		vi.spyOn(modelRegistry, "getApiKey").mockResolvedValue("test-key");
@@ -160,8 +161,8 @@ describe("compaction fallback on provider budget exhaustion", () => {
 			initialState: { model: exhausted, systemPrompt: ["Test"], tools: [], messages: [] },
 		});
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		authStorage.setRuntimeApiKey(exhausted.provider, "openai-token");
-		authStorage.setRuntimeApiKey(spare.provider, "anthropic-token");
+		authStorage.keys.setRuntime(exhausted.provider, "openai-token");
+		authStorage.keys.setRuntime(spare.provider, "anthropic-token");
 		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([exhausted, spare]);
 		vi.spyOn(modelRegistry, "getApiKey").mockResolvedValue("test-key");

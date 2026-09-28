@@ -5,6 +5,7 @@ import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { cfgAdvisorMemoryReminderInterval } from "@oh-my-pi/pi-coding-agent/advisor/settings";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -31,7 +32,7 @@ describe("advisor memory reminder integration", () => {
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@pi-advisor-memory-reminder-");
 		authStorage = await AuthStorage.create(tempDir.join("auth.db"));
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
 	});
 
 	afterEach(async () => {
@@ -40,14 +41,14 @@ describe("advisor memory reminder integration", () => {
 		await tempDir.remove();
 	});
 
-	it("injects the instruction artifact on the eighth context read without recall", async () => {
+	it("injects reminders at the configured interval and applies live interval edits", async () => {
 		const primaryMock = createMockModel({
 			provider: "anthropic",
-			responses: Array.from({ length: 8 }, () => ({ content: ["primary complete"] })),
+			responses: Array.from({ length: 12 }, () => ({ content: ["primary complete"] })),
 		});
 		const advisorMock = createMockModel({
 			provider: "anthropic",
-			responses: Array.from({ length: 8 }, () => ({ content: ["advisor reviewed"] })),
+			responses: Array.from({ length: 12 }, () => ({ content: ["advisor reviewed"] })),
 		});
 		const roleModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!roleModel) throw new Error("Expected advisor role model");
@@ -108,6 +109,21 @@ describe("advisor memory reminder integration", () => {
 		const rebuiltStats = session.getAdvisorStats();
 		expect(rebuiltStats.memoryReminderInjections).toBe(1);
 		expect(rebuiltStats.advisors[0]?.memoryReminderInjections).toBe(1);
+
+		cfgAdvisorMemoryReminderInterval.set(settings, 4);
+		await Promise.resolve();
+		const updatedAdvisor = session.getAdvisorAgent();
+		if (!updatedAdvisor) throw new Error("Expected rebuilt memory advisor runtime");
+		updatedAdvisor.setModel(advisorMock);
+		for (let index = 0; index < 4; index++) {
+			await session.prompt(`updated interval ${index + 1}`);
+			expect(await session.waitForAdvisorCatchup(2_000)).toBe(true);
+		}
+		for (const call of advisorMock.calls.slice(8, 11)) {
+			expect(JSON.stringify(call.context.messages)).not.toContain("advisor-memory-reminder");
+		}
+		expect(JSON.stringify(advisorMock.calls[11].context.messages)).toContain("advisor-memory-reminder");
+		expect(session.getAdvisorStats().memoryReminderInjections).toBe(2);
 
 		const artifactsDir = sessionManager.getArtifactsDir();
 		if (!artifactsDir) throw new Error("Expected persisted artifact directory");

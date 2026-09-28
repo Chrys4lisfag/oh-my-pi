@@ -47,7 +47,7 @@ describe("truncated transport close is replay-safe", () => {
 	beforeAll(async () => {
 		tempDir = TempDir.createSync("@pi-transport-close-");
 		authStorage = await AuthStorage.create(tempDir.join("auth.db"));
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
 		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!bundled) throw new Error("expected bundled model");

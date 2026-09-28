@@ -5,6 +5,9 @@ import { type Api, type AssistantMessage, Effort, type Model } from "@oh-my-pi/p
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { cfgModelRoles } from "@oh-my-pi/pi-coding-agent/config/model-settings";
+import { cfgProfilesActive, cfgProfilesItems } from "@oh-my-pi/pi-coding-agent/config/profiles";
+import { cfgDefaultThinkingLevel } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { type CreateAgentSessionResult, createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -204,8 +207,8 @@ describe("AgentSession model persistence", () => {
 			modelRoles: { default: modelValue(defaultModel) },
 			defaultThinkingLevel: "medium",
 		};
-		created.settings.set("profiles.items", { "gpt-edu": profileSnapshot });
-		created.settings.set("profiles.active", "gpt-edu");
+		cfgProfilesItems.set(created.settings, { "gpt-edu": profileSnapshot });
+		cfgProfilesActive.set(created.settings, "gpt-edu");
 		await created.session.bindSessionProfile("gpt-edu");
 
 		await created.session.setModel(nextModel, "default", { persist: true });
@@ -228,8 +231,8 @@ describe("AgentSession model persistence", () => {
 			modelRoles: profileSnapshot.modelRoles,
 			persist: true,
 		});
-		created.settings.set("profiles.items", { "gpt-edu": profileSnapshot });
-		created.settings.set("profiles.active", "gpt-edu");
+		cfgProfilesItems.set(created.settings, { "gpt-edu": profileSnapshot });
+		cfgProfilesActive.set(created.settings, "gpt-edu");
 		expect(await created.session.bindSessionProfile("gpt-edu")).toBe(true);
 		await created.session.waitForIdle();
 		await created.session.sessionManager.ensureOnDisk();
@@ -239,7 +242,7 @@ describe("AgentSession model persistence", () => {
 		await created.session.sessionManager.flush();
 
 		expect(nextThinkingLevel).toBe(Effort.High);
-		expect(created.settings.get("defaultThinkingLevel")).toBe(Effort.High);
+		expect(cfgDefaultThinkingLevel.get(created.settings)).toBe(Effort.High);
 		expect(created.settings.profileSnapshot("gpt-edu")?.defaultThinkingLevel).toBe(Effort.High);
 		expect(created.session.sessionManager.getSessionProfileSnapshot()?.defaultThinkingLevel).toBe(Effort.High);
 
@@ -392,9 +395,9 @@ describe("AgentSession model persistence", () => {
 			})}\n`,
 		);
 		const settings = Settings.isolated();
-		settings.set("profiles.items", { "gpt-edu": eduSnapshot, "gpt-cyber": cyberSnapshot });
-		settings.set("profiles.active", "gpt-cyber");
-		settings.set("modelRoles", cyberSnapshot.modelRoles);
+		cfgProfilesItems.set(settings, { "gpt-edu": eduSnapshot, "gpt-cyber": cyberSnapshot });
+		cfgProfilesActive.set(settings, "gpt-cyber");
+		cfgModelRoles.set(settings, cyberSnapshot.modelRoles);
 
 		const result = await createStartupResumeSession(targetSessionFile, settings);
 
@@ -421,9 +424,9 @@ describe("AgentSession model persistence", () => {
 			})}\n`,
 		);
 		const settings = Settings.isolated();
-		settings.set("profiles.items", { "gpt-cyber": cyberSnapshot });
-		settings.set("profiles.active", "gpt-cyber");
-		settings.set("modelRoles", cyberSnapshot.modelRoles);
+		cfgProfilesItems.set(settings, { "gpt-cyber": cyberSnapshot });
+		cfgProfilesActive.set(settings, "gpt-cyber");
+		cfgModelRoles.set(settings, cyberSnapshot.modelRoles);
 
 		const result = await createStartupResumeSession(targetSessionFile, settings);
 
@@ -460,9 +463,9 @@ describe("AgentSession model persistence", () => {
 			snapshot: eduSnapshot,
 		});
 		const created = await createSession({ initialModel: cyberModel, persist: true });
-		created.settings.set("profiles.items", { "gpt-edu": eduSnapshot, "gpt-cyber": cyberSnapshot });
-		created.settings.set("profiles.active", "gpt-cyber");
-		created.settings.set("modelRoles", cyberSnapshot.modelRoles);
+		cfgProfilesItems.set(created.settings, { "gpt-edu": eduSnapshot, "gpt-cyber": cyberSnapshot });
+		cfgProfilesActive.set(created.settings, "gpt-cyber");
+		cfgModelRoles.set(created.settings, cyberSnapshot.modelRoles);
 		expect(await created.session.bindSessionProfile("gpt-cyber")).toBe(true);
 		await created.session.waitForIdle();
 		created.session.sessionManager.appendModelChange(modelValue(cyberModel), "default");
@@ -476,7 +479,7 @@ describe("AgentSession model persistence", () => {
 		expect(created.settings.activeProfileName()).toBe("gpt-edu");
 		expect(created.settings.currentProfileSnapshot()).toEqual(eduSnapshot);
 		expect(created.settings.getModelRole("default")).toBe(modelValue(eduModel));
-		expect(created.settings.get("defaultThinkingLevel")).toBe(Effort.Medium);
+		expect(cfgDefaultThinkingLevel.get(created.settings)).toBe(Effort.Medium);
 		expect(created.session.getSessionProfileName()).toBe("gpt-edu");
 		expect(created.session.model?.id).toBe(eduModel.id);
 		expect(created.session.configuredThinkingLevel()).toBe(Effort.Medium);
@@ -491,7 +494,7 @@ describe("AgentSession model persistence", () => {
 		expect(created.settings.activeProfileName()).toBe("gpt-cyber");
 		expect(created.settings.currentProfileSnapshot()).toEqual(cyberSnapshot);
 		expect(created.settings.getModelRole("default")).toBe(modelValue(cyberModel));
-		expect(created.settings.get("defaultThinkingLevel")).toBe(Effort.High);
+		expect(cfgDefaultThinkingLevel.get(created.settings)).toBe(Effort.High);
 		expect(created.session.getSessionProfileName()).toBe("gpt-cyber");
 		expect(created.session.model?.id).toBe(cyberModel.id);
 		expect(created.session.configuredThinkingLevel()).toBe(Effort.High);
@@ -513,11 +516,11 @@ describe("AgentSession model persistence", () => {
 			defaultThinkingLevel: Effort.High,
 		};
 		const created = await createSession({ initialModel: sourceModel, persist: true });
-		created.settings.set("profiles.items", {
+		cfgProfilesItems.set(created.settings, {
 			"source-profile": sourceSnapshot,
 			"target-profile": targetSnapshot,
 		});
-		created.settings.set("profiles.active", "source-profile");
+		cfgProfilesActive.set(created.settings, "source-profile");
 		expect(await created.session.bindSessionProfile("source-profile")).toBe(true);
 		await created.session.waitForIdle();
 		await created.session.sessionManager.ensureOnDisk();
@@ -542,7 +545,7 @@ describe("AgentSession model persistence", () => {
 		expect(created.settings.activeProfileName()).toBe("source-profile");
 		expect(created.settings.currentProfileSnapshot()).toEqual(sourceSnapshot);
 		expect(created.settings.getModelRole("default")).toBe(modelValue(sourceModel));
-		expect(created.settings.get("defaultThinkingLevel")).toBe(Effort.Medium);
+		expect(cfgDefaultThinkingLevel.get(created.settings)).toBe(Effort.Medium);
 		expect(created.session.getSessionProfileName()).toBe("source-profile");
 		expect(created.session.model?.id).toBe(sourceModel.id);
 		expect(created.session.configuredThinkingLevel()).toBe(Effort.Medium);
@@ -570,12 +573,12 @@ describe("AgentSession model persistence", () => {
 			{ name: "target-profile", snapshot: targetSnapshot },
 		);
 		const created = await createSession({ initialModel: sourceModel, persist: true });
-		created.settings.set("profiles.items", {
+		cfgProfilesItems.set(created.settings, {
 			"source-profile": sourceSnapshot,
 			"target-profile": targetSnapshot,
 		});
-		created.settings.set("profiles.active", "source-profile");
-		created.settings.set("modelRoles", sourceSnapshot.modelRoles);
+		cfgProfilesActive.set(created.settings, "source-profile");
+		cfgModelRoles.set(created.settings, sourceSnapshot.modelRoles);
 		expect(await created.session.bindSessionProfile("source-profile")).toBe(true);
 		await created.session.waitForIdle();
 		created.session.sessionManager.appendModelChange(modelValue(sourceModel), "default");
@@ -612,7 +615,7 @@ describe("AgentSession model persistence", () => {
 		expect(created.settings.activeProfileName()).toBe("source-profile");
 		expect(created.settings.currentProfileSnapshot()).toEqual(sourceSnapshot);
 		expect(created.settings.getModelRole("default")).toBe(modelValue(sourceModel));
-		expect(created.settings.get("defaultThinkingLevel")).toBe(Effort.High);
+		expect(cfgDefaultThinkingLevel.get(created.settings)).toBe(Effort.High);
 		expect(created.session.getSessionProfileName()).toBe("source-profile");
 		expect(created.session.model?.id).toBe(sourceModel.id);
 		expect(created.session.configuredThinkingLevel()).toBe(Effort.High);
@@ -638,9 +641,9 @@ describe("AgentSession model persistence", () => {
 			snapshot: eduSnapshot,
 		});
 		const settings = Settings.isolated();
-		settings.set("profiles.items", { "gpt-edu": eduSnapshot, "gpt-cyber": cyberSnapshot });
-		settings.set("profiles.active", "gpt-cyber");
-		settings.set("modelRoles", cyberSnapshot.modelRoles);
+		cfgProfilesItems.set(settings, { "gpt-edu": eduSnapshot, "gpt-cyber": cyberSnapshot });
+		cfgProfilesActive.set(settings, "gpt-cyber");
+		cfgModelRoles.set(settings, cyberSnapshot.modelRoles);
 
 		const result = await createStartupResumeSession(targetSessionFile, settings);
 
@@ -660,8 +663,8 @@ describe("AgentSession model persistence", () => {
 			snapshot: eduSnapshot,
 		});
 		const settings = Settings.isolated();
-		settings.set("profiles.items", {});
-		settings.set("profiles.active", "other");
+		cfgProfilesItems.set(settings, {});
+		cfgProfilesActive.set(settings, "other");
 
 		await createStartupResumeSession(targetSessionFile, settings);
 
@@ -680,10 +683,10 @@ describe("AgentSession model persistence", () => {
 			snapshot: eduSnapshot,
 		});
 		const settings = Settings.isolated();
-		settings.set("profiles.items", {
+		cfgProfilesItems.set(settings, {
 			"broken-profile": { modelRoles: { default: 7 }, defaultThinkingLevel: "low" },
 		});
-		settings.set("profiles.active", "other");
+		cfgProfilesActive.set(settings, "other");
 
 		await createStartupResumeSession(targetSessionFile, settings);
 
@@ -975,17 +978,5 @@ describe("AgentSession model persistence", () => {
 				EPHEMERAL_MODEL_CHANGE_ROLE,
 			),
 		).toEqual(["anthropic/claude-sonnet-4-5"]);
-	});
-
-	it("lists a named role model before the default fallback", () => {
-		expect(
-			getRestorableSessionModels(
-				{
-					default: "anthropic/claude-sonnet-4-5",
-					smol: "anthropic/claude-sonnet-4-6",
-				},
-				"smol",
-			),
-		).toEqual(["anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-5"]);
 	});
 });

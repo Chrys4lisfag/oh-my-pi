@@ -53,7 +53,7 @@ describe("stale retry-fallback pin", () => {
 	beforeAll(async () => {
 		tempDir = TempDir.createSync("@pi-stale-pin-");
 		authStorage = await AuthStorage.create(tempDir.join("testauth.db"));
-		authStorage.setRuntimeApiKey("openai", "test-key");
+		authStorage.keys.setRuntime("openai", "test-key");
 		modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
 		const bundled = getBundledModel("openai", "gpt-4o-mini");
 		if (!bundled) throw new Error("Expected bundled model gpt-4o-mini");

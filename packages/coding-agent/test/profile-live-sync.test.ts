@@ -5,7 +5,10 @@ import { Effort } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { cfgModelRoles } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { cfgProfilesActive, cfgProfilesItems } from "@oh-my-pi/pi-coding-agent/config/profiles";
+import { cfgDefaultThinkingLevel, cfgExternalThinking } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -17,7 +20,7 @@ const INITIAL_MODEL_ID = "claude-sonnet-4-5";
 const FALLBACK_MODEL_ID = "claude-haiku-4-5";
 type TestProfileSnapshot = { modelRoles: Record<string, string>; defaultThinkingLevel: string };
 function profileSnapshot(settings: Settings, name: string): TestProfileSnapshot | undefined {
-	return settings.get("profiles.items")[name] as TestProfileSnapshot | undefined;
+	return cfgProfilesItems.get(settings)[name] as TestProfileSnapshot | undefined;
 }
 
 describe("live profile synchronization", () => {
@@ -62,7 +65,7 @@ describe("live profile synchronization", () => {
 
 		peer = await writer.cloneForCwd(tempDir.path());
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
-		authStorage.setRuntimeApiKey(PROVIDER, "test-key");
+		authStorage.keys.setRuntime(PROVIDER, "test-key");
 		modelRegistry = new ModelRegistry(authStorage);
 		const initialModel = getBundledModel(PROVIDER, INITIAL_MODEL_ID);
 		if (!initialModel) throw new Error(`Expected bundled model ${PROVIDER}/${INITIAL_MODEL_ID}`);
@@ -106,15 +109,15 @@ describe("live profile synchronization", () => {
 			modelRoles: { default: `${PROVIDER}/${FALLBACK_MODEL_ID}` },
 			defaultThinkingLevel: Effort.High,
 		});
-		writer.set("defaultThinkingLevel", Effort.Low);
+		cfgDefaultThinkingLevel.set(writer, Effort.Low);
 		await writer.flush();
 
 		await waitFor(() => profileSnapshot(peer, "fallback")?.defaultThinkingLevel === Effort.Low);
 
-		expect(peer.get("profiles.active")).toBe("selected");
+		expect(cfgProfilesActive.get(peer)).toBe("selected");
 		expect(peer.getModelRole("default")).toBe(`${PROVIDER}/${INITIAL_MODEL_ID}`);
 		expect(session.model?.id).toBe(INITIAL_MODEL_ID);
-		expect(peer.get("defaultThinkingLevel")).toBe(Effort.Medium);
+		expect(cfgDefaultThinkingLevel.get(peer)).toBe(Effort.Medium);
 		expect(profileSnapshot(writer, "fallback")?.defaultThinkingLevel).toBe(Effort.Low);
 	});
 
@@ -132,9 +135,9 @@ describe("live profile synchronization", () => {
 		await peer.flush();
 		await waitFor(
 			() =>
-				peer.get("profiles.active") === "fallback" &&
+				cfgProfilesActive.get(peer) === "fallback" &&
 				peer.getModelRole("default") === `${PROVIDER}/${FALLBACK_MODEL_ID}` &&
-				peer.get("defaultThinkingLevel") === Effort.Low &&
+				cfgDefaultThinkingLevel.get(peer) === Effort.Low &&
 				session.model?.id === FALLBACK_MODEL_ID &&
 				session.thinkingLevel === Effort.Low,
 		);
@@ -248,7 +251,7 @@ describe("live profile synchronization", () => {
 					session.model?.id === FALLBACK_MODEL_ID,
 			);
 
-			expect(peer.get("profiles.active")).toBe("selected");
+			expect(cfgProfilesActive.get(peer)).toBe("selected");
 			expect(profileSnapshot(writer, "selected")?.modelRoles.default).toBe(`${PROVIDER}/${FALLBACK_MODEL_ID}`);
 			expect(profileSnapshot(peer, "selected")?.modelRoles.default).toBe(`${PROVIDER}/${FALLBACK_MODEL_ID}`);
 			expect(writerSession.sessionManager.getSessionProfileSnapshot()?.modelRoles.default).toBe(
@@ -287,7 +290,7 @@ describe("live profile synchronization", () => {
 			await writer.flush();
 			await waitFor(
 				() =>
-					peer.get("defaultThinkingLevel") === Effort.High &&
+					cfgDefaultThinkingLevel.get(peer) === Effort.High &&
 					writerSession.thinkingLevel === Effort.High &&
 					session.thinkingLevel === Effort.High,
 			);
@@ -298,8 +301,8 @@ describe("live profile synchronization", () => {
 			// No manual sync: writer watcher must update terminal 2 and its live session.
 			await waitFor(
 				() =>
-					writer.get("defaultThinkingLevel") === Effort.Medium &&
-					peer.get("defaultThinkingLevel") === Effort.Medium &&
+					cfgDefaultThinkingLevel.get(writer) === Effort.Medium &&
+					cfgDefaultThinkingLevel.get(peer) === Effort.Medium &&
 					writerSession.thinkingLevel === Effort.Medium &&
 					session.thinkingLevel === Effort.Medium,
 			);
@@ -313,7 +316,7 @@ describe("live profile synchronization", () => {
 
 	it("preserves local live model and thinking edits across unrelated external writes", async () => {
 		peer.setModelRole("default", `${PROVIDER}/${FALLBACK_MODEL_ID}`);
-		peer.set("defaultThinkingLevel", Effort.XHigh);
+		cfgDefaultThinkingLevel.set(peer, Effort.XHigh);
 		await peer.flush();
 		await session.applyProfileToSession();
 
@@ -323,32 +326,32 @@ describe("live profile synchronization", () => {
 		});
 		await writer.flush();
 
-		await waitFor(() => "external-only" in peer.get("profiles.items"));
-		expect(peer.get("profiles.active")).toBe("selected");
+		await waitFor(() => "external-only" in cfgProfilesItems.get(peer));
+		expect(cfgProfilesActive.get(peer)).toBe("selected");
 		expect(peer.getModelRole("default")).toBe(`${PROVIDER}/${FALLBACK_MODEL_ID}`);
-		expect(peer.get("defaultThinkingLevel")).toBe(Effort.XHigh);
+		expect(cfgDefaultThinkingLevel.get(peer)).toBe(Effort.XHigh);
 		expect(session.model?.id).toBe(FALLBACK_MODEL_ID);
 		expect(session.thinkingLevel).toBe(Effort.XHigh);
 	});
 	it("keeps the selected profile and live session when another terminal deletes its definition", async () => {
-		peer.overrideModelRoles({ default: "google/gemini-stale" });
+		cfgModelRoles.override(peer, { default: "google/gemini-stale" });
 
 		writer.deleteProfileItem("selected");
 		await writer.flush();
 		await peer.syncFromDisk();
 
-		expect(peer.get("profiles.active")).toBe("selected");
+		expect(cfgProfilesActive.get(peer)).toBe("selected");
 		expect(peer.getModelRole("default")).toBe("google/gemini-stale");
 		expect(session.model?.id).toBe(INITIAL_MODEL_ID);
-		expect(peer.get("profiles.items")).toHaveProperty("selected");
+		expect(cfgProfilesItems.get(peer)).toHaveProperty("selected");
 	});
 
 	it("syncs an inactive deletion without changing the selected live model", async () => {
 		writer.deleteProfileItem("inactive");
 		await writer.flush();
 
-		await waitFor(() => !("inactive" in peer.get("profiles.items")));
-		expect(peer.get("profiles.active")).toBe("selected");
+		await waitFor(() => !("inactive" in cfgProfilesItems.get(peer)));
+		expect(cfgProfilesActive.get(peer)).toBe("selected");
 		expect(peer.getModelRole("default")).toBe(`${PROVIDER}/${INITIAL_MODEL_ID}`);
 		expect(session.model?.id).toBe(INITIAL_MODEL_ID);
 	});
@@ -416,7 +419,7 @@ describe("live profile synchronization", () => {
 		await writer.flush();
 		await peer.syncFromDisk();
 		await applyStarted.promise;
-		peer.set("externalThinking", true);
+		cfgExternalThinking.set(peer, true);
 
 		const preprocessingModels: Array<string | undefined> = [];
 		const getEnabledToolNames = session.getEnabledToolNames.bind(session);
@@ -446,7 +449,7 @@ describe("live profile synchronization", () => {
 		});
 
 		peer.setModelRole("default", `${PROVIDER}/${FALLBACK_MODEL_ID}`);
-		peer.set("defaultThinkingLevel", Effort.High);
+		cfgDefaultThinkingLevel.set(peer, Effort.High);
 		const applying = session.applyProfileToSession();
 		await applyStarted.promise;
 
@@ -495,20 +498,20 @@ describe("live profile synchronization", () => {
 		await writer.flush();
 		await Bun.sleep(400);
 		// Peer was disposed, so it did not run deletion sync
-		expect(peer.get("profiles.active")).toBe("selected");
+		expect(cfgProfilesActive.get(peer)).toBe("selected");
 	});
 
 	it("binds resumed settings to the recorded profile without changing the durable active marker", async () => {
 		expect(peer.bindSessionToProfile("fallback")).toBe(true);
-		expect(peer.get("profiles.active")).toBe("fallback");
+		expect(cfgProfilesActive.get(peer)).toBe("fallback");
 		expect(peer.getModelRole("default")).toBe(`${PROVIDER}/${FALLBACK_MODEL_ID}`);
-		expect(peer.get("defaultThinkingLevel")).toBe(Effort.High);
+		expect(cfgDefaultThinkingLevel.get(peer)).toBe(Effort.High);
 		expect(peer.bindSessionToProfile("does-not-exist")).toBe(false);
 
 		// Binding is terminal-local: the next save keeps the startup marker.
 		await peer.flush();
 		await writer.syncFromDisk();
-		expect(writer.get("profiles.active")).toBe("selected");
+		expect(cfgProfilesActive.get(writer)).toBe("selected");
 	});
 
 	it("routes persisted model edits to the bound profile, not the startup default", async () => {
@@ -525,7 +528,7 @@ describe("live profile synchronization", () => {
 		await peer.flush();
 		await writer.syncFromDisk();
 
-		const items = writer.get("profiles.items") as Record<
+		const items = cfgProfilesItems.get(writer) as Record<
 			string,
 			{ modelRoles: Record<string, string>; defaultThinkingLevel: string }
 		>;
@@ -559,10 +562,10 @@ describe("live profile synchronization", () => {
 			// Resume of an unbound legacy session retires profile ownership so
 			// persisted edits cannot land in the startup-default snapshot.
 			peer.unbindSessionFromProfile();
-			expect(peer.get("profiles.active")).toBe("");
+			expect(cfgProfilesActive.get(peer)).toBe("");
 			peer.setModelRole("default", `${PROVIDER}/${FALLBACK_MODEL_ID}`);
 			await peer.flush();
-			const items = peer.get("profiles.items") as Record<
+			const items = cfgProfilesItems.get(peer) as Record<
 				string,
 				{ modelRoles: Record<string, string>; defaultThinkingLevel: string }
 			>;

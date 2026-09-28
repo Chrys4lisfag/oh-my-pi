@@ -406,7 +406,7 @@ expand a file argument into a large test bucket.
   test/advisor-memory-reminder-integration.test.ts \
   test/advisor-toggle.test.ts \
   test/modes/controllers/advisor-status-command.test.ts \
-  test/modes/controllers/selector-controller-settings.test.ts \
+  test/modes/controllers/selector-controller-model-writes.test.ts \
   test/provider-insecure-tls.test.ts \
   test/models-yml-live-reload.test.ts \
   test/zero-model-cache-recovery.test.ts \

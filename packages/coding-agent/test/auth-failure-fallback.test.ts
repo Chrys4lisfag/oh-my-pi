@@ -48,7 +48,7 @@ describe("auth failure is recoverable", () => {
 		tempDir = TempDir.createSync("@pi-auth-fallback-");
 		authStorage = await AuthStorage.create(tempDir.join("auth.db"));
 		for (const provider of ["anthropic", "openai"]) {
-			authStorage.setRuntimeApiKey(provider, "test-key");
+			authStorage.keys.setRuntime(provider, "test-key");
 		}
 		modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
 		const p = getBundledModel("anthropic", "claude-sonnet-4-5");

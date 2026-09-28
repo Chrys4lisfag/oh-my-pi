@@ -53,7 +53,7 @@ describe("retry fallback chains are strictly scoped", () => {
 		tempDir = TempDir.createSync("@pi-strict-chains-");
 		authStorage = await AuthStorage.create(tempDir.join("auth.db"));
 		for (const provider of ["openai", "anthropic", "google"]) {
-			authStorage.setRuntimeApiKey(provider, "test-key");
+			authStorage.keys.setRuntime(provider, "test-key");
 		}
 		registry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
 		const session = getBundledModel("openai", "gpt-4o-mini");

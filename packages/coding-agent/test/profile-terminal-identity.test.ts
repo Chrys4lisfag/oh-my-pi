@@ -7,6 +7,9 @@ import { Agent } from "@oh-my-pi/pi-agent-core";
 import { Effort } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { cfgModelRoles } from "@oh-my-pi/pi-coding-agent/config/model-settings";
+import { cfgProfilesActive, cfgProfilesItems } from "@oh-my-pi/pi-coding-agent/config/profiles";
+import { cfgDefaultThinkingLevel } from "@oh-my-pi/pi-coding-agent/session/settings";
 import {
 	addProfile,
 	cycleProfile,
@@ -43,17 +46,17 @@ const LATE_MODEL_ID = "kimi-for-coding";
 type Snapshot = { modelRoles: Record<string, string>; defaultThinkingLevel: string };
 
 function snapshot(settings: Settings, name: string): Snapshot | undefined {
-	return settings.get("profiles.items")[name] as Snapshot | undefined;
+	return cfgProfilesItems.get(settings)[name] as Snapshot | undefined;
 }
 
 function isolatedProfiles(items: Record<string, Snapshot>, active: string): Settings {
 	const local = Settings.isolated();
-	local.set("profiles.items", items);
-	local.set("profiles.active", active);
+	cfgProfilesItems.set(local, items);
+	cfgProfilesActive.set(local, active);
 	const selected = items[active];
 	if (selected) {
-		local.set("modelRoles", selected.modelRoles);
-		local.set("defaultThinkingLevel", selected.defaultThinkingLevel as never);
+		cfgModelRoles.set(local, selected.modelRoles);
+		cfgDefaultThinkingLevel.set(local, selected.defaultThinkingLevel as never);
 	}
 	return local;
 }
@@ -66,7 +69,7 @@ async function createSessionHarness(settings: Settings): Promise<{
 	dispose: () => Promise<void>;
 }> {
 	const authStorage = await AuthStorage.create(":memory:");
-	authStorage.setRuntimeApiKey(RUNTIME_PROVIDER, "test-key");
+	authStorage.keys.setRuntime(RUNTIME_PROVIDER, "test-key");
 	const modelRegistry = new ModelRegistry(authStorage);
 	const runtimeModel = getBundledModel(RUNTIME_PROVIDER, RUNTIME_MODEL_ID);
 	if (!runtimeModel) throw new Error(`Expected bundled model ${RUNTIME_PROVIDER}/${RUNTIME_MODEL_ID}`);
@@ -158,7 +161,7 @@ describe("terminal-pinned profile identity", () => {
 		await peer.flush();
 		await terminal.syncFromDisk();
 		expect(terminal.activeProfileName()).toBe("gpt-edu");
-		expect(terminal.get("defaultThinkingLevel")).toBe(Effort.Medium);
+		expect(cfgDefaultThinkingLevel.get(terminal)).toBe(Effort.Medium);
 	});
 
 	it("04 same-profile model edit synchronizes models", async () => {
@@ -173,11 +176,11 @@ describe("terminal-pinned profile identity", () => {
 	it("05 same-profile edit preserves profile identity", async () => {
 		const { terminal, peer } = await seeded();
 		peer.bindSessionToProfile("gpt-edu");
-		peer.set("defaultThinkingLevel", Effort.High);
+		cfgDefaultThinkingLevel.set(peer, Effort.High);
 		await peer.flush();
 		await terminal.syncFromDisk();
 		expect(terminal.activeProfileName()).toBe("gpt-edu");
-		expect(terminal.get("defaultThinkingLevel")).toBe(Effort.High);
+		expect(cfgDefaultThinkingLevel.get(terminal)).toBe(Effort.High);
 	});
 
 	it("06 external active-profile deletion preserves identity and snapshot", async () => {
@@ -293,11 +296,11 @@ describe("terminal-pinned profile identity", () => {
 	});
 
 	it("16 keybind-style cycle ignores stale singleton profile state", () => {
-		Settings.instance.set("profiles.items", { stale: EDU, zzz: CYBER });
-		Settings.instance.set("profiles.active", "stale");
+		cfgProfilesItems.set(Settings.instance, { stale: EDU, zzz: CYBER });
+		cfgProfilesActive.set(Settings.instance, "stale");
 		const local = isolatedProfiles({ alpha: EDU, beta: CYBER }, "alpha");
 		expect(cycleProfile(local)?.name).toBe("beta");
-		expect(Settings.instance.get("profiles.active")).toBe("stale");
+		expect(cfgProfilesActive.get(Settings.instance)).toBe("stale");
 	});
 
 	it("17 keybind-style cycle leaves peer active profile unchanged", () => {
@@ -345,7 +348,7 @@ describe("terminal-pinned profile identity", () => {
 			expect(harness.session.getConfiguredDefaultModelState().unavailable).toBe(true);
 			expect(harness.session.model?.id).toBe(RUNTIME_MODEL_ID);
 
-			harness.authStorage.setRuntimeApiKey(LATE_PROVIDER, "test-key");
+			harness.authStorage.keys.setRuntime(LATE_PROVIDER, "test-key");
 			await harness.modelRegistry.refresh();
 			await harness.session.waitForIdle();
 

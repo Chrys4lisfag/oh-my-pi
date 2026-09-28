@@ -15,7 +15,7 @@ import type {
 
 /** Runtime provenance for the winning advisor definition. */
 export interface AdvisorConfigSource {
-	scope: "project" | "user" | "runtime" | "overlay" | "default";
+	scope: "project" | "user" | "env" | "runtime" | "overlay" | "default";
 	/** Present for WATCHDOG.yml/WATCHDOG.yaml sources; absent for settings layers. */
 	path?: string;
 }

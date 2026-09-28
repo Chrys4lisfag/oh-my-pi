@@ -16,6 +16,10 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Effort } from "@oh-my-pi/pi-ai";
+import { cfgModelRoles } from "@oh-my-pi/pi-coding-agent/config/model-settings";
+import { cfgProfilesActive, cfgProfilesItems } from "@oh-my-pi/pi-coding-agent/config/profiles";
+import { cfgDefaultThinkingLevel } from "@oh-my-pi/pi-coding-agent/session/settings";
+import { cfgSetupVersion } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import {
 	onSettingsSynchronized,
 	resetSettingsForTest,
@@ -29,7 +33,7 @@ import { YAML } from "bun";
 const SNAP = { modelRoles: { default: "anthropic/claude-sonnet-4" }, defaultThinkingLevel: "high" };
 type TestProfileSnapshot = { modelRoles: Record<string, string>; defaultThinkingLevel: string };
 function profileSnapshot(settings: Settings, name: string): TestProfileSnapshot | undefined {
-	return settings.get("profiles.items")[name] as TestProfileSnapshot | undefined;
+	return cfgProfilesItems.get(settings)[name] as TestProfileSnapshot | undefined;
 }
 
 describe("profiles multi-instance persistence", () => {
@@ -81,7 +85,7 @@ describe("profiles multi-instance persistence", () => {
 		await b.flush();
 
 		const reader = await load();
-		const items = reader.get("profiles.items") as Record<string, unknown>;
+		const items = cfgProfilesItems.get(reader) as Record<string, unknown>;
 		expect(Object.keys(items).sort()).toEqual(["base", "from-a", "from-b"]);
 	});
 
@@ -99,7 +103,7 @@ describe("profiles multi-instance persistence", () => {
 		await b.flush();
 
 		const reader = await load();
-		const items = reader.get("profiles.items") as Record<string, unknown>;
+		const items = cfgProfilesItems.get(reader) as Record<string, unknown>;
 		expect(Object.keys(items).sort()).toEqual(["from-b", "keep"]);
 	});
 
@@ -119,7 +123,7 @@ describe("profiles multi-instance persistence", () => {
 		await a.flush();
 
 		const reader = await load();
-		const items = reader.get("profiles.items") as Record<string, unknown>;
+		const items = cfgProfilesItems.get(reader) as Record<string, unknown>;
 		expect(Object.keys(items).sort()).toEqual(["base", "external", "from-a"]);
 	});
 	it("does not resurrect a deleted profile when a stale instance updates that same name", async () => {
@@ -138,7 +142,7 @@ describe("profiles multi-instance persistence", () => {
 		await stale.flush();
 
 		const reader = await load();
-		expect(reader.get("profiles.items")).toEqual({});
+		expect(cfgProfilesItems.get(reader)).toEqual({});
 	});
 
 	it("deletion wins when the stale same-profile update saves first", async () => {
@@ -157,7 +161,7 @@ describe("profiles multi-instance persistence", () => {
 		await deleter.flush();
 
 		const reader = await load();
-		expect(reader.get("profiles.items")).toEqual({});
+		expect(cfgProfilesItems.get(reader)).toEqual({});
 	});
 
 	it("allows a fresh instance to intentionally recreate a deleted profile name", async () => {
@@ -177,32 +181,32 @@ describe("profiles multi-instance persistence", () => {
 		await fresh.flush();
 
 		const reader = await load();
-		expect(reader.get("profiles.items")).toEqual({ shared: replacement });
+		expect(cfgProfilesItems.get(reader)).toEqual({ shared: replacement });
 	});
 
 	it("keeps a stale selected identity local without resurrecting its deleted definition", async () => {
 		const seed = await load();
 		seed.setProfileItem("shared", SNAP);
-		seed.set("profiles.active", "shared");
+		cfgProfilesActive.set(seed, "shared");
 		await seed.flush();
 
 		const stale = await load();
 		const deleter = await load();
 		deleter.deleteProfileItem("shared");
-		deleter.set("profiles.active", "");
+		cfgProfilesActive.set(deleter, "");
 		await deleter.flush();
 
 		stale.setProfileItem("shared", {
 			modelRoles: { default: "xai-oauth/grok-4.5" },
 			defaultThinkingLevel: "auto",
 		});
-		stale.set("profiles.active", "shared");
+		cfgProfilesActive.set(stale, "shared");
 		await stale.flush();
 
 		const disk = YAML.parse(fsSync.readFileSync(path.join(dir, "config.yml"), "utf8")) as Record<string, any>;
 		expect(disk.profiles.items).toEqual({});
 		const reader = await load();
-		expect(reader.get("profiles.active")).toBe("shared");
+		expect(cfgProfilesActive.get(reader)).toBe("shared");
 		expect(profileSnapshot(reader, "shared")).toBeDefined();
 	});
 
@@ -217,20 +221,20 @@ describe("profiles multi-instance persistence", () => {
 		await writer.flush();
 
 		const reader = await load();
-		expect(reader.get("profiles.items")).toEqual({ new: edited });
+		expect(cfgProfilesItems.get(reader)).toEqual({ new: edited });
 	});
 	it("persists a profile created and renamed before its first debounce flush", async () => {
 		const settings = await load();
 		settings.setProfileItem("old", SNAP);
 		settings.activateProfile("old", SNAP);
 		settings.renameProfileItem("old", "new", SNAP, true);
-		settings.set("defaultThinkingLevel", Effort.Medium);
+		cfgDefaultThinkingLevel.set(settings, Effort.Medium);
 		await settings.flush();
 
 		const reader = await load();
-		expect(reader.get("profiles.items")).not.toHaveProperty("old");
+		expect(cfgProfilesItems.get(reader)).not.toHaveProperty("old");
 		expect(profileSnapshot(reader, "new")?.defaultThinkingLevel).toBe(Effort.Medium);
-		expect(reader.get("profiles.active")).toBe("new");
+		expect(cfgProfilesActive.get(reader)).toBe("new");
 	});
 
 	it("collapses an inverse rename before the debounce flush", async () => {
@@ -245,11 +249,11 @@ describe("profiles multi-instance persistence", () => {
 		settings.renameProfileItem("beta", "alpha", original, true);
 		await settings.flush();
 
-		expect(settings.get("profiles.items")).toEqual({ alpha: original });
-		expect(settings.get("profiles.active")).toBe("alpha");
+		expect(cfgProfilesItems.get(settings)).toEqual({ alpha: original });
+		expect(cfgProfilesActive.get(settings)).toBe("alpha");
 		const reader = await load();
-		expect(reader.get("profiles.items")).toEqual({ alpha: original });
-		expect(reader.get("profiles.active")).toBe("alpha");
+		expect(cfgProfilesItems.get(reader)).toEqual({ alpha: original });
+		expect(cfgProfilesActive.get(reader)).toBe("alpha");
 	});
 
 	it("does not rename a stale source after another instance deletes it", async () => {
@@ -265,7 +269,7 @@ describe("profiles multi-instance persistence", () => {
 		await stale.flush();
 
 		const reader = await load();
-		expect(reader.get("profiles.items")).toEqual({});
+		expect(cfgProfilesItems.get(reader)).toEqual({});
 	});
 
 	it("does not overwrite a rename destination concurrently created by another instance", async () => {
@@ -305,16 +309,16 @@ describe("profiles multi-instance persistence", () => {
 			stale.renameProfileItem("old", "new", SNAP, true);
 			const firstFlush = stale.flush();
 			await saveEntered.promise;
-			stale.set("defaultThinkingLevel", Effort.Low);
+			cfgDefaultThinkingLevel.set(stale, Effort.Low);
 			releaseSave.resolve();
 			await firstFlush;
 			await stale.flush();
 
-			expect(stale.get("profiles.active")).toBe("old");
-			expect(stale.get("defaultThinkingLevel")).toBe(Effort.Low);
+			expect(cfgProfilesActive.get(stale)).toBe("old");
+			expect(cfgDefaultThinkingLevel.get(stale)).toBe(Effort.Low);
 			expect(profileSnapshot(stale, "new")).toEqual(concurrent);
 			const reader = await load();
-			expect(reader.get("profiles.items")).toEqual({
+			expect(cfgProfilesItems.get(reader)).toEqual({
 				old: { ...SNAP, defaultThinkingLevel: Effort.Low },
 				new: concurrent,
 			});
@@ -352,15 +356,15 @@ describe("profiles multi-instance persistence", () => {
 			settings.renameProfileItem("old", "new", SNAP, true);
 			const firstFlush = settings.flush();
 			await saveEntered.promise;
-			settings.set("defaultThinkingLevel", Effort.Medium);
+			cfgDefaultThinkingLevel.set(settings, Effort.Medium);
 			releaseSave.resolve();
 			await firstFlush;
 			await settings.flush();
 
 			const reader = await load();
-			expect(reader.get("profiles.items")).not.toHaveProperty("old");
+			expect(cfgProfilesItems.get(reader)).not.toHaveProperty("old");
 			expect(profileSnapshot(reader, "new")?.defaultThinkingLevel).toBe(Effort.Medium);
-			expect(reader.get("profiles.active")).toBe("new");
+			expect(cfgProfilesActive.get(reader)).toBe("new");
 		} finally {
 			releaseSave.resolve();
 			openSpy.mockRestore();
@@ -374,8 +378,8 @@ describe("profiles multi-instance persistence", () => {
 		const seed = await load();
 		seed.setProfileItem("old", old);
 		seed.setProfileItem("target", staleTarget);
-		seed.set("profiles.active", "old");
-		seed.set("modelRoles", old.modelRoles);
+		cfgProfilesActive.set(seed, "old");
+		cfgModelRoles.set(seed, old.modelRoles);
 		await seed.flush();
 
 		const stale = await load();
@@ -385,14 +389,14 @@ describe("profiles multi-instance persistence", () => {
 		stale.activateProfile("target", staleTarget);
 		await stale.flush();
 
-		expect(stale.get("profiles.active")).toBe("target");
+		expect(cfgProfilesActive.get(stale)).toBe("target");
 		expect(stale.getModelRole("default")).toBe("openai/fresh");
-		expect(stale.get("defaultThinkingLevel")).toBe(Effort.High);
+		expect(cfgDefaultThinkingLevel.get(stale)).toBe(Effort.High);
 		const reader = await load();
-		expect(reader.get("profiles.items").target).toEqual(freshTarget);
-		expect(reader.get("profiles.active")).toBe("target");
-		expect(reader.get("modelRoles")).toEqual(freshTarget.modelRoles);
-		expect(reader.get("defaultThinkingLevel")).toBe(Effort.High);
+		expect(cfgProfilesItems.get(reader).target).toEqual(freshTarget);
+		expect(cfgProfilesActive.get(reader)).toBe("target");
+		expect(cfgModelRoles.get(reader)).toEqual(freshTarget.modelRoles);
+		expect(cfgDefaultThinkingLevel.get(reader)).toBe(Effort.High);
 	});
 
 	it("renames the freshest source without overwriting a concurrently changed active marker", async () => {
@@ -401,8 +405,8 @@ describe("profiles multi-instance persistence", () => {
 		const seed = await load();
 		seed.setProfileItem("old", SNAP);
 		seed.setProfileItem("other", other);
-		seed.set("profiles.active", "old");
-		seed.set("modelRoles", SNAP.modelRoles);
+		cfgProfilesActive.set(seed, "old");
+		cfgModelRoles.set(seed, SNAP.modelRoles);
 		await seed.flush();
 
 		const stale = await load();
@@ -416,9 +420,9 @@ describe("profiles multi-instance persistence", () => {
 		await stale.flush();
 
 		const reader = await load();
-		expect(reader.get("profiles.items")).toEqual({ new: fresh, other });
-		expect(reader.get("profiles.active")).toBe("other");
-		expect(reader.get("modelRoles")).toEqual(other.modelRoles);
+		expect(cfgProfilesItems.get(reader)).toEqual({ new: fresh, other });
+		expect(cfgProfilesActive.get(reader)).toBe("other");
+		expect(cfgModelRoles.get(reader)).toEqual(other.modelRoles);
 	});
 
 	it("does not overwrite a concurrently changed active marker when deleting stale active state", async () => {
@@ -426,8 +430,8 @@ describe("profiles multi-instance persistence", () => {
 		const seed = await load();
 		seed.setProfileItem("selected", SNAP);
 		seed.setProfileItem("other", other);
-		seed.set("profiles.active", "selected");
-		seed.set("modelRoles", SNAP.modelRoles);
+		cfgProfilesActive.set(seed, "selected");
+		cfgModelRoles.set(seed, SNAP.modelRoles);
 		await seed.flush();
 
 		const stale = await load();
@@ -440,17 +444,17 @@ describe("profiles multi-instance persistence", () => {
 		await stale.flush();
 
 		const reader = await load();
-		expect(reader.get("profiles.items")).toEqual({ other });
-		expect(reader.get("profiles.active")).toBe("other");
-		expect(reader.get("modelRoles")).toEqual(other.modelRoles);
+		expect(cfgProfilesItems.get(reader)).toEqual({ other });
+		expect(cfgProfilesActive.get(reader)).toBe("other");
+		expect(cfgModelRoles.get(reader)).toEqual(other.modelRoles);
 	});
 
 	it("preserves pinned profile-owned slots and unrelated overrides after final deletion", async () => {
 		const seed = await load();
 		seed.setProfileItem("only", SNAP);
-		seed.set("profiles.active", "only");
-		seed.set("modelRoles", SNAP.modelRoles);
-		seed.set("defaultThinkingLevel", Effort.High);
+		cfgProfilesActive.set(seed, "only");
+		cfgModelRoles.set(seed, SNAP.modelRoles);
+		cfgDefaultThinkingLevel.set(seed, Effort.High);
 		await seed.flush();
 		await fs.mkdir(path.join(dir, ".omp"), { recursive: true });
 		await fs.writeFile(
@@ -481,22 +485,22 @@ describe("profiles multi-instance persistence", () => {
 		expect(peer.getModelRole("default")).toBe(SNAP.modelRoles.default);
 		expect(peer.getModelRole("advisor")).toBe("runtime/advisor");
 		expect(peer.getModelRole("smol")).toBe("project/smol");
-		expect(peer.get("defaultThinkingLevel")).toBe(Effort.High);
+		expect(cfgDefaultThinkingLevel.get(peer)).toBe(Effort.High);
 	});
 
 	it("does not adopt another terminal's first activation when local selection is empty", async () => {
 		const emptyTerminal = await load();
-		const initialRoles = emptyTerminal.get("modelRoles");
-		const initialThinking = emptyTerminal.get("defaultThinkingLevel");
+		const initialRoles = cfgModelRoles.get(emptyTerminal);
+		const initialThinking = cfgDefaultThinkingLevel.get(emptyTerminal);
 		const writer = await load();
 		writer.setProfileItem("first", SNAP);
 		writer.activateProfile("first", SNAP);
 		await writer.flush();
 
-		await waitFor(() => "first" in emptyTerminal.get("profiles.items"));
-		expect(emptyTerminal.get("profiles.active")).toBe("");
-		expect(emptyTerminal.get("modelRoles")).toEqual(initialRoles);
-		expect(emptyTerminal.get("defaultThinkingLevel")).toBe(initialThinking);
+		await waitFor(() => "first" in cfgProfilesItems.get(emptyTerminal));
+		expect(cfgProfilesActive.get(emptyTerminal)).toBe("");
+		expect(cfgModelRoles.get(emptyTerminal)).toEqual(initialRoles);
+		expect(cfgDefaultThinkingLevel.get(emptyTerminal)).toBe(initialThinking);
 	});
 
 	it("does not switch other instances when one instance switches active profile", async () => {
@@ -509,8 +513,8 @@ describe("profiles multi-instance persistence", () => {
 			modelRoles: { default: "openai/other" },
 			defaultThinkingLevel: "low",
 		});
-		seed.set("profiles.active", "work");
-		seed.set("modelRoles", { default: "anthropic/initial" });
+		cfgProfilesActive.set(seed, "work");
+		cfgModelRoles.set(seed, { default: "anthropic/initial" });
 		await seed.flush();
 
 		const writer = await load();
@@ -523,7 +527,7 @@ describe("profiles multi-instance persistence", () => {
 		await writer.flush();
 		await Bun.sleep(400);
 
-		expect(peer.get("profiles.active")).toBe("work");
+		expect(cfgProfilesActive.get(peer)).toBe("work");
 		expect(peer.getModelRole("default")).toBe("anthropic/initial");
 	});
 
@@ -535,15 +539,15 @@ describe("profiles multi-instance persistence", () => {
 
 		const first = await load();
 		const second = await load();
-		first.set("defaultThinkingLevel", Effort.Medium);
+		cfgDefaultThinkingLevel.set(first, Effort.Medium);
 		await first.flush();
 		await second.syncFromDisk();
 		await first.syncFromDisk();
 
-		expect(first.get("profiles.active")).toBe("gpt-edu");
-		expect(second.get("profiles.active")).toBe("gpt-edu");
-		expect(first.get("defaultThinkingLevel")).toBe(Effort.Medium);
-		expect(second.get("defaultThinkingLevel")).toBe(Effort.Medium);
+		expect(cfgProfilesActive.get(first)).toBe("gpt-edu");
+		expect(cfgProfilesActive.get(second)).toBe("gpt-edu");
+		expect(cfgDefaultThinkingLevel.get(first)).toBe(Effort.Medium);
+		expect(cfgDefaultThinkingLevel.get(second)).toBe(Effort.Medium);
 		expect(profileSnapshot(first, "gpt-edu")?.defaultThinkingLevel).toBe(Effort.Medium);
 		expect(profileSnapshot(second, "gpt-edu")?.defaultThinkingLevel).toBe(Effort.Medium);
 	});
@@ -575,7 +579,7 @@ describe("profiles multi-instance persistence", () => {
 
 		const stale = await load();
 		const deleter = await load();
-		stale.set("defaultThinkingLevel", Effort.Medium);
+		cfgDefaultThinkingLevel.set(stale, Effort.Medium);
 		deleter.deleteProfileItem("shared");
 		await deleter.flush();
 		await stale.flush();
@@ -583,8 +587,8 @@ describe("profiles multi-instance persistence", () => {
 		const disk = YAML.parse(fsSync.readFileSync(path.join(dir, "config.yml"), "utf8")) as Record<string, any>;
 		expect(disk.profiles.items).toEqual({});
 		const reader = await load();
-		expect(reader.get("profiles.active")).toBe("shared");
-		expect(reader.get("defaultThinkingLevel")).toBe(Effort.Medium);
+		expect(cfgProfilesActive.get(reader)).toBe("shared");
+		expect(cfgDefaultThinkingLevel.get(reader)).toBe(Effort.Medium);
 	});
 
 	it("merges disjoint same-profile role edits in either flush order", async () => {
@@ -616,7 +620,7 @@ describe("profiles multi-instance persistence", () => {
 			default: "openai/default-c",
 			advisor: "google/advisor-d",
 		});
-		expect(reader.get("modelRoles")).toEqual({ default: "openai/default-c", advisor: "google/advisor-d" });
+		expect(cfgModelRoles.get(reader)).toEqual({ default: "openai/default-c", advisor: "google/advisor-d" });
 	});
 
 	it("merges concurrent same-profile thinking and role edits", async () => {
@@ -627,7 +631,7 @@ describe("profiles multi-instance persistence", () => {
 
 		const thinkingWriter = await load();
 		const roleWriter = await load();
-		thinkingWriter.set("defaultThinkingLevel", Effort.Medium);
+		cfgDefaultThinkingLevel.set(thinkingWriter, Effort.Medium);
 		roleWriter.setModelRole("advisor", "openai/advisor-new");
 		await Promise.all([thinkingWriter.flush(), roleWriter.flush()]);
 
@@ -636,7 +640,7 @@ describe("profiles multi-instance persistence", () => {
 			modelRoles: { ...SNAP.modelRoles, advisor: "openai/advisor-new" },
 			defaultThinkingLevel: Effort.Medium,
 		});
-		expect(reader.get("defaultThinkingLevel")).toBe(Effort.Medium);
+		expect(cfgDefaultThinkingLevel.get(reader)).toBe(Effort.Medium);
 	});
 
 	it("requeues same-profile role and thinking deltas after an atomic write failure", async () => {
@@ -646,7 +650,7 @@ describe("profiles multi-instance persistence", () => {
 		await seed.flush();
 
 		const writer = await load();
-		writer.set("defaultThinkingLevel", Effort.Medium);
+		cfgDefaultThinkingLevel.set(writer, Effort.Medium);
 		writer.setModelRole("advisor", "openai/advisor-retried");
 
 		const open = fsSync.promises.open.bind(fsSync.promises);
@@ -666,7 +670,7 @@ describe("profiles multi-instance persistence", () => {
 		});
 		try {
 			await expect(writer.flush()).rejects.toThrow("synthetic atomic write failure");
-			expect(writer.get("profiles.active")).toBe("shared");
+			expect(cfgProfilesActive.get(writer)).toBe("shared");
 
 			await writer.flush();
 
@@ -676,7 +680,7 @@ describe("profiles multi-instance persistence", () => {
 				defaultThinkingLevel: Effort.Medium,
 			});
 			expect(disk.profiles.active).toBe("shared");
-			expect(writer.get("profiles.active")).toBe("shared");
+			expect(cfgProfilesActive.get(writer)).toBe("shared");
 		} finally {
 			openSpy.mockRestore();
 		}
@@ -701,7 +705,7 @@ describe("profiles multi-instance persistence", () => {
 
 		const reader = await load();
 		expect(profileSnapshot(reader, "shared")?.modelRoles).toEqual({ advisor: "google/advisor-new" });
-		expect(reader.get("modelRoles")).toEqual({ advisor: "google/advisor-new" });
+		expect(cfgModelRoles.get(reader)).toEqual({ advisor: "google/advisor-new" });
 	});
 
 	it("keeps explicit runtime overrides while syncing the underlying same-profile snapshot", async () => {
@@ -712,16 +716,16 @@ describe("profiles multi-instance persistence", () => {
 
 		const writer = await load();
 		const overridden = await load();
-		overridden.overrideModelRoles({ default: "google/local-override" });
-		overridden.override("defaultThinkingLevel", Effort.XHigh);
+		cfgModelRoles.override(overridden, { default: "google/local-override" });
+		cfgDefaultThinkingLevel.override(overridden, Effort.XHigh);
 
 		writer.setModelRole("default", "openai-codex/gpt-5.6");
-		writer.set("defaultThinkingLevel", Effort.Medium);
+		cfgDefaultThinkingLevel.set(writer, Effort.Medium);
 		await writer.flush();
 		await overridden.syncFromDisk();
 
 		expect(overridden.getModelRole("default")).toBe("google/local-override");
-		expect(overridden.get("defaultThinkingLevel")).toBe(Effort.XHigh);
+		expect(cfgDefaultThinkingLevel.get(overridden)).toBe(Effort.XHigh);
 		expect(profileSnapshot(overridden, "gpt-edu")?.modelRoles.default).toBe("openai-codex/gpt-5.6");
 		expect(profileSnapshot(overridden, "gpt-edu")?.defaultThinkingLevel).toBe(Effort.Medium);
 	});
@@ -741,23 +745,23 @@ describe("profiles multi-instance persistence", () => {
 		await alphaTerminal.syncFromDisk();
 
 		alphaTerminal.setModelRole("default", "openai/alpha-new");
-		alphaTerminal.set("defaultThinkingLevel", Effort.Medium);
+		cfgDefaultThinkingLevel.set(alphaTerminal, Effort.Medium);
 		await alphaTerminal.flush();
 		await betaTerminal.syncFromDisk();
 		await alphaTerminal.syncFromDisk();
 
-		expect(alphaTerminal.get("profiles.active")).toBe("alpha");
+		expect(cfgProfilesActive.get(alphaTerminal)).toBe("alpha");
 		expect(alphaTerminal.getModelRole("default")).toBe("openai/alpha-new");
-		expect(alphaTerminal.get("defaultThinkingLevel")).toBe(Effort.Medium);
-		expect(betaTerminal.get("profiles.active")).toBe("beta");
+		expect(cfgDefaultThinkingLevel.get(alphaTerminal)).toBe(Effort.Medium);
+		expect(cfgProfilesActive.get(betaTerminal)).toBe("beta");
 		expect(betaTerminal.getModelRole("default")).toBe("google/beta");
-		expect(betaTerminal.get("defaultThinkingLevel")).toBe(Effort.Low);
+		expect(cfgDefaultThinkingLevel.get(betaTerminal)).toBe(Effort.Low);
 
 		const reader = await load();
-		expect(reader.get("profiles.active")).toBe("beta");
+		expect(cfgProfilesActive.get(reader)).toBe("beta");
 		expect(reader.getModelRole("default")).toBe("google/beta");
-		expect(reader.get("defaultThinkingLevel")).toBe(Effort.Low);
-		expect(reader.get("profiles.items").alpha).toEqual({
+		expect(cfgDefaultThinkingLevel.get(reader)).toBe(Effort.Low);
+		expect(cfgProfilesItems.get(reader).alpha).toEqual({
 			modelRoles: { default: "openai/alpha-new" },
 			defaultThinkingLevel: Effort.Medium,
 		});
@@ -796,11 +800,11 @@ describe("profiles multi-instance persistence", () => {
 			});
 			releaseRead.resolve();
 			expect(await synchronization).toBe(false);
-			expect(settings.get("profiles.items")).toHaveProperty("created-during-read");
+			expect(cfgProfilesItems.get(settings)).toHaveProperty("created-during-read");
 			await settings.flush();
 
 			const reader = await load();
-			expect(reader.get("profiles.items")).toHaveProperty("created-during-read");
+			expect(cfgProfilesItems.get(reader)).toHaveProperty("created-during-read");
 		} finally {
 			releaseRead.resolve();
 			readSpy.mockRestore();
@@ -813,9 +817,9 @@ describe("profiles multi-instance persistence", () => {
 		const seed = await load();
 		seed.setProfileItem("work", work);
 		seed.setProfileItem("other", other);
-		seed.set("profiles.active", "work");
-		seed.set("modelRoles", work.modelRoles);
-		seed.set("defaultThinkingLevel", Effort.Medium);
+		cfgProfilesActive.set(seed, "work");
+		cfgModelRoles.set(seed, work.modelRoles);
+		cfgDefaultThinkingLevel.set(seed, Effort.Medium);
 		await seed.flush();
 
 		const stale = await seed.cloneForCwd(dir);
@@ -824,15 +828,15 @@ describe("profiles multi-instance persistence", () => {
 		writer.activateProfile("other", other);
 		await writer.flush();
 
-		stale.set("setupVersion", 2);
+		cfgSetupVersion.set(stale, 2);
 		await stale.flush();
 
-		expect(stale.get("profiles.active")).toBe("work");
+		expect(cfgProfilesActive.get(stale)).toBe("work");
 		expect(stale.getModelRole("default")).toBe("anthropic/work");
-		expect(stale.get("defaultThinkingLevel")).toBe(Effort.Medium);
+		expect(cfgDefaultThinkingLevel.get(stale)).toBe(Effort.Medium);
 		const reader = await load();
-		expect(reader.get("setupVersion")).toBe(2);
-		expect(reader.get("profiles.active")).toBe("other");
+		expect(cfgSetupVersion.get(reader)).toBe(2);
+		expect(cfgProfilesActive.get(reader)).toBe("other");
 		expect(reader.getModelRole("default")).toBe("openai/other");
 	});
 
@@ -844,8 +848,8 @@ describe("profiles multi-instance persistence", () => {
 		seed.setProfileItem("work", work);
 		seed.setProfileItem("foreign", foreign);
 		seed.setProfileItem("latest", latest);
-		seed.set("profiles.active", "work");
-		seed.set("modelRoles", work.modelRoles);
+		cfgProfilesActive.set(seed, "work");
+		cfgModelRoles.set(seed, work.modelRoles);
 		await seed.flush();
 
 		const settings = await seed.cloneForCwd(dir);
@@ -877,26 +881,26 @@ describe("profiles multi-instance persistence", () => {
 			defaultThinkingLevel: "medium",
 		};
 		try {
-			settings.set("setupVersion", 2);
+			cfgSetupVersion.set(settings, 2);
 			const firstFlush = settings.flush();
 			await saveEntered.promise;
 			settings.activateProfile("latest", latest);
-			settings.set("setupVersion", 3);
+			cfgSetupVersion.set(settings, 3);
 			settings.setProfileItem("created-during-save", createdDuringSave);
 			releaseSave.resolve();
 			await firstFlush;
 
-			expect(settings.get("profiles.active")).toBe("latest");
-			expect(settings.get("setupVersion")).toBe(3);
-			expect(settings.get("profiles.items")).toHaveProperty("created-during-save", createdDuringSave);
+			expect(cfgProfilesActive.get(settings)).toBe("latest");
+			expect(cfgSetupVersion.get(settings)).toBe(3);
+			expect(cfgProfilesItems.get(settings)).toHaveProperty("created-during-save", createdDuringSave);
 			await settings.flush();
 
 			expect(settings.getModelRole("default")).toBe("google/latest");
-			expect(settings.get("defaultThinkingLevel")).toBe(Effort.High);
+			expect(cfgDefaultThinkingLevel.get(settings)).toBe(Effort.High);
 			const reader = await load();
-			expect(reader.get("profiles.active")).toBe("latest");
-			expect(reader.get("setupVersion")).toBe(3);
-			expect(reader.get("profiles.items")).toHaveProperty("created-during-save", createdDuringSave);
+			expect(cfgProfilesActive.get(reader)).toBe("latest");
+			expect(cfgSetupVersion.get(reader)).toBe(3);
+			expect(cfgProfilesItems.get(reader)).toHaveProperty("created-during-save", createdDuringSave);
 			expect(reader.getModelRole("default")).toBe("google/latest");
 		} finally {
 			releaseSave.resolve();
@@ -927,9 +931,9 @@ describe("profiles multi-instance persistence", () => {
 		});
 		try {
 			await settings.reloadFromDisk();
-			expect(settings.get("profiles.active")).toBe("work");
+			expect(cfgProfilesActive.get(settings)).toBe("work");
 			expect(settings.getModelRole("default")).toBe("anthropic/work-new");
-			expect(settings.get("defaultThinkingLevel")).toBe(Effort.High);
+			expect(cfgDefaultThinkingLevel.get(settings)).toBe(Effort.High);
 			expect(notifications).toHaveLength(1);
 			expect(notifications[0]).not.toContain("profiles.active");
 			expect(notifications[0]).toEqual(expect.arrayContaining(["modelRoles", "defaultThinkingLevel"]));
@@ -949,12 +953,12 @@ describe("profiles multi-instance persistence", () => {
 			defaultThinkingLevel: "high",
 		};
 		settings.setProfileItem("target", target);
-		settings.set("profiles.active", "old");
+		cfgProfilesActive.set(settings, "old");
 		await settings.flush();
 
 		settings.activateProfile("target", target);
 		await settings.flush();
-		expect(settings.get("profiles.active")).toBe("target");
+		expect(cfgProfilesActive.get(settings)).toBe("target");
 		expect(settings.getModelRole("default")).toBe("openai/target");
 	});
 
@@ -966,7 +970,7 @@ describe("profiles multi-instance persistence", () => {
 		seed.setProfileItem("old", old);
 		seed.setProfileItem("target", target);
 		seed.setProfileItem("winner", winner);
-		seed.set("profiles.active", "old");
+		cfgProfilesActive.set(seed, "old");
 		await seed.flush();
 
 		const stale = await load();
@@ -981,16 +985,16 @@ describe("profiles multi-instance persistence", () => {
 		});
 		try {
 			await stale.flush();
-			expect(stale.get("profiles.active")).toBe("target");
+			expect(cfgProfilesActive.get(stale)).toBe("target");
 			expect(stale.getModelRole("default")).toBe("openai/target");
 			expect(synchronizations).toBe(0);
 
 			await concurrent.syncFromDisk();
-			expect(concurrent.get("profiles.active")).toBe("winner");
+			expect(cfgProfilesActive.get(concurrent)).toBe("winner");
 			expect(concurrent.getModelRole("default")).toBe("anthropic/winner");
 
 			const reader = await load();
-			expect(reader.get("profiles.active")).toBe("target");
+			expect(cfgProfilesActive.get(reader)).toBe("target");
 		} finally {
 			unsubscribe();
 		}
@@ -1018,21 +1022,21 @@ describe("profiles multi-instance persistence", () => {
 
 		const deleter = await load();
 		const peer = await load();
-		peer.overrideModelRoles({ default: "google/gemini-stale" });
+		cfgModelRoles.override(peer, { default: "google/gemini-stale" });
 
 		deleter.deleteProfileItem("selected");
 		await deleter.flush();
 		await peer.syncFromDisk();
-		expect(peer.get("profiles.active")).toBe("selected");
+		expect(cfgProfilesActive.get(peer)).toBe("selected");
 		expect(peer.getModelRole("default")).toBe("google/gemini-stale");
-		expect(peer.get("profiles.items")).toHaveProperty("selected");
+		expect(cfgProfilesItems.get(peer)).toHaveProperty("selected");
 
 		peer.setModelRole("advisor", "anthropic/advisor-after-delete");
 		await peer.flush();
 		const disk = YAML.parse(fsSync.readFileSync(path.join(dir, "config.yml"), "utf8")) as Record<string, any>;
 		expect(disk.profiles.items).not.toHaveProperty("selected");
 		const reader = await load();
-		expect(reader.get("profiles.active")).toBe("selected");
+		expect(cfgProfilesActive.get(reader)).toBe("selected");
 		expect(reader.getModelRole("advisor")).toBe("anthropic/advisor-after-delete");
 	});
 
@@ -1043,8 +1047,8 @@ describe("profiles multi-instance persistence", () => {
 			modelRoles: { default: "openai/inactive" },
 			defaultThinkingLevel: "low",
 		});
-		seed.set("profiles.active", "active");
-		seed.set("modelRoles", { ...SNAP.modelRoles });
+		cfgProfilesActive.set(seed, "active");
+		cfgModelRoles.set(seed, { ...SNAP.modelRoles });
 		await seed.flush();
 
 		const deleter = await load();
@@ -1052,8 +1056,8 @@ describe("profiles multi-instance persistence", () => {
 		deleter.deleteProfileItem("inactive");
 		await deleter.flush();
 
-		await waitFor(() => !("inactive" in peer.get("profiles.items")));
-		expect(peer.get("profiles.active")).toBe("active");
-		expect(peer.get("modelRoles")).toEqual(SNAP.modelRoles);
+		await waitFor(() => !("inactive" in cfgProfilesItems.get(peer)));
+		expect(cfgProfilesActive.get(peer)).toBe("active");
+		expect(cfgModelRoles.get(peer)).toEqual(SNAP.modelRoles);
 	});
 });
