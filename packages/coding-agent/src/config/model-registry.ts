@@ -278,7 +278,6 @@ export class ModelRegistry {
 	#modelOverrides: Map<string, Map<string, ModelOverride>> = new Map();
 	#configError: ConfigError | undefined = undefined;
 	#modelsConfigFile: ConfigFile<ModelsConfig>;
-	#lastStaticLoadMtime: number | null | undefined;
 	#lastStaticLoadFingerprint: string | null | undefined;
 	#registeredProviderSources: Set<string> = new Set();
 	#providerDiscoveryStates: Map<string, ProviderDiscoveryState> = new Map();
@@ -574,7 +573,7 @@ export class ModelRegistry {
 			await this.#backgroundRefresh;
 			changed = true;
 		}
-		if (this.#modelsConfigFile.getMtimeMs() !== this.#lastStaticLoadMtime) {
+		if (this.#modelsConfigFile.getContentFingerprint() !== this.#lastStaticLoadFingerprint) {
 			await this.refresh("offline");
 			changed = true;
 		}

@@ -10,6 +10,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { computeExecutablePath, detectBrowserPlatform } from "@oh-my-pi/pi-utils/browsers";
+import { APP_NAME } from "@oh-my-pi/pi-utils/dirs";
 import { PUPPETEER_REVISIONS } from "puppeteer-core/internal/revisions.js";
 
 const EXECUTABLE_PROBE = path.resolve(import.meta.dir, "../fixtures/browser-executable-probe.ts");
@@ -49,6 +50,17 @@ describe("browser launch stealth defaults", () => {
 			}
 		}
 	});
+
+	it.skipIf(process.platform === "win32")(
+		"continues filtering Puppeteer's automation default for Chrome and Chromium executables",
+		() => {
+			for (const executablePath of CHROME_EXECUTABLE_PATHS) {
+				const ignoreDefaultArgs = stealthIgnoreDefaultArgsForTest(executablePath);
+
+				expect(ignoreDefaultArgs).toContain(AUTOMATION_FLAG);
+			}
+		},
+	);
 });
 
 describe("shared browser launch", () => {
@@ -218,7 +230,7 @@ describe("browser executable selection", () => {
 		}
 	});
 
-	it("prefers Chrome for Testing over a detected system Chrome on macOS (#8673)", async () => {
+	it("prefers Chrome for Testing over a detected system Chrome on macOS using the profile cache (#8673)", async () => {
 		const tempDir = TempDir.createSync("@browser-macos-cft-");
 		try {
 			const home = path.join(tempDir.path(), "home");
@@ -262,4 +274,60 @@ describe("browser executable selection", () => {
 			await tempDir.remove();
 		}
 	});
+
+	// The child pins its puppeteer cache via XDG_CACHE_HOME, which the dirs
+	// resolver honors only on Linux/macOS hosts; on Windows it would resolve the
+	// real user cache and attempt a network download.
+	it.skipIf(process.platform === "win32")(
+		"prefers Chrome for Testing over a detected system Chrome on macOS using XDG cache (#8673)",
+		async () => {
+			const tempDir = TempDir.createSync("@browser-macos-cft-");
+			try {
+				const home = path.join(tempDir.path(), "home");
+				const xdgCache = path.join(tempDir.path(), "cache");
+				// resolveIf() (packages/utils/src/dirs.ts) only redirects to an XDG
+				// root when its `<XDG>/omp` dir already exists, so create them to pin
+				// the child's puppeteer cache to this isolated location.
+				for (const xdg of [xdgCache, path.join(tempDir.path(), "data"), path.join(tempDir.path(), "state")]) {
+					fs.mkdirSync(path.join(xdg, APP_NAME), { recursive: true });
+				}
+				const env = {
+					...process.env,
+					HOME: home,
+					XDG_CACHE_HOME: xdgCache,
+					XDG_DATA_HOME: path.join(tempDir.path(), "data"),
+					XDG_STATE_HOME: path.join(tempDir.path(), "state"),
+					OMP_BROWSER_PROBE_PLATFORM: "darwin",
+					PUPPETEER_EXECUTABLE_PATH: "",
+				};
+
+				// System Google Chrome bundle (com.google.Chrome) — the LaunchServices
+				// hijacker the fix must avoid selecting.
+				const systemChrome = path.join(home, "Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+				await Bun.write(systemChrome, "#!/bin/sh\necho 'Google Chrome 151'\n");
+				fs.chmodSync(systemChrome, 0o755);
+
+				// Seed the isolated Chrome for Testing binary in the child's cache so the
+				// probe resolves it without a network download. getPuppeteerDir() resolves
+				// to `<XDG_CACHE_HOME>/omp/puppeteer` given the dirs created above.
+				const cacheDir = path.join(xdgCache, APP_NAME, "puppeteer");
+				const platform = detectBrowserPlatform();
+				if (!platform) throw new Error("unsupported host platform for Chrome-for-Testing selection test");
+				const buildId = PUPPETEER_REVISIONS.chrome;
+				const chromeForTesting = computeExecutablePath({ buildId, cacheDir, platform });
+				await Bun.write(chromeForTesting, "#!/bin/sh\necho 'Chrome for Testing'\n");
+				fs.chmodSync(chromeForTesting, 0o755);
+
+				const result = Bun.spawnSync([process.execPath, EXECUTABLE_PROBE], { env, stdout: "pipe", stderr: "pipe" });
+				const stderr = new TextDecoder().decode(result.stderr);
+
+				expect(result.exitCode, stderr).toBe(0);
+				const selected = new TextDecoder().decode(result.stdout);
+				expect(selected).toBe(chromeForTesting);
+				expect(selected).not.toBe(systemChrome);
+			} finally {
+				await tempDir.remove();
+			}
+		},
+	);
 });
