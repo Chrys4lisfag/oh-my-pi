@@ -1555,13 +1555,15 @@ describe("AgentSession retry delay cap", () => {
 					event.role === "default",
 			),
 		).toBe(true);
-		expect(fallbackEvents).toContainEqual({
-			type: "retry_fallback_applied",
-			from: `${exhaustedModel.provider}/${exhaustedModel.id}`,
-			to: `${fallbackModel.provider}/${fallbackModel.id}`,
-			role: "default",
-			reason: expect.stringContaining("429 Weekly usage limit reached"),
-		});
+		expect(fallbackEvents).toContainEqual(
+			expect.objectContaining({
+				type: "retry_fallback_applied",
+				from: `${exhaustedModel.provider}/${exhaustedModel.id}`,
+				to: `${fallbackModel.provider}/${fallbackModel.id}`,
+				role: "default",
+				reason: expect.stringContaining("429 Weekly usage limit reached"),
+			}),
+		);
 		for (const call of waitSpy.mock.calls) {
 			expect(call[0]).toBeLessThan(300_000);
 		}

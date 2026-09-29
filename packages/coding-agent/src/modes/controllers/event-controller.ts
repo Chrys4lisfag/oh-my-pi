@@ -2438,7 +2438,11 @@ export class EventController {
 		const reason = event.reason
 			? `\n${previewLine(sanitizeText(event.reason), TRUNCATE_LENGTHS.LINE * PREVIEW_LIMITS.COLLAPSED_LINES)}`
 			: "";
-		this.ctx.showWarning(`Fallback: ${event.from} -> ${event.to}${reason}`);
+		const elapsed =
+			event.durationMs !== undefined && Number.isFinite(event.durationMs) && event.durationMs >= 0
+				? ` after ${formatDuration(event.durationMs)}`
+				: "";
+		this.ctx.showWarning(`Fallback${elapsed}: ${event.from} -> ${event.to}${reason}`);
 	}
 
 	async #handleRetryFallbackSucceeded(

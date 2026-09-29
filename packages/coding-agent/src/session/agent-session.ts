@@ -4874,6 +4874,7 @@ export class AgentSession implements SettingsScope {
 				to: event.to,
 				role: event.role,
 				reason: event.reason,
+				durationMs: event.durationMs,
 			});
 		} else if (event.type === "retry_fallback_succeeded") {
 			await this.#extensionRunner.emit({

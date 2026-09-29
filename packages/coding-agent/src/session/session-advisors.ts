@@ -2090,6 +2090,7 @@ export class SessionAdvisors {
 					to: selector.raw,
 					role,
 					reason: describeFallbackReason(message),
+					durationMs: assistantFailure?.duration,
 				});
 				return true;
 			}

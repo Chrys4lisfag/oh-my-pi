@@ -2150,7 +2150,7 @@ export class TurnRecovery {
 		role: string,
 		selector: RetryFallbackSelector,
 		currentSelector: string,
-		options?: { pinFallback?: boolean; apiKey?: string; signal?: AbortSignal; reason?: string },
+		options?: { pinFallback?: boolean; apiKey?: string; signal?: AbortSignal; reason?: string; durationMs?: number },
 	): Promise<boolean> {
 		const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
 		const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
@@ -2233,6 +2233,7 @@ export class TurnRecovery {
 			to: selector.raw,
 			role,
 			reason: options?.reason,
+			durationMs: options?.durationMs,
 		});
 		return true;
 	}
@@ -2368,6 +2369,7 @@ export class TurnRecovery {
 				const applied = await this.applyRetryFallbackCandidate(role, selector, currentSelector, {
 					...options,
 					reason: describeFallbackReason(failedMessage.errorMessage),
+					durationMs: failedMessage.duration,
 				});
 				const editModeChanged = this.#host.resolveActiveEditMode() !== previousEditMode;
 				if (applied && options?.pinFallback === true && canRedeemFallbackCredit && !editModeChanged) {
@@ -2474,7 +2476,7 @@ export class TurnRecovery {
 	 * fallback that makes Fast a safe default. Returns false when the current
 	 * model is not a fast variant, the base id is missing, or it has no key.
 	 */
-	async #tryFireworksFastFallback(currentSelector: string): Promise<boolean> {
+	async #tryFireworksFastFallback(currentSelector: string, failedMessage: AssistantMessage): Promise<boolean> {
 		const model = this.#activeFireworksFastModel();
 		if (!model) return false;
 		const baseModel = this.#host.modelRegistry.find("fireworks", toFireworksBaseModelId(model.id));
@@ -2496,6 +2498,7 @@ export class TurnRecovery {
 			to: baseSelector,
 			role: "fireworks-fast",
 			reason: "Request rejected by the Fast tier. Retrying on the Standard tier.",
+			durationMs: failedMessage.duration,
 		});
 		return true;
 	}
@@ -2880,7 +2883,7 @@ export class TurnRecovery {
 			// best-effort, degrade to Standard on failure) and triggers on hard router
 			// errors the generic retry classifier would otherwise reject.
 			if (!switchedModel && allowModelFallback && options?.fireworksFastFallback) {
-				switchedModel = await this.#tryFireworksFastFallback(currentSelector);
+				switchedModel = await this.#tryFireworksFastFallback(currentSelector, message);
 			}
 			if (switchedModel) {
 				delayMs = 0;

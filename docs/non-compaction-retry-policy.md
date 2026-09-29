@@ -212,7 +212,7 @@ Session-level retry events:
 
 - `auto_retry_start { attempt, maxAttempts, delayMs, errorMessage, errorId? }`
 - `auto_retry_end { success, attempt, finalError?, retryErrors? }`
-- `retry_fallback_applied { from, to, role, reason? }`
+- `retry_fallback_applied { from, to, role, reason?, durationMs? }`
 - `retry_fallback_succeeded { model, role }`
 
 `from`, `to`, and `role` retain their existing selector semantics.
@@ -226,6 +226,10 @@ and state that no request was sent to the source model for that attempt.
 Startup quota skips use the same explanation in `modelFallbackMessage`.
 Request-failure notices include the provider's error instead of implying a
 preflight skip.
+When the failed response records a request duration, `durationMs` carries that
+measurement and the TUI displays `Fallback after 30.2s: source -> target`.
+It excludes subsequent recovery/backoff and is not cumulative across chain hops.
+Preflight skips and responses without timing omit the duration rather than show zero.
 
 On success, `auto_retry_end` also carries additive `retryErrors`: one `RetryErrorUpdate` (`entryId`, `persistenceKey?`, `note`, `retryRecovery`) per persisted error entry left behind by the retry chain, recording how recovery happened (`recovery`: `plain`/`wait`/`credential`/`model`, plus a human-readable `note` such as `rate-limited; switched account; retried`) and which successful message superseded each error (`supersededBy` with timestamp/provider/model/responseId). Extensions and RPC consumers receive the same fields.
 

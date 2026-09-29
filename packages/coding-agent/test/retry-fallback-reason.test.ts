@@ -12,13 +12,16 @@ import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
+import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { initTheme } from "@oh-my-pi/pi-tui/theme/theme";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session-events";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { describeFallbackReason } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
 import { describeUsageFallback } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-reason";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { formatDuration, TempDir } from "@oh-my-pi/pi-utils";
 
 describe("describeFallbackReason", () => {
 	it("flattens a multi-line provider error to one line", () => {
@@ -46,6 +49,7 @@ describe("describeFallbackReason", () => {
 
 describe("session emits the triggering error", () => {
 	it("carries the provider error on the applied event", async () => {
+		await initTheme(false);
 		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const fallback = getBundledModel("google", "gemini-2.5-flash");
 		if (!primary || !fallback) throw new Error("Expected bundled fallback models");
@@ -66,7 +70,7 @@ describe("session emits the triggering error", () => {
 			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn: (model, context, options) => {
 				if (`${model.provider}/${model.id}` === primarySelector) {
-					mock.push({ stopReason: "error", errorMessage: providerError });
+					mock.push({ stopReason: "error", errorMessage: providerError, delayMs: 30 });
 				} else {
 					mock.push({ content: ["recovered"] });
 				}
@@ -81,6 +85,12 @@ describe("session emits the triggering error", () => {
 		settings.setModelRole("default", primarySelector);
 
 		const applied: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
+		let failedDuration: number | undefined;
+		const warnings: string[] = [];
+		const controller = new EventController({
+			isInitialized: true,
+			showWarning: (text: string) => warnings.push(text),
+		} as unknown as InteractiveModeContext);
 		const session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
@@ -88,6 +98,13 @@ describe("session emits the triggering error", () => {
 			modelRegistry,
 		});
 		session.subscribe(event => {
+			if (
+				event.type === "message_end" &&
+				event.message.role === "assistant" &&
+				event.message.stopReason === "error"
+			) {
+				failedDuration = event.message.duration;
+			}
 			if (event.type === "retry_fallback_applied") applied.push(event);
 		});
 
@@ -101,6 +118,14 @@ describe("session emits the triggering error", () => {
 			// One line, provider text preserved, newline collapsed.
 			expect(applied[0]?.reason).toContain("does not support parameters: ['reasoning_effort']");
 			expect(applied[0]?.reason).not.toContain("\n");
+			expect(failedDuration).toBeGreaterThanOrEqual(20);
+			expect(applied[0]?.durationMs).toBe(failedDuration);
+			await controller.handleEvent(applied[0]!);
+			expect(Bun.stripANSI(warnings[0]!)).toContain(`after ${formatDuration(failedDuration!)}`);
+			expect(Bun.stripANSI(warnings[0]!)).toContain(primarySelector);
+			expect(Bun.stripANSI(warnings[0]!)).toContain(fallbackSelector);
+			await controller.handleEvent({ ...applied[0]!, durationMs: undefined });
+			expect(Bun.stripANSI(warnings[1]!)).not.toContain("after");
 		} finally {
 			await session.dispose();
 			authStorage.close();

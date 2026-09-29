@@ -1154,6 +1154,7 @@ class RetryFallbackAppliedEvent:
     to_model: str
     role: str
     type: Literal["retry_fallback_applied"] = "retry_fallback_applied"
+    duration_ms: float | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -1937,6 +1938,7 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
             from_model=str(payload.get("from", "")),
             to_model=str(payload.get("to", "")),
             role=str(payload.get("role", "")),
+            duration_ms=_optional_float(payload, "durationMs"),
         )
     if event_type == "retry_fallback_succeeded":
         return RetryFallbackSucceededEvent(

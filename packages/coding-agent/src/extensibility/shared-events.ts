@@ -276,6 +276,8 @@ export interface RetryFallbackAppliedEvent {
 	role: string;
 	/** Decision-time cause, including whether the source request was skipped. */
 	reason?: string;
+	/** Failed request duration, excluding subsequent recovery and backoff. */
+	durationMs?: number;
 }
 
 /** Fired when a request succeeds on the fallback model applied by auto-retry. */
