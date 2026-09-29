@@ -16,6 +16,7 @@ ThinkingLevel: TypeAlias = Literal[
     "off", "minimal", "low", "medium", "high", "xhigh", "max"
 ]
 StreamingBehavior: TypeAlias = Literal["steer", "followUp"]
+QueuedMessageQueue: TypeAlias = Literal["steering", "followUp"]
 SteeringMode: TypeAlias = Literal["all", "one-at-a-time"]
 InterruptMode: TypeAlias = Literal["immediate", "wait"]
 StopReason: TypeAlias = Literal["stop", "length", "toolUse", "error", "aborted"]
@@ -854,6 +855,15 @@ class ContextUsage:
 
 
 @dataclass(slots=True, frozen=True)
+class QueuedMessagesState:
+    """Displayable queue-chip text for pending user-authored messages,
+    mirroring `AgentSession.getQueuedMessages()` on the TypeScript side."""
+
+    steering: tuple[str, ...]
+    follow_up: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True)
 class SessionState:
     model: ModelInfo | None
     thinking_level: ThinkingLevel | None
@@ -868,6 +878,9 @@ class SessionState:
     auto_compaction_enabled: bool
     message_count: int
     queued_message_count: int
+    queued_messages: QueuedMessagesState = field(
+        default_factory=lambda: QueuedMessagesState(steering=(), follow_up=())
+    )
     todo_phases: tuple[TodoPhase, ...] = ()
     system_prompt: tuple[str, ...] = ()
     dump_tools: tuple[ToolDescriptor, ...] = ()
@@ -935,6 +948,11 @@ class OpenSessionResult:
     resumed: bool
     session_id: str
     session_file: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class RemoveQueuedMessageResult:
+    removed: bool
 
 
 @dataclass(slots=True, frozen=True)
@@ -1154,6 +1172,7 @@ class RetryFallbackAppliedEvent:
     to_model: str
     role: str
     type: Literal["retry_fallback_applied"] = "retry_fallback_applied"
+    reason: str | None = None
     duration_ms: float | None = None
 
 
@@ -1224,6 +1243,17 @@ class SessionSettledEvent:
 
 
 @dataclass(slots=True, frozen=True)
+class QueueUpdateEvent:
+    """Coalesced snapshot of the displayable steering/follow-up queue, emitted
+    whenever it differs from the last one sent (enqueue, dequeue on delivery,
+    remove, clear/restore, or session switch)."""
+
+    steering: tuple[str, ...]
+    follow_up: tuple[str, ...]
+    type: Literal["queue_update"] = "queue_update"
+
+
+@dataclass(slots=True, frozen=True)
 class UnknownNotification:
     payload: JsonObject
     type: Literal["unknown"] = "unknown"
@@ -1250,6 +1280,7 @@ RpcAgentEvent: TypeAlias = (
     | TtsrTriggeredEvent
     | TodoReminderEvent
     | TodoAutoClearEvent
+    | QueueUpdateEvent
 )
 
 RpcNotification: TypeAlias = (
@@ -1464,6 +1495,18 @@ def parse_todo_phases(payload: JsonValue | None) -> tuple[TodoPhase, ...]:
     return tuple(parse_todo_phase(cast(JsonObject, item)) for item in payload)
 
 
+def parse_queued_messages_state(
+    payload: JsonObject | None,
+) -> QueuedMessagesState:
+    payload = payload or {}
+    return QueuedMessagesState(
+        steering=_tuple_of_strings(payload.get("steering"), field="queuedMessages.steering")
+        or (),
+        follow_up=_tuple_of_strings(payload.get("followUp"), field="queuedMessages.followUp")
+        or (),
+    )
+
+
 def parse_session_state(payload: JsonObject) -> SessionState:
     dump_tools = tuple(
         parse_tool_descriptor(_clone_json_object(item, field="dumpTools[]"))
@@ -1511,6 +1554,11 @@ def parse_session_state(payload: JsonObject) -> SessionState:
         auto_compaction_enabled=bool(payload.get("autoCompactionEnabled", False)),
         message_count=_int_or(payload, "messageCount"),
         queued_message_count=_int_or(payload, "queuedMessageCount"),
+        queued_messages=parse_queued_messages_state(
+            _optional_json_object(
+                payload.get("queuedMessages"), field="sessionState.queuedMessages"
+            )
+        ),
         todo_phases=parse_todo_phases(
             cast(JsonValue | None, payload.get("todoPhases"))
         ),
@@ -1597,6 +1645,10 @@ def parse_open_session_result(payload: JsonObject) -> OpenSessionResult:
         session_id=_require_str(payload, "sessionId"),
         session_file=_optional_str(payload, "sessionFile"),
     )
+
+
+def parse_remove_queued_message_result(payload: JsonObject) -> RemoveQueuedMessageResult:
+    return RemoveQueuedMessageResult(removed=_require_bool(payload, "removed"))
 
 
 def parse_branch_result(payload: JsonObject | None) -> BranchResult:
@@ -1938,6 +1990,7 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
             from_model=str(payload.get("from", "")),
             to_model=str(payload.get("to", "")),
             role=str(payload.get("role", "")),
+            reason=_optional_str(payload, "reason"),
             duration_ms=_optional_float(payload, "durationMs"),
         )
     if event_type == "retry_fallback_succeeded":
@@ -1961,6 +2014,13 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
         )
     if event_type == "todo_auto_clear":
         return TodoAutoClearEvent()
+    if event_type == "queue_update":
+        return QueueUpdateEvent(
+            steering=_tuple_of_strings(payload.get("steering"), field="queue_update.steering")
+            or (),
+            follow_up=_tuple_of_strings(payload.get("followUp"), field="queue_update.followUp")
+            or (),
+        )
     return UnknownNotification(
         payload=_clone_json_object(payload, field="notification")
     )
