@@ -4995,7 +4995,7 @@ describe("AgentSession retry fallback", () => {
 		expect(session.model?.provider).toBe(fallbackModel.provider);
 		expect(session.model?.id).toBe(fallbackModel.id);
 	});
-	it("suppresses cooled selectors and lazily reverts to the role primary after cooldown expiry", async () => {
+	it.each([12 * 60_000, 5 * 60 * 60_000])("lazily reverts a successful fallback after %d ms", async elapsed => {
 		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
 		if (!primaryModel || !fallbackModel) {
@@ -5043,7 +5043,7 @@ describe("AgentSession retry fallback", () => {
 		expect(session.model?.provider).toBe(fallbackModel.provider);
 		expect(session.model?.id).toBe(fallbackModel.id);
 
-		now += 12 * 60_000;
+		now += elapsed;
 		await session.prompt("Third prompt should lazily revert to primary");
 		await session.waitForIdle();
 		expect(requestedModels).toEqual([

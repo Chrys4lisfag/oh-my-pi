@@ -193,7 +193,7 @@ import {
 	resolveRetryFallbackChainKey,
 } from "./session/retry-fallback-chains";
 import { describeUsageFallback } from "./session/retry-fallback-reason";
-import { getRestorableSessionModels } from "./session/session-context";
+import { EPHEMERAL_MODEL_CHANGE_ROLE } from "./session/session-entries";
 import { SessionManager } from "./session/session-manager";
 import {
 	collectMountedMCPToolRoutes,
@@ -1955,7 +1955,7 @@ async function createAgentSessionScopedWithSettings(
 	// extensions register below.
 	const sessionModelStrings =
 		!hasExplicitModel && hasExistingSession
-			? getRestorableSessionModels(existingSession.models, sessionManager.getLastModelChangeRole())
+			? sessionManager.getRestorableModels(sessionProfile ? defaultRoleValue : undefined)
 			: [];
 	let restoredSessionModelIndex = -1;
 	let restoredSessionThinkingLevel: ConfiguredThinkingLevel | undefined;
@@ -4403,7 +4403,15 @@ async function createAgentSessionScopedWithSettings(
 		} else {
 			// Save initial model, thinking level, and service tier for new sessions so they can be restored on resume.
 			if (model) {
-				sessionManager.appendModelChange(`${model.provider}/${model.id}`);
+				if (initialRetryFallback) {
+					sessionManager.appendModelChange(initialRetryFallback.originalSelector);
+					if (initialRetryFallback.role !== "default" && !initialRetryFallback.role.includes("/")) {
+						sessionManager.appendModelChange(initialRetryFallback.originalSelector, initialRetryFallback.role);
+					}
+					sessionManager.appendModelChange(formatModelStringWithRouting(model), EPHEMERAL_MODEL_CHANGE_ROLE, true);
+				} else {
+					sessionManager.appendModelChange(formatModelStringWithRouting(model));
+				}
 			}
 			if (!autoThinking) {
 				// Do not write the `auto` selector before the first turn resolves; auto

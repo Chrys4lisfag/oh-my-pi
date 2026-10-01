@@ -104,6 +104,131 @@ describe("live profile synchronization", () => {
 		} catch {}
 	});
 
+	async function startOnFallback(): Promise<void> {
+		await session.dispose();
+		peer = await writer.cloneForCwd(tempDir.path());
+		const model = getBundledModel(PROVIDER, FALLBACK_MODEL_ID);
+		if (!model) throw new Error("Expected bundled fallback model");
+		const mock = createMockModel({ handler: () => ({ content: ["ok"] }) });
+		session = new AgentSession({
+			agent: new Agent({
+				initialState: { model, thinkingLevel: Effort.Medium, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: (activeModel, context, options) => {
+					requestedModels.push(activeModel.id);
+					return mock.stream(activeModel, context, options);
+				},
+			}),
+			sessionManager: SessionManager.inMemory(),
+			settings: peer,
+			modelRegistry,
+			initialRetryFallback: {
+				role: "default",
+				originalSelector: `${PROVIDER}/${INITIAL_MODEL_ID}`,
+				originalThinkingLevel: Effort.Medium,
+			},
+		});
+	}
+
+	it("preserves a healthy fallback across unrelated same-profile synchronization", async () => {
+		await startOnFallback();
+		writer.setProfileItem("inactive", {
+			modelRoles: { default: `${PROVIDER}/${INITIAL_MODEL_ID}` },
+			defaultThinkingLevel: Effort.Low,
+		});
+		await writer.flush();
+		await peer.syncFromDisk();
+		await session.waitForIdle();
+		expect(session.model?.id).toBe(FALLBACK_MODEL_ID);
+		expect(session.servingModel?.isFallback).toBe(true);
+	});
+
+	it("clears fallback ownership when the bound profile changes its default to that same model", async () => {
+		await startOnFallback();
+		writer.setProfileItem("selected", {
+			modelRoles: { default: `${PROVIDER}/${FALLBACK_MODEL_ID}` },
+			defaultThinkingLevel: Effort.High,
+		});
+		await writer.flush();
+		await peer.syncFromDisk();
+		await session.waitForIdle();
+		expect(session.model?.id).toBe(FALLBACK_MODEL_ID);
+		expect(session.servingModel?.isFallback).toBe(false);
+		await session.prompt("use the edited profile");
+		expect(requestedModels).toEqual([FALLBACK_MODEL_ID]);
+	});
+
+	it("makes the current fallback the new profile's primary even when the model identity is unchanged", async () => {
+		await startOnFallback();
+		modelRegistry.suppressSelector(`${PROVIDER}/${FALLBACK_MODEL_ID}`, Date.now() + 60_000);
+		expect(session.servingModel?.isFallback).toBe(true);
+
+		expect(await session.bindSessionProfile("fallback")).toBe(true);
+		expect(session.model?.id).toBe(FALLBACK_MODEL_ID);
+		expect(modelRegistry.isSelectorSuppressed(`${PROVIDER}/${FALLBACK_MODEL_ID}`)).toBe(false);
+		expect(session.servingModel?.isFallback).toBe(false);
+		await session.prompt("use the new primary");
+		expect(requestedModels).toEqual([FALLBACK_MODEL_ID]);
+		expect(session.servingModel?.isFallback).toBe(false);
+	});
+
+	it("reselects the configured primary when explicitly rebinding the same profile", async () => {
+		await startOnFallback();
+		expect(await session.bindSessionProfile("selected")).toBe(true);
+		expect(session.model?.id).toBe(INITIAL_MODEL_ID);
+		await session.prompt("use the configured primary");
+		expect(requestedModels).toEqual([INITIAL_MODEL_ID]);
+		expect(session.servingModel?.isFallback).toBe(false);
+	});
+
+	it("restores fallback ownership when a profile apply fails", async () => {
+		await startOnFallback();
+		const apply = vi.spyOn(session, "setModel").mockRejectedValueOnce(new Error("profile apply failed"));
+		try {
+			await expect(session.bindSessionProfile("fallback")).rejects.toThrow("profile apply failed");
+			await session.waitForIdle();
+			expect(session.getSessionProfileName()).toBe("selected");
+			expect(session.model?.id).toBe(FALLBACK_MODEL_ID);
+			expect(session.servingModel?.isFallback).toBe(true);
+			await session.prompt("continue the previous fallback");
+			expect(requestedModels).toEqual([FALLBACK_MODEL_ID]);
+			expect(session.servingModel?.isFallback).toBe(true);
+		} finally {
+			apply.mockRestore();
+		}
+	});
+
+	it("does not let a pending old-primary restore override an explicit profile bind", async () => {
+		await startOnFallback();
+		await session.prompt("establish successful fallback");
+		const now = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 13 * 60_000);
+		const lookupStarted = Promise.withResolvers<void>();
+		const releaseLookup = Promise.withResolvers<void>();
+		const getApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+		const lookup = vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, sessionId) => {
+			if (model.id === INITIAL_MODEL_ID) {
+				lookupStarted.resolve();
+				await releaseLookup.promise;
+			}
+			return getApiKey(model, sessionId);
+		});
+		const prompting = session.prompt("continue after cooldown");
+		try {
+			await lookupStarted.promise;
+			expect(await session.bindSessionProfile("fallback")).toBe(true);
+			releaseLookup.resolve();
+			await prompting;
+			expect(session.model?.id).toBe(FALLBACK_MODEL_ID);
+			expect(requestedModels).toEqual([FALLBACK_MODEL_ID]);
+			await session.prompt("dispatch after the profile transition");
+			expect(requestedModels).toEqual([FALLBACK_MODEL_ID, FALLBACK_MODEL_ID]);
+			expect(session.servingModel?.isFallback).toBe(false);
+		} finally {
+			releaseLookup.resolve();
+			lookup.mockRestore();
+			now.mockRestore();
+		}
+	});
+
 	it("isolates a switch and subsequent edit to a different active profile", async () => {
 		writer.activateProfile("fallback", {
 			modelRoles: { default: `${PROVIDER}/${FALLBACK_MODEL_ID}` },

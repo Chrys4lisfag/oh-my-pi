@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed resumed sessions retaining outdated fallback models instead of their configured profile primary, and profile switches retaining previous fallback ownership.
+
 ## [18.4.4] - 2026-09-29
 
 ### Added

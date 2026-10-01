@@ -1840,9 +1840,15 @@ export class TurnRecovery {
 	}
 
 	/** Clears fallback ownership after an explicit model change or a restore. */
-	clearActiveRetryFallback(): void {
+	clearActiveRetryFallback(): () => void {
+		const active = this.#activeRetryFallback;
+		const routedFor = this.#fallbackRoutedFor;
 		this.#activeRetryFallback = undefined;
 		this.#fallbackRoutedFor = undefined;
+		return () => {
+			this.#activeRetryFallback = active ? { ...active } : undefined;
+			this.#fallbackRoutedFor = routedFor;
+		};
 	}
 
 	/** Checks whether a fallback selector remains in cooldown. */
@@ -2523,6 +2529,8 @@ export class TurnRecovery {
 		// No sleeps: restore only at an existing continuation/user-prompt boundary.
 		if (Date.now() - this.#activeRetryFallback.startedAt < 12 * 60_000) return false;
 		if (!this.#activeRetryFallback.succeeded && !this.#activeRetryFallback.chainExhausted) return false;
+		const active = this.#activeRetryFallback;
+		const sessionId = this.#host.sessionId();
 
 		const {
 			originalSelector: originalSelectorRaw,
@@ -2560,7 +2568,15 @@ export class TurnRecovery {
 			resolvedPrimary.model ?? this.#host.modelRegistry.find(originalSelector.provider, originalSelector.id);
 		if (!primaryModel) return false;
 		const apiKey = await this.#host.modelRegistry.getApiKey(primaryModel, this.#host.sessionId());
-		if (!apiKey) return false;
+		if (
+			!apiKey ||
+			this.#activeRetryFallback !== active ||
+			this.#host.sessionId() !== sessionId ||
+			this.#host.model() !== currentModel ||
+			this.#host.isDisposed()
+		) {
+			return false;
+		}
 
 		const currentThinkingLevel = this.#host.configuredThinkingLevel();
 		const thinkingToApply =

@@ -760,6 +760,58 @@ describe("AgentSession model persistence", () => {
 		expect(result.session.model?.id).toBe(defaultModel.id);
 	});
 
+	it.each(["startup", "switch"])("returns to the bound primary after historic fallback on %s resume", async resume => {
+		const primary = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const historic = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		const snapshot = { modelRoles: { default: modelValue(primary) }, defaultThinkingLevel: "medium" };
+		const target = await writeRoleModelSession(
+			modelValue(historic),
+			modelValue(historic),
+			EPHEMERAL_MODEL_CHANGE_ROLE,
+			{
+				name: "bound-primary",
+				snapshot,
+			},
+		);
+		if (resume === "startup") {
+			const result = await createStartupResumeSession(target);
+			expect(result.session.model?.id).toBe(primary.id);
+		} else {
+			const created = await createSession({ initialModel: historic, persist: true });
+			expect(await created.session.switchSession(target)).toBe(true);
+			expect(created.session.model?.id).toBe(primary.id);
+		}
+	});
+
+	it("preserves a bound session's explicit temporary selection across restart", async () => {
+		const primary = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const selected = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		const target = await writeRoleModelSession(modelValue(primary), modelValue(selected), "temporary", {
+			name: "bound-primary",
+			snapshot: { modelRoles: { default: modelValue(primary) }, defaultThinkingLevel: "medium" },
+		});
+		const result = await createStartupResumeSession(target);
+		expect(result.session.model?.id).toBe(selected.id);
+	});
+
+	it("does not adopt a flagged role fallback as a durable session selection", () => {
+		const manager = SessionManager.inMemory();
+		manager.appendModelChange("anthropic/claude-sonnet-4-5", "default");
+		manager.appendModelChange("anthropic/claude-haiku-4-5", "smol");
+		manager.appendModelChange("openai/gpt-4o-mini", "smol", true);
+		expect(manager.getRestorableModels("google/gemini-2.5-flash")).toEqual([
+			"anthropic/claude-haiku-4-5",
+			"anthropic/claude-sonnet-4-5",
+		]);
+	});
+
+	it("preserves an unbound session's durable default without borrowing a profile", () => {
+		const manager = SessionManager.inMemory();
+		manager.appendModelChange("anthropic/claude-sonnet-4-5", "default");
+		manager.appendModelChange("openai/gpt-4o-mini", EPHEMERAL_MODEL_CHANGE_ROLE, true);
+		expect(manager.getRestorableModels()).toEqual(["anthropic/claude-sonnet-4-5"]);
+	});
+
 	it("restores a temporary model when switching sessions", async () => {
 		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
 		const temporaryModel = getAnthropicModelOrThrow("claude-sonnet-4-6");

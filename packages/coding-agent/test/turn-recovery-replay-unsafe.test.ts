@@ -174,6 +174,53 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 		}
 	});
 
+	it.each([false, true])("rejects stale restoration after explicit switch (rollback=%s)", async rollback => {
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		const selected = getBundledModel("anthropic", "claude-sonnet-4-6");
+		if (!fallback || !selected) throw new Error("Missing test models");
+		let now = Date.now();
+		vi.spyOn(Date, "now").mockImplementation(() => now);
+		let active = fallback;
+		const host = createHost(model, modelRegistry);
+		host.model = () => active;
+		const writes = vi.fn();
+		host.sessionManager = { getSessionId: () => "restore-race", appendModelChange: writes } as never;
+		host.setModelWithProviderSessionReset = async next => {
+			active = next;
+		};
+		const recovery = new TurnRecovery(host, {
+			initialRetryFallback: {
+				role: "default",
+				originalSelector: `${model.provider}/${model.id}`,
+				originalThinkingLevel: undefined,
+			},
+		});
+		await recovery.onAssistantSettledSuccessfully({ ...makeMessage([], fallback), stopReason: "stop" });
+		now += 5 * 60 * 60_000;
+		const key = Promise.withResolvers<string>();
+		const entered = Promise.withResolvers<void>();
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async () => {
+			entered.resolve();
+			return key.promise;
+		});
+		const restoring = recovery.maybeRestoreRetryFallbackPrimary();
+		await entered.promise;
+		const restoreOwnership = recovery.clearActiveRetryFallback();
+		active = selected;
+		if (rollback) {
+			active = fallback;
+			restoreOwnership();
+		}
+		key.resolve("test-key");
+		expect(await restoring).toBe(false);
+		expect(active).toBe(rollback ? fallback : selected);
+		expect(writes).not.toHaveBeenCalled();
+		if (rollback) {
+			expect(await recovery.maybeRestoreRetryFallbackPrimary()).toBe(true);
+			expect(active.id).toBe(model.id);
+		}
+	});
+
 	it("keeps the first activation deadline and success across later fallback hops", async () => {
 		const fallback = getBundledModel("openai", "gpt-4o-mini");
 		const nextFallback = getBundledModel("google", "gemini-2.5-flash");

@@ -391,7 +391,7 @@ import {
 	type SessionAdvisorsHost,
 } from "./session-advisors";
 import type { BuildSessionContextOptions, SessionContext } from "./session-context";
-import { getRestorableSessionModels, isTranscriptEntry } from "./session-context";
+import { isTranscriptEntry } from "./session-context";
 import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer";
 import { isUserRequestEntry, transcriptEntryMessage, userTurnDraft } from "@oh-my-pi/pi-tui/chat/transcript-entry";
 import { formatSessionDumpText } from "./session-dump-format";
@@ -10732,6 +10732,7 @@ export class AgentSession implements SettingsScope {
 		this.#queuedMessageDrainBlocked = false;
 		this.#usagePreflightReadyForNextModelCall = false;
 		this.#usagePreflightReadyModel = undefined;
+		const restoreRetryFallback = this.#recovery.clearActiveRetryFallback();
 
 		let cwdChangeTarget: string | undefined;
 		try {
@@ -10824,9 +10825,9 @@ export class AgentSession implements SettingsScope {
 			}
 
 			// Restore model if saved
-			const targetModelStrings = getRestorableSessionModels(
-				sessionContext.models,
-				this.sessionManager.getLastModelChangeRole(),
+			const configuredPrimary = this.getSessionProfileName() ? this.resolveRoleModel("default") : undefined;
+			const targetModelStrings = this.sessionManager.getRestorableModels(
+				configuredPrimary ? `${configuredPrimary.provider}/${configuredPrimary.id}` : undefined,
 			);
 			if (targetModelStrings.length > 0) {
 				const availableModels = this.#modelRegistry.getAvailable();
@@ -11002,6 +11003,7 @@ export class AgentSession implements SettingsScope {
 			}
 			this.#models.restoreThinkingSnapshot(previousThinkingLevel, previousAutoThinking, previousAutoResolvedLevel);
 			this.#models.restoreServiceTiers(previousServiceTierByFamily);
+			restoreRetryFallback();
 			if (modelRolledBack) {
 				this.#emit({ type: "model_changed" });
 			}
@@ -12742,7 +12744,7 @@ export class AgentSession implements SettingsScope {
 	}
 
 	async applyProfileToSession(isCurrent: () => boolean = () => true): Promise<void> {
-		if (this.#isDisposed) return;
+		if (this.#isDisposed || !isCurrent()) return;
 		const model = this.resolveRoleModel("default");
 		const previousModel = this.model;
 		const previousThinking = this.configuredThinkingLevel();
@@ -12753,9 +12755,10 @@ export class AgentSession implements SettingsScope {
 					thinkingLevel: previousAdvisor.state.thinkingLevel,
 				}
 			: undefined;
+		const restoreRetryFallback = this.#recovery.clearActiveRetryFallback();
 
 		try {
-			if (model && (!this.model || !modelsAreEqual(this.model, model))) {
+			if (model) {
 				await this.setModel(model);
 				if (!isCurrent()) return;
 				if (this.#isDisposed) return;
@@ -12776,6 +12779,7 @@ export class AgentSession implements SettingsScope {
 			try {
 				if (previousModel && (!this.model || !modelsAreEqual(this.model, previousModel))) {
 					await this.setModel(previousModel);
+					if (!isCurrent()) throw error;
 					if (this.#isDisposed) return;
 				}
 				this.setThinkingLevel(previousThinking);
@@ -12789,6 +12793,7 @@ export class AgentSession implements SettingsScope {
 						advisor.appendOnlyContext?.invalidateForModelChange();
 					}
 				}
+				restoreRetryFallback();
 			} catch (rollbackError) {
 				throw new Error(
 					`${error instanceof Error ? error.message : String(error)} (live runtime rollback failed: ${
@@ -12834,6 +12839,7 @@ export class AgentSession implements SettingsScope {
 			this.#explicitProfileBindDepth--;
 		}
 		if (!bound) return false;
+		const restoreRetryFallback = this.#recovery.clearActiveRetryFallback();
 		const bindSettled = Promise.withResolvers<void>();
 		const previousProfileApply = this.#settingsSyncApplyPromise;
 		this.#settingsSyncApplyPromise = Promise.all([
@@ -12869,21 +12875,23 @@ export class AgentSession implements SettingsScope {
 				this.#queueSynchronizedProfileApply();
 				throw error;
 			}
-			// Invalidate any apply queued by the failed Settings notification before
-			// restoring ownership. A bound restore queues a fresh apply; an unbound
-			// restore deliberately leaves the previously captured pending state.
+			// Invalidate queued work before restoring the previous profile transaction.
 			this.#synchronizedProfileApplyGeneration++;
 			this.#synchronizedProfileApplyPending = previousSynchronizedApplyPending;
 			this.#sessionProfile = previousSessionProfile;
 			this.#sessionProfileUnbound = previousSessionProfileUnbound;
 
 			let rollbackError: unknown;
+			this.#explicitProfileBindDepth++;
 			try {
 				this.settings.restoreTerminalProfileActivation(previousTerminalProfileActivation);
 			} catch (caught) {
 				rollbackError = caught;
+			} finally {
+				this.#explicitProfileBindDepth--;
 			}
 			await this.#queueSessionProfilePersist(previousHeaderProfile, previousHeaderSnapshot);
+			if (bindGeneration === this.#explicitProfileBindGeneration) restoreRetryFallback();
 
 			if (rollbackError !== undefined) {
 				throw new Error(

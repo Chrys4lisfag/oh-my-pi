@@ -40,7 +40,12 @@ import {
 	sanitizeRehydratedOpenAIResponsesAssistantMessage,
 	stripInternalDetailsFields,
 } from "./messages";
-import { type BuildSessionContextOptions, buildSessionContext, type SessionContext } from "./session-context";
+import {
+	type BuildSessionContextOptions,
+	buildSessionContext,
+	getRestorableSessionModels,
+	type SessionContext,
+} from "./session-context";
 import {
 	type BranchSummaryEntry,
 	type CompactionEntry,
@@ -48,6 +53,7 @@ import {
 	CURRENT_SESSION_VERSION,
 	type CustomEntry,
 	type CustomMessageEntry,
+	EPHEMERAL_MODEL_CHANGE_ROLE,
 	type FileEntry,
 	type LabelEntry,
 	type ModeChangeEntry,
@@ -3168,6 +3174,29 @@ export class SessionManager {
 			if (entry.type === "model_change") return entry.role ?? "default";
 		}
 		return undefined;
+	}
+
+	/** Restores durable selections, never a transient fallback without its recovery owner. */
+	getRestorableModels(configuredPrimary?: string): string[] {
+		const branch = this.getBranch();
+		const models: Record<string, string> = {};
+		let lastRole: string | undefined;
+		let transient = false;
+		let hasModelChange = false;
+		for (const entry of branch) {
+			if (entry.type !== "model_change") continue;
+			hasModelChange = true;
+			const role = entry.role ?? "default";
+			transient = role === EPHEMERAL_MODEL_CHANGE_ROLE || entry.resolvedModelIsFallback === true;
+			if (transient) continue;
+			models[role] = entry.model;
+			lastRole = role;
+		}
+		if (!hasModelChange) return getRestorableSessionModels(this.buildSessionContext().models, undefined);
+		if (transient && configuredPrimary && (!lastRole || lastRole === "default")) {
+			return [configuredPrimary];
+		}
+		return getRestorableSessionModels(models, lastRole);
 	}
 
 	getEntry(id: string): SessionEntry | undefined {

@@ -1031,11 +1031,90 @@ describe("createAgentSession deferred model pattern resolution", () => {
 				// proves the suffix is inherited rather than the model default applied.
 				expect(session.thinkingLevel).toBe(Effort.Low);
 				expect(modelFallbackMessage).toBeUndefined();
+				expect(session.sessionManager.getRestorableModels()).toEqual(["missing-provider/missing-model:low"]);
 			} finally {
 				await session.dispose();
 			}
 		} finally {
 			exitSpy.mockRestore();
+		}
+	});
+
+	test("returns to the original primary when restarting a startup-selected fallback", async () => {
+		const settings = Settings.isolated({
+			"retry.fallbackChains": { default: ["runtime-provider/runtime-fallback-model"] },
+		});
+		settings.setModelRole("default", "recovered-provider/recovered-model");
+		const authStorage = createInMemoryAuthStorage();
+		authStorage.keys.setRuntime("runtime-provider", "test-key");
+		authStorage.keys.setRuntime("recovered-provider", "test-key");
+		authStoragesToClose.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "startup-fallback.yml"));
+		const sessionManager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+		const options = { ...buildSessionOptions("default"), authStorage, modelRegistry, sessionManager, settings };
+		const first = await createAgentSession({
+			...options,
+			extensions: [
+				pi => {
+					pi.registerProvider("runtime-provider", {
+						baseUrl: "https://runtime.example.com/v1",
+						apiKey: "RUNTIME_KEY",
+						api: "openai-completions",
+						models: [
+							{
+								id: "runtime-fallback-model",
+								name: "Fallback",
+								reasoning: false,
+								input: ["text"],
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+								contextWindow: 128000,
+								maxTokens: 8192,
+							},
+						],
+					});
+				},
+			],
+		});
+		try {
+			expect(first.session.model?.id).toBe("runtime-fallback-model");
+			expect(sessionManager.getRestorableModels()).toEqual(["recovered-provider/recovered-model"]);
+			sessionManager.appendMessage({ role: "user", content: "Resume this session", timestamp: Date.now() });
+			await sessionManager.ensureOnDisk();
+		} finally {
+			await first.session.dispose();
+		}
+		const resumedManager = await SessionManager.open(sessionManager.getSessionFile()!);
+		const resumed = await createAgentSession({
+			...options,
+			sessionManager: resumedManager,
+			modelPattern: undefined,
+			extensions: [
+				providerExtension,
+				pi => {
+					pi.registerProvider("recovered-provider", {
+						baseUrl: "https://recovered.example.com/v1",
+						apiKey: "RECOVERED_KEY",
+						api: "openai-completions",
+						models: [
+							{
+								id: "recovered-model",
+								name: "Recovered primary",
+								reasoning: false,
+								input: ["text"],
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+								contextWindow: 128000,
+								maxTokens: 8192,
+							},
+						],
+					});
+				},
+			],
+		});
+		try {
+			expect(resumed.session.model?.provider).toBe("recovered-provider");
+			expect(resumed.session.model?.id).toBe("recovered-model");
+		} finally {
+			await resumed.session.dispose();
 		}
 	});
 
