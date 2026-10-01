@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Fixed extended context staying at 128K for GPT-6.1 Sol on custom providers with incomplete discovery metadata; recognized vendor-prefixed routes now inherit the 922K input ceiling.
 - Model manager refresh results now report whether remote sources were actually attempted, allowing `/models` to distinguish a fresh failed/empty network probe from an offline zero-model cache without duplicate requests or delayed recovery.
 - LiteLLM rich metadata and LM Studio native discovery now preserve query parameters when appending management endpoint paths, supporting query-routed discovery gateways.
 - Fixed Qwen models on the Venice provider (`api.venice.ai`) failing every request with `400 Unrecognized key(s) in object: 'enable_thinking'`. `buildOpenAICompat` picked `thinkingFormat: "qwen"` from the `qwen*` id for any non-NVIDIA/Fireworks host, emitting a top-level `enable_thinking` field that Venice's strict (`additionalProperties: false`) chat-completions schema rejects — the same failure class as NVIDIA NIM (#2299). Venice is now a registered host and its Qwen models route to the standard `"openai"` reasoning_effort dialect (mirroring the Fireworks Qwen carve-out), so the wire body no longer carries `enable_thinking`.

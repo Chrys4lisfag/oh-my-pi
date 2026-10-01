@@ -2828,6 +2828,53 @@ describe("ModelRegistry", () => {
 			expect(registry.find("openai-codex", "gpt-6-astra")?.contextWindow).toBe(922_000);
 		});
 
+		test("widens custom Sol 6.1 routes without shrinking larger windows or changing disabled context", async () => {
+			writeRawModelsJson({
+				"future-sol-provider": {
+					baseUrl: "https://example.test/v1",
+					api: "openai-responses",
+					auth: "none",
+					discovery: { type: "openai-models-list" },
+					models: [],
+				},
+			});
+			writeModelCache(
+				"future-sol-provider:openai-models-list-context-v3",
+				Date.now(),
+				[
+					["vendor/gpt-6.1-sol", 128_000],
+					["openrouter/openai/gpt-6.1-sol", 1_050_000],
+				].map(([id, contextWindow]) =>
+					buildModel({
+						id: String(id),
+						name: String(id),
+						provider: "future-sol-provider",
+						api: "openai-responses",
+						baseUrl: "https://example.test/v1",
+						contextWindow: Number(contextWindow),
+						maxTokens: 32_768,
+						reasoning: true,
+						input: ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					}),
+				),
+				true,
+				"",
+				path.join(tempDir, "models.db"),
+			);
+			const testSettings = Settings.isolated();
+			cfgExtendedContext.set(testSettings, true);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { settings: testSettings });
+			expect(registry.find("future-sol-provider", "vendor/gpt-6.1-sol")?.contextWindow).toBe(922_000);
+			expect(registry.find("future-sol-provider", "openrouter/openai/gpt-6.1-sol")?.contextWindow).toBe(1_050_000);
+			cfgExtendedContext.set(testSettings, false);
+			await registry.reapplyModelPolicies();
+			expect(registry.find("future-sol-provider", "vendor/gpt-6.1-sol")?.contextWindow).toBe(128_000);
+			cfgExtendedContext.set(testSettings, true);
+			await registry.refresh("offline");
+			expect(registry.find("future-sol-provider", "vendor/gpt-6.1-sol")?.contextWindow).toBe(922_000);
+		});
+
 		test.each([
 			["maximum-only override", "modelOverrides", undefined, 272_000],
 			["paired override", "modelOverrides", 400_000, 400_000],

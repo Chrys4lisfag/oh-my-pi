@@ -79,6 +79,38 @@ test("corrects GPT-6.1 Sol's stale 872K Codex maximum to the documented 922K inp
 	}
 });
 
+test("grants Sol 6.1 extended context to new custom providers and prefixed routes", () => {
+	for (const id of [
+		"gpt-6.1-sol",
+		"Wukong-Codex/gpt-6.1-sol",
+		"智舵MaaS/openai/gpt-6.1-sol",
+		"openrouter/openai/gpt-6.1-sol-wm",
+	]) {
+		const model = buildModel({
+			...bundledAstra(),
+			provider: "future-custom-provider",
+			id,
+			contextWindow: 128_000,
+			maxContextWindow: undefined,
+		});
+		expect(resolveMaxContextWindow(model)).toBe(922_000);
+		expect(resolveMaxContextWindow({ ...model, maxContextWindow: 1_200_000 })).toBe(1_200_000);
+	}
+});
+
+test("does not infer the Sol 6.1 ceiling for narrower deployments or other model lines", () => {
+	for (const id of ["azure/gpt-6.1-sol-2026-09-29-private", "gpt-6.1-luna", "gpt-6.2-sol"]) {
+		const model = buildModel({
+			...bundledAstra(),
+			provider: "future-custom-provider",
+			id,
+			contextWindow: 128_000,
+			maxContextWindow: undefined,
+		});
+		expect(resolveMaxContextWindow(model)).toBeUndefined();
+	}
+});
+
 test("leaves models without a curated maximum to the live value or undefined", () => {
 	const legacy = bundledLegacy();
 	// No `max-context-window` rule owns this SKU, so extended-context widening

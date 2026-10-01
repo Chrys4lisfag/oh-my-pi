@@ -62,6 +62,11 @@ class "openai" {
 	models "*gpt-6-astra" "*gpt-6-astra-wm" {
 		max-context-window 922000
 	}
+	// residue: vendor-prefixed Sol 6.1 ids share the 922K input ceiling;
+	// anchored selectors exclude narrower dated/private deployment variants.
+	models "*gpt-6.1-sol" "*gpt-6.1-sol-wm" {
+		max-context-window 922000
+	}
 	// Codex SKUs: the advertised 400K figure includes the output budget; the
 	// true prompt window is 272K. Spark budgets are its own family's.
 	family "codex" {
