@@ -69,7 +69,7 @@ from pathlib import Path
 from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_RPC_SRC = _REPO_ROOT / "python" / "omp-rpc" / "src"
+_RPC_SRC = _REPO_ROOT / "sdk" / "python" / "omp-rpc" / "src"
 if _RPC_SRC.is_dir() and str(_RPC_SRC) not in sys.path:
     sys.path.insert(0, str(_RPC_SRC))
 

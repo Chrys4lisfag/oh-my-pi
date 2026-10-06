@@ -2,7 +2,7 @@
 """Compare two images with three OMP models in parallel.
 
 Requires the repository's ``omp-rpc`` package:
-    pip install -e python/omp-rpc
+    pip install -e sdk/python/omp-rpc
 
 Example:
     python scripts/compare_images_rpc.py before.png after.png -o report.json

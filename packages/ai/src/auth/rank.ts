@@ -20,6 +20,11 @@ export type UsageCandidate<T extends AuthCredential> = {
 	inReserve?: boolean;
 	/** True only when reserve ranking had a usable remaining-fraction measurement. */
 	reserveMeasured?: boolean;
+	/**
+	 * Present after ranking: the account's renewable allowance for this request is
+	 * spent, so if it still serves it draws on paid overage such as Codex credits.
+	 */
+	allowanceSpent?: boolean;
 };
 
 /** OAuth credential eligible for usage ranking. */
@@ -39,6 +44,7 @@ export type UsageRankedCandidate<T extends AuthCredential> = UsageCandidate<T> &
 	reserveMeasured?: boolean;
 	accountPriority: number;
 	hasPriorityBoost: boolean;
+	allowanceSpent: boolean;
 	usageMeasured: boolean;
 	planPriority: number;
 	secondaryUsed: number;
@@ -90,6 +96,9 @@ function compareUsageRankedCandidatePriority(
 	if (planGated && left.planPriority !== right.planPriority) {
 		return left.planPriority - right.planPriority;
 	}
+	// Paid overage (Codex credits) never renews, so an account serving past its
+	// allowance yields to any sibling whose renewable allowance is left (#13889).
+	if (left.allowanceSpent !== right.allowanceSpent) return left.allowanceSpent ? 1 : -1;
 	if (left.inReserve !== right.inReserve) return left.inReserve ? 1 : -1;
 	if (left.accountPriority !== right.accountPriority) return right.accountPriority - left.accountPriority;
 	if (left.accountPriority > 0) return 0;
@@ -131,7 +140,7 @@ function compareUsageRankedCandidates(
 	return priority !== 0 ? priority : left.orderPos - right.orderPos;
 }
 
-/** Sort ranked candidates by blocks, plan, reserve, account priority and automatic usage heuristics. */
+/** Sort by blocks, plan, spent allowance, reserve, account priority, then automatic usage heuristics. */
 export function orderUsageRankedCandidates<T extends AuthCredential>(
 	candidates: UsageRankedCandidate<T>[],
 	planGated: boolean,
@@ -143,5 +152,6 @@ export function orderUsageRankedCandidates<T extends AuthCredential>(
 		usageChecked: candidate.usageChecked,
 		inReserve: candidate.inReserve,
 		reserveMeasured: candidate.reserveMeasured,
+		allowanceSpent: candidate.allowanceSpent,
 	}));
 }

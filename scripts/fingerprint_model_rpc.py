@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(
-    0, str(Path(__file__).resolve().parent.parent / "python" / "omp-rpc" / "src")
+    0, str(Path(__file__).resolve().parent.parent / "sdk" / "python" / "omp-rpc" / "src")
 )
 
 from omp_rpc import RpcClient

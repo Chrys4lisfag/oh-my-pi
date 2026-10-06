@@ -287,28 +287,40 @@ describe("profiles multi-instance persistence", () => {
 		creator.setProfileItem("new", concurrent);
 		await creator.flush();
 
+		for (const settings of [seed, stale, creator]) settings.stopWatching();
 		const saveEntered = Promise.withResolvers<void>();
 		const releaseSave = Promise.withResolvers<void>();
-		const open = fsSync.promises.open.bind(fsSync.promises);
+		const readFile = fsSync.promises.readFile.bind(fsSync.promises);
 		const configPath = path.join(dir, "config.yml");
 		let intercepted = false;
-		const openSpy = vi.spyOn(fsSync.promises, "open").mockImplementation(async (file, flags, mode) => {
-			if (
-				!intercepted &&
-				path.dirname(String(file)) === path.dirname(configPath) &&
-				path.basename(String(file)).startsWith(`${path.basename(configPath)}.`) &&
-				String(file).endsWith(".tmp")
-			) {
+		const readSpy = vi.spyOn(fsSync.promises, "readFile").mockImplementation((async (
+			file: fsSync.PathLike | fsSync.promises.FileHandle,
+			options?: unknown,
+		) => {
+			const content = await readFile(file, options as never);
+			if (!intercepted && path.normalize(String(file)) === path.normalize(configPath)) {
 				intercepted = true;
 				saveEntered.resolve();
 				await releaseSave.promise;
 			}
-			return open(file, flags, mode);
-		});
+			return content;
+		}) as never);
+		let firstFlush: Promise<void> | undefined;
+		// Failure fuse for real filesystem I/O; fake time cannot complete the locked read.
+		const timeout = setTimeout(
+			() => saveEntered.reject(new Error("Timed out waiting for locked config read")),
+			3_000,
+		);
 		try {
 			stale.renameProfileItem("old", "new", SNAP, true);
-			const firstFlush = stale.flush();
-			await saveEntered.promise;
+			firstFlush = stale.flush();
+			await Promise.race([
+				saveEntered.promise,
+				firstFlush.then(() => {
+					throw new Error("Save completed without reading config");
+				}),
+			]);
+			clearTimeout(timeout);
 			cfgDefaultThinkingLevel.set(stale, Effort.Low);
 			releaseSave.resolve();
 			await firstFlush;
@@ -323,8 +335,10 @@ describe("profiles multi-instance persistence", () => {
 				new: concurrent,
 			});
 		} finally {
+			clearTimeout(timeout);
 			releaseSave.resolve();
-			openSpy.mockRestore();
+			readSpy.mockRestore();
+			await firstFlush;
 		}
 	});
 	it("keeps an active-profile edit made while its rename save is in flight", async () => {

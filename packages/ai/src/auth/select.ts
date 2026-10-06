@@ -280,6 +280,7 @@ export class CredentialSelector {
 				blockedUntil,
 				inReserve: false,
 				accountPriority: 0,
+				allowanceSpent: remainingUsageFraction(strategy, usage, args.rankingContext, nowMs) === 0,
 				usageMeasured,
 				hasPriorityBoost: strategy.hasPriorityBoost?.(primary, primaryUncapped, args.rankingContext) ?? false,
 				planPriority: 0,
@@ -488,6 +489,7 @@ export class CredentialSelector {
 					reserveFraction !== undefined && remainingFraction !== undefined && remainingFraction <= reserveFraction,
 				reserveMeasured: reserveFraction !== undefined && remainingFraction !== undefined,
 				accountPriority,
+				allowanceSpent: remainingFraction === 0,
 				usageMeasured,
 				hasPriorityBoost: strategy?.hasPriorityBoost?.(primary, primaryUncapped, args.rankingContext) ?? false,
 				planPriority: planPriority(args.planGate, usage),
@@ -590,13 +592,28 @@ export class CredentialSelector {
 			sessionPreferredCanRefreshOrUse &&
 			!this.#deps.blocks.isBlocked(provider, providerKey, sessionPreferredIndex, blockScopes);
 		const sessionPinIsExplicit = sessionCredential?.type === "oauth" && sessionCredential.explicit === true;
+		const rankDespitePin =
+			hasPriorityPolicy ||
+			!sessionPreferredIsAvailable ||
+			!sessionPreferredIsWarm ||
+			hasPlanRequirement ||
+			(policyReserveEnabled && !sessionPinIsExplicit);
+		// A warm automatic pin whose allowance is spent keeps serving on paid overage
+		// (Codex credits) and is never blocked, so check it and rank when spent: a
+		// sibling with renewable allowance left must take over (#13889). tryOAuth
+		// reads this same report for the pin, so it is handed on below.
+		const sessionPreferredUsage =
+			checkUsage && !rankDespitePin && !sessionPinIsExplicit && sessionPreferredCredential
+				? await this.#deps.usage.report(provider, sessionPreferredCredential, {
+						...options,
+						timeoutMs: this.#deps.usage.requestTimeoutMs,
+					})
+				: undefined;
 		const shouldRank =
 			checkUsage &&
-			(hasPriorityPolicy ||
-				!sessionPreferredIsAvailable ||
-				!sessionPreferredIsWarm ||
-				hasPlanRequirement ||
-				(policyReserveEnabled && !sessionPinIsExplicit));
+			(rankDespitePin ||
+				(sessionPreferredUsage !== undefined &&
+					remainingUsageFraction(strategy, sessionPreferredUsage, rankingContext, Date.now()) === 0));
 		// When ranking, seed the pinned credential first in the evaluation order so it wins genuine
 		// ties (the ranked comparator falls back to `orderPos`) without overriding a strictly-better
 		// sibling — this respects the residual value of a same-account shared static prefix that other
@@ -637,11 +654,11 @@ export class CredentialSelector {
 			: policyOrder
 					.map(idx => credentials[idx])
 					.filter((selection): selection is { credential: OAuthCredential; index: number } => Boolean(selection))
-					.map(selection => ({
-						selection,
-						usage: null,
-						usageChecked: false,
-					}));
+					.map(selection =>
+						selection.index === sessionPreferredIndex && sessionPreferredUsage !== undefined
+							? { selection, usage: sessionPreferredUsage, usageChecked: true }
+							: { selection, usage: null, usageChecked: false },
+					);
 		const preflightFailures = new Set<OAuthCandidate>();
 
 		const sessionPreferredCandidate = candidates.findIndex(
@@ -650,40 +667,46 @@ export class CredentialSelector {
 				candidate.selection.index === sessionPreferredIndex,
 		);
 		const preferredCandidate = sessionPreferredCandidate === -1 ? undefined : candidates[sessionPreferredCandidate];
-		const priorityWouldEvictAutomaticPin = (excludePreflightFailures: boolean): boolean =>
-			!sessionPinIsExplicit &&
-			preferredCandidate !== undefined &&
-			candidates.some(
-				candidate =>
-					(!excludePreflightFailures || !preflightFailures.has(candidate)) &&
-					!this.#deps.blocks.isBlocked(provider, providerKey, candidate.selection.index, blockScopes) &&
-					(!hasPlanRequirement || planGate?.(candidate.usage) !== false) &&
-					candidate.inReserve !== true &&
-					this.#accountPriority(provider, candidate.selection.credential) >
-						this.#accountPriority(provider, preferredCandidate.selection.credential),
-			);
 		const keepPreferredPriority =
 			preferredCandidate !== undefined &&
 			this.#accountPriority(provider, preferredCandidate.selection.credential) > 0;
-		const reserveWouldEvictAutomaticPin = (excludePreflightFailures: boolean): boolean =>
+		// Automatic pins yield to a usable higher priority, explicit reserve, or spent allowance.
+		const automaticPinWouldBeEvicted = (excludePreflightFailures: boolean): boolean =>
 			!sessionPinIsExplicit &&
-			preferredCandidate?.inReserve === true &&
-			candidates.some(
-				candidate =>
-					candidate !== preferredCandidate &&
-					(!excludePreflightFailures || !preflightFailures.has(candidate)) &&
+			preferredCandidate !== undefined &&
+			candidates.some(candidate => {
+				if (candidate === preferredCandidate) return false;
+				if (excludePreflightFailures && preflightFailures.has(candidate)) return false;
+				if (
+					!this.#deps.blocks.isBlocked(provider, providerKey, candidate.selection.index, blockScopes) &&
+					(!hasPlanRequirement || planGate?.(candidate.usage) !== false) &&
+					candidate.inReserve !== true &&
+					candidate.allowanceSpent !== true &&
+					this.#accountPriority(provider, candidate.selection.credential) >
+						this.#accountPriority(provider, preferredCandidate.selection.credential)
+				) {
+					return true;
+				}
+				if (
+					preferredCandidate.inReserve === true &&
 					candidate.reserveMeasured === true &&
-					candidate.inReserve === false,
-			);
-		const reserveWouldEvictBeforePreflight = reserveWouldEvictAutomaticPin(false);
-		// Explicit pins win; automatic pins yield to reserve and higher account priority.
+					candidate.inReserve === false
+				) {
+					return true;
+				}
+				return (
+					preferredCandidate.allowanceSpent === true &&
+					candidate.usage !== null &&
+					candidate.allowanceSpent === false &&
+					!this.#deps.blocks.isBlocked(provider, providerKey, candidate.selection.index, blockScopes)
+				);
+			});
+		const pinEvictedBeforePreflight = automaticPinWouldBeEvicted(false);
 		if (
 			!hasPlanRequirement &&
 			sessionPreferredCandidate > 0 &&
-			!priorityWouldEvictAutomaticPin(false) &&
-			(!shouldRank ||
-				sessionPinIsExplicit ||
-				((sessionPreferredIsWarm || keepPreferredPriority) && !reserveWouldEvictBeforePreflight))
+			!pinEvictedBeforePreflight &&
+			(!shouldRank || sessionPinIsExplicit || sessionPreferredIsWarm || keepPreferredPriority)
 		) {
 			const [preferred] = candidates.splice(sessionPreferredCandidate, 1);
 			candidates.unshift(preferred);
@@ -807,15 +830,14 @@ export class CredentialSelector {
 			}),
 		);
 
-		const reserveWouldEvictAfterPreflight = reserveWouldEvictAutomaticPin(true);
+		const pinEvictedAfterPreflight = automaticPinWouldBeEvicted(true);
 		if (
 			!hasPlanRequirement &&
 			preferredCandidate !== undefined &&
 			!preflightFailures.has(preferredCandidate) &&
 			(sessionPreferredIsWarm || keepPreferredPriority) &&
 			!sessionPinIsExplicit &&
-			!priorityWouldEvictAutomaticPin(true) &&
-			!reserveWouldEvictAfterPreflight
+			!pinEvictedAfterPreflight
 		) {
 			const preferredIndex = candidates.indexOf(preferredCandidate);
 			if (preferredIndex > 0) {
@@ -837,12 +859,7 @@ export class CredentialSelector {
 		// unenforced and the pin is not known-ineligible) so an active session never
 		// silently migrates accounts mid-conversation; blocked, exhausted, or
 		// known-ineligible pins still fall through to the ranked sibling.
-		if (
-			hasPlanRequirement &&
-			preferredCandidate !== undefined &&
-			!reserveWouldEvictAfterPreflight &&
-			!priorityWouldEvictAutomaticPin(true)
-		) {
+		if (hasPlanRequirement && preferredCandidate !== undefined && !pinEvictedAfterPreflight) {
 			const planEligibility = planGate?.(preferredCandidate.usage);
 			if (planEligibility === true || (!enforcePlanRequirement && planEligibility !== false)) {
 				const preferredIndex = candidates.indexOf(preferredCandidate);
@@ -1072,7 +1089,9 @@ export class CredentialSelector {
 				}
 			}
 			this.#deps.pool.noteBearer(provider, result.apiKey, credentialId);
-			this.#deps.affinity.record(provider, sessionId, "oauth", selection.index);
+			if (options?.recordAffinity !== false) {
+				this.#deps.affinity.record(provider, sessionId, "oauth", selection.index);
+			}
 			return { apiKey: result.apiKey, credential: updated, credentialId };
 		} catch (error) {
 			const errorMsg = String(error);

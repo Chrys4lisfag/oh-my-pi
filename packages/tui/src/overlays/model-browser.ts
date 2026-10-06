@@ -10,10 +10,10 @@
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
-import type { ModelKind } from "@oh-my-pi/pi-catalog/types";
+import { getModelPricingStatus, modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
+import type { ModelKind, ModelPricingStatus } from "@oh-my-pi/pi-catalog/types";
 import type { Component } from "../tui";
-import { FuzzyText, fuzzyRank } from "../fuzzy";
+import { FuzzyCorpus, fuzzyRank } from "../fuzzy";
 import { Input } from "../components/input";
 import { ScrollView } from "../components/scroll-view";
 import { matchesKey } from "../keys";
@@ -344,8 +344,8 @@ function modelItemComparator(items: readonly ModelBrowserItem[], options: SortMo
 		// Both have dates — descending (newest first)
 		if (aDate && bDate) return bDate.localeCompare(aDate);
 
-		// One has date, other is latest — latest first
-		return aIsLatest ? -1 : bIsLatest ? 1 : a.id.localeCompare(b.id);
+		// Both -latest — alphabetical (a fixed -1 here made the order depend on input order)
+		return a.id.localeCompare(b.id);
 	};
 }
 
@@ -530,79 +530,104 @@ function compactModelSearchText(value: string): string {
 	return value.toLowerCase().replace(/[^\p{Letter}\p{Mark}\p{Number}]+/gu, "");
 }
 
-interface ModelSearchEntry {
-	item: ModelBrowserItem;
-	text: FuzzyText;
-	id: string;
-	selector: string;
+/** Exact id/selector → contiguous literal → fuzzy-only, against precomputed compact forms. */
+function modelSearchTier(query: string, id: string, selector: string): number {
+	if (!query) return 2;
+	if (query === id || query === selector) return 0;
+	if (id.includes(query) || selector.includes(query)) return 1;
+	return 2;
 }
 
-function prepareModelSearch(item: ModelBrowserItem): ModelSearchEntry {
-	return {
-		item,
-		text: new FuzzyText(modelSearchText(item)),
-		id: compactModelSearchText(item.id),
-		selector: compactModelSearchText(item.selector),
-	};
+/** Inputs to {@link rankModelItems} / {@link ModelItemRanker}. */
+export interface ModelRankOptions {
+	roles: RoleAssignments;
+	mruOrder: ReadonlyArray<string>;
+	affinity: SearchAffinity;
 }
 
-function rankModelMatches(
-	query: string,
-	matches: { item: ModelBrowserItem; score: number }[],
-	affinity: SearchAffinity,
-	compare: (a: ModelBrowserItem, b: ModelBrowserItem) => number,
-	prepared?: ReadonlyMap<ModelBrowserItem, ModelSearchEntry>,
-): ModelBrowserItem[] {
-	const queryKey = compactModelSearchText(query);
-	const ranked = matches.map(({ item, score }) => {
-		const entry = prepared?.get(item);
-		const id = entry?.id ?? compactModelSearchText(item.id);
-		const selector = entry?.selector ?? compactModelSearchText(item.selector);
-		const tier = !queryKey
-			? 2
-			: queryKey === id || queryKey === selector
-				? 0
-				: id.includes(queryKey) || selector.includes(queryKey)
-					? 1
-					: 2;
-		return {
-			item,
-			score,
-			tier,
-			bucket: Math.round(score / 10),
-			model: affinity.models.get(item.selector.toLowerCase()) ?? Number.MAX_SAFE_INTEGER,
-			provider: affinity.providers.get(item.provider.toLowerCase()) ?? Number.MAX_SAFE_INTEGER,
-		};
-	});
-	ranked.sort(
-		(a, b) =>
-			a.tier - b.tier ||
-			a.model - b.model ||
-			a.provider - b.provider ||
-			a.bucket - b.bucket ||
-			compare(a.item, b.item) ||
-			a.score - b.score,
-	);
-	return ranked.map(result => result.item);
+/** Query-independent sort keys of one candidate, computed once per ranker. */
+interface ModelRankKeys {
+	compactId: string;
+	compactSelector: string;
+	modelAffinity: number;
+	providerAffinity: number;
+	/** Position class in the MRU/version order; comparator-equal items share it. */
+	orderGroup: number;
+}
+
+/**
+ * {@link rankModelItems} prepared for one candidate list: the fuzzy index, the
+ * MRU/version order, and the affinity ranks depend only on the items and options,
+ * so per-keystroke callers (composer mentions, `/switch` arguments, the picker)
+ * hold one ranker and pay only the per-query fuzzy scan.
+ */
+export class ModelItemRanker {
+	readonly items: ReadonlyArray<ModelBrowserItem>;
+	readonly options: ModelRankOptions;
+	readonly #corpus: FuzzyCorpus<ModelBrowserItem>;
+	readonly #keys = new Map<ModelBrowserItem, ModelRankKeys>();
+
+	constructor(items: ReadonlyArray<ModelBrowserItem>, options: ModelRankOptions) {
+		this.items = items;
+		this.options = options;
+		this.#corpus = new FuzzyCorpus(items, modelSearchText);
+		const compare = modelItemComparator(items, {
+			roles: options.roles,
+			mruOrder: options.mruOrder,
+			skipRoleRank: true,
+		});
+		const ordered = [...items].sort(compare);
+		let group = 0;
+		for (let i = 0; i < ordered.length; i++) {
+			const item = ordered[i]!;
+			if (i > 0 && compare(ordered[i - 1]!, item) !== 0) group++;
+			this.#keys.set(item, {
+				compactId: compactModelSearchText(item.id),
+				compactSelector: compactModelSearchText(item.selector),
+				modelAffinity: options.affinity.models.get(item.selector.toLowerCase()) ?? Number.MAX_SAFE_INTEGER,
+				providerAffinity: options.affinity.providers.get(item.provider.toLowerCase()) ?? Number.MAX_SAFE_INTEGER,
+				orderGroup: group,
+			});
+		}
+	}
+
+	/** Rank by text relevance, user affinity, and MRU/version order. */
+	rank(query: string): ModelBrowserItem[] {
+		if (!query.trim()) return [...this.items];
+		const queryKey = compactModelSearchText(query);
+		// Exact and contiguous matches stay ahead of fuzzy-only candidates; affinity
+		// breaks ties before fuzzy quality and the normal MRU/version ordering, and
+		// fuzzy order settles items that ordering cannot tell apart.
+		const rows = this.#corpus.rank(query).map((result, fuzzyIndex) => {
+			const keys = this.#keys.get(result.item)!;
+			return {
+				item: result.item,
+				keys,
+				tier: modelSearchTier(queryKey, keys.compactId, keys.compactSelector),
+				bucket: Math.round(result.score / 10),
+				fuzzyIndex,
+			};
+		});
+		rows.sort(
+			(a, b) =>
+				a.tier - b.tier ||
+				a.keys.modelAffinity - b.keys.modelAffinity ||
+				a.keys.providerAffinity - b.keys.providerAffinity ||
+				a.bucket - b.bucket ||
+				a.keys.orderGroup - b.keys.orderGroup ||
+				a.fuzzyIndex - b.fuzzyIndex,
+		);
+		return rows.map(row => row.item);
+	}
 }
 
 /** Rank picker and mention candidates by text relevance, user affinity, and MRU/version order. */
 export function rankModelItems(
 	query: string,
 	items: ReadonlyArray<ModelBrowserItem>,
-	options: { roles: RoleAssignments; mruOrder: ReadonlyArray<string>; affinity: SearchAffinity },
+	options: ModelRankOptions,
 ): ModelBrowserItem[] {
-	if (!query.trim()) return [...items];
-	const matches = fuzzyRank(items, query, modelSearchText);
-	return rankModelMatches(
-		query,
-		matches,
-		options.affinity,
-		modelItemComparator(
-			matches.map(result => result.item),
-			{ mruOrder: options.mruOrder, skipRoleRank: true },
-		),
-	);
+	return new ModelItemRanker(items, options).rank(query);
 }
 
 /**
@@ -640,10 +665,23 @@ function roleChipSpans(role: string, assignment: RoleAssignment, settings: Model
 	return spans;
 }
 
-/** Both token legs at zero cost — the condition {@link formatCostPair} renders as `free`. */
+/**
+ * The non-rate pricing state a catalog rule declared for a zero-rate row
+ * (`pricing-status`), or `undefined` when the row publishes rates or declares
+ * nothing. Undeclared zero-rate rows keep the `free` convention below.
+ */
+function declaredPricingStatus(model: Model): Exclude<ModelPricingStatus, "fixed"> | undefined {
+	if (model.pricingStatus === undefined) return undefined;
+	const status = getModelPricingStatus(model);
+	return status === "fixed" ? undefined : status;
+}
+/** No token price and no subscription-credit charge (unless a pricing state is declared). */
 function isFreeModel(model: Model): boolean {
+	const declared = declaredPricingStatus(model);
+	if (declared !== undefined) return declared === "free";
 	const cost = model.cost;
-	return !cost || (cost.input === 0 && cost.output === 0);
+	const credits = model.factoryDroidCredits;
+	return (!cost || (cost.input === 0 && cost.output === 0)) && (credits === undefined || credits === 0);
 }
 
 /** One per-million price leg: `3`, `0.25`, `12.5`; `?` when unknown. */
@@ -656,10 +694,37 @@ function formatCostLeg(n: number): string {
 	return s.includes(".") ? s.replace(/\.?0+$/, "") : s;
 }
 
-/** `$in/out` per-million cost pair; `free` when both legs are zero. */
+/**
+ * Adds Factory Droid's `N×` base Standard Credits rate to a dollar price,
+ * replacing the price when the model has no dollar reference. Neither the
+ * reference price nor the base credit rate includes live promotions.
+ */
+function withCreditBadge(model: Model, price: string): string {
+	const credits = model.factoryDroidCredits;
+	if (credits === undefined) return price;
+	const badge = `${formatCostLeg(credits)}×`;
+	return model.cost.input !== 0 || model.cost.output !== 0 ? `${price} ${badge}` : badge;
+}
+
+const PRICING_STATUS_LABELS: Record<Exclude<ModelPricingStatus, "fixed">, { short: string; detail: string }> = {
+	free: { short: "free", detail: "free" },
+	included: { short: "included", detail: "included" },
+	variable: { short: "varies", detail: "price varies" },
+	unknown: { short: "unknown", detail: "pricing unknown" },
+};
+
+/** `$in/out` per-million cost pair with any credit badge; `free` when nothing is charged; a declared pricing state otherwise. */
 function formatCostPair(model: Model): string {
+	const declared = declaredPricingStatus(model);
+	if (declared !== undefined) return PRICING_STATUS_LABELS[declared].short;
 	if (isFreeModel(model)) return "free";
-	return `$${formatCostLeg(model.cost.input)}/${formatCostLeg(model.cost.output)}`;
+	return withCreditBadge(model, `$${formatCostLeg(model.cost.input)}/${formatCostLeg(model.cost.output)}`);
+}
+
+/** Detail-pane price fact: `$3/15 per M`, or the declared pricing state in words. */
+function formatCostDetail(model: Model): string {
+	const declared = declaredPricingStatus(model);
+	return declared !== undefined ? PRICING_STATUS_LABELS[declared].detail : `${formatCostPair(model)} per M`;
 }
 
 /** Fact columns of a model picker (Stencil `NATIVE_REDESIGN.md` §4.7); the lowest priority hides first. */
@@ -670,18 +735,22 @@ export const MODEL_PICKER_COLUMNS: readonly TspPickerColumn[] = [
 	{ id: "price", head: "$/M", format: "price", priority: 3 },
 ];
 
-/** `$3·15` price fact of a picker row (`free` at zero cost). */
+/** `$3·15` price fact of a picker row; `free` at zero cost; a declared pricing state otherwise. */
 function pickerPrice(model: Model): string {
+	const declared = declaredPricingStatus(model);
+	if (declared !== undefined) return PRICING_STATUS_LABELS[declared].short;
 	if (isFreeModel(model)) return "free";
-	return `$${formatCostLeg(model.cost.input)}·${formatCostLeg(model.cost.output)}`;
+	return withCreditBadge(model, `$${formatCostLeg(model.cost.input)}·${formatCostLeg(model.cost.output)}`);
 }
 
 /** `$2 in · $10 out · $0.2 cache` for a model preview. */
 function previewPrice(model: Model): string {
+	const declared = declaredPricingStatus(model);
+	if (declared !== undefined) return PRICING_STATUS_LABELS[declared].detail;
 	const cost = model.cost;
 	const parts = [`$${formatCostLeg(cost.input)} in`, `$${formatCostLeg(cost.output)} out`];
 	if (cost.cacheRead > 0) parts.push(`$${formatCostLeg(cost.cacheRead)} cache`);
-	return parts.join(" · ");
+	return withCreditBadge(model, parts.join(" · "));
 }
 
 /** The omp theme token of a thinking level's dot (`thinkingHigh`); none for inherit and auto. */
@@ -794,6 +863,21 @@ const DETAIL_ROWS = 3;
 const PERF_TPS_MIN_WIDTH = 76;
 /** Row width from which the perf column also includes TTFT. */
 const PERF_FULL_MIN_WIDTH = 96;
+/** Narrowest model-name cell retained before cost and context are dropped. */
+const MIN_NAME_WIDTH = 16;
+
+/** Total width of present metadata columns, joined by two-space gaps. */
+function metaColumnsWidth(widths: readonly number[]): number {
+	let total = 0;
+	let count = 0;
+	for (const width of widths) {
+		if (width <= 0) continue;
+		total += width;
+		count++;
+	}
+	return count > 0 ? total + 2 * (count - 1) : 0;
+}
+
 /** What the per-row perf column shows at the current width. */
 type PerfMode = "off" | "tps" | "full";
 
@@ -815,8 +899,7 @@ export class ModelBrowser implements Component {
 	#mruOrder: ReadonlyArray<string> = [];
 	#affinity: SearchAffinity = { models: new Map(), providers: new Map() };
 	#affinityDirty = true;
-	#searchEntries: Map<ModelBrowserItem, ModelSearchEntry> | undefined;
-	#searchComparator: ((a: ModelBrowserItem, b: ModelBrowserItem) => number) | undefined;
+	#ranker?: { source: readonly ModelBrowserItem[]; ranker: ModelItemRanker };
 	#baseItems: ModelBrowserItem[] = [];
 	#separatorDirty = false;
 	#perf: ReadonlyMap<string, ModelBrowserPerf> = new Map();
@@ -911,8 +994,7 @@ export class ModelBrowser implements Component {
 	setItems(items: ModelBrowserItem[]): void {
 		const selectedKey = this.getSelected()?.selector;
 		this.#baseItems = items.filter(item => !this.#isDisabled(item));
-		this.#searchEntries = undefined;
-		this.#searchComparator = undefined;
+		this.#ranker = undefined;
 		this.#separatorDirty = false;
 		this.#menu.setItems(this.#insertSeparator(this.#baseItems), selectedKey);
 		this.onSelectionChange?.(this.getSelected());
@@ -931,7 +1013,6 @@ export class ModelBrowser implements Component {
 		this.#mruOrder = order;
 		this.#affinityDirty = true;
 		this.#separatorDirty = true;
-		this.#searchComparator = undefined;
 	}
 
 	#syncAffinity(): void {
@@ -1016,25 +1097,26 @@ export class ModelBrowser implements Component {
 	 */
 	#filterItems(query: string): readonly ModelBrowserItem[] {
 		this.#syncAffinity();
-		this.#searchEntries ??= new Map(this.#baseItems.map(item => [item, prepareModelSearch(item)]));
-		const matches: { item: ModelBrowserItem; score: number }[] = [];
-		const matchText = FuzzyText.matcher(query);
-		for (const entry of this.#searchEntries.values()) {
-			const match = matchText(entry.text);
-			if (match.matches) matches.push({ item: entry.item, score: match.score });
-		}
-		let ranked: ModelBrowserItem[];
 		if (this.#preserveQueryOrder) {
-			matches.sort((a, b) => a.score - b.score);
-			ranked = matches.map(result => result.item);
-		} else {
-			this.#searchComparator ??= modelItemComparator(this.#baseItems, {
-				mruOrder: this.#mruOrder,
-				skipRoleRank: true,
-			});
-			ranked = rankModelMatches(query, matches, this.#affinity, this.#searchComparator, this.#searchEntries);
+			return this.#insertSeparator(
+				query.trim()
+					? fuzzyRank(this.#baseItems, query, modelSearchText).map(result => result.item)
+					: this.#baseItems,
+			);
 		}
-		return this.#insertSeparator(ranked);
+		let cached = this.#ranker;
+		if (cached?.source !== this.#baseItems || cached.ranker.options.affinity !== this.#affinity) {
+			cached = {
+				source: this.#baseItems,
+				ranker: new ModelItemRanker(this.#baseItems, {
+					roles: this.#roles,
+					mruOrder: this.#mruOrder,
+					affinity: this.#affinity,
+				}),
+			};
+			this.#ranker = cached;
+		}
+		return this.#insertSeparator(cached.ranker.rank(query));
 	}
 
 	/** True when `item`'s context window is smaller than the live session token count (grayed row; hosts compact before switching). */
@@ -1290,25 +1372,19 @@ export class ModelBrowser implements Component {
 			: "";
 		let left = `${prefix}${providerPrefix}${name}${currentMark}${overLimit}`;
 
-		// Metric columns collapse independently when no visible row has data.
-		const intelligenceCol =
-			intelligenceWidth > 0
-				? `${theme.fg("dim", padLeftVisible(formatIntelligence(item.model), intelligenceWidth))}  `
-				: "";
-		const perfCol =
-			perfWidth > 0 ? `${theme.fg("dim", padLeftVisible(this.#perfCell(item, perfMode), perfWidth))}  ` : "";
-		const meta = `${intelligenceCol}${perfCol}${theme.fg("dim", padLeftVisible(formatContext(item.model), ctxWidth))}  ${theme.fg("dim", padLeftVisible(formatCostPair(item.model), costWidth))}`;
-		const metaWidth =
-			ctxWidth +
-			costWidth +
-			2 +
-			(intelligenceWidth > 0 ? intelligenceWidth + 2 : 0) +
-			(perfWidth > 0 ? perfWidth + 2 : 0);
-		const available = Math.max(1, width - metaWidth - 1);
+		// Metric columns collapse when empty or when the row needs room for its name.
+		const cols: string[] = [];
+		if (intelligenceWidth > 0)
+			cols.push(theme.fg("dim", padLeftVisible(formatIntelligence(item.model), intelligenceWidth)));
+		if (perfWidth > 0) cols.push(theme.fg("dim", padLeftVisible(this.#perfCell(item, perfMode), perfWidth)));
+		if (ctxWidth > 0) cols.push(theme.fg("dim", padLeftVisible(formatContext(item.model), ctxWidth)));
+		if (costWidth > 0) cols.push(theme.fg("dim", padLeftVisible(formatCostPair(item.model), costWidth)));
+		const metaWidth = metaColumnsWidth([intelligenceWidth, perfWidth, ctxWidth, costWidth]);
+		const available = Math.max(1, width - metaWidth - (cols.length > 0 ? 1 : 0));
 		left = truncateToWidth(left, available);
 		const gap = Math.max(0, available - visibleWidth(left));
 
-		let line = `${left}${" ".repeat(gap)} ${meta}`;
+		let line = cols.length > 0 ? `${left}${" ".repeat(gap)} ${cols.join("  ")}` : `${left}${" ".repeat(gap)}`;
 		if (overContext) {
 			// Gray the whole row but keep the selection cursor visible: over-context
 			// models stay selectable (the host compacts before switching).
@@ -1336,7 +1412,7 @@ export class ModelBrowser implements Component {
 		if (model.isRecommended) facts.push("recommended");
 		if (model.contextWindow) facts.push(`${formatNumber(model.contextWindow).toLowerCase()} ctx`);
 		if (model.maxTokens) facts.push(`${formatNumber(model.maxTokens).toLowerCase()} out`);
-		facts.push(`${formatCostPair(model)} per M`);
+		facts.push(formatCostDetail(model));
 		if (model.reasoning) facts.push("reasoning");
 		if (model.input.includes("image")) facts.push("vision");
 		const intelligence = formatIntelligence(model);
@@ -1418,6 +1494,11 @@ export class ModelBrowser implements Component {
 				}
 				perfWidth = Math.max(perfWidth, visibleWidth(this.#perfCell(item, perfMode)));
 			}
+			// Preserve at least a readable name by dropping cost, then context.
+			let nameRoom = width - 2 - metaColumnsWidth([intelligenceWidth, perfWidth, ctxWidth, costWidth]);
+			if (nameRoom < MIN_NAME_WIDTH) costWidth = 0;
+			nameRoom = width - 2 - metaColumnsWidth([intelligenceWidth, perfWidth, ctxWidth, costWidth]);
+			if (nameRoom < MIN_NAME_WIDTH) ctxWidth = 0;
 
 			const rows: string[] = [];
 			for (let i = startIndex; i < endIndex; i++) {
@@ -1599,7 +1680,7 @@ export class ModelBrowser implements Component {
 			const facts: string[] = [];
 			if (model.contextWindow) facts.push(`${formatNumber(model.contextWindow).toLowerCase()} ctx`);
 			if (model.maxTokens) facts.push(`${formatNumber(model.maxTokens).toLowerCase()} out`);
-			facts.push(`${formatCostPair(model)} per M`);
+			facts.push(formatCostDetail(model));
 			if (model.reasoning) facts.push("reasoning");
 			if (model.input.includes("image")) facts.push("vision");
 			const intelligence = formatIntelligence(model);
@@ -1916,7 +1997,7 @@ export class ModelBrowser implements Component {
 			const facts: { k: TspText; v: TspText }[] = [];
 			if (ctx > 0) facts.push({ k: "ctx", v: formatNumber(ctx).toLowerCase() });
 			if (out > 0) facts.push({ k: "out", v: formatNumber(out).toLowerCase() });
-			facts.push({ k: "price", v: isFreeModel(model) ? "free" : `${formatCostPair(model)} per M` });
+			facts.push({ k: "price", v: isFreeModel(model) ? "free" : formatCostDetail(model) });
 			facts.push({ k: "reasoning", v: model.reasoning ? "yes" : "no" });
 			const children: NativeChild[] = [node("kv", { items: facts, layout: "inline" })];
 			const chips: NativeChild[] = [];

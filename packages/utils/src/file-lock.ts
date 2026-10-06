@@ -45,6 +45,11 @@ function getCompatibilityDbPath(lockPath: string): string {
 	return `${lockPath}.sqlite`;
 }
 
+/** Acquire an exclusive lease without waiting; `null` while another holder owns it. */
+export function tryAcquireFileLock(filePath: string): FileLockHandle | null {
+	return tryAcquireLock(getLockPath(filePath));
+}
+
 function sqliteErrorCode(error: unknown): string | undefined {
 	if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
 	return typeof error.code === "string" ? error.code : undefined;
@@ -126,7 +131,10 @@ function createTryAcquire(
 	}
 	return lockPath => {
 		const native = nativeConstructor.tryAcquire(lockPath);
-		if (!native.acquired) return null;
+		if (!native.acquired) {
+			native.release();
+			return null;
+		}
 		try {
 			const compatibility = tryAcquireCompatibilityLock(lockPath);
 			if (compatibility) return new CompositeFileLock(compatibility, native);
