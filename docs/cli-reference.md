@@ -254,3 +254,11 @@ Run `omp <command> --help` for each command's own flags and examples.
 > reachable through related mechanisms (the `plugin` command, the `/join` slash
 > command, and so on). The table lists each as it is registered in
 > `packages/coding-agent/src/cli-commands.ts`.
+
+## Account routing priorities
+
+In `/accounts`, choose an OAuth provider and account. `+` (or `=`) raises its priority, `-` lowers it, and `a` restores **Auto**. Higher positive numbers win; decreasing priority 1 returns to Auto. Enter/Space still enables or disables request routing.
+
+Auto preserves OMP's normal usage balancing and session stickiness. A positive priority keeps the account preferred until quota exhaustion or another eligibility/cooldown block; it does not hand off merely because the account reaches the normal global reserve or a hot usage window. Equal priorities retain sticky selection. Explicit session pins and per-account `reservePct` remain authoritative. Disabled or model-ineligible accounts are skipped.
+
+Priorities persist in `auth.accountPolicies` by provider and OAuth identity, including organization where available. Raw API-key entries have no editable priority. Returning to Auto removes only the priority and preserves any configured reserve. If another settings layer overrides the policy, the manager reports that source rather than pretending a global edit took effect.

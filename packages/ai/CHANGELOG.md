@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Positive account priorities now override automatic quota-balancing preferences until exhaustion; explicit account reserves, session pins, and hard eligibility still apply.
+
 ## [18.4.4] - 2026-09-29
 
 ### Added

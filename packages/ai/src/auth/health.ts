@@ -133,9 +133,10 @@ export class CredentialHealth implements HealthApi {
 		const resolveReserveFraction = (entry: StoredCredential): number => {
 			const policy = this.#deps.policies.forCredential(provider, entry.credential);
 			const configured = policy?.reservePct;
-			return configured === undefined || !Number.isFinite(configured)
-				? reserveFraction
-				: Math.max(0, Math.min(1, configured / 100));
+			if (configured !== undefined && Number.isFinite(configured)) {
+				return Math.max(0, Math.min(1, configured / 100));
+			}
+			return (policy?.priority ?? 0) > 0 ? 0 : reserveFraction;
 		};
 		const nowMs = Date.now();
 		let accounts = await Promise.all(

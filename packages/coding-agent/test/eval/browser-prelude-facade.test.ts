@@ -182,6 +182,27 @@ describe("browser JavaScript facade", () => {
 });
 
 describe("browser facade in real Eval runtimes", () => {
+	it("rejects conflicting global state options through both real Eval languages", async () => {
+		let definitions: readonly EvalPreludeDefinition[] = [];
+		const session = makeSession(() => definitions);
+		definitions = [createBrowserPrelude(session)];
+		const js = await executeJs('await browser.open({ globalState: true, app: { cdp_url: "http://127.0.0.1:1" } });', {
+			cwd: process.cwd(),
+			sessionId: `browser-global-js-${crypto.randomUUID()}`,
+			session,
+		});
+		const py = await executePython('await browser.open(globalState=True, app={"cdp_url": "http://127.0.0.1:1"})', {
+			cwd: process.cwd(),
+			sessionId: `browser-global-py-${crypto.randomUUID()}`,
+			toolSession: session,
+			kernelMode: "per-call",
+		});
+		for (const result of [js, py]) {
+			expect(result.exitCode).not.toBe(0);
+			expect(result.output).toContain("globalState:true requires managed Chromium");
+		}
+	});
+
 	it("unwraps values, displays host text, and preserves JavaScript helper chains", async () => {
 		const calls: unknown[] = [];
 		let definitions: readonly EvalPreludeDefinition[] = [];

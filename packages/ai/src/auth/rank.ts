@@ -91,6 +91,8 @@ function compareUsageRankedCandidatePriority(
 		return left.planPriority - right.planPriority;
 	}
 	if (left.inReserve !== right.inReserve) return left.inReserve ? 1 : -1;
+	if (left.accountPriority !== right.accountPriority) return right.accountPriority - left.accountPriority;
+	if (left.accountPriority > 0) return 0;
 	if (left.hasPriorityBoost !== right.hasPriorityBoost) return left.hasPriorityBoost ? -1 : 1;
 	// Short-window guard: candidates whose primary (e.g. 5h) window is
 	// nearly exhausted rank behind cool ones regardless of drain urgency —
@@ -105,7 +107,6 @@ function compareUsageRankedCandidatePriority(
 	const leftMeasured = left.usageMeasured;
 	const rightMeasured = right.usageMeasured;
 	if (leftMeasured !== rightMeasured) return leftMeasured ? -1 : 1;
-	if (left.accountPriority !== right.accountPriority) return right.accountPriority - left.accountPriority;
 	// Required drain, descending: the account whose remaining quota must
 	// burn fastest to avoid expiring unused at its reset comes first, so
 	// staggered resets land at ~100% utilization instead of stranding
@@ -130,7 +131,7 @@ function compareUsageRankedCandidates(
 	return priority !== 0 ? priority : left.orderPos - right.orderPos;
 }
 
-/** Sort ranked candidates by blocks, plan, reserve, boost, hot window, usage and drain. */
+/** Sort ranked candidates by blocks, plan, reserve, account priority and automatic usage heuristics. */
 export function orderUsageRankedCandidates<T extends AuthCredential>(
 	candidates: UsageRankedCandidate<T>[],
 	planGated: boolean,

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added account priority badges and `+`/`-`/`a` controls to the account manager, with save-failure feedback.
+
 ## [18.4.4] - 2026-09-29
 
 ### Added

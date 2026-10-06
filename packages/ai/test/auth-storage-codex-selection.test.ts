@@ -479,6 +479,154 @@ describe("AuthStorage codex oauth ranking", () => {
 		expectExclusivePreference(counts, "api-acct-preferred", "api-acct-urgent");
 	});
 
+	test("positive priority stays through hot windows and global reserve until exhaustion", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+		await authStorage.credentials.set("openai-codex", [
+			{ type: "oauth", ...createCredential("acct-priority", "priority@example.com") },
+			{ type: "oauth", ...createCredential("acct-auto", "auto@example.com") },
+		]);
+		const setUsage = (priorityUsed: number) => {
+			usageByAccount.set(
+				"acct-priority",
+				createCodexUsageReport({
+					accountId: "acct-priority",
+					primary: { usedFraction: priorityUsed, resetInMs: HOUR_MS },
+					secondary: { usedFraction: priorityUsed, resetInMs: 6 * 24 * HOUR_MS },
+				}),
+			);
+			usageByAccount.set(
+				"acct-auto",
+				createCodexUsageReport({
+					accountId: "acct-auto",
+					primary: { usedFraction: 0.1, resetInMs: HOUR_MS },
+					secondary: { usedFraction: 0.1, resetInMs: HOUR_MS },
+				}),
+			);
+		};
+		setUsage(0.95);
+		expect(await authStorage.keys.get("openai-codex", "priority-live-policy")).toBe("api-acct-auto");
+		authStorage.setAccountPolicies({
+			accountPolicies: [{ provider: "openai-codex", account: { accountId: "acct-priority" }, priority: 1 }],
+			defaultReservePct: 10,
+		});
+		expect(await authStorage.keys.get("openai-codex", "priority-live-policy")).toBe("api-acct-priority");
+		setUsage(0.99);
+		await authStorage.usage.invalidate("openai-codex");
+		expect(await authStorage.keys.get("openai-codex", "priority-live-policy")).toBe("api-acct-priority");
+		const nearLimitHealth = await authStorage.health.model("openai-codex", { reserveFraction: 0.1 });
+		expect(nearLimitHealth.accounts.map(account => account.state)).toEqual(["healthy", "healthy"]);
+		setUsage(1);
+		await authStorage.usage.invalidate("openai-codex");
+		expect(await authStorage.keys.get("openai-codex", "priority-live-policy")).toBe("api-acct-auto");
+		const exhaustedHealth = await authStorage.health.model("openai-codex", { reserveFraction: 0.1 });
+		expect(exhaustedHealth.accounts.map(account => account.state)).toEqual(["depleted", "healthy"]);
+	});
+
+	test("priority updates replace warm automatic affinity and Auto restores usage ranking", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+		await authStorage.credentials.set("openai-codex", [
+			{ type: "oauth", ...createCredential("acct-first", "first@example.com") },
+			{ type: "oauth", ...createCredential("acct-second", "second@example.com") },
+		]);
+		for (const [accountId, usedFraction] of [
+			["acct-first", 0.95],
+			["acct-second", 0.1],
+		] as const) {
+			usageByAccount.set(
+				accountId,
+				createCodexUsageReport({
+					accountId,
+					primary: { usedFraction, resetInMs: HOUR_MS },
+					secondary: { usedFraction, resetInMs: WEEK_MS },
+				}),
+			);
+		}
+		const setPriorities = (first: number, second: number) =>
+			authStorage!.setAccountPolicies({
+				accountPolicies: [
+					{ provider: "openai-codex", account: { accountId: "acct-first" }, priority: first },
+					{ provider: "openai-codex", account: { accountId: "acct-second" }, priority: second },
+				],
+				defaultReservePct: 10,
+			});
+		setPriorities(2, 1);
+		expect(await authStorage.keys.get("openai-codex", "updated-priority")).toBe("api-acct-first");
+		setPriorities(2, 3);
+		expect(await authStorage.keys.get("openai-codex", "updated-priority")).toBe("api-acct-second");
+		setPriorities(4, 3);
+		expect(await authStorage.keys.get("openai-codex", "updated-priority")).toBe("api-acct-first");
+		authStorage.setAccountPolicies({ accountPolicies: [], defaultReservePct: 10 });
+		expect(await authStorage.keys.get("openai-codex", "new-auto-session")).toBe("api-acct-second");
+	});
+
+	test("equal positive priorities retain automatic affinity across usage and idle changes", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+		const now = Date.now();
+		let elapsed = 0;
+		vi.spyOn(Date, "now").mockImplementation(() => now + elapsed);
+		await authStorage.credentials.set("openai-codex", [
+			{ type: "oauth", ...createCredential("acct-first", "first@example.com") },
+			{ type: "oauth", ...createCredential("acct-second", "second@example.com") },
+		]);
+		authStorage.setAccountPolicies({
+			accountPolicies: [
+				{ provider: "openai-codex", account: { accountId: "acct-first" }, priority: 1 },
+				{ provider: "openai-codex", account: { accountId: "acct-second" }, priority: 1 },
+			],
+			defaultReservePct: 10,
+		});
+		for (const [accountId, usedFraction] of [
+			["acct-first", 0.99],
+			["acct-second", 0.01],
+		] as const) {
+			usageByAccount.set(
+				accountId,
+				createCodexUsageReport({
+					accountId,
+					primary: { usedFraction, resetInMs: HOUR_MS },
+					secondary: { usedFraction, resetInMs: WEEK_MS },
+				}),
+			);
+		}
+		expect(await authStorage.keys.get("openai-codex", "equal-priority")).toBe("api-acct-first");
+		elapsed = 20 * 60_000;
+		expect(await authStorage.keys.get("openai-codex", "equal-priority")).toBe("api-acct-first");
+	});
+
+	test("priority honors explicit pins, disabled accounts and paid model eligibility", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+		await authStorage.credentials.set("openai-codex", [
+			{ type: "oauth", ...createCredential("acct-priority", "priority@example.com") },
+			{ type: "oauth", ...createCredential("acct-paid", "paid@example.com") },
+		]);
+		for (const [accountId, planType] of [
+			["acct-priority", "free"],
+			["acct-paid", "plus"],
+		] as const) {
+			usageByAccount.set(
+				accountId,
+				createCodexUsageReport({
+					accountId,
+					primary: { usedFraction: 0.1, resetInMs: HOUR_MS },
+					secondary: { usedFraction: 0.1, resetInMs: WEEK_MS },
+					metadata: { planType },
+				}),
+			);
+		}
+		authStorage.setAccountPolicies({
+			accountPolicies: [{ provider: "openai-codex", account: { accountId: "acct-priority" }, priority: 10 }],
+			defaultReservePct: 10,
+		});
+		expect(await authStorage.keys.get("openai-codex", "priority-paid-gate", { modelId: "gpt-5.6" })).toBe(
+			"api-acct-paid",
+		);
+		const accounts = authStorage.oauth.accounts("openai-codex");
+		expect(authStorage.sessions.pin("openai-codex", "explicit-priority", accounts[1]!.credentialId)).toBe(true);
+		expect(await authStorage.keys.get("openai-codex", "explicit-priority")).toBe("api-acct-paid");
+		authStorage.credentials.setRoutingEnabled("openai-codex", accounts[0]!.credentialId, false);
+		expect(await authStorage.keys.get("openai-codex", "disabled-priority")).toBe("api-acct-paid");
+	});
+
 	test("account reserve protects a preferred account while an eligible sibling remains", async () => {
 		if (!store) throw new Error("test setup failed");
 		authStorage = new AuthStorage(store, {
@@ -829,15 +977,10 @@ describe("AuthStorage codex oauth ranking", () => {
 		).toThrow("without surrounding whitespace");
 	});
 
-	test("keeps hot-window and measured-usage safety ahead of configured priority", async () => {
+	test("Auto prefers measured cool accounts while explicit priority overrides those heuristics", async () => {
 		if (!store) throw new Error("test setup failed");
 		authStorage = new AuthStorage(store, {
 			usageProviderResolver: provider => (provider === "openai-codex" ? usageProvider : undefined),
-			accountPolicies: [
-				{ provider: "openai-codex", account: { email: "hot@example.com" }, priority: 300 },
-				{ provider: "openai-codex", account: { email: "unknown@example.com" }, priority: 200 },
-				{ provider: "openai-codex", account: { email: "safe@example.com" }, priority: 10 },
-			],
 		});
 		await authStorage.credentials.set("openai-codex", [
 			{ type: "oauth", ...createCredential("acct-hot", "hot@example.com") },
@@ -864,6 +1007,16 @@ describe("AuthStorage codex oauth ranking", () => {
 		const counts = await countApiKeySelections(authStorage, "openai-codex", "policy-safety");
 		expectExclusivePreference(counts, "api-acct-safe", "api-acct-hot");
 		expectExclusivePreference(counts, "api-acct-safe", "api-acct-unknown");
+		authStorage.setAccountPolicies({
+			accountPolicies: [{ provider: "openai-codex", account: { accountId: "acct-hot" }, priority: 1 }],
+			defaultReservePct: 10,
+		});
+		expect(await authStorage.keys.get("openai-codex", "hot-priority")).toBe("api-acct-hot");
+		authStorage.setAccountPolicies({
+			accountPolicies: [{ provider: "openai-codex", account: { accountId: "acct-unknown" }, priority: 1 }],
+			defaultReservePct: 10,
+		});
+		expect(await authStorage.keys.get("openai-codex", "unknown-priority")).toBe("api-acct-unknown");
 	});
 
 	test("applies deterministic priority without a usage ranking strategy", async () => {
@@ -918,7 +1071,7 @@ describe("AuthStorage codex oauth ranking", () => {
 				{
 					provider: "openai-codex",
 					account: { accountId: "acct-protected" },
-					priority: 100,
+					reservePct: 10,
 				},
 			],
 		});
@@ -973,7 +1126,7 @@ describe("AuthStorage codex oauth ranking", () => {
 				{
 					provider: "openai-codex",
 					account: { accountId: "acct-protected" },
-					priority: 100,
+					reservePct: 10,
 				},
 			],
 		});

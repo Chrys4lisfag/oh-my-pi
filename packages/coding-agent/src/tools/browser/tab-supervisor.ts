@@ -1593,7 +1593,11 @@ async function closeTargetById(browser: PuppeteerBrowserHandle, targetId: string
 function sharedScopeOf(browser: BrowserHandle): SharedTargetScope | undefined {
 	if (!("browser" in browser)) return undefined;
 	if (browser.kind.kind !== "headless" || !browser.sharedDaemon) return undefined;
-	return { projectDir: browser.sharedDaemon.projectDir, daemonName: browser.sharedDaemon.name };
+	return {
+		projectDir: browser.sharedDaemon.projectDir,
+		daemonName: browser.sharedDaemon.name,
+		runtimeDir: browser.sharedDaemon.runtimeDir,
+	};
 }
 
 /**

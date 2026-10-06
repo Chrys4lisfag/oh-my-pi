@@ -23,6 +23,8 @@ export interface LogoutAccount {
 	active: boolean;
 	/** Routing-disabled credentials remain visible for usage and logout. */
 	routingDisabled?: boolean;
+	/** Undefined keeps automatic account selection. Higher priorities win. */
+	priority?: number;
 }
 
 /** Account picker for `/logout` after the provider has been selected. */

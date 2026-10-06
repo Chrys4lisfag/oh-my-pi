@@ -58,7 +58,7 @@ export interface AuthAccountSelector {
 export interface AuthAccountPolicy {
 	readonly provider: string;
 	readonly account: AuthAccountSelector;
-	/** Higher values win after hard, plan, reserve, hot-window, and measured-usage safety checks. */
+	/** Higher values win before automatic usage heuristics; positive priority drains to exhaustion unless reservePct is explicit. */
 	readonly priority?: number;
 	/** Protected remaining quota percentage for this account. */
 	readonly reservePct?: number;

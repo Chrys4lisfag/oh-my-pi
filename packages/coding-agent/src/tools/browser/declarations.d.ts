@@ -145,6 +145,8 @@ interface BrowserOpenOptions {
 	allow_file_access?: boolean;
 	/** Override the configured display mode for this open. */
 	headed?: boolean;
+	/** Autosave persistent site data in an OMP-owned profile shared across projects/sessions (default false). Managed Chromium only; headed/headless profiles are separate. Independent of persist. */
+	globalState?: boolean;
 	/** Keep the tab live across turn settle and idle close (default false). */
 	persist?: boolean;
 	/** Open timeout in seconds, excluding first-use browser installation. */

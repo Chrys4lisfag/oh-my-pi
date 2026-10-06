@@ -7,29 +7,33 @@ import { DynamicBorder } from "../chrome/dynamic-border";
 const ACCOUNT_SELECTOR_MAX_VISIBLE = 10;
 
 /**
- * Account manager for `/accounts <provider>`: toggle whether each stored
- * credential is used for request ROUTING. A disabled account is skipped for
- * model requests but stays logged in and keeps refreshing / reporting usage
- * (deletion lives in `/logout`). The picker stays open across toggles so the
- * user can flip several accounts in one pass; Esc closes it.
+ * Account routing and priority manager for `/accounts <provider>`.
+ * Disabled accounts stay logged in; Auto retains automatic account selection.
  */
 export class AccountManagerSelectorComponent extends Container {
 	#listContainer: Container;
 	#accounts: LogoutAccount[];
 	#selectedIndex = 0;
 	#statusMessage: string | undefined;
-	#onToggleCallback: (account: LogoutAccount, nextDisabled: boolean) => void;
+	#onToggleCallback: (account: LogoutAccount, nextDisabled: boolean) => void | Promise<void>;
+	#onPriorityCallback: (account: LogoutAccount, priority: number | undefined) => void | Promise<void>;
 	#onCloseCallback: () => void;
+	#onChangeCallback: () => void;
+	#busy = false;
 
 	constructor(
 		providerName: string,
 		accounts: LogoutAccount[],
-		onToggle: (account: LogoutAccount, nextDisabled: boolean) => void,
+		onToggle: (account: LogoutAccount, nextDisabled: boolean) => void | Promise<void>,
+		onPriority: (account: LogoutAccount, priority: number | undefined) => void | Promise<void>,
 		onClose: () => void,
+		onChange: () => void,
 	) {
 		super();
 		this.#accounts = accounts;
 		this.#onToggleCallback = onToggle;
+		this.#onPriorityCallback = onPriority;
+		this.#onChangeCallback = onChange;
 		this.#onCloseCallback = onClose;
 		const activeIndex = accounts.findIndex(account => account.active);
 		this.#selectedIndex = activeIndex >= 0 ? activeIndex : 0;
@@ -64,11 +68,17 @@ export class AccountManagerSelectorComponent extends Container {
 				? theme.fg("warning", "⊘ routing off")
 				: theme.fg("accent", "● routing on");
 			const activeTag = account.active ? theme.fg("muted", " (active)") : "";
+			const priority = theme.fg(
+				"muted",
+				` · priority ${account.type === "api_key" ? "N/A" : (account.priority ?? "Auto")}`,
+			);
 			const detail = account.detail ? theme.fg("dim", `  ${account.detail}`) : "";
 			if (i === this.#selectedIndex) {
-				rows.push(`${theme.fg("accent", `${theme.nav.cursor} ${account.label}`)}${activeTag}  ${badge}${detail}`);
+				rows.push(
+					`${theme.fg("accent", `${theme.nav.cursor} ${account.label}`)}${activeTag}  ${badge}${priority}${detail}`,
+				);
 			} else {
-				rows.push(`  ${account.label}${activeTag}  ${badge}${detail}`);
+				rows.push(`  ${account.label}${activeTag}  ${badge}${priority}${detail}`);
 			}
 		}
 
@@ -90,7 +100,11 @@ export class AccountManagerSelectorComponent extends Container {
 		}
 
 		this.#listContainer.addChild(
-			new TruncatedText(theme.fg("muted", "  ↑/↓ select · ↵/Space toggle routing · Esc done"), 0, 0),
+			new TruncatedText(
+				theme.fg("muted", "  ↑/↓ select · ↵/Space routing · +/- priority · a Auto · Esc done"),
+				0,
+				0,
+			),
 		);
 
 		if (this.#statusMessage) {
@@ -99,17 +113,39 @@ export class AccountManagerSelectorComponent extends Container {
 		}
 	}
 
-	#toggleSelected(): void {
+	async #mutateSelected(change: "routing" | "increase" | "decrease" | "auto"): Promise<void> {
 		const account = this.#accounts[this.#selectedIndex];
 		if (!account) return;
-		const nextDisabled = !account.routingDisabled;
-		account.routingDisabled = nextDisabled;
-		this.#statusMessage = `${account.label}: routing ${nextDisabled ? "off" : "on"}`;
-		this.#onToggleCallback(account, nextDisabled);
-		this.#updateList();
+		this.#busy = true;
+		try {
+			if (change === "routing") {
+				const nextDisabled = !account.routingDisabled;
+				await this.#onToggleCallback(account, nextDisabled);
+				account.routingDisabled = nextDisabled;
+				this.#statusMessage = `${account.label}: routing ${nextDisabled ? "off" : "on"}`;
+			} else {
+				if (account.type !== "oauth") throw new Error("Priority is available only for OAuth accounts");
+				let priority: number | undefined;
+				if (change === "increase") priority = Math.max(1, Math.floor(account.priority ?? 0) + 1);
+				else if (change === "decrease" && account.priority !== undefined && account.priority > 1) {
+					priority = Math.max(1, Math.ceil(account.priority) - 1);
+				}
+				if (priority !== undefined && !Number.isSafeInteger(priority)) throw new Error("Priority is too large");
+				await this.#onPriorityCallback(account, priority);
+				account.priority = priority;
+				this.#statusMessage = `${account.label}: priority ${priority ?? "Auto"}`;
+			}
+		} catch (error) {
+			this.#statusMessage = `Could not update ${account.label}: ${error instanceof Error ? error.message : String(error)}`;
+		} finally {
+			this.#busy = false;
+			this.#updateList();
+			this.#onChangeCallback();
+		}
 	}
 
-	handleInput(keyData: string): void {
+	async handleInput(keyData: string): Promise<void> {
+		if (this.#busy) return;
 		if (matchesSelectCancel(keyData)) {
 			this.#onCloseCallback();
 			return;
@@ -143,7 +179,13 @@ export class AccountManagerSelectorComponent extends Container {
 			this.#statusMessage = undefined;
 			this.#updateList();
 		} else if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n" || keyData === " ") {
-			this.#toggleSelected();
+			await this.#mutateSelected("routing");
+		} else if (keyData === "+" || keyData === "=") {
+			await this.#mutateSelected("increase");
+		} else if (keyData === "-") {
+			await this.#mutateSelected("decrease");
+		} else if (keyData === "a" || keyData === "A") {
+			await this.#mutateSelected("auto");
 		}
 	}
 }

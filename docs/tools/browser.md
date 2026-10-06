@@ -41,7 +41,7 @@ await tab.close();
 - `browser.close({ name?, all?, kill?, timeout? }) -> Promise<void>` releases one or all managed tabs.
 - `tab.close({ kill?, timeout? }) -> Promise<void>` releases that handle's tab.
 
-`open` accepts `name`, `url`, `viewport`, `wait_until`, `dialogs`, `app`, and `timeout`. `timeout` is in seconds, defaults to 30, and is clamped to 1–300.
+`open` accepts `name`, `url`, `app`, `viewport`, `wait_until`, `dialogs`, `allowed_domains`, `init_scripts`, `downloads`, `user_agent`, `ignore_https_errors`, `allow_file_access`, `headed`, `globalState`, `persist`, and `timeout`. `timeout` is in seconds, defaults to 30, and is clamped to 1–300.
 
 ### Direct tab helpers
 
@@ -107,6 +107,26 @@ Python `tab.run` accepts a JavaScript string only; it does not accept a Python c
 - **Cmux:** drives an available cmux WKWebView surface.
 
 Reusing one tab name across browser kinds is rejected until the existing tab is closed. Closing omp-owned headless pages and owned cmux surfaces closes them. Connected and relay pages remain open. Spawned browser processes remain open unless `kill: true` releases their last managed tab and terminates the process.
+
+### Shared, autosaved browser state
+
+Pass `globalState: true` to use an OMP-owned Chromium disk profile shared across projects and sessions. The default is `false`, preserving project isolation. This does not attach to or import your personal Chrome profile.
+
+```js
+const tab = await browser.open({ name: "account", url: "https://example.com", headed: true, globalState: true });
+```
+
+```python
+tab = await browser.open(name="account", url="https://example.com", headed=True, globalState=True)
+```
+
+Chromium automatically saves persistent cookies, localStorage, IndexedDB, service-worker data, and other persistent site data. No `saveState`/`loadState` snapshot is required. Session-only cookies and sessionStorage retain their normal browser/page lifetimes, and websites can still expire or revoke login sessions.
+
+Headed and headless browsers use **separate global profiles**. Use the same `headed` value when returning to a login; state is not copied between those profiles. Global state is shared with other opted-in projects, so clearing cookies/storage or logging out also affects those projects.
+
+`persist: true` independently keeps a tab live across turn settle and idle close; it does not select a storage profile. Closing a tab does not clear the global profile. Reusing a tab name with a different profile scope is rejected: close it first or use a different name.
+
+Global state requires managed Chromium. It rejects explicit app/attach options, configured CDP or relay, cmux, Tern, and `allow_file_access: true` instead of silently opening without persistence. `app.relay: false` and `app.tern: false` remain valid backend opt-outs. Disable other selected backends before requesting global state. A failed persistent-browser launch never falls back to a temporary profile.
 
 ## Screenshots and output
 

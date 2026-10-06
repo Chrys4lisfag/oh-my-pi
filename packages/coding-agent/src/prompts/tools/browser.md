@@ -4,7 +4,7 @@ Drive real Chromium tabs from JavaScript or Python Eval with the global `browser
 - Static content? Use `read`. Use `browser` for JavaScript execution, authenticated sessions, and interactive actions.
 - JavaScript: `await browser.open(options)` returns a `BrowserTab`; `browser.tab(name)` returns an existing handle; `await browser.tabs()` lists managed tabs; `await browser.close(options)` releases tabs.
 - Python: `await browser.open(name=…, url=…)`, synchronous `browser.tab(name)`, `await browser.tabs()`, and `await browser.close(name=…)`. Python methods accept keyword arguments.
-- `open` options: `name`, `url`, `app`, `viewport`, `wait_until`, `dialogs`, `allowed_domains`, `init_scripts`, `downloads`, `user_agent`, `ignore_https_errors`, `allow_file_access`, `headed`, `timeout`, `persist`.
+- `open` options: `name`, `url`, `app`, `viewport`, `wait_until`, `dialogs`, `allowed_domains`, `init_scripts`, `downloads`, `user_agent`, `ignore_https_errors`, `allow_file_access`, `headed`, `globalState`, `timeout`, `persist`.
 - `close` options: `name`, `all`, `kill`, `timeout`.
 - Direct tab helpers:
   - Navigation: `url`, `title`, `goto`, `back`, `forward`, `reload`, `pushState`.
@@ -41,6 +41,8 @@ Application modes:
 
 - Omit `app` for default automation; no executable path required. Managed Chromium installs automatically on first use.
 - `headed` picks a visible or hidden managed browser per open. `allow_file_access` is a launch flag and cannot change an already-running shared Chromium; use a dedicated `app.path` with `app.args`. `ignore_https_errors` applies per tab through CDP.
+- `globalState: true` (Python `globalState=True`) opts into autosaved persistent site data shared across projects and sessions in an OMP-owned Chromium profile, never your personal Chrome profile. Default false keeps project isolation. Headed and headless use separate global profiles: keep `headed` consistent to reuse logins. Chromium saves persistent cookies, localStorage, IndexedDB and other persistent site data; sessionStorage and session-only cookies retain normal browser lifetimes. No `saveState`/`loadState` calls are needed. `persist` only controls tab lifetime; closing the tab does not clear global data.
+- `globalState` requires managed Chromium: incompatible `app` options, configured CDP/relay, cmux, Tern, and `allow_file_access:true` fail rather than silently lose state. `app.relay:false` and `app.tern:false` may opt out of those backends. Close a named tab before switching its profile scope.
 - `app.path`: launch the specified browser or Electron executable. Chromium-family browsers use an omp-owned profile unless `args` supplies `--user-data-dir`.
 - `app.cdp_url`: attach to an existing CDP endpoint.
 - `app.relay: true`: drive the user's Chrome through the omp relay. `app.target` selects a tab by URL/title substring; without it, the visible tab is adopted. Opening with `url` navigates that adopted tab.

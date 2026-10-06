@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { withOAuthAccess } from "@oh-my-pi/pi-ai/auth-retry";
 import { type AuthCredentialStore, AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
 import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
+import type { UsageProvider } from "@oh-my-pi/pi-ai/usage";
 
 const PROVIDER = "unit-oauth-select";
 
@@ -54,6 +55,66 @@ describe("AuthStorage OAuth account selection", () => {
 		expect(accounts.map(a => a.email)).toEqual(["a@example.com", "b@example.com", "c@example.com"]);
 		// Read-only: listing must not refresh any token.
 		expect(refreshSpy).not.toHaveBeenCalled();
+	});
+
+	test("priority changes override automatic affinity without a usage provider", async () => {
+		const storage = authStorage;
+		if (!storage) throw new Error("test setup failed");
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
+			const credential = credentials[provider];
+			return credential ? { newCredentials: credential, apiKey: credential.access } : null;
+		});
+		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
+		storage.setAccountPolicies({
+			accountPolicies: [{ provider: PROVIDER, account: { accountId: "acc-a" }, priority: 1 }],
+			defaultReservePct: 10,
+		});
+		expect(await storage.keys.get(PROVIDER, "generic-priority")).toBe("access-a");
+		storage.setAccountPolicies({
+			accountPolicies: [{ provider: PROVIDER, account: { accountId: "acc-b" }, priority: 2 }],
+			defaultReservePct: 10,
+		});
+		expect(await storage.keys.get(PROVIDER, "generic-priority")).toBe("access-b");
+		storage.setAccountPolicies({ accountPolicies: [], defaultReservePct: 10 });
+		expect(await storage.keys.get(PROVIDER, "generic-priority")).toBe("access-b");
+		storage.keys.setConfig(PROVIDER, "configured-key");
+		expect(await storage.keys.get(PROVIDER, "generic-priority")).toBe("configured-key");
+		storage.keys.setRuntime(PROVIDER, "runtime-key");
+		expect(await storage.keys.get(PROVIDER, "generic-priority")).toBe("runtime-key");
+	});
+
+	test("generic usage exhaustion cannot prioritize a depleted account over a usable sibling", async () => {
+		if (!store) throw new Error("test setup failed");
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
+			const credential = credentials[provider];
+			return credential ? { newCredentials: credential, apiKey: credential.access } : null;
+		});
+		const usageProvider: UsageProvider = {
+			id: PROVIDER,
+			async fetchUsage({ credential }) {
+				const exhausted = credential.accountId === "acc-a";
+				return {
+					provider: PROVIDER,
+					fetchedAt: Date.now(),
+					limits: [
+						{
+							id: "requests",
+							label: "Requests",
+							scope: { provider: PROVIDER },
+							amount: { unit: "percent", usedFraction: exhausted ? 1 : 0.1 },
+							status: exhausted ? "exhausted" : "ok",
+						},
+					],
+				};
+			},
+		};
+		const storage = new AuthStorage(store, {
+			usageProviderResolver: provider => (provider === PROVIDER ? usageProvider : undefined),
+			accountPolicies: [{ provider: PROVIDER, account: { accountId: "acc-a" }, priority: 10 }],
+		});
+		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
+		expect(await storage.keys.get(PROVIDER, "generic-exhausted")).toBe("access-b");
+		expect(await storage.keys.get(PROVIDER, "generic-exhausted")).toBe("access-b");
 	});
 
 	test("sessions.pin selects and restores the exact stored account", async () => {

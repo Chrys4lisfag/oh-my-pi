@@ -127,6 +127,7 @@ const browserSchema = type({
 	"ignore_https_errors?": type("boolean").describe("ignore invalid HTTPS certificates"),
 	"allow_file_access?": type("boolean").describe("allow file URLs to read local files"),
 	"headed?": type("boolean").describe("override the configured browser display mode"),
+	"globalState?": type("boolean").describe("share an autosaved OMP Chromium profile across projects (default false)"),
 	"code?": type("string").describe("js body to run in tab"),
 	"fn?": type("string").describe("serialized JavaScript function to run in tab"),
 	"args?": type("unknown[]").describe("arguments passed to a serialized function"),
@@ -160,6 +161,31 @@ export function resolveBrowserKind(
 	params: BrowserParams,
 	session: ToolSession,
 	env: Record<string, string | undefined> = process.env,
+): BrowserKind {
+	if (
+		params.globalState &&
+		params.app &&
+		Object.entries(params.app).some(
+			([key, value]) => value !== undefined && !((key === "relay" || key === "tern") && value === false),
+		)
+	) {
+		throw new ToolError(
+			"globalState:true requires managed Chromium and cannot be combined with app options other than relay:false or tern:false.",
+		);
+	}
+	const kind = resolveConfiguredBrowserKind(params, session, env);
+	if (params.globalState && kind.kind !== "headless") {
+		throw new ToolError(
+			`globalState:true requires managed Chromium, but ${kind.kind} is selected. Disable the configured CDP, relay, cmux, or Tern backend first.`,
+		);
+	}
+	return kind;
+}
+
+function resolveConfiguredBrowserKind(
+	params: BrowserParams,
+	session: ToolSession,
+	env: Record<string, string | undefined>,
 ): BrowserKind {
 	const app = params.app;
 	if (app?.cdp_url) {
@@ -232,6 +258,7 @@ function chromiumKind(params: BrowserParams, session: ToolSession): BrowserKind 
 	return {
 		kind: "headless",
 		headless,
+		globalState: params.globalState ?? false,
 		ignoreHttpsErrors: params.ignore_https_errors,
 		allowFileAccess: params.allow_file_access,
 	};
@@ -615,7 +642,7 @@ function describeBrowser(handle: BrowserHandle): string {
 	}
 	switch (handle.kind.kind) {
 		case "headless":
-			return `headless browser (${handle.kind.headless ? "hidden" : "visible"}${handle.sharedDaemon ? ", shared" : ""})`;
+			return `headless browser (${handle.kind.headless ? "hidden" : "visible"}${handle.kind.globalState ? ", global state" : ""}${handle.sharedDaemon ? ", shared" : ""})`;
 		case "spawned":
 			return `spawned ${handle.kind.path} (pid ${handle.pid ?? "?"})`;
 		case "connected":
@@ -628,7 +655,7 @@ function describeBrowser(handle: BrowserHandle): string {
 function describeKind(kind: BrowserKind): string {
 	switch (kind.kind) {
 		case "headless":
-			return `headless ${kind.headless ? "hidden" : "visible"}`;
+			return `headless ${kind.headless ? "hidden" : "visible"}${kind.globalState ? " global state" : ""}`;
 		case "spawned":
 			return `spawned:${kind.path}`;
 		case "connected":

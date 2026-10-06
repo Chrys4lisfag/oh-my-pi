@@ -608,10 +608,11 @@ def _make_browser():
             ignore_https_errors=None,
             allow_file_access=None,
             headed=None,
+            globalState=None,
             timeout=None,
             persist=None,
         ):
-            """Open or attach to a browser tab and return its handle."""
+            """Open a tab; globalState shares autosaved site data across projects, not tab lifetime."""
             if name is not None:
                 _require_name(name, "browser.open()")
             details = await _invoke(
@@ -630,6 +631,7 @@ def _make_browser():
                     "ignore_https_errors": ignore_https_errors,
                     "allow_file_access": allow_file_access,
                     "headed": headed,
+                    "globalState": globalState,
                     "timeout": timeout,
                     "persist": persist,
                 },

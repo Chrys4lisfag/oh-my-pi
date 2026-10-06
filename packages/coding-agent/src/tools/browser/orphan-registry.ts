@@ -28,10 +28,12 @@ import { daemonRuntimeDir } from "../../launch/paths";
 
 /** Identifies one shared-browser daemon's target registry. */
 export interface SharedTargetScope {
-	/** Canonical project directory owning the broker (as stamped on the handle). */
+	/** Canonical broker scope (project directory or global service directory). */
 	projectDir: string;
 	/** Broker daemon name, e.g. `omp.browser.headless`. */
 	daemonName: string;
+	/** Explicit runtime directory for a machine-global broker scope. */
+	runtimeDir?: string;
 }
 
 /** On-disk ownership record: one file per owning omp process. */
@@ -55,7 +57,7 @@ const ownedByDir = new Map<string, Set<string>>();
 const writeChains = new Map<string, Promise<void>>();
 
 function registryDir(scope: SharedTargetScope): string {
-	return path.join(daemonRuntimeDir(scope.projectDir), `${scope.daemonName}.targets`);
+	return path.join(scope.runtimeDir ?? daemonRuntimeDir(scope.projectDir), `${scope.daemonName}.targets`);
 }
 
 /** Serialize a write against others for the same registry dir. */

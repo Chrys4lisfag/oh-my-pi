@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added persistent OAuth account priorities in `/accounts`: use `+`/`-` to prefer accounts until quota exhaustion and `a` to restore automatic routing.
+- Added `browser.open({ globalState: true })` to automatically persist cookies and website storage across projects, with separate headed and headless profiles.
+
 ### Fixed
 
 - Fixed resumed sessions retaining outdated fallback models instead of their configured profile primary, and profile switches retaining previous fallback ownership.

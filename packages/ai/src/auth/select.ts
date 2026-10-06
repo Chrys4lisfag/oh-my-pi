@@ -34,6 +34,7 @@ import {
 	isUsageLimitReached,
 	normalizeUsageFraction,
 	remainingUsageFraction,
+	reserveUsageLimits,
 	scopedUsageLimits,
 	usageResetAtMs,
 	windowRequiredDrain,
@@ -131,6 +132,10 @@ export class CredentialSelector {
 		return order;
 	}
 
+	#accountPriority(provider: string, credential: AuthCredential): number {
+		return this.#deps.policies.forCredential(provider, credential)?.priority ?? 0;
+	}
+
 	/**
 	 * Selects a credential of the specified type for a provider.
 	 * Returns both the credential and its index in the original array (for updates/removal).
@@ -163,6 +168,13 @@ export class CredentialSelector {
 
 		const providerKey = providerTypeKey(provider, type);
 		const order = this.#getCredentialOrder(providerKey, sessionId, credentials.length);
+		if (type === "oauth") {
+			order.sort(
+				(left, right) =>
+					this.#accountPriority(provider, credentials[right]!.credential) -
+					this.#accountPriority(provider, credentials[left]!.credential),
+			);
+		}
 		const fallback = credentials[order[0]];
 
 		for (const idx of order) {
@@ -434,7 +446,11 @@ export class CredentialSelector {
 			const { selection, usage, usageChecked } = result;
 			let { blockedUntil } = result;
 			let blocked = blockedUntil !== undefined;
-			const scopedLimits = usage && strategy ? scopedUsageLimits(strategy, usage, args.rankingContext) : undefined;
+			const scopedLimits = usage
+				? strategy
+					? scopedUsageLimits(strategy, usage, args.rankingContext)
+					: reserveUsageLimits(undefined, usage, args.rankingContext)
+				: undefined;
 			if (!blocked && scopedLimits && isUsageLimitReached(scopedLimits)) {
 				const resetAtMs = usageResetAtMs(scopedLimits, nowMs);
 				blockedUntil = resetAtMs ?? Date.now() + DEFAULT_BLOCK_MS;
@@ -456,7 +472,8 @@ export class CredentialSelector {
 				strategy === undefined ? remainingFraction !== undefined : primary !== undefined || secondary !== undefined;
 			const primaryUncapped = primary === undefined && secondary !== undefined;
 			const policy = this.#deps.policies.forCredential(args.provider, selection.credential);
-			const reservePct = policy?.reservePct ?? args.defaultReservePct;
+			const accountPriority = policy?.priority ?? 0;
+			const reservePct = policy?.reservePct ?? (accountPriority > 0 ? 0 : args.defaultReservePct);
 			const reserveFraction =
 				reservePct === undefined || !Number.isFinite(reservePct)
 					? undefined
@@ -470,7 +487,7 @@ export class CredentialSelector {
 				inReserve:
 					reserveFraction !== undefined && remainingFraction !== undefined && remainingFraction <= reserveFraction,
 				reserveMeasured: reserveFraction !== undefined && remainingFraction !== undefined,
-				accountPriority: policy?.priority === undefined || !Number.isFinite(policy.priority) ? 0 : policy.priority,
+				accountPriority,
 				usageMeasured,
 				hasPriorityBoost: strategy?.hasPriorityBoost?.(primary, primaryUncapped, args.rankingContext) ?? false,
 				planPriority: planPriority(args.planGate, usage),
@@ -517,10 +534,7 @@ export class CredentialSelector {
 				(entry): entry is { credential: OAuthCredential; index: number } =>
 					entry.credential.type === "oauth" && !this.#deps.pool.isRoutingDisabledAtIndex(provider, entry.index),
 			);
-		this.#deps.policies.validateFor(
-			provider,
-			credentials.map(entry => entry.credential),
-		);
+		this.#deps.policies.validateFor(provider, this.#deps.pool.credentials(provider));
 
 		if (credentials.length === 0) return undefined;
 		this.#deps.policies.validateUsageCapability(provider, this.#deps.usage.canFetchOAuthUsage(provider));
@@ -545,9 +559,7 @@ export class CredentialSelector {
 		const hasAccountPolicy = credentials.some(
 			({ credential }) => this.#deps.policies.forCredential(provider, credential) !== undefined,
 		);
-		const hasPriorityPolicy = credentials.some(
-			({ credential }) => this.#deps.policies.forCredential(provider, credential)?.priority !== undefined,
-		);
+		const hasPriorityPolicy = credentials.some(({ credential }) => this.#accountPriority(provider, credential) > 0);
 		const canFetchPolicyUsage = strategy !== undefined || this.#deps.usage.canFetchOAuthUsage(provider);
 		const policyReserveEnabled = hasAccountPolicy && canFetchPolicyUsage;
 		const checkUsage =
@@ -580,7 +592,8 @@ export class CredentialSelector {
 		const sessionPinIsExplicit = sessionCredential?.type === "oauth" && sessionCredential.explicit === true;
 		const shouldRank =
 			checkUsage &&
-			(!sessionPreferredIsAvailable ||
+			(hasPriorityPolicy ||
+				!sessionPreferredIsAvailable ||
 				!sessionPreferredIsWarm ||
 				hasPlanRequirement ||
 				(policyReserveEnabled && !sessionPinIsExplicit));
@@ -590,17 +603,15 @@ export class CredentialSelector {
 		// workspace traffic may have kept warm, while still rotating away from a clearly-worse account.
 		const baseRankingOrder = credentials.map((_credential, index) => index);
 		const policyOrder = hasPriorityPolicy
-			? [...baseRankingOrder].sort((leftIndex, rightIndex) => {
-					const leftPriority =
-						this.#deps.policies.forCredential(provider, credentials[leftIndex]!.credential)?.priority ?? 0;
-					const rightPriority =
-						this.#deps.policies.forCredential(provider, credentials[rightIndex]!.credential)?.priority ?? 0;
-					return rightPriority - leftPriority || leftIndex - rightIndex;
-				})
+			? order.sort(
+					(left, right) =>
+						this.#accountPriority(provider, credentials[right]!.credential) -
+						this.#accountPriority(provider, credentials[left]!.credential),
+				)
 			: order;
 		let rankingOrder = shouldRank && sessionId ? baseRankingOrder : policyOrder;
 		const sessionPreferredRankingPos =
-			shouldRank && sessionId && sessionPreferredIndex !== undefined && !hasPlanRequirement
+			shouldRank && sessionId && sessionPreferredIndex !== undefined && (!hasPlanRequirement || hasPriorityPolicy)
 				? credentials.findIndex(entry => entry.index === sessionPreferredIndex)
 				: -1;
 		if (sessionPreferredRankingPos > 0) {
@@ -639,6 +650,21 @@ export class CredentialSelector {
 				candidate.selection.index === sessionPreferredIndex,
 		);
 		const preferredCandidate = sessionPreferredCandidate === -1 ? undefined : candidates[sessionPreferredCandidate];
+		const priorityWouldEvictAutomaticPin = (excludePreflightFailures: boolean): boolean =>
+			!sessionPinIsExplicit &&
+			preferredCandidate !== undefined &&
+			candidates.some(
+				candidate =>
+					(!excludePreflightFailures || !preflightFailures.has(candidate)) &&
+					!this.#deps.blocks.isBlocked(provider, providerKey, candidate.selection.index, blockScopes) &&
+					(!hasPlanRequirement || planGate?.(candidate.usage) !== false) &&
+					candidate.inReserve !== true &&
+					this.#accountPriority(provider, candidate.selection.credential) >
+						this.#accountPriority(provider, preferredCandidate.selection.credential),
+			);
+		const keepPreferredPriority =
+			preferredCandidate !== undefined &&
+			this.#accountPriority(provider, preferredCandidate.selection.credential) > 0;
 		const reserveWouldEvictAutomaticPin = (excludePreflightFailures: boolean): boolean =>
 			!sessionPinIsExplicit &&
 			preferredCandidate?.inReserve === true &&
@@ -650,12 +676,14 @@ export class CredentialSelector {
 					candidate.inReserve === false,
 			);
 		const reserveWouldEvictBeforePreflight = reserveWouldEvictAutomaticPin(false);
-		// A warm automatic pin normally wins. Reserve is the one policy allowed
-		// to evict it, and only while a sibling is confirmed outside reserve.
+		// Explicit pins win; automatic pins yield to reserve and higher account priority.
 		if (
 			!hasPlanRequirement &&
 			sessionPreferredCandidate > 0 &&
-			(!shouldRank || sessionPinIsExplicit || (sessionPreferredIsWarm && !reserveWouldEvictBeforePreflight))
+			!priorityWouldEvictAutomaticPin(false) &&
+			(!shouldRank ||
+				sessionPinIsExplicit ||
+				((sessionPreferredIsWarm || keepPreferredPriority) && !reserveWouldEvictBeforePreflight))
 		) {
 			const [preferred] = candidates.splice(sessionPreferredCandidate, 1);
 			candidates.unshift(preferred);
@@ -784,8 +812,9 @@ export class CredentialSelector {
 			!hasPlanRequirement &&
 			preferredCandidate !== undefined &&
 			!preflightFailures.has(preferredCandidate) &&
-			sessionPreferredIsWarm &&
+			(sessionPreferredIsWarm || keepPreferredPriority) &&
 			!sessionPinIsExplicit &&
+			!priorityWouldEvictAutomaticPin(true) &&
 			!reserveWouldEvictAfterPreflight
 		) {
 			const preferredIndex = candidates.indexOf(preferredCandidate);
@@ -808,12 +837,19 @@ export class CredentialSelector {
 		// unenforced and the pin is not known-ineligible) so an active session never
 		// silently migrates accounts mid-conversation; blocked, exhausted, or
 		// known-ineligible pins still fall through to the ranked sibling.
-		if (hasPlanRequirement && sessionPreferredCandidate > 0 && !reserveWouldEvictAfterPreflight) {
-			const preferred = candidates[sessionPreferredCandidate]!;
-			const planEligibility = planGate?.(preferred.usage);
+		if (
+			hasPlanRequirement &&
+			preferredCandidate !== undefined &&
+			!reserveWouldEvictAfterPreflight &&
+			!priorityWouldEvictAutomaticPin(true)
+		) {
+			const planEligibility = planGate?.(preferredCandidate.usage);
 			if (planEligibility === true || (!enforcePlanRequirement && planEligibility !== false)) {
-				candidates.splice(sessionPreferredCandidate, 1);
-				candidates.unshift(preferred);
+				const preferredIndex = candidates.indexOf(preferredCandidate);
+				if (preferredIndex > 0) {
+					candidates.splice(preferredIndex, 1);
+					candidates.unshift(preferredCandidate);
+				}
 			}
 		}
 
@@ -946,8 +982,10 @@ export class CredentialSelector {
 			if (applyPlanFilter && planGate?.(usage) !== true) {
 				return undefined;
 			}
-			if (checkUsage && !allowBlocked && usage && strategy && rankingContext) {
-				const scopedLimits = scopedUsageLimits(strategy, usage, rankingContext);
+			if (checkUsage && !allowBlocked && usage && rankingContext) {
+				const scopedLimits = strategy
+					? scopedUsageLimits(strategy, usage, rankingContext)
+					: reserveUsageLimits(undefined, usage, rankingContext);
 				if (isUsageLimitReached(scopedLimits)) {
 					const resetAtMs = usageResetAtMs(scopedLimits, Date.now());
 					this.#deps.blocks.mark(
@@ -1015,8 +1053,10 @@ export class CredentialSelector {
 				if (applyPlanFilter && planGate?.(usage) !== true) {
 					return undefined;
 				}
-				if (checkUsage && !allowBlocked && usage && strategy && rankingContext) {
-					const scopedLimits = scopedUsageLimits(strategy, usage, rankingContext);
+				if (checkUsage && !allowBlocked && usage && rankingContext) {
+					const scopedLimits = strategy
+						? scopedUsageLimits(strategy, usage, rankingContext)
+						: reserveUsageLimits(undefined, usage, rankingContext);
 					if (isUsageLimitReached(scopedLimits)) {
 						const resetAtMs = usageResetAtMs(scopedLimits, Date.now());
 						this.#deps.blocks.mark(

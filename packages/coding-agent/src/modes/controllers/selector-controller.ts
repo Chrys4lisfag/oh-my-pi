@@ -2,6 +2,7 @@ import { type AgentMessage, type AgentToolResult, ThinkingLevel } from "@oh-my-p
 import type { CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Model, PASTE_CODE_LOGIN_PROVIDERS as PasteCodeLoginProviders, UsageReport } from "@oh-my-pi/pi-ai";
 import type { getOAuthProviders as GetOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
+import { AccountPolicies } from "@oh-my-pi/pi-ai/auth/policy";
 import type { OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import type { Component, OverlayHandle } from "@oh-my-pi/pi-tui";
@@ -29,6 +30,7 @@ import { formatLoginIdentity } from "../../cli/oauth-terminal";
 import { resolveAdvisorRoleSelection, resolveModelRoleValue } from "../../config/model-resolver";
 import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import { getRoleInfo } from "../../config/model-roles";
+import { cfgAuthAccountPolicies } from "../../config/model-settings";
 import { settings } from "../../config/settings";
 import { createSettingsHost } from "../../config/settings-ui";
 import { createPluginSettingsHost } from "../../extensibility/plugins/settings-host";
@@ -59,6 +61,7 @@ import { SessionManager } from "../../session/session-manager";
 import { loadPinnedSessionIds } from "../../session/session-pins";
 import { FileSessionStorage } from "../../session/session-storage";
 import { toLogoutAccounts } from "../../slash-commands/helpers/logout";
+import { setAccountPriority } from "../../slash-commands/helpers/account-priority";
 import type { LogoutAccount } from "@oh-my-pi/pi-tui/overlays/logout-account-selector";
 import { describeRedeemOutcome, toResetUsageAccounts } from "../../slash-commands/helpers/reset-usage";
 import { toSessionPinAccounts } from "../../slash-commands/helpers/session-pin";
@@ -2046,17 +2049,19 @@ export class SelectorController {
 		}
 		const { getOAuthProviders, AccountManagerSelectorComponent } = loadProviderAuthUi();
 		const provider = getOAuthProviders().find(candidate => candidate.id === providerId);
-		const accounts = toLogoutAccounts(providerId, authStorage.credentials.list(providerId), {
+		const credentials = authStorage.credentials.list(providerId);
+		const policies = new AccountPolicies(cfgAuthAccountPolicies.get(this.ctx.settings), undefined);
+		const accounts = toLogoutAccounts(providerId, credentials, {
 			activeIdentity: authStorage.oauth.identity(providerId, this.ctx.session.sessionId),
 			activeApiKey: authStorage.keys.source(providerId)?.kind === "api_key",
 			isRoutingDisabled: credentialId => authStorage.credentials.isRoutingDisabled(credentialId),
 		});
+		for (const account of accounts) {
+			const credential = credentials.find(row => row.id === account.credentialId)?.credential;
+			if (credential) account.priority = policies.forCredential(providerId, credential)?.priority;
+		}
 		if (accounts.length === 0) {
 			this.ctx.showError(`No stored credentials for ${providerId} to manage.`);
-			return;
-		}
-		if (accounts.length === 1) {
-			this.ctx.showStatus(`${providerId} has a single account; routing toggle needs 2+ accounts.`);
 			return;
 		}
 		this.showSelector(done => {
@@ -2064,14 +2069,23 @@ export class SelectorController {
 				provider?.name ?? providerId,
 				accounts,
 				(account, nextDisabled) => {
-					// Persist the toggle immediately; the selector stays open.
 					authStorage.credentials.setRoutingEnabled(providerId, account.credentialId, !nextDisabled);
-					this.ctx.ui.requestRender();
+				},
+				async (account, priority) => {
+					await authStorage.credentials.reload();
+					await setAccountPriority(
+						this.ctx.settings,
+						providerId,
+						authStorage.credentials.list(providerId),
+						account.credentialId,
+						priority,
+					);
 				},
 				() => {
 					done();
 					this.ctx.ui.requestRender();
 				},
+				() => this.ctx.ui.requestRender(),
 			);
 			return { component: selector, focus: selector };
 		});

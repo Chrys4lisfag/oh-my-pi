@@ -27,6 +27,8 @@ export type PuppeteerBrowserKind =
 	| {
 			kind: "headless";
 			headless: boolean;
+			/** Share a persistent OMP-owned Chromium profile across projects and sessions. */
+			globalState?: boolean;
 			/** Process-local launch flag; shared browsers use the tab-scoped CDP override instead. */
 			ignoreHttpsErrors?: boolean;
 			/** Process-local file access launch flag, unsupported by an already-running shared browser. */
@@ -61,7 +63,7 @@ export interface PuppeteerBrowserHandle extends BrowserHandleCommon {
 	/** OMP-owned temp Chromium profile directory removed on dispose (process-local headless launches). */
 	userDataDir?: string;
 	/** Broker daemon backing this handle; dispose disconnects instead of closing, kill routes to the broker. */
-	sharedDaemon?: { name: string; projectDir: string };
+	sharedDaemon?: { name: string; projectDir: string; runtimeDir?: string };
 	subprocess?: Subprocess;
 	stealth: { browserSession: CDPSession | null; override: UserAgentOverride | null };
 }
@@ -95,7 +97,7 @@ const pendingOpens = new Map<string, Promise<BrowserHandle>>();
 export function browserKey(kind: BrowserKind): string {
 	switch (kind.kind) {
 		case "headless":
-			return `headless:${kind.headless ? "1" : "0"}:${kind.ignoreHttpsErrors ? "tls" : ""}:${kind.allowFileAccess ? "file" : ""}`;
+			return `headless:${kind.headless ? "1" : "0"}:${kind.ignoreHttpsErrors ? "tls" : ""}:${kind.allowFileAccess ? "file" : ""}${kind.globalState ? ":global" : ""}`;
 		case "spawned":
 			return `spawned:${JSON.stringify([kind.path, kind.args ?? []])}`;
 		case "connected":
@@ -193,12 +195,9 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		return { key: browserKey(kind), kind, tern, refCount: 0 };
 	}
 	if (kind.kind === "headless") {
-		// Every real omp process (session, subagent, worker — anything with a CLI
-		// worker host) MUST go through the project-shared broker-owned Chromium:
-		// per-process launches are what produced launch storms and orphaned
-		// process trees. The process-local launch survives only for hosts that
-		// cannot spawn the broker (bun test, SDK embedding without a CLI entry).
-		if (isCompiledBinary() || workerHostEntry() !== null) {
+		// CLI hosts always use a broker. Global state requires one even in SDK
+		// hosts, where the broker resolves the package CLI worker entry itself.
+		if (kind.globalState || isCompiledBinary() || workerHostEntry() !== null) {
 			return await openSharedHeadlessHandle(kind, opts);
 		}
 		const { browser, userDataDir } = await launchHeadlessBrowser({
@@ -431,7 +430,7 @@ async function openSharedHeadlessHandle(
 ): Promise<PuppeteerBrowserHandle> {
 	if (kind.allowFileAccess) {
 		throw new ToolError(
-			"browser.open({ allow_file_access:true }) requires a process-local Chromium launch and cannot be applied to the project-shared browser. Use app.path to launch a dedicated browser.",
+			"browser.open({ allow_file_access:true }) requires a process-local Chromium launch and cannot be applied to a shared browser, including globalState. Use app.path to launch a dedicated browser.",
 		);
 	}
 	const vp = opts.viewport ?? DEFAULT_VIEWPORT;
@@ -439,6 +438,7 @@ async function openSharedHeadlessHandle(
 		const shared = await ensureSharedBrowser({
 			projectDir: opts.cwd,
 			headless: kind.headless,
+			globalState: kind.globalState,
 			viewport: vp,
 			signal: opts.signal,
 		});
@@ -463,12 +463,16 @@ async function openSharedHeadlessHandle(
 		// left behind by omp processes that died without teardown — bounds
 		// accumulation without a background timer. Best-effort and detached so a
 		// slow reap never delays the open (issue #10022).
-		void reapOrphanSharedTargets(browser, { projectDir: shared.projectDir, daemonName: shared.daemonName });
+		void reapOrphanSharedTargets(browser, {
+			projectDir: shared.projectDir,
+			daemonName: shared.daemonName,
+			runtimeDir: shared.runtimeDir,
+		});
 		return {
 			key: browserKey(kind),
 			kind,
 			browser,
-			sharedDaemon: { name: shared.daemonName, projectDir: shared.projectDir },
+			sharedDaemon: { name: shared.daemonName, projectDir: shared.projectDir, runtimeDir: shared.runtimeDir },
 			refCount: 0,
 			stealth: { browserSession: null, override: null },
 		};

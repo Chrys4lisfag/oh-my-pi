@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { afterAll, describe, expect, it } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
-import { createBrowserPrelude } from "@oh-my-pi/pi-coding-agent/tools/browser";
+import { createBrowserPrelude, resolveBrowserKind } from "@oh-my-pi/pi-coding-agent/tools/browser";
 import { applyIgnoreHttpsErrors, resolveInitScriptSources } from "@oh-my-pi/pi-coding-agent/tools/browser/open-options";
 import { buildHeadlessLaunchArgs } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import { releaseAllTabs } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
@@ -89,6 +89,58 @@ describe("browser open options CDP helpers", () => {
 			"globalThis.fromFile = true;",
 			"globalThis.inline = true;",
 		]);
+	});
+});
+
+describe("browser global state options", () => {
+	function session(settings: Record<string, unknown> = {}): ToolSession {
+		return {
+			cwd: process.cwd(),
+			hasUI: false,
+			getSessionFile: () => null,
+			getSessionSpawns: () => null,
+			settings: Settings.isolated({ "browser.relay": false, ...settings }),
+		};
+	}
+
+	const incompatibleApps: NonNullable<Parameters<typeof resolveBrowserKind>[0]["app"]>[] = [
+		{ path: "chrome.exe" },
+		{ cdp_url: "http://127.0.0.1:9222" },
+		{ relay: true },
+		{ tern: true },
+		{ target: "Account" },
+		{ args: ["--user-data-dir=personal"] },
+	];
+	it.each(incompatibleApps)("rejects app options rather than ignoring global state: %j", app => {
+		expect(() => resolveBrowserKind({ action: "open", globalState: true, app }, session(), {})).toThrow(
+			/globalState:true requires managed Chromium/,
+		);
+	});
+
+	it.each([
+		{ settings: { "browser.cdpUrl": "http://127.0.0.1:9222" }, env: {}, backend: "connected" },
+		{ settings: { "browser.relay": true }, env: {}, backend: "relay" },
+		{ settings: {}, env: { CMUX_SOCKET_PATH: "/tmp/cmux.sock" }, backend: "cmux" },
+		{ settings: {}, env: { TERN_PANE_SOCKET: "/tmp/tern.sock", TERN_PANE: "42" }, backend: "tern" },
+	])("rejects selected $backend backend without changing its normal selection", ({ settings, env, backend }) => {
+		const host = session(settings);
+		expect(resolveBrowserKind({ action: "open", globalState: false }, host, env).kind).toBe(backend);
+		expect(() => resolveBrowserKind({ action: "open", globalState: true }, host, env)).toThrow(
+			`globalState:true requires managed Chromium, but ${backend} is selected`,
+		);
+	});
+
+	it("allows relay and Tern opt-outs while retaining global storage and display selection", () => {
+		const kind = resolveBrowserKind(
+			{ action: "open", globalState: true, headed: true, app: { relay: false, tern: false } },
+			session({ "browser.relay": true }),
+			{ TERN_PANE_SOCKET: "/tmp/tern.sock", TERN_PANE: "42" },
+		);
+		expect(kind).toMatchObject({ kind: "headless", headless: false, globalState: true });
+	});
+
+	it("rejects non-boolean global state before launching a browser", async () => {
+		await expect(browserHost()({ action: "open", globalState: "true" })).rejects.toThrow(/invalid arguments/);
 	});
 });
 
