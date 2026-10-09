@@ -10,6 +10,7 @@
 ### Fixed
 
 - Fixed resumed sessions retaining outdated fallback models instead of their configured profile primary, and profile switches retaining previous fallback ownership.
+- Fixed unrelated model-role edits dropping saved profile defaults and profile-only edits not persisting; profiles without a primary now warn and block prompts instead of silently using the previous model.
 ## [18.6.3] - 2026-10-06
 
 ### Breaking Changes

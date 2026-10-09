@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { Effort } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
@@ -14,6 +15,12 @@ import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
+import { StatusLineComponent } from "@oh-my-pi/pi-tui/status-line";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import { statusLineHost } from "@oh-my-pi/pi-coding-agent/modes/status-line-host";
+import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
+import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { StatusLineTestComponents } from "./helpers/status-line";
 
 const PROVIDER = "anthropic";
 const INITIAL_MODEL_ID = "claude-sonnet-4-5";
@@ -32,6 +39,20 @@ describe("live profile synchronization", () => {
 	let session: AgentSession;
 	let requestedModels: string[];
 	let onProviderCall: (() => void) | undefined;
+	const statusLines = new StatusLineTestComponents();
+
+	function renderModel(): string {
+		const footer = statusLines.track(
+			new StatusLineComponent(session, {
+				...statusLineHost,
+				getSettings: () => ({ preset: "custom", leftSegments: ["model"], rightSegments: [], sessionAccent: false }),
+				getSettingsRevision: () => peer.revision,
+				gitEnabled: () => false,
+				codexResetFireworksEnabled: () => false,
+			}),
+		);
+		return stripVTControlCharacters(footer.getTopBorder(180).content);
+	}
 
 	async function waitFor(predicate: () => boolean, timeoutMs = 3_000): Promise<void> {
 		const deadline = Date.now() + timeoutMs;
@@ -43,6 +64,7 @@ describe("live profile synchronization", () => {
 
 	beforeEach(async () => {
 		resetSettingsForTest();
+		await initTheme();
 		tempDir = TempDir.createSync("@pi-profile-live-sync-");
 		writer = await Settings.loadIsolated({ cwd: tempDir.path(), agentDir: tempDir.path() });
 		writer.setProfileItem("selected", {
@@ -95,6 +117,7 @@ describe("live profile synchronization", () => {
 
 	afterEach(async () => {
 		vi.useRealTimers();
+		statusLines.dispose();
 		if (session) await session.dispose();
 		resetSettingsForTest();
 		AgentStorage.close();
@@ -178,6 +201,135 @@ describe("live profile synchronization", () => {
 		await session.prompt("use the configured primary");
 		expect(requestedModels).toEqual([INITIAL_MODEL_ID]);
 		expect(session.servingModel?.isFallback).toBe(false);
+	});
+
+	it("switches the displayed and requested primary through a profile round trip", async () => {
+		await session.prompt("profile A");
+		expect(await session.bindSessionProfile("fallback")).toBe(true);
+		expect(session.getConfiguredDefaultModelState()).toMatchObject({ missing: false, unavailable: false });
+		expect(renderModel()).toContain("Haiku");
+		expect(renderModel()).not.toContain("Sonnet");
+		await session.prompt("profile B");
+
+		expect(await session.bindSessionProfile("selected")).toBe(true);
+		expect(session.model?.id).toBe(INITIAL_MODEL_ID);
+		expect(session.thinkingLevel).toBe(Effort.Medium);
+		expect(renderModel()).toContain("Sonnet");
+		await session.prompt("profile A again");
+		expect(requestedModels).toEqual([INITIAL_MODEL_ID, FALLBACK_MODEL_ID, INITIAL_MODEL_ID]);
+	});
+
+	it("blocks a profile without a primary instead of guessing from another role or sending the old model", async () => {
+		peer.setProfileItem("no-primary", {
+			modelRoles: { task: `${PROVIDER}/${FALLBACK_MODEL_ID}`, slow: `${PROVIDER}/${INITIAL_MODEL_ID}` },
+			defaultThinkingLevel: Effort.Low,
+		});
+		const warnings: string[] = [];
+		const errors: string[] = [];
+		const ctx = {
+			settings: peer,
+			session,
+			statusLine: { invalidate: () => {} },
+			updateEditorBorderColor: () => {},
+			showStatus: () => {},
+			showWarning: (message: string) => warnings.push(message),
+			showError: (message: string) => errors.push(message),
+		} as unknown as InteractiveModeContext;
+		await new CommandController(ctx).handleProfilesCommand("switch no-primary");
+		expect(errors).toEqual([]);
+		expect(warnings.some(message => message.includes("/model"))).toBe(true);
+		expect(session.getSessionProfileName()).toBe("no-primary");
+		expect(session.getConfiguredDefaultModelState()).toMatchObject({
+			configuredSelector: undefined,
+			resolvedModel: undefined,
+			missing: true,
+			unavailable: false,
+		});
+		const footer = renderModel();
+		expect(footer).toContain("no-model");
+		expect(footer).toContain("[not configured]");
+		expect(footer).not.toContain("Sonnet");
+		await expect(session.prompt("do not use the previous profile")).rejects.toThrow(/no default model configured/);
+		expect(requestedModels).toEqual([]);
+
+		const replacement = getBundledModel(PROVIDER, FALLBACK_MODEL_ID)!;
+		await session.setModel(replacement, "default", { persist: true });
+		await peer.flush();
+		expect(session.getConfiguredDefaultModelState().missing).toBe(false);
+		expect(renderModel()).toContain("Haiku");
+		await session.prompt("use the repaired primary");
+		expect(await session.bindSessionProfile("selected")).toBe(true);
+		await session.prompt("return to A");
+		expect(await session.bindSessionProfile("no-primary")).toBe(true);
+		await session.prompt("return to repaired B");
+		expect(requestedModels).toEqual([FALLBACK_MODEL_ID, INITIAL_MODEL_ID, FALLBACK_MODEL_ID]);
+	});
+
+	it("keeps an explicitly selected unavailable profile but never sends its previous runtime model", async () => {
+		const selector = "missing-provider/missing-model";
+		peer.setProfileItem("unavailable", {
+			modelRoles: { default: selector },
+			defaultThinkingLevel: Effort.Low,
+		});
+		expect(await session.bindSessionProfile("unavailable")).toBe(true);
+		expect(session.getSessionProfileName()).toBe("unavailable");
+		expect(peer.getModelRole("default")).toBe(selector);
+		const footer = renderModel();
+		expect(footer).toContain(selector);
+		expect(footer).toContain("[unavailable]");
+		expect(footer).not.toContain("Sonnet");
+		await expect(session.prompt("blocked unavailable profile")).rejects.toThrow(/is unavailable/);
+		expect(requestedModels).toEqual([]);
+	});
+
+	it("allows an unbound session to use its automatic runtime model without a default role", async () => {
+		peer.unbindSessionFromProfile();
+		peer.setModelRole("default", undefined);
+		await session.waitForIdle();
+		expect(session.getSessionProfileName()).toBeUndefined();
+		expect(session.getConfiguredDefaultModelState()).toMatchObject({ missing: false, unavailable: false });
+		expect(renderModel()).toContain("Sonnet");
+		await session.prompt("use the automatic model");
+		expect(requestedModels).toEqual([INITIAL_MODEL_ID]);
+	});
+
+	it("uses an explicit project default when the selected profile has no primary", async () => {
+		writer.setProfileItem("no-primary", {
+			modelRoles: { task: `${PROVIDER}/${INITIAL_MODEL_ID}` },
+			defaultThinkingLevel: Effort.Low,
+		});
+		await writer.flush();
+		const projectDir = path.join(tempDir.path(), "project");
+		await Bun.write(
+			path.join(projectDir, ".omp", "config.yml"),
+			`modelRoles:\n  default: ${PROVIDER}/${FALLBACK_MODEL_ID}\n`,
+		);
+		await session.dispose();
+		peer = await writer.cloneForCwd(projectDir);
+		const mock = createMockModel({ handler: () => ({ content: ["ok"] }) });
+		session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model: getBundledModel(PROVIDER, INITIAL_MODEL_ID)!,
+					systemPrompt: ["Test"],
+					tools: [],
+					messages: [],
+				},
+				streamFn: (model, context, options) => {
+					requestedModels.push(model.id);
+					return mock.stream(model, context, options);
+				},
+			}),
+			sessionManager: SessionManager.inMemory(),
+			settings: peer,
+			modelRegistry,
+		});
+		expect(await session.bindSessionProfile("no-primary")).toBe(true);
+		expect(peer.getModelRoleProvenance("default")).toBe("project");
+		expect(session.getConfiguredDefaultModelState().missing).toBe(false);
+		expect(renderModel()).toContain("Haiku");
+		await session.prompt("use the explicit project primary");
+		expect(requestedModels).toEqual([FALLBACK_MODEL_ID]);
 	});
 
 	it("restores fallback ownership when a profile apply fails", async () => {

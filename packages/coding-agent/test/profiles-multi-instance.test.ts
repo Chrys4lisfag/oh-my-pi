@@ -637,6 +637,102 @@ describe("profiles multi-instance persistence", () => {
 		expect(cfgModelRoles.get(reader)).toEqual({ default: "openai/default-c", advisor: "google/advisor-d" });
 	});
 
+	for (const writer of [
+		{
+			name: "setModelRole",
+			edit: (settings: Settings, role: string, value: string | undefined) => settings.setModelRole(role, value),
+		},
+		{
+			name: "setEntry",
+			edit: (settings: Settings, role: string, value: string | undefined) =>
+				cfgModelRoles.setEntry(settings, role, value),
+		},
+	]) {
+		for (const rootDefault of [undefined, "openai/previous-profile"]) {
+			it(`${writer.name} preserves a saved primary when an unrelated edit uses a ${rootDefault ? "stale" : "missing"} root primary`, async () => {
+				const snapshot = {
+					modelRoles: { default: "openai/saved-primary", task: "openai/task-old" },
+					defaultThinkingLevel: "high",
+				};
+				await Bun.write(
+					path.join(dir, "config.yml"),
+					YAML.stringify({
+						profiles: { active: "shared", items: { shared: snapshot } },
+						modelRoles: { ...(rootDefault ? { default: rootDefault } : {}), task: "openai/task-old" },
+						defaultThinkingLevel: "high",
+					}),
+				);
+				const settings = await load();
+				writer.edit(settings, "task", "openai/task-new");
+				await settings.flush();
+
+				const reader = await load();
+				expect(profileSnapshot(reader, "shared")?.modelRoles).toEqual({
+					default: "openai/saved-primary",
+					task: "openai/task-new",
+				});
+				expect(reader.getModelRole("default")).toBe("openai/saved-primary");
+			});
+		}
+
+		for (const primary of [undefined, "openai/selected-primary"]) {
+			it(`${writer.name} persists an explicit primary ${primary ? "assignment" : "clear"} even when the root is unchanged`, async () => {
+				await Bun.write(
+					path.join(dir, "config.yml"),
+					YAML.stringify({
+						profiles: { active: "shared", items: { shared: SNAP } },
+						modelRoles: primary ? { default: primary } : {},
+						defaultThinkingLevel: SNAP.defaultThinkingLevel,
+					}),
+				);
+				const settings = await load();
+				writer.edit(settings, "default", primary);
+				await settings.flush();
+
+				const reader = await load();
+				expect(profileSnapshot(reader, "shared")?.modelRoles).toEqual(primary ? { default: primary } : {});
+				expect(reader.getModelRole("default")).toBe(primary);
+			});
+		}
+	}
+
+	it("persists a whole-role replacement even when only the profile snapshot changes", async () => {
+		const roles = { task: "openai/task" };
+		await Bun.write(
+			path.join(dir, "config.yml"),
+			YAML.stringify({
+				profiles: { active: "shared", items: { shared: SNAP } },
+				modelRoles: roles,
+				defaultThinkingLevel: SNAP.defaultThinkingLevel,
+			}),
+		);
+		const settings = await load();
+		cfgModelRoles.set(settings, roles);
+		await settings.flush();
+
+		const reader = await load();
+		expect(profileSnapshot(reader, "shared")?.modelRoles).toEqual(roles);
+		expect(reader.getModelRole("default")).toBeUndefined();
+	});
+
+	it("persists thinking changes to the selected profile when the root already holds the value", async () => {
+		await Bun.write(
+			path.join(dir, "config.yml"),
+			YAML.stringify({
+				profiles: { active: "shared", items: { shared: SNAP } },
+				modelRoles: SNAP.modelRoles,
+				defaultThinkingLevel: "medium",
+			}),
+		);
+		const settings = await load();
+		cfgDefaultThinkingLevel.set(settings, Effort.Medium);
+		await settings.flush();
+
+		const reader = await load();
+		expect(profileSnapshot(reader, "shared")).toEqual({ ...SNAP, defaultThinkingLevel: "medium" });
+		expect(cfgDefaultThinkingLevel.get(reader)).toBe(Effort.Medium);
+	});
+
 	it("merges concurrent same-profile thinking and role edits", async () => {
 		const seed = await load();
 		seed.setProfileItem("shared", SNAP);

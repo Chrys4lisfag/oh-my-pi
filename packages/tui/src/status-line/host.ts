@@ -53,7 +53,7 @@ export interface StatusLineSession {
 		isUsingOAuth(model: Model): boolean;
 	};
 	getContextUsage(): { tokens: number; contextWindow: number; percent: number | null } | undefined;
-	getConfiguredDefaultModelState?(): { unavailable: boolean; configuredSelector?: string };
+	getConfiguredDefaultModelState?(): { unavailable: boolean; missing?: boolean; configuredSelector?: string };
 	autoResolvedThinkingLevel(): string | undefined;
 	isFastModeActive(): boolean;
 	/** Anthropic usage-limit label (`limit reached · wrapping up · resets 14:30`, `low priority until 14:30 · 62% left`). */

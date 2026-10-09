@@ -973,21 +973,22 @@ export class Settings {
 		// Re-setting the persisted global value is a no-op for config.yml: staging it would still
 		// queue a full re-read, rewrite, fsync, and rename of the file.
 		const persistGlobal = layer === "global" && !this.#globalWriteIsNoop(setting.segments, value);
+		let persistProfile = false;
 		if (layer === "global") {
 			if (persistGlobal) this.#stageGlobal(setting.segments, value);
 			this.#releaseSoftPin(setting);
 			if (this.#profileRuntimeOwner && setting === cfgModelRoles) {
 				this.#replaceProfileOwnedModelRoles(this.#profileRuntimeOwner, value as Record<string, string>);
-				this.#updateActiveProfileSnapshot({ modelRoles: value as Record<string, string> });
+				persistProfile = this.#updateActiveProfileSnapshot({ modelRoles: value as Record<string, string> });
 			} else if (this.#profileRuntimeOwner && setting === cfgDefaultThinkingLevel) {
 				this.#setProfileOwnedThinkingOverride(this.#profileRuntimeOwner, value as string);
-				this.#updateActiveProfileSnapshot({ defaultThinkingLevel: value as string });
+				persistProfile = this.#updateActiveProfileSnapshot({ defaultThinkingLevel: value as string });
 			}
 		} else {
 			setByPath(this.#overrides, setting.segments, value);
 		}
 		this.#rebuildMerged();
-		if (persistGlobal) this.#queueSave();
+		if (persistGlobal || persistProfile) this.#queueSave();
 		this.#fireIfChanged(setting, prev);
 	}
 
@@ -1032,7 +1033,10 @@ export class Settings {
 				? !this.#globalWriteIsNoop([...setting.segments, key], entries[key])
 				: isRecord(record) && Object.hasOwn(record, key),
 		);
-		if (keys.length === 0 && !this.#softPins.has(setting)) return;
+		const persistProfile =
+			setting === cfgModelRoles &&
+			this.#updateActiveProfileSnapshot({ modelRoleEntries: entries as Record<string, string | undefined> });
+		if (keys.length === 0 && !this.#softPins.has(setting) && !persistProfile) return;
 		const prev = setting.get(this);
 		this.#releaseSoftPin(setting);
 		if (keys.length > 0) {
@@ -1040,7 +1044,6 @@ export class Settings {
 			for (const key of keys) this.#stageGlobal([...setting.segments, key], entries[key]);
 			if (setting === cfgModelRoles) {
 				const roles = this.#modelRolesFromLayer(this.#global);
-				if (this.#profileRuntimeOwner) this.#updateActiveProfileSnapshot({ modelRoles: roles });
 				for (const role of keys) {
 					const value = roles[role];
 					if (this.#profileRuntimeOwner) {
@@ -1061,7 +1064,7 @@ export class Settings {
 			}
 		}
 		this.#rebuildMerged();
-		if (keys.length > 0) this.#queueSave();
+		if (keys.length > 0 || persistProfile) this.#queueSave();
 		this.#fireIfChanged(setting, prev);
 	}
 
@@ -1106,20 +1109,30 @@ export class Settings {
 	#updateActiveProfileSnapshot(
 		update: Partial<{
 			modelRoles: Record<string, string>;
+			modelRoleEntries: Readonly<Record<string, string | undefined>>;
 			defaultThinkingLevel: string;
 		}>,
-	): void {
-		if (this.#suppressActiveProfileSnapshotUpdate) return;
+	): boolean {
+		if (this.#suppressActiveProfileSnapshotUpdate) return false;
 		const profile = this.#profileRuntimeOwner;
-		if (!profile) return;
+		if (!profile) return false;
 		const raw = getByPath(this.#global, ["profiles", "items", profile]);
 		const snapshot = this.#profileSnapshotFromUnknown(raw);
-		if (!snapshot) return;
+		if (!snapshot) return false;
 		const next = {
 			modelRoles: { ...(update.modelRoles ?? snapshot.modelRoles) },
 			defaultThinkingLevel: update.defaultThinkingLevel ?? snapshot.defaultThinkingLevel,
 		};
+		// Entry edits must not copy a stale root projection over untouched saved roles.
+		if (update.modelRoleEntries) {
+			for (const [role, modelId] of Object.entries(update.modelRoleEntries)) {
+				if (modelId === undefined) delete next.modelRoles[role];
+				else next.modelRoles[role] = modelId;
+			}
+		}
+		if (Bun.deepEquals(snapshot, next)) return false;
 		setByPath(this.#global, ["profiles", "items", profile], next);
+		this.#persistedMutationGeneration++;
 
 		let persistenceProfile = profile;
 		const visitedProfiles = new Set<string>();
@@ -1141,7 +1154,7 @@ export class Settings {
 			delta = { modelRoles: new Map() };
 			this.#modifiedProfileLiveFields.set(persistenceProfile, delta);
 		}
-		if (update.modelRoles) {
+		if (update.modelRoles || update.modelRoleEntries) {
 			for (const role of new Set([...Object.keys(snapshot.modelRoles), ...Object.keys(next.modelRoles)])) {
 				if (snapshot.modelRoles[role] === next.modelRoles[role]) continue;
 				delta.modelRoles.set(role, next.modelRoles[role]);
@@ -1150,6 +1163,7 @@ export class Settings {
 		if (update.defaultThinkingLevel !== undefined && snapshot.defaultThinkingLevel !== next.defaultThinkingLevel) {
 			delta.defaultThinkingLevel = next.defaultThinkingLevel;
 		}
+		return true;
 	}
 
 	/**
@@ -2362,9 +2376,9 @@ export class Settings {
 	 */
 	setModelRole(role: ModelRole | string, modelId: string | undefined): void {
 		const prev = cfgModelRoles.get(this);
-		// Re-setting the persisted role (or clearing an absent one) stages no config.yml rewrite;
-		// the runtime-override sync below still applies.
-		if (!this.#globalWriteIsNoop(["modelRoles", role], modelId)) {
+		// A root no-op may still change this terminal's selected profile snapshot.
+		const persistGlobal = !this.#globalWriteIsNoop(["modelRoles", role], modelId);
+		if (persistGlobal) {
 			const current = this.#modelRolesFromLayer(this.#global);
 			this.#captureGlobalMutation(role, this.#modifiedGlobalModelRoleMutations, current[role]);
 			if (modelId === undefined) {
@@ -2380,10 +2394,9 @@ export class Settings {
 			this.#modifiedGlobalModelRoles.add(role);
 			this.#persistedMutationGeneration++;
 			this.#rebuildMerged();
-			this.#queueSave();
 		}
+		const persistProfile = this.#updateActiveProfileSnapshot({ modelRoleEntries: { [role]: modelId } });
 		if (this.#profileRuntimeOwner) {
-			this.#updateActiveProfileSnapshot({ modelRoles: this.#modelRolesFromLayer(this.#global) });
 			if (modelId === undefined) {
 				this.#supersedeProfileOwnedModelRole(role);
 				const runtimeRoles = this.#getRuntimeModelRoleOverrides();
@@ -2402,6 +2415,7 @@ export class Settings {
 			}
 		}
 		this.#rebuildMerged();
+		if (persistGlobal || persistProfile) this.#queueSave();
 		this.#fireIfChanged(cfgModelRoles, prev);
 	}
 

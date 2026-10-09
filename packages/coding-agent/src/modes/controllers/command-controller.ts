@@ -1619,17 +1619,21 @@ export class CommandController {
 			try {
 				switchProfile(name, this.ctx.settings);
 				activationStarted = true;
+				await this.#applyProfileModelToSession(name);
 				this.ctx.statusLine.invalidate();
 				this.ctx.updateEditorBorderColor();
-				const configuredDefault = this.ctx.settings.getModelRole("default");
-				if (configuredDefault && !this.ctx.session.resolveRoleModel("default")) {
+				const configuredDefault = this.ctx.session.getConfiguredDefaultModelState();
+				if (configuredDefault.missing) {
 					this.ctx.showWarning(
-						`Switched to profile "${name}". Default model "${configuredDefault}" is currently unavailable. Select a model with /model or Ctrl+P.`,
+						`Switched to profile "${name}". No default model is configured. Prompts are blocked until you select a default model with /model.`,
+					);
+				} else if (configuredDefault.unavailable) {
+					this.ctx.showWarning(
+						`Switched to profile "${name}". Default model "${configuredDefault.configuredSelector}" is currently unavailable. Select a model with /model or Ctrl+P.`,
 					);
 				} else {
 					this.ctx.showStatus(`Switched to profile "${name}".`);
 				}
-				await this.#applyProfileModelToSession(name);
 			} catch (err) {
 				if (activationStarted && getActiveProfileName(this.ctx.settings) === name) {
 					try {

@@ -2718,9 +2718,10 @@ export class InputController {
 		const rolesSummary = Object.entries(result.snapshot.modelRoles)
 			.map(([role, model]) => `${theme.fg("muted", role)}: ${model.split("/").pop()}`)
 			.join(theme.fg("dim", ", "));
-		const configuredDefault = result.snapshot.modelRoles.default;
-		const unavailableNotice =
-			configuredDefault && !this.ctx.session.resolveRoleModel("default")
+		const configuredDefault = this.ctx.settings.getModelRole("default");
+		const unavailableNotice = !configuredDefault
+			? ` ${theme.fg("warning", "[default not configured — select with /model]")}`
+			: !this.ctx.session.resolveRoleModel("default")
 				? ` ${theme.fg("warning", "[model unavailable]")}`
 				: "";
 		this.ctx.showStatus(`Profile: ${profileName} (${rolesSummary})${unavailableNotice}`, { dim: false });

@@ -7814,6 +7814,12 @@ export class AgentSession implements SettingsScope {
 			// state the status line renders, so the reject and the footer can
 			// never name different models.
 			const configuredDefaultState = this.getConfiguredDefaultModelState();
+			if (configuredDefaultState.missing) {
+				throw new Error(
+					`Profile "${this.getSessionProfileName()}" has no default model configured.\n\n` +
+						"Use /model to select a default model for this profile, or /profiles switch <name> to use another profile.",
+				);
+			}
 			if (configuredDefaultState.unavailable) {
 				throw new Error(
 					`Default model "${configuredDefaultState.configuredSelector}" is unavailable.\n\n` +
@@ -13316,10 +13322,9 @@ export class AgentSession implements SettingsScope {
 	 *   3. advisors       — rebuilt so they pick up the profile's `advisor`-role
 	 *      model instead of staying pinned to the previous profile's.
 	 *
-	 * An unavailable configured default leaves the previous runtime model in
-	 * place only for display and settings repair. Prompt submission validates
-	 * the configured role and rejects before dispatch, so requests can never be
-	 * sent through the previous profile's model.
+	 * A missing or unavailable configured default leaves the previous runtime
+	 * object in place for settings repair only. Prompt preflight and the footer
+	 * use the configured state, never that previous profile's model.
 	 */
 	#queueSynchronizedProfileApply(): void {
 		// A legacy resumed session without a recorded profile must not let every
@@ -13523,17 +13528,19 @@ export class AgentSession implements SettingsScope {
 	/**
 	 * Single source of truth for the configured default model's availability,
 	 * shared by prompt preflight and the status line so they can never diverge.
-	 * `runtimeModel` may lag `configuredSelector` while an unavailable default
-	 * keeps the previous runtime model in place for display/repair.
+	 * `missing` distinguishes a bound profile without a primary from an unbound
+	 * session, which may legitimately use an automatically selected model.
 	 */
 	getConfiguredDefaultModelState(): {
 		configuredSelector: string | undefined;
 		resolvedModel: Model | undefined;
 		runtimeModel: Model | undefined;
 		unavailable: boolean;
+		missing: boolean;
 	} {
 		const configuredSelector = this.settings.getModelRole("default");
 		const runtimeModel = this.model;
+		const missing = Boolean(this.getSessionProfileName() && !configuredSelector);
 		// The status line calls this on every repaint — i.e. once per keystroke —
 		// and `resolveRoleModel` walks `ModelRegistry.getAvailable()`, which
 		// recomposes and collapses the whole static catalog (measured 24-42ms at
@@ -13542,7 +13549,7 @@ export class AgentSession implements SettingsScope {
 		// (`onModelsUpdated`, `modelRoles`/settings hooks -> #invalidateConfiguredDefaultModelState).
 		const cached = this.#configuredDefaultModelState;
 		if (cached && cached.configuredSelector === configuredSelector) {
-			return { ...cached.state, runtimeModel, unavailable: cached.state.unavailable };
+			return { ...cached.state, runtimeModel, missing };
 		}
 		const resolvedModel = configuredSelector ? this.resolveRoleModel("default") : undefined;
 		const state = {
@@ -13551,7 +13558,7 @@ export class AgentSession implements SettingsScope {
 			unavailable: Boolean(configuredSelector && !resolvedModel),
 		};
 		this.#configuredDefaultModelState = { configuredSelector, state };
-		return { ...state, runtimeModel };
+		return { ...state, runtimeModel, missing };
 	}
 
 	/**

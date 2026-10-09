@@ -338,7 +338,11 @@ describe("profiles", () => {
 				settings: local,
 				session: {
 					bindSessionProfile,
-					resolveRoleModel: vi.fn(() => ({ provider: "provider", id: "local-target" })),
+					getConfiguredDefaultModelState: () => ({
+						configuredSelector: local.getModelRole("default"),
+						missing: false,
+						unavailable: false,
+					}),
 				},
 				statusLine: { invalidate: vi.fn() },
 				updateEditorBorderColor: vi.fn(),

@@ -345,13 +345,15 @@ const modelSegment: StatusLineSegment = {
 		// The footer reports the live runtime model. Role cycling intentionally
 		// changes only that runtime model (for example `default` → `smol`) while
 		// leaving `modelRoles.default` untouched, so a resolved configured
-		// default must never replace `state.model` here. The one exception is an
-		// unresolved configured default: prompt preflight blocks dispatch, so
-		// show that selector with an explicit marker instead of falsely implying
-		// the retained runtime model can still serve.
+		// default must never replace `state.model` here. A missing profile primary
+		// or unresolved configured default blocks dispatch, so report that state
+		// instead of falsely implying the retained runtime model can still serve.
 		let modelName: string;
 		const unavailable = Boolean(configuredState?.unavailable && configuredState.configuredSelector);
-		if (unavailable) {
+		const missing = Boolean(configuredState?.missing);
+		if (missing) {
+			modelName = "no-model";
+		} else if (unavailable) {
 			modelName = configuredState?.configuredSelector?.trim() || "no-model";
 		} else {
 			modelName = state.model?.name || state.model?.id || "no-model";
@@ -364,7 +366,7 @@ const modelSegment: StatusLineSegment = {
 		// when the model supports thinking and the segment isn't hiding it.
 		const thinkingModel = state.model;
 		let thinkingDisplay = "";
-		if (opts.showThinkingLevel !== false && thinkingModel?.thinking && !unavailable) {
+		if (opts.showThinkingLevel !== false && thinkingModel?.thinking && !unavailable && !missing) {
 			if (ctx.session.isAutoThinking) {
 				// Pending (no turn classified yet / classifying) shows a symbol-theme
 				// question-box marker; once resolved it shows `<level>`.
@@ -392,13 +394,15 @@ const modelSegment: StatusLineSegment = {
 		// theme.fg resets only the fg, so the spans are concatenated (not
 		// nested) to keep each color intact.
 		let tail = "";
-		if (!unavailable && ctx.session.isFastModeActive() && theme.icon.fast) {
+		if (!unavailable && !missing && ctx.session.isFastModeActive() && theme.icon.fast) {
 			tail += ` ${theme.icon.fast}`;
 		}
 		if (!compact && thinkingDisplay) {
 			tail += `${theme.sep.dot}${thinkingDisplay}`;
 		}
-		if (unavailable) {
+		if (missing) {
+			tail += theme.fg("error", " [not configured]");
+		} else if (unavailable) {
 			tail += theme.fg("error", " [unavailable]");
 		}
 

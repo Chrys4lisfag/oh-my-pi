@@ -32,10 +32,10 @@ intent into current upstream architecture.
 2. Add per-profile dirty tracking and locked freshest-file merge in `Settings`.
 3. Keep terminal profile identity immutable during sync/reload/save/deletion; only
    same-name model/thinking snapshots synchronize.
-4. Preserve upstream's `shouldWrite` gate in `#saveNow`, but set it from every
-   fork profile mutation (item write/delete, live-field delta, successful and
-   failed active rename, activation, durable-projection change). A missed flag
-   silently skips the atomic write and hangs any flow that awaits it.
+4. Preserve upstream's `shouldWrite` gate in `#saveNow`, setting it for changed
+   profile snapshots even when root settings are unchanged. Upstream also skips
+   writes when serialized content is identical: concurrency tests must synchronize
+   on the locked read, not wait indefinitely for a temp-file write that is elided.
 5. Persist session header profile name + snapshot and bind it before model restoration.
 6. Add `config/profiles.ts`; every API accepts the session `Settings` instance and every
    mutation uses `setProfileItem` or `deleteProfileItem`.
@@ -43,6 +43,12 @@ intent into current upstream architecture.
 8. Add `app.profile.cycle = alt+c`; keybind cycle uses/reports `ctx.settings`.
 9. Run `profile-terminal-identity.test.ts` (all 20 numbered contracts), process,
    multi-instance, resume, keybind, and advisor coupling suites.
+10. Granular role edits update only that role in the active profile; never replace
+    its whole role map from a stale/incomplete root projection. Full replacements
+    and explicit default clears remain intentional. Test disk reopen, not just memory.
+11. Exercise A→B→A through actual session requests and footer rendering. A bound
+    profile lacking an effective default must warn and block requests, not silently
+    dispatch to the previous runtime; unbound automatic sessions remain supported.
 
 ### 2. Advisor synchronization
 

@@ -18,9 +18,9 @@
  *   #5 `applyProfileToSession()` — apply the active profile's model roles +
  *                                 thinking level to a live session (primary
  *                                 model via `default` role, `defaultThinkingLevel`,
- *                                 advisor rebuild). An unresolvable `default`
- *                                 role rejects before any partial runtime apply,
- *                                 preventing profile/header model divergence.
+ *                                 advisor rebuild). Missing or unavailable
+ *                                 profile defaults block prompt dispatch without
+ *                                 discarding the selected profile.
  *
  * The reference harness (real ModelRegistry(authStorage) + new AgentSession)
  * mirrors `advisor-toggle.test.ts` and `model-registry-models-updated.test.ts`.
@@ -424,6 +424,34 @@ describe("AgentSession advisor + profile model sync", () => {
 			expect(session.thinkingLevel).toBe(Effort.Low);
 			await expect(session.prompt("hello")).rejects.toThrow(
 				'Default model "bogus-provider/nonexistent-model" is unavailable',
+			);
+		});
+
+		it("updates the advisor but blocks primary requests for a profile without a default", async () => {
+			const { session, settings } = await createHarness({
+				settingsOverrides: {
+					"advisor.enabled": true,
+				},
+				credentialedProviders: [PRIMARY_PROVIDER],
+			});
+			settings.setProfileItem("primary-and-advisor", {
+				modelRoles: {
+					default: `${PRIMARY_PROVIDER}/${PRIMARY_MODEL_ID}`,
+					advisor: `${PRIMARY_PROVIDER}/${PRIMARY_MODEL_ID}`,
+				},
+				defaultThinkingLevel: Effort.Medium,
+			});
+			expect(await session.bindSessionProfile("primary-and-advisor")).toBe(true);
+			settings.setProfileItem("advisor-only", {
+				modelRoles: { advisor: `${PRIMARY_PROVIDER}/${SWAP_MODEL_ID}` },
+				defaultThinkingLevel: Effort.Low,
+			});
+			expect(await session.bindSessionProfile("advisor-only")).toBe(true);
+			expect(session.getSessionProfileName()).toBe("advisor-only");
+			expect(session.getAdvisorAgent()?.state.model?.id).toBe(SWAP_MODEL_ID);
+			expect(session.getConfiguredDefaultModelState().missing).toBe(true);
+			await expect(session.prompt("do not treat advisor as the primary")).rejects.toThrow(
+				/no default model configured/,
 			);
 		});
 
