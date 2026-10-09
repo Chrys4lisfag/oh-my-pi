@@ -796,6 +796,99 @@ describe("profiles multi-instance persistence", () => {
 		}
 	});
 
+	for (const reload of ["reloadFromDisk", "syncFromDisk"] as const) {
+		it(`${reload} retains pending profile mutations while adopting external settings after a save failure`, async () => {
+			const configPath = path.join(dir, "config.yml");
+			await Bun.write(
+				configPath,
+				YAML.stringify({
+					profiles: { active: "original", items: { updated: SNAP, removed: SNAP, original: SNAP } },
+					modelRoles: SNAP.modelRoles,
+					defaultThinkingLevel: SNAP.defaultThinkingLevel,
+				}),
+			);
+			const settings = await load();
+			settings.stopWatching();
+			const changed = { modelRoles: { default: "openai/updated" }, defaultThinkingLevel: "medium" };
+			const created = { modelRoles: { default: "openai/created" }, defaultThinkingLevel: "low" };
+			const external = { modelRoles: { default: "openai/external" }, defaultThinkingLevel: "high" };
+			const renamed = { ...SNAP, defaultThinkingLevel: "medium" };
+			const open = fsSync.promises.open.bind(fsSync.promises);
+			const openSpy = vi.spyOn(fsSync.promises, "open").mockImplementation(async (file, flags, mode) => {
+				if (String(file).startsWith(`${configPath}.`) && String(file).endsWith(".tmp")) {
+					throw new Error("synthetic atomic write failure");
+				}
+				return open(file, flags, mode);
+			});
+			try {
+				settings.setProfileItem("created", created);
+				settings.setProfileItem("updated", changed);
+				settings.deleteProfileItem("removed");
+				settings.renameProfileItem("original", "renamed", SNAP, true);
+				cfgDefaultThinkingLevel.set(settings, Effort.Medium);
+				rewriteConfig(config => {
+					config.profiles.items.external = external;
+					config.setupVersion = 42;
+				});
+				await settings[reload]();
+				expect(cfgProfilesItems.get(settings)).toEqual({ updated: changed, created, renamed, external });
+				expect(settings.activeProfileName()).toBe("renamed");
+				expect(cfgDefaultThinkingLevel.get(settings)).toBe(Effort.Medium);
+				expect(cfgSetupVersion.get(settings)).toBe(42);
+			} finally {
+				openSpy.mockRestore();
+			}
+
+			await settings.flush();
+			const reader = await load();
+			expect(cfgProfilesItems.get(reader)).toEqual({ updated: changed, created, renamed, external });
+			expect(reader.activeProfileName()).toBe("renamed");
+			expect(cfgSetupVersion.get(reader)).toBe(42);
+		});
+
+		it(`${reload} merges unsaved profile-only fields without losing disjoint external roles`, async () => {
+			const configPath = path.join(dir, "config.yml");
+			await Bun.write(
+				configPath,
+				YAML.stringify({
+					profiles: { active: "shared", items: { shared: SNAP } },
+					modelRoles: {},
+					defaultThinkingLevel: "medium",
+				}),
+			);
+			const settings = await load();
+			settings.stopWatching();
+			const expected = { modelRoles: { advisor: "openai/external" }, defaultThinkingLevel: "medium" };
+			const open = fsSync.promises.open.bind(fsSync.promises);
+			const openSpy = vi.spyOn(fsSync.promises, "open").mockImplementation(async (file, flags, mode) => {
+				if (String(file).startsWith(`${configPath}.`) && String(file).endsWith(".tmp")) {
+					throw new Error("synthetic atomic write failure");
+				}
+				return open(file, flags, mode);
+			});
+			try {
+				settings.setModelRole("default", undefined);
+				cfgDefaultThinkingLevel.set(settings, Effort.Medium);
+				rewriteConfig(config => {
+					config.profiles.items.shared.modelRoles.advisor = "openai/external";
+				});
+				await settings[reload]();
+				expect(profileSnapshot(settings, "shared")).toEqual(expected);
+				expect(settings.getModelRole("default")).toBeUndefined();
+				expect(settings.getModelRole("advisor")).toBe("openai/external");
+				expect(cfgDefaultThinkingLevel.get(settings)).toBe(Effort.Medium);
+			} finally {
+				openSpy.mockRestore();
+			}
+
+			await settings.flush();
+			const reader = await load();
+			expect(profileSnapshot(reader, "shared")).toEqual(expected);
+			expect(cfgModelRoles.get(reader)).toEqual(expected.modelRoles);
+			expect(cfgDefaultThinkingLevel.get(reader)).toBe(Effort.Medium);
+		});
+	}
+
 	it("merges a same-profile role deletion with a sibling role update", async () => {
 		const initial = {
 			modelRoles: { default: "anthropic/default-old", advisor: "anthropic/advisor-old" },

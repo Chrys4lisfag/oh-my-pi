@@ -400,6 +400,19 @@ export const cfgTerminalShowProgress = register({
 	},
 });
 
+export const cfgTerminalProgramStatus = register({
+	id: "terminal.programStatus",
+	type: "boolean",
+	default: true,
+	ui: {
+		tab: "appearance",
+		group: "Display",
+		label: "Program Status (OSC 7501)",
+		description:
+			"Report whether the agent is working, waiting on you, done, or failed over OSC 7501, for terminal tab indicators and agent inboxes",
+	},
+});
+
 export const cfgTuiTextSizing = register({
 	id: "tui.textSizing",
 	type: "boolean",
@@ -422,6 +435,46 @@ export const cfgTuiRenderMermaid = register({
 		group: "Display",
 		label: "Render Mermaid Diagrams",
 		description: "Render Mermaid fenced code blocks as ASCII diagrams",
+	},
+});
+
+export const cfgTuiRenderSvg = register({
+	id: "tui.renderSvg",
+	type: "boolean",
+	default: true,
+	ui: {
+		tab: "appearance",
+		group: "Display",
+		label: "Render SVG Figures",
+		description:
+			"Invite the agent to draw diagrams and charts as SVG, rendered inline as images on terminals that show graphics",
+	},
+});
+
+export const cfgTuiAutoGraph = register({
+	id: "tui.autoGraph",
+	type: "enum",
+	values: ["smart", "always", "off"] as const,
+	default: "always",
+	ui: {
+		tab: "appearance",
+		group: "Display",
+		label: "Auto-Graph Tables",
+		description:
+			"Draw a chart under numeric tables in the agent's answers, in your theme's colors, on terminals that show graphics",
+		options: [
+			{
+				value: "smart",
+				label: "Smart",
+				description: "The judge model picks the chart kind and columns for tables with several numeric columns",
+			},
+			{
+				value: "always",
+				label: "Always",
+				description: "Chart every table that reads as numeric, using the built-in best guess",
+			},
+			{ value: "off", label: "Off", description: "Leave tables as tables" },
+		],
 	},
 });
 

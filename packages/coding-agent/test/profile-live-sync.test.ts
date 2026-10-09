@@ -282,6 +282,54 @@ describe("live profile synchronization", () => {
 		expect(requestedModels).toEqual([]);
 	});
 
+	it.each([undefined, "missing-provider/missing-model"])(
+		"dispatches the explicit subagent model with inherited profile default %s while keeping the main blocked",
+		async defaultSelector => {
+			peer.setProfileItem("task-only", {
+				modelRoles: {
+					task: `${PROVIDER}/${FALLBACK_MODEL_ID}`,
+					...(defaultSelector ? { default: defaultSelector } : {}),
+				},
+				defaultThinkingLevel: Effort.Low,
+			});
+			expect(await session.bindSessionProfile("task-only")).toBe(true);
+			await peer.flush();
+			const childSettings = await peer.cloneForCwd(tempDir.path());
+			const taskModel = getBundledModel(PROVIDER, FALLBACK_MODEL_ID)!;
+			const mock = createMockModel({ handler: () => ({ content: ["task completed"] }) });
+			const child = new AgentSession({
+				agent: new Agent({
+					initialState: { model: taskModel, systemPrompt: ["Test"], tools: [], messages: [] },
+					streamFn: (model, context, options) => {
+						requestedModels.push(model.id);
+						return mock.stream(model, context, options);
+					},
+				}),
+				agentKind: "sub",
+				sessionManager: SessionManager.inMemory(),
+				settings: childSettings,
+				modelRegistry,
+			});
+			try {
+				expect(child.getSessionProfileName()).toBe("task-only");
+				expect(childSettings.getModelRole("default")).toBe(defaultSelector);
+				await child.prompt("complete the delegated task");
+				expect(requestedModels).toEqual([FALLBACK_MODEL_ID]);
+				expect(child.messages.at(-1)).toMatchObject({
+					role: "assistant",
+					content: [{ type: "text", text: "task completed" }],
+				});
+				expect(peer.getModelRole("default")).toBe(defaultSelector);
+				await expect(session.prompt("do not infer a primary from the task model")).rejects.toThrow(
+					defaultSelector ? /is unavailable/ : /no default model configured/,
+				);
+				expect(requestedModels).toEqual([FALLBACK_MODEL_ID]);
+			} finally {
+				await child.dispose();
+			}
+		},
+	);
+
 	it("allows an unbound session to use its automatic runtime model without a default role", async () => {
 		peer.unbindSessionFromProfile();
 		peer.setModelRole("default", undefined);

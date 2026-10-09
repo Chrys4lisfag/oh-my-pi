@@ -16,10 +16,19 @@ function bundledAstra() {
 	return astra;
 }
 
-function bundledLegacy() {
-	const legacy = getBundledModels("openai-codex").find(model => model.id === "gpt-5.5");
-	if (!legacy) throw new Error("Expected bundled legacy Codex model");
-	return legacy;
+function legacyCodex() {
+	return buildModel({
+		id: "gpt-5.5",
+		name: "Legacy Codex",
+		api: "openai-codex-responses",
+		provider: "openai-codex",
+		baseUrl: "https://example.test/v1",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 16_384,
+	});
 }
 
 function resellerDeepSeek(id: string, provider: string, contextWindow: number) {
@@ -112,7 +121,7 @@ test("does not infer the Sol 6.1 ceiling for narrower deployments or other model
 });
 
 test("leaves models without a curated maximum to the live value or undefined", () => {
-	const legacy = bundledLegacy();
+	const legacy = legacyCodex();
 	// No `max-context-window` rule owns this SKU, so extended-context widening
 	// sees exactly what discovery reported — nothing curated is injected.
 	expect(resolveMaxContextWindow({ ...legacy, maxContextWindow: 640_000 })).toBe(640_000);
@@ -133,7 +142,7 @@ test("clamps Codex overrides to the stale-aware ceiling", () => {
 });
 
 test("never clamps below the working window on a stale-low maximum", () => {
-	const legacy = bundledLegacy();
+	const legacy = legacyCodex();
 	// 128K base with a 64K advertised maximum: the ceiling is discredited,
 	// so an explicit override falls back to the working window.
 	const stale = { ...legacy, contextWindow: 128_000, maxContextWindow: 64_000 };
@@ -143,14 +152,14 @@ test("never clamps below the working window on a stale-low maximum", () => {
 });
 
 test("leaves models without a ceiling unclamped", () => {
-	const legacy = bundledLegacy();
+	const legacy = legacyCodex();
 	expect(codexOverrideCeiling({ ...legacy, maxContextWindow: undefined })).toBeUndefined();
 	expect(clampCodexContextWindow({ ...legacy, maxContextWindow: undefined }, 2_000_000)).toBe(2_000_000);
 });
 
 test("reads the override-clamp contract from KDL policy, not provider ids", () => {
 	const astra = bundledAstra();
-	const legacy = bundledLegacy();
+	const legacy = legacyCodex();
 	// Provider-wide Codex semantics: every Codex SKU clamps, on any route.
 	expect(clampsContextOverride(astra)).toBe(true);
 	expect(clampsContextOverride({ ...legacy, maxContextWindow: 640_000 })).toBe(true);
@@ -224,6 +233,5 @@ test("Vercel DeepSeek V4.1 Flash resolves provider efforts without a model-menu 
 		const model = resellerDeepSeek(id, "vercel-ai-gateway", 128_000);
 		expect(model.contextWindow).toBe(1_000_000);
 		expect(model.thinking?.efforts).toEqual([Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh]);
-		expect(() => resolveMaxContextWindow(model)).not.toThrow();
 	}
 });

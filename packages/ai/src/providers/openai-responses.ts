@@ -1,13 +1,14 @@
 import { scheduler } from "node:timers/promises";
 import {
 	$flag,
+	cloneJsonTree,
 	isUnexpectedSocketCloseMessage,
 	logger,
 	type ServerSentEvent,
 	structuredCloneJSON,
 } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
-import { getEnvApiKey } from "../stream";
+import { getEnvApiKey } from "../env-api-key";
 import type {
 	AssistantMessage,
 	CacheRetention,
@@ -55,6 +56,7 @@ import {
 import { compactGrammarDefinition } from "./grammar";
 import {
 	getOpenAIEffortControlState,
+	releaseOpenAIEffortControlSession,
 	type OpenAIEffortControlState,
 	planStableOpenAIEffort,
 } from "./openai-configuration-update";
@@ -94,6 +96,7 @@ import {
 	getJuiceValue,
 	getOpenAIPromptCacheKey,
 	getOpenAIResponsesRoutingSessionId,
+	normalizeOpenAIPromptCacheKey,
 	getOpenAIStrictToolsScope,
 	getOpenRouterResponsesSessionId,
 	isCompiledGrammarTooLargeStrictError,
@@ -404,6 +407,7 @@ interface OpenAIResponsesProviderSessionState
 type ResponsesStableEffort = Exclude<ReasoningEffort, "none" | null>;
 
 interface OpenAIResponsesChainState {
+	sessionId: string;
 	/**
 	 * Wire params of the last successful turn; never carries
 	 * `previous_response_id`.
@@ -429,6 +433,14 @@ function createOpenAIResponsesProviderSessionState(): OpenAIResponsesProviderSes
 		nativeHistoryReplayWarmed: false,
 		chains: new Map(),
 		effortControls: new Map(),
+		releaseSession: sessionId => {
+			const normalizedSessionId = normalizeOpenAIPromptCacheKey(sessionId);
+			if (!normalizedSessionId) return;
+			for (const [key, chain] of state.chains) {
+				if (chain.sessionId === normalizedSessionId) state.chains.delete(key);
+			}
+			releaseOpenAIEffortControlSession(state.effortControls, normalizedSessionId);
+		},
 		close: () => {
 			state.nativeHistoryReplayWarmed = false;
 			state.chains.clear();
@@ -511,7 +523,7 @@ function getOpenAIResponsesChainState(
 	const key = `${resolvedBaseUrl ?? model.baseUrl ?? ""}\u0000${model.id}\u0000${sessionId}`;
 	const existing = providerSessionState.chains.get(key);
 	if (existing) return existing;
-	const created: OpenAIResponsesChainState = { canAppend: false, staleFailures: 0, disabled: false };
+	const created: OpenAIResponsesChainState = { sessionId, canAppend: false, staleFailures: 0, disabled: false };
 	providerSessionState.chains.set(key, created);
 	return created;
 }
@@ -1236,13 +1248,13 @@ const streamOpenAIResponsesOnce = (
 
 			output.providerPayload = createOpenAIResponsesHistoryPayload(model.provider, nativeOutputItems);
 			const replayableResponseItems = sanitizeOpenAIResponsesAssistantHistoryItemsForReplay(
-				structuredCloneJSON(nativeOutputItems),
+				cloneJsonTree(nativeOutputItems),
 				{ supportsImageDetailOriginal: model.compat.supportsImageDetailOriginal },
 			);
 			if (replayableResponseItems) {
 				if (providerSessionState) providerSessionState.nativeHistoryReplayWarmed = true;
 				if (chainState) {
-					chainState.lastParams = structuredCloneJSON(
+					chainState.lastParams = cloneJsonTree(
 						activeTrailingScaffoldingItems > 0 && Array.isArray(activeParams.input)
 							? {
 									...activeParams,
@@ -1275,7 +1287,7 @@ const streamOpenAIResponsesOnce = (
 				// baseline, but `lastParams` still records the successful wire controls
 				// without re-enabling `previous_response_id` chaining.
 				chainState.canAppend = false;
-				chainState.lastParams = structuredCloneJSON(
+				chainState.lastParams = cloneJsonTree(
 					activeTrailingScaffoldingItems > 0 && Array.isArray(activeParams.input)
 						? {
 								...activeParams,
@@ -1746,6 +1758,7 @@ function applyResponsesStableEffort(
 	const state = getOpenAIEffortControlState(
 		providerSessionState.effortControls,
 		`${model.baseUrl ?? ""}\u0000${model.id}\u0000${sessionId}`,
+		sessionId,
 	);
 	params.reasoning = { ...reasoning, effort: planStableOpenAIEffort(state, input, effort) };
 }
