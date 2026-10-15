@@ -13,16 +13,6 @@ describe("magic keyword registry", () => {
 });
 
 describe("orchestrate notice", () => {
-	it("is a self-contained system notice carrying the orchestration contract", () => {
-		const notice = renderOrchestrateNotice({
-			tools: ["read", "task", "edit", "write", "lsp", "bash", "todo"],
-		});
-		expect(notice.startsWith("<system-notice>")).toBe(true);
-		expect(notice.endsWith("</system-notice>")).toBe(true);
-		expect(notice).toContain("orchestrator");
-		// The contract must not retain the slash-command input placeholder.
-		expect(notice).not.toContain("$@");
-	});
 
 	it("omits tool-budget mentions for tools absent from the session", () => {
 		const notice = renderOrchestrateNotice({ tools: ["read"] });

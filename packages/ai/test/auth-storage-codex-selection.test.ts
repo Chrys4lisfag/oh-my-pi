@@ -814,17 +814,17 @@ describe("AuthStorage codex oauth ranking", () => {
 		).toBeUndefined();
 	});
 
-	test("rejects account selectors that match zero or multiple available OAuth accounts", async () => {
+	test("keeps unmatched account policies dormant while rejecting ambiguous identities", async () => {
 		if (!store) throw new Error("test setup failed");
 		authStorage = new AuthStorage(store, {
 			accountPolicies: [{ provider: "openai-codex", account: { email: "missing@example.com" }, priority: 1 }],
 		});
-		await expect(
-			authStorage.credentials.set("openai-codex", [
-				{ type: "oauth", ...createCredential("acct-a", "a@example.com") },
-				{ type: "oauth", ...createCredential("acct-b", "b@example.com") },
-			]),
-		).rejects.toThrow("matches no stored OAuth account");
+		await authStorage.credentials.set("openai-codex", [
+			{ type: "oauth", ...createCredential("acct-a", "a@example.com") },
+			{ type: "oauth", ...createCredential("acct-b", "b@example.com") },
+		]);
+		await authStorage.credentials.reload();
+		expect(await authStorage.keys.get("openai-codex", "missing-policy")).toMatch(/^api-acct-[ab]$/);
 
 		authStorage = new AuthStorage(store, {
 			accountPolicies: [{ provider: "openai-codex", account: { email: "shared@example.com" }, priority: 1 }],
@@ -926,7 +926,7 @@ describe("AuthStorage codex oauth ranking", () => {
 		}
 	});
 
-	test("validates the prospective pool before removing a selector's sole match", async () => {
+	test("permits removing a prioritized account and routes to the remaining sibling", async () => {
 		if (!store) throw new Error("test setup failed");
 		authStorage = new AuthStorage(store, {
 			accountPolicies: [{ provider: "openai-codex", account: { accountId: "acct-required" }, priority: 1 }],
@@ -940,14 +940,28 @@ describe("AuthStorage codex oauth ranking", () => {
 		const sibling = accounts.find(account => account.accountId === "acct-sibling");
 		if (!required || !sibling) throw new Error("expected both accounts");
 
-		await expect(authStorage.credentials.removeById("openai-codex", required.credentialId)).rejects.toThrow(
-			"matches no stored OAuth account",
-		);
-		expect(store.listAuthCredentials("openai-codex")).toHaveLength(2);
-		expect(await authStorage.credentials.removeById("openai-codex", sibling.credentialId)).toBe(true);
-		expect(store.listAuthCredentials("openai-codex")).toHaveLength(1);
 		expect(await authStorage.credentials.removeById("openai-codex", required.credentialId)).toBe(true);
+		await authStorage.credentials.reload();
+		expect(await authStorage.keys.get("openai-codex", "removed-priority")).toBe("api-acct-sibling");
+		expect(store.listAuthCredentials("openai-codex")).toHaveLength(1);
+		expect(await authStorage.credentials.removeById("openai-codex", sibling.credentialId)).toBe(true);
 		expect(store.listAuthCredentials("openai-codex")).toHaveLength(0);
+	});
+
+	test("reactivates a dormant priority after its matching account returns", async () => {
+		if (!store) throw new Error("test setup failed");
+		authStorage = new AuthStorage(store, {
+			accountPolicies: [{ provider: "openai-codex", account: { accountId: "acct-returning" }, priority: 100 }],
+		});
+		await authStorage.credentials.set("openai-codex", [
+			{ type: "oauth", ...createCredential("acct-sibling", "sibling@example.com") },
+		]);
+		expect(await authStorage.keys.get("openai-codex", "policy-return")).toBe("api-acct-sibling");
+		await authStorage.credentials.set("openai-codex", [
+			{ type: "oauth", ...createCredential("acct-sibling", "sibling@example.com") },
+			{ type: "oauth", ...createCredential("acct-returning", "returning@example.com") },
+		]);
+		expect(await authStorage.keys.get("openai-codex", "policy-return")).toBe("api-acct-returning");
 	});
 
 	test("keeps a definitively failed credential disabled when its policy becomes unmatched", async () => {
@@ -970,17 +984,19 @@ describe("AuthStorage codex oauth ranking", () => {
 			};
 		});
 
-		await expect(authStorage.keys.get("openai-codex", "definitive-policy-disable")).rejects.toThrow(
-			"matches no stored OAuth account",
-		);
-		await expect(authStorage.oauth.access("openai-codex", "definitive-policy-disable-retry")).rejects.toThrow(
-			"matches no stored OAuth account",
-		);
+		expect(await authStorage.keys.get("openai-codex", "definitive-policy-disable")).toBe("api-acct-sibling");
+		await authStorage.credentials.reload();
+		expect(await authStorage.keys.get("openai-codex", "definitive-policy-disable-retry")).toBe("api-acct-sibling");
 		expect(
 			store
 				.listAuthCredentials("openai-codex")
 				.map(row => (row.credential.type === "oauth" ? row.credential.accountId : undefined)),
 		).toEqual(["acct-sibling"]);
+		authStorage = new AuthStorage(store, {
+			accountPolicies: [{ provider: "openai-codex", account: { accountId: "acct-required" }, priority: 100 }],
+		});
+		await authStorage.credentials.reload();
+		expect(await authStorage.keys.get("openai-codex", "restart-after-disabled")).toBe("api-acct-sibling");
 		expect((await authStorage.credentials.listDisabled("openai-codex")).map(row => row.accountId)).toContain(
 			"acct-required",
 		);

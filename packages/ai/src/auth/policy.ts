@@ -124,9 +124,9 @@ export class AccountPolicies {
 				}
 			}
 			const path = `auth.accountPolicies[${index}].account`;
-			if (matches.length === 0) {
-				throw new AIError.ConfigurationError(`${path} matches no stored OAuth account for ${provider}`);
-			}
+			// Credentials can be removed or disabled independently of persistent settings.
+			// Keep unmatched policies dormant; never redirect them to another identity.
+			if (matches.length === 0) continue;
 			if (matches.length > 1) {
 				throw new AIError.ConfigurationError(
 					`${path} matches ${matches.length} stored OAuth accounts for ${provider}; add another identity field`,

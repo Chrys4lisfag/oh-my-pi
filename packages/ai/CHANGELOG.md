@@ -5,6 +5,11 @@
 ### Changed
 
 - Positive account priorities now override automatic quota-balancing preferences until exhaustion; explicit account reserves, session pins, and hard eligibility still apply.
+
+### Fixed
+
+- Fixed saved account priorities preventing startup, credential reload, or account removal after their matching OAuth account was disabled or deleted; unmatched policies stay dormant until that identity returns.
+
 ## [18.8.7] - 2026-10-09
 
 ### Added
