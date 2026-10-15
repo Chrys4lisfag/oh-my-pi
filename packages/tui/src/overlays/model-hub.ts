@@ -23,7 +23,6 @@ import type {
 import type { KeysApi, Model } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
-import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { providerEntry } from "@oh-my-pi/pi-catalog/compat/providers";
 import { MODEL_KINDS, modelKind, type ModelKind } from "@oh-my-pi/pi-catalog/types";
 import type { Component, TUI } from "../tui";
@@ -59,9 +58,11 @@ import {
 	ModelBrowser,
 	type ModelBrowserItem,
 	modelSearchText,
+	providerMark,
 	thinkingDotToken,
 	type RoleAssignments,
 	resolveRoleAssignments,
+	scopedRolePool,
 	sortModelItems,
 } from "./model-browser";
 import {
@@ -326,14 +327,6 @@ const MODEL_KIND_LABELS: Record<"all" | ModelKind, string> = {
 	rerank: "Rerank",
 	video: "Video",
 };
-
-/** A provider mark's initials: `amazon-bedrock` → `AB`, `anthropic` → `An`. */
-function providerInitials(providerId: string): string {
-	const words = providerId.split(/[-_\s.]+/).filter(word => word.length > 0);
-	if (words.length >= 2) return `${words[0]!.charAt(0)}${words[1]!.charAt(0)}`.toUpperCase();
-	const word = words[0] ?? providerId;
-	return `${word.charAt(0).toUpperCase()}${word.charAt(1)}`;
-}
 
 const PROVIDER_REFRESH_DEBOUNCE_MS = 120;
 const EMPTY_PROVIDER_RETRY_COOLDOWN_MS = 30_000;
@@ -683,22 +676,6 @@ export class ModelHubComponent implements Component {
 		return this.#settings.knownRoleIds.filter(role => !this.#settings.getRoleInfo(role).hidden);
 	}
 
-	/**
-	 * Models a `--models`/`enabledModels` scope exposes. The scope only resolves
-	 * chat models (it feeds Ctrl+P cycling), so available non-chat runners
-	 * (judge, search, image, …) join from the registry — runtime role
-	 * resolution ignores the scope for them as well.
-	 */
-	#scopedPool(): Model[] {
-		const pool = this.#scopedModels.map(scoped => scoped.model);
-		for (const model of this.#registry.getAvailable("all")) {
-			if (modelKind(model) === "chat") continue;
-			if (this.#scopedModels.some(scoped => modelsAreEqual(scoped.model, model))) continue;
-			pool.push(model);
-		}
-		return pool;
-	}
-
 	/** Resolve every known role: configured values first, auto-selection for the rest. */
 	#reloadRoles(autoCandidates: ReadonlyArray<Model>): void {
 		const allModels = this.#scopedModels.length > 0 ? autoCandidates : this.#allModels;
@@ -753,7 +730,10 @@ export class ModelHubComponent implements Component {
 		if (this.#scopedModels.length > 0) {
 			this.#configError = undefined;
 			try {
-				allModels = this.#scopedPool();
+				allModels = scopedRolePool(
+					this.#scopedModels.map(scoped => scoped.model),
+					this.#registry,
+				);
 			} catch (error) {
 				this.#configError = error instanceof Error ? error.message : String(error);
 				allModels = this.#scopedModels.map(scoped => scoped.model);
@@ -1769,6 +1749,7 @@ export class ModelHubComponent implements Component {
 	 */
 	#thinkingOptionsFor(model: Model): ConfiguredThinkingLevel[] {
 		if (!model.reasoning) return [];
+		if (model.thinking?.unverified) return [ThinkingLevel.Inherit, ThinkingLevel.Off, ...getSupportedEfforts(model)];
 		return [ThinkingLevel.Inherit, ThinkingLevel.Off, AUTO_THINKING, ...getSupportedEfforts(model)];
 	}
 
@@ -3977,7 +3958,7 @@ export class ModelHubComponent implements Component {
 					break;
 				case "provider": {
 					const providerId = entry.providerId ?? entry.label;
-					const mark = { text: providerInitials(providerId), seed: providerId };
+					const mark = providerMark(providerId);
 					if (entry.locked) {
 						const envVars = providerEntry(providerId)?.envVars ?? [];
 						scopes.push({

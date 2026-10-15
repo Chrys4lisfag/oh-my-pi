@@ -13,6 +13,7 @@ import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { formatShakeSummary } from "@oh-my-pi/pi-coding-agent/session/shake-types";
+import { TodoTool } from "@oh-my-pi/pi-coding-agent/tools";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 import {
@@ -291,6 +292,44 @@ describe("AgentSession shake", () => {
 			const imageResult = await session.shake("images");
 			expect(imageResult.imagesDropped).toBe(1);
 			expect(mixedResult.content.some(block => block.type === "image")).toBe(false);
+		});
+
+		it("saves the tokens it elides from an assistant turn with the turn", async () => {
+			const fence = `\`\`\`ts\n${"const value = compute(a, b, c, d, e);\n".repeat(200)}\`\`\``;
+			sessionManager.appendMessage({
+				role: "user",
+				content: [{ type: "text", text: "write it" }],
+				timestamp: Date.now() - 2,
+			});
+			sessionManager.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: `Here it is:\n${fence}\nDone.` }],
+				...apiInfo,
+				stopReason: "stop",
+				usage,
+				timestamp: Date.now() - 1,
+			});
+			appendRecentProtectedTail();
+
+			const result = await session.shake("elide");
+
+			expect(result.blocksDropped).toBe(1);
+			expect(result.tokensFreed).toBeGreaterThan(0);
+			const sessionFile = sessionManager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected persisted shake session");
+			const persisted = await SessionManager.open(sessionFile, tempDir.path());
+			try {
+				const turn = persisted
+					.getBranch()
+					.find(entry => entry.type === "message" && entry.message.role === "assistant");
+				expect(
+					turn?.type === "message" && turn.message.role === "assistant"
+						? turn.message.elidedOutputTokens
+						: undefined,
+				).toBe(result.tokensFreed);
+			} finally {
+				await persisted.close();
+			}
 		});
 
 		it("updates provider-anchored context usage immediately after rewriting prompt history", async () => {
@@ -705,6 +744,15 @@ describe("AgentSession shake", () => {
 
 		it("continues terminal-settle todo policy after a successful checkpoint rewrite", async () => {
 			useMillionContextModel();
+			session.agent.setTools([
+				new TodoTool({
+					cwd: tempDir.path(),
+					hasUI: false,
+					getSessionFile: () => null,
+					getSessionSpawns: () => "*",
+					settings: session.settings,
+				}),
+			]);
 			session.setTodoPhases([{ name: "Work", tasks: [{ content: "finish", status: "pending" }] }]);
 			const todoReminder = Promise.withResolvers<void>();
 			const unsubscribe = session.subscribe(event => {

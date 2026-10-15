@@ -68,26 +68,7 @@ export async function openInEditor(
 
 	try {
 		await Bun.write(tmpFile, content);
-
-		// GUI editor launchers exit after delegating to a background daemon. Add
-		// their wait flag unless the configured command already supplies one.
-		const lowerCmd = editorCmd.toLowerCase();
-		const isGuiEditor = ["code", "code-insiders", "cursor", "subl", "zed", "atom"].some(gui =>
-			lowerCmd.includes(gui),
-		);
-		const hasWaitFlag = lowerCmd.includes("--wait") || / -w(\s|$)/.test(lowerCmd);
-		const waitFlag = isGuiEditor && !hasWaitFlag ? (lowerCmd.includes("subl") ? "-w" : "--wait") : undefined;
-		const editorWithWait = `${editorCmd}${waitFlag ? ` ${waitFlag}` : ""}`;
-		const spawnCommand = resolveEditorSpawnCommand(editorWithWait, tmpFile);
-		// Inherit the real pane pty so terminal editors (including emacsclient,
-		// which resolves the device via ttyname) render into the visible pane.
-		const child = Bun.spawn(spawnCommand.cmd, {
-			stdin: "inherit",
-			stdout: "inherit",
-			stderr: "inherit",
-			windowsVerbatimArguments: spawnCommand.windowsVerbatimArguments,
-		});
-		const exitCode = await child.exited;
+		const exitCode = await openEditorOnPath(editorCmd, tmpFile);
 		if (exitCode === 0) {
 			const text = await Bun.file(tmpFile).text();
 			if (options?.trimTrailingNewline === false) {
@@ -103,4 +84,29 @@ export async function openInEditor(
 			// Ignore cleanup errors
 		}
 	}
+}
+
+/**
+ * Opens an existing file in the user's editor, which writes it in place, and
+ * returns the editor's exit code. The file may have been saved even when the
+ * code is non-zero, so callers that care re-read it.
+ *
+ * The caller is responsible for stopping/starting the TUI around this call.
+ */
+export async function openEditorOnPath(editorCmd: string, filePath: string): Promise<number> {
+	// GUI launchers delegate to a background process unless explicitly told to wait.
+	const lowerCmd = editorCmd.toLowerCase();
+	const isGuiEditor = ["code", "code-insiders", "cursor", "subl", "zed", "atom"].some(gui => lowerCmd.includes(gui));
+	const hasWaitFlag = lowerCmd.includes("--wait") || / -w(\s|$)/.test(lowerCmd);
+	const waitFlag = isGuiEditor && !hasWaitFlag ? (lowerCmd.includes("subl") ? "-w" : "--wait") : undefined;
+	const spawnCommand = resolveEditorSpawnCommand(`${editorCmd}${waitFlag ? ` ${waitFlag}` : ""}`, filePath);
+	// Inherit the real pane pty so terminal editors (including emacsclient,
+	// which resolves the device via ttyname) render into the visible pane.
+	const child = Bun.spawn(spawnCommand.cmd, {
+		stdin: "inherit",
+		stdout: "inherit",
+		stderr: "inherit",
+		windowsVerbatimArguments: spawnCommand.windowsVerbatimArguments,
+	});
+	return child.exited;
 }

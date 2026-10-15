@@ -4,7 +4,7 @@ import { AuthStorage, type UsageReport } from "@oh-my-pi/pi-ai";
 import { CommandController, renderUsageReports } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
 import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/selector-controller";
 import * as activityClient from "@oh-my-pi/pi-coding-agent/stats/activity-client";
-import { visibleWidth } from "@oh-my-pi/pi-tui";
+import { Container, visibleWidth } from "@oh-my-pi/pi-tui";
 import { UsageDashboardComponent } from "@oh-my-pi/pi-tui/overlays/usage-dashboard";
 import { getThemeByName, setThemeInstance, theme } from "@oh-my-pi/pi-tui/theme";
 import { createInteractiveModeContext } from "../../helpers/interactive-mode-context";
@@ -396,6 +396,34 @@ describe("interactive /usage account visibility", () => {
 		return stripVTControlCharacters(mounted?.render(120).join("\n") ?? "");
 	}
 
+	it("renders advisor status before usage refresh returns", async () => {
+		const refresh = Promise.withResolvers<UsageReport[] | null>();
+		const ctx = createInteractiveModeContext({
+			reportContainer: new Container(),
+			commandReportRows: () => 20,
+			ui: { terminal: { columns: 120, rows: 30 } },
+			session: {
+				getAdvisorStats: () => ({
+					configured: true,
+					active: false,
+					contextWindow: 0,
+					contextTokens: 0,
+					tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					cost: 0,
+					messages: { user: 0, assistant: 0, total: 0 },
+					advisors: [],
+					tools: [],
+				}),
+				fetchUsageReports: () => refresh.promise,
+				modelRegistry: { authStorage },
+			},
+		});
+		const result = new CommandController(ctx).handleAdvisorStatusCommand();
+		expect(stripVTControlCharacters(ctx.reportContainer.render(120).join("\n"))).toContain("Advisor Status");
+		refresh.resolve([]);
+		await result;
+	});
+
 	it("warns without opening the dashboard when usage reporting is not configured", async () => {
 		const warnings: string[] = [];
 		await command(undefined, warnings).handleUsageCommand();
@@ -423,6 +451,19 @@ describe("interactive /usage account visibility", () => {
 		};
 		await command(async () => [report]).handleUsageCommand();
 
+		const accounts = display();
+		expect(accounts).toContain("Usage · Accounts");
+		expect(accounts.match(/shared@example\.test/g)).toHaveLength(2);
+		expect(accounts).toContain("shared@example.test (org-team)");
+		expect(accounts).toMatch(/shared@example\.test.*org-personal.*usage unavailable/);
+		expect(accounts.match(/usage unavailable/g)).toHaveLength(1);
+		expect(accounts).toContain("75% remaining");
+		expect(accounts).not.toMatch(/org-team.*usage unavailable/);
+		expect(accounts).not.toContain("No account usage data available");
+		expect(accounts).not.toContain("Tavily");
+
+		mounted?.handleInput("o");
+
 		const overview = display();
 		expect(overview).toContain("2 accts");
 		expect(overview).toContain(email);
@@ -440,6 +481,15 @@ describe("interactive /usage account visibility", () => {
 		expect(details).toContain("1 usable now");
 		expect(details).toContain("in use by this session: shared@example.test (org-personal)");
 		expect(details).not.toMatch(/org-team.*usage unavailable/);
+
+		mounted?.handleInput("a");
+		expect(display()).toBe(accounts);
+		mounted?.handleInput("\r");
+		expect(display()).toBe(details);
+		mounted?.handleInput("\x1b");
+		expect(display()).toBe(overview);
+		mounted?.handleInput("\x1b");
+		expect(mounted).toBeUndefined();
 	});
 
 	it.each(["empty", "null", "error"] as const)(
@@ -449,6 +499,21 @@ describe("interactive /usage account visibility", () => {
 				if (result === "error") throw new Error("usage endpoint unavailable");
 				return result === "null" ? null : [];
 			}).handleUsageCommand();
+
+			const accounts = display();
+			expect(accounts).toContain("Usage · Accounts");
+			expect(accounts.match(/shared@example\.test/g)).toHaveLength(2);
+			expect(accounts).toMatch(/shared@example\.test.*org-team.*usage unavailable/);
+			expect(accounts).toMatch(/shared@example\.test.*org-personal.*usage unavailable/);
+			expect(accounts.match(/usage unavailable/g)).toHaveLength(2);
+			expect(accounts).not.toContain("%");
+			expect(accounts).not.toContain("untouched");
+			expect(accounts).not.toContain("no limits");
+			expect(accounts).not.toContain("No quota windows reported");
+			expect(accounts).not.toContain("No account usage data available");
+			expect(accounts).not.toContain("Tavily");
+
+			mounted?.handleInput("o");
 
 			const overview = display();
 			expect(overview).toContain("2 accts");
@@ -470,7 +535,11 @@ describe("interactive /usage account visibility", () => {
 			expect(details).not.toContain("Infinity");
 
 			mounted?.handleInput("\x1b");
-			expect(display()).toContain("2 accts");
+			expect(display()).toBe(overview);
+			mounted?.handleInput("a");
+			expect(display()).toBe(accounts);
+			mounted?.handleInput("\x1b");
+			expect(display()).toBe(overview);
 			mounted?.handleInput("\x1b");
 			expect(mounted).toBeUndefined();
 		},
