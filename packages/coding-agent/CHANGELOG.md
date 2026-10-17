@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `replace_global.bat` for Windows source builds with native-addon backups, verified executable replacement, and rollback on failure.
+
 ### Changed
 
 - Reduced status-line refresh overhead while subagents have long conversations ([#15874](https://github.com/can1357/oh-my-pi/pull/15874) by [@iliaal](https://github.com/iliaal)).
