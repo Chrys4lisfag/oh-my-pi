@@ -1,8 +1,7 @@
 # Build this checkout and replace the compiled Windows omp installation.
 [CmdletBinding()]
 param(
-    [string]$InstallDir,
-    [switch]$NoPause
+    [string]$InstallDir
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,7 +52,6 @@ try {
     if ($env:CROSS_TARGET) { throw 'Unset CROSS_TARGET before building a local Windows installation.' }
     $bun = (Get-Command bun -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
     $null = Get-Command git -CommandType Application -ErrorAction Stop
-    $null = Get-Command cargo -CommandType Application -ErrorAction Stop
     if (-not $InstallDir) {
         $bunHome = if ($env:BUN_INSTALL) { $env:BUN_INSTALL } else { Join-Path $env:USERPROFILE '.bun' }
         $InstallDir = Join-Path $bunHome 'bin'
@@ -65,6 +63,10 @@ try {
     # Prevent two invocations in this checkout from racing over build artifacts.
     $lock = [IO.File]::Open((Join-Path $distDir '.replace-global.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
     Set-Location -LiteralPath $repoRoot
+    . (Join-Path $PSScriptRoot 'windows-rust.ps1')
+    $cargo = Ensure-WindowsCargo
+    # Resolves/downloads the checkout's rust-toolchain.toml before touching artifacts.
+    Invoke-Checked $cargo @('--version')
     Write-Host "Building checkout: $repoRoot"
     Write-Host "Installing to: $destination"
 
@@ -145,6 +147,5 @@ try {
     if ($staged -and (Test-Path -LiteralPath $staged)) { Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue }
     if ($lock) { $lock.Dispose() }
     Set-Location -LiteralPath $originalLocation
-    if (-not $NoPause) { $null = Read-Host 'Press Enter to close' }
 }
 exit $exitCode

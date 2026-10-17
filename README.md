@@ -656,12 +656,12 @@ bun dev
 On Windows, double-click `replace_global.bat` to build this checkout and replace the compiled `omp.exe`, or run:
 
 ```powershell
-.\replace_global.bat -NoPause
+.\replace_global.bat
 # Optional alternative destination:
-.\replace_global.bat -NoPause -InstallDir "D:\Tools\omp"
+.\replace_global.bat -InstallDir "D:\Tools\omp"
 ```
 
-Requires Bun, Git, Rust/Cargo, and Visual Studio C++ Build Tools with the Windows SDK. The launcher installs dependencies, rebuilds natives, compiles the CLI, and smoke-tests the candidate before replacing `%BUN_INSTALL%\bin\omp.exe` (or `%USERPROFILE%\.bun\bin\omp.exe` when `BUN_INSTALL` is unset). It verifies the installed SHA-256 and smoke test, retaining the prior executable beside it for rollback. Existing native/build artifacts are backed up before replacement; failures restore originals where Windows permits. No processes are killed; if a file cannot be renamed, close the process holding it and retry. Ensure the destination is first on PATH; restart OMP afterward. Configurations and sessions are untouched. Do not run other builds in this checkout concurrently.
+Requires Bun, Git, and Visual Studio C++ Build Tools with the Windows SDK. Rust is discovered on PATH or under `%CARGO_HOME%\bin` / `%USERPROFILE%\.cargo\bin`; when missing, the launcher downloads the official rustup installer, verifies its SHA-256, and installs it unattended. Cargo resolves this checkout's pinned `rust-toolchain.toml` automatically without changing your default Rust toolchain. The current process PATH is updated immediately: no terminal restart is required. The launcher then installs dependencies, rebuilds natives, compiles the CLI, and smoke-tests the candidate before replacing `%BUN_INSTALL%\bin\omp.exe` (or `%USERPROFILE%\.bun\bin\omp.exe` when `BUN_INSTALL` is unset). It verifies the installed SHA-256 and smoke test, retaining the prior executable beside it for rollback. Existing native/build artifacts are backed up before replacement; failures restore originals where Windows permits. No prompts, pauses, elevation requests, or process termination are performed; if Windows prevents a file rename, the script fails with a nonzero exit code. Ensure the destination is first on PATH; restart OMP afterward. Configurations and sessions are untouched. Do not run other builds in this checkout concurrently.
 
 Nix users get the pinned Bun and Rust toolchains plus all native build dependencies:
 

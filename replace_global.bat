@@ -1,7 +1,7 @@
 @echo off
 setlocal DisableDelayedExpansion
-REM Double-click to build and replace OMP. Use -NoPause for automation.
+REM Build and replace OMP without interactive prompts.
 REM Optional: -InstallDir "D:\Tools\omp"
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\replace-global.ps1" %*
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0scripts\replace-global.ps1" %*
 set "OMP_BUILD_EXIT=%ERRORLEVEL%"
 endlocal & exit /b %OMP_BUILD_EXIT%

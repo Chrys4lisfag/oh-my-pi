@@ -8,6 +8,8 @@
 
 ### Changed
 
+- Windows source replacement now installs missing Rust automatically, discovers Cargo outside PATH, and runs without interactive pauses.
+
 - Reduced status-line refresh overhead while subagents have long conversations ([#15874](https://github.com/can1357/oh-my-pi/pull/15874) by [@iliaal](https://github.com/iliaal)).
 
 ## [18.11.1] - 2026-10-15

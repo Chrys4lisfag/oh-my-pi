@@ -22,6 +22,13 @@ class Fixture {
   string stage = args.Length > 0 ? args[0] : "";
   if (stage == "run") stage = args[1];
   if (stage == "--smoke-test") stage = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\\\').EndsWith("bin") ? "installed" : "candidate";
+  if (stage == "-y") {
+   if (String.Join(" ", args) != "-y --profile minimal --default-toolchain none") return 24;
+   if (stage == Environment.GetEnvironmentVariable("OMP_REPLACE_TEST_FAIL")) return 23;
+   string bin = Path.Combine(Environment.GetEnvironmentVariable("CARGO_HOME"), "bin");
+   Directory.CreateDirectory(bin);
+   File.Copy(System.Diagnostics.Process.GetCurrentProcess().MainModule.FileName, Path.Combine(bin, "cargo.exe"), true);
+  }
   if (stage == Environment.GetEnvironmentVariable("OMP_REPLACE_TEST_FAIL")) return 23;
   if (stage == "build:native") {
    Directory.CreateDirectory("packages/natives/native");
@@ -74,7 +81,11 @@ class Fixture {
 			path.join(dir, "scripts/replace-global.ps1"),
 			Bun.file(path.join(import.meta.dir, "replace-global.ps1")),
 		);
-		const child = Bun.spawn(["cmd.exe", "/d", "/c", "replace_global.bat -NoPause"], {
+		await Bun.write(
+			path.join(dir, "scripts/windows-rust.ps1"),
+			Bun.file(path.join(import.meta.dir, "windows-rust.ps1")),
+		);
+		const child = Bun.spawn(["cmd.exe", "/d", "/c", "replace_global.bat"], {
 			cwd: dir,
 			env: {
 				...process.env,
@@ -105,6 +116,57 @@ class Fixture {
 		expect(backup).toBeDefined();
 		expect(await Bun.file(path.join(path.dirname(result.installed), backup!)).text()).toBe("old install");
 	}, 30_000);
+
+	for (const mode of ["existing", "install", "bad-checksum", "installer-error"]) {
+		test(`Rust bootstrap handles ${mode} without user input`, async () => {
+			const dir = await fs.mkdtemp(path.join(root, "rust bootstrap "));
+			const cargoHome = path.join(dir, "cargo home");
+			const cargo = path.join(cargoHome, "bin/cargo.exe");
+			if (mode === "existing") {
+				await fs.mkdir(path.dirname(cargo), { recursive: true });
+				await fs.copyFile(tool, cargo);
+			}
+			const system = process.env.SystemRoot ?? "C:\\Windows";
+			const child = Bun.spawn(
+				[
+					path.join(system, "System32/WindowsPowerShell/v1.0/powershell.exe"),
+					"-NoProfile",
+					"-NonInteractive",
+					"-ExecutionPolicy",
+					"Bypass",
+					"-File",
+					path.join(import.meta.dir, "test-fixtures/windows-rust.ps1"),
+					path.join(import.meta.dir, "windows-rust.ps1"),
+					tool,
+					mode,
+				],
+				{
+					env: {
+						...process.env,
+						PATH: path.join(system, "System32"),
+						CARGO_HOME: cargoHome,
+						OMP_REPLACE_TEST_FAIL: mode === "installer-error" ? "-y" : "",
+					},
+					stdout: "pipe",
+					stderr: "pipe",
+				},
+			);
+			const [out, err, code] = await Promise.all([
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+				child.exited,
+			]);
+			if (mode === "existing" || mode === "install") {
+				expect(code).toBe(0);
+				expect(out).toContain("cargo-ready");
+				expect(await Bun.file(cargo).arrayBuffer()).toEqual(await Bun.file(tool).arrayBuffer());
+			} else {
+				expect(code).toBe(1);
+				expect(`${out}${err}`).toContain(mode === "bad-checksum" ? "SHA256 mismatch" : "exited with code 23");
+				expect(await Bun.file(cargo).exists()).toBe(false);
+			}
+		}, 30_000);
+	}
 
 	for (const failure of ["install", "build:native", "build", "candidate", "installed"]) {
 		test(`preserves installed OMP and restores artifacts when ${failure} fails`, async () => {
